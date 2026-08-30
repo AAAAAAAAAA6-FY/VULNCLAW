@@ -1,0 +1,99 @@
+---
+# SPDX-License-Identifier: AGPL-3.0-or-later WITH Classpath-exception-2.0
+name: 💰 商业授权询价 (Commercial License Inquiry)
+description: |
+  请发邮件到 vulnclaw.official@outlook.com（不要用 Issue）；
+  本模板仅作你写询价邮件的「信息收集清单」，复制内容填好粘贴到邮件正文即可。
+title: "[Commercial Inquiry]: <公司 / 团队名> - <方案档位>"
+labels: ["commercial", "needs triage"]
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > ⚠️ **请不要用本 Issue 提交**。
+        > 请把本页你填写的内容**复制**后，**发邮件到：`vulnclaw.official@outlook.com`**
+        > 邮件标题格式：**`[商业授权] <公司/团队名> - <方案档位>`**
+        >
+        > 报价单 & 付款信息 & 授权证书 & 企业功能包 只会通过邮件回发（1 工作日内）。
+
+  - type: input
+    id: company
+    validations:
+      required: true
+    attributes:
+      label: ① 公司 / 团队全称
+      placeholder: 例：上海某某科技有限公司 / 某某红队工作室（个人请填你的名字 + ID）
+
+  - type: input
+    id: contact
+    validations:
+      required: true
+    attributes:
+      label: ② 联系人 & 对接邮箱
+      placeholder: 例：王工，wang@example.com  （将用于发送报价单/授权证书，必填）
+
+  - type: dropdown
+    id: tier
+    validations:
+      required: true
+    attributes:
+      label: ③ 期望的方案档位
+      description: 详细权益对比请读 README 的「商业授权与定价」章节。
+      options:
+        - "⭐ 大企业版（50+ 人团队） $1,999 / 年 — 含面板/RBAC/告警联动/SLA 24h"
+        - "🀄 中型企业版（11-50 人） $499 / 年 — 含 RBAC/审计日志/告警联动"
+        - "🔹 小团队版（≤10 人） $99 / 年"
+        - "📦 永久买断版（终身授权） $999 一次性 — 不含后续大版本升级"
+        - "☁️ SaaS 托管版 $49 / 月起（按量，免部署）"
+        - "🏭 定制 / 私有化部署（工控/金融/政企/定制协议/SLA/NDA） 邮件详细聊"
+        - "🤝 暂不确定，需要你帮我推荐方案（请在④里描述一下规模）"
+
+  - type: textarea
+    id: scale
+    validations:
+      required: true
+    attributes:
+      label: ④ 使用规模 & 场景
+      description: 这会影响报价和方案匹配（例如分布式节点数、扫描并发量、合规要求）。
+      placeholder: |
+        员工 / 安全团队规模：约 120 人 / 8 人红队
+        年扫描目标数量：约 3,000 域名 + 120 个代码仓库
+        用途场景：
+          - □ SaaS 产品内置（需要 AGPL 豁免）
+          - □ 内部红队 / 合规自检 / 渗透测试交付
+          - □ 客户化交付（给乙方客户做报告和扫描）
+          - □ 其他（说明）
+        合规要求：□ 等保三级 □ ISO27001 □ PCI-DSS □ 自定义 NDA
+      render: markdown
+
+  - type: dropdown
+    id: invoice
+    validations:
+      required: true
+    attributes:
+      label: ⑤ 是否需要发票（决定是否含税报价）
+      options:
+        - "否，不需要发票（含税/不含税双报价都会一起回，你自己选）"
+        - "✅ 需要增值税电子普通发票"
+        - "✅ 需要增值税专用发票（需提供一般纳税人信息）"
+
+  - type: input
+    id: start_date
+    attributes:
+      label: ⑥ 期望授权起始日期（可选）
+      placeholder: 例：2026-09-15  （留空默认付款当日起算）
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: ⑦ 其他说明 / 特殊要求
+      placeholder: 例如：需要先试用 7 天大企业版评估；需要签署 NDA 后才能进一步沟通；需要现场部署培训等
+      render: markdown
+
+  - type: markdown
+    attributes:
+      value: |
+        ---
+        📧 **填好以上 7 项后，全部复制粘贴，发到：vulnclaw.official@outlook.com**
+        （标题务必带 `[商业授权]`，会自动进入商务邮箱过滤器，1 工作日内必回）

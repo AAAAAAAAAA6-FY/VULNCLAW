@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>VULNCLAW Dashboard</title>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', monospace; background: #0d1117; color: #c9d1d9; }
+        #app { display: flex; flex-direction: column; height: 100vh; }
+        .header { background: #161b22; padding: 12px 24px; border-bottom: 1px solid #30363d; display: flex; justify-content: space-between; align-items: center; }
+        .header h1 { font-size: 18px; color: #58a6ff; }
+        .header .status { font-size: 12px; color: #8b949e; }
+        .main { display: flex; flex: 1; overflow: hidden; }
+        .sidebar { width: 240px; background: #161b22; border-right: 1px solid #30363d; padding: 16px; overflow-y: auto; }
+        .content { flex: 1; padding: 16px; overflow-y: auto; }
+        .card { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 16px; margin-bottom: 16px; }
+        .card h2 { font-size: 14px; color: #8b949e; margin-bottom: 12px; text-transform: uppercase; }
+        .stat-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+        .stat { text-align: center; }
+        .stat .value { font-size: 28px; font-weight: bold; color: #58a6ff; }
+        .stat .label { font-size: 12px; color: #8b949e; }
+        table { width: 100%; border-collapse: collapse; }
+        th { text-align: left; font-size: 12px; color: #8b949e; padding: 8px; border-bottom: 1px solid #30363d; }
+        td { padding: 8px; border-bottom: 1px solid #21262d; font-size: 13px; }
+        .badge { padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: bold; }
+        .badge-idle { background: #1f6feb22; color: #58a6ff; }
+        .badge-busy { background: #f0883e22; color: #f0883e; }
+        .badge-dead { background: #da363322; color: #da3633; }
+        .badge-success { background: #23863622; color: #3fb950; }
+        .dag-node { display: inline-block; padding: 4px 12px; margin: 4px; border-radius: 4px; font-size: 12px; }
+        .dag-running { background: #f0883e; color: #fff; }
+        .dag-done { background: #238636; color: #fff; }
+        .dag-pending { background: #30363d; color: #8b949e; }
+        .ws-indicator { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+        .ws-connected { background: #3fb950; }
+        .ws-disconnected { background: #da3633; }
+        .tab { display: inline-block; padding: 8px 16px; cursor: pointer; border-bottom: 2px solid transparent; }
+        .tab.active { border-color: #58a6ff; color: #58a6ff; }
+    </style>
+</head>
+<body>
+<div id="app">
+    <div class="header">
+        <h1>VULNCLAW Dashboard</h1>
+        <div class="status">
+            <span class="ws-indicator" :class="wsConnected ? 'ws-connected' : 'ws-disconnected'"></span>
+            {{ wsConnected ? 'Connected' : 'Disconnected' }} | {{ currentTime }}
+        </div>
+    </div>
+    <div class="main">
+        <div class="sidebar">
+            <div class="card">
+                <h2>Navigation</h2>
+                <div v-for="tab in tabs" :key="tab" class="tab" :class="{active: activeTab === tab}" @click="switchTab(tab)">
+                    {{ tab }}
+                </div>
+            </div>
+            <div class="card">
+                <h2>Workers</h2>
+                <div v-for="w in workers" :key="w.id" style="margin-bottom: 8px;">
+                    <span class="badge" :class="'badge-' + w.status">{{ w.status }}</span>
+                    <span style="font-size: 12px; margin-left: 8px;">{{ w.id }}</span>
+                </div>
+                <div v-if="workers.length === 0" style="color: #8b949e; font-size: 12px;">No workers</div>
+            </div>
+        </div>
+        <div class="content">
+            <!-- Overview Tab -->
+            <div v-show="activeTab === 'Overview'">
+                <div class="card">
+                    <h2>Cluster Status</h2>
+                    <div class="stat-grid">
+                        <div class="stat">
+                            <div class="value">{{ clusterStatus.workers || 0 }}</div>
+                            <div class="label">Workers</div>
+                        </div>
+                        <div class="stat">
+                            <div class="value">{{ clusterStatus.pending_tasks || 0 }}</div>
+                            <div class="label">Pending</div>
+                        </div>
+                        <div class="stat">
+                            <div class="value">{{ clusterStatus.completed_tasks || 0 }}</div>
+                            <div class="label">Completed</div>
+                        </div>
+                        <div class="stat">
+                            <div class="value">{{ findings.length }}</div>
+                            <div class="label">Findings</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="card">
+                    <h2>New Scan</h2>
+                    <div style="display: flex; gap: 8px;">
+                        <input v-model="newTarget" placeholder="https://example.com" style="flex: 1; background: #0d1117; border: 1px solid #30363d; color: #c9d1d9; padding: 8px; border-radius: 4px;" @keyup.enter="startScan" />
+                        <button @click="startScan" :disabled="scanStarting" style="background: #238636; border: none; color: #fff; padding: 8px 16px; border-radius: 4px; cursor: pointer;">{{ scanStarting ? 'Starting...' : 'Start' }}</button>
+                    </div>
+                    <div v-if="scanMessage" style="margin-top: 8px; font-size: 12px; color: #58a6ff;">{{ scanMessage }}</div>
+                </div>
+            </div>
+            <!-- DAG Tab -->
+            <div v-show="activeTab === 'DAG'">
+                <div class="card">
+                    <h2>DAG Nodes</h2>
+                    <select v-model="dagScanId" @change="loadDag()" style="background: #0d1117; border: 1px solid #30363d; color: #c9d1d9; padding: 6px; border-radius: 4px; margin-bottom: 12px; width: 100%;">
+                        <option v-for="s in scans" :key="s.scan_id" :value="s.scan_id">{{ shortId(s.scan_id) }} — {{ s.target }}</option>
+                    </select>
+                    <div v-if="dagLoading" style="color: #8b949e; font-size: 12px;">Loading...</div>
+                    <div v-for="node in dagNodes" :key="node.id">
+                        <span class="dag-node" :class="dagClass(node.status)">{{ node.id }} ({{ node.status }})</span>
+                    </div>
+                    <div v-if="dagNodes.length === 0 && !dagLoading" style="color: #8b949e;">No DAG data</div>
+                </div>
+            </div>
+            <!-- Findings Tab -->
+            <div v-show="activeTab === 'Findings'">
+                <div class="card">
+                    <h2>Vulnerabilities</h2>
+                    <table>
+                        <thead>
+                            <tr><th>Scan</th><th>Type</th><th>URL</th><th>Severity</th><th>Status</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr v-for="f in findings" :key="f.id">
+                                <td style="font-size: 11px; color: #8b949e;">{{ shortId(f.scan_id) }}</td>
+                                <td>{{ f.type }}</td>
+                                <td style="max-width: 260px; overflow: hidden; text-overflow: ellipsis;">{{ f.url }}</td>
+                                <td><span class="badge" :class="severityBadge(f.severity)">{{ f.severity }}</span></td>
+                                <td><span class="badge" :class="f.verified ? 'badge-success' : 'badge-idle'">{{ f.verified ? 'Verified' : 'Pending' }}</span></td>
+                            </tr>
+                        </tbody>
+                    </table>
+                    <div v-if="findings.length === 0" style="color: #8b949e;">No findings</div>
+                </div>
+            </div>
+            <!-- Logs Tab -->
+            <div v-show="activeTab === 'Logs'">
+                <div class="card">
+                    <h2>Live Logs</h2>
+                    <pre style="font-size: 12px; overflow-y: auto; max-height: 400px; color: #8b949e;">{{ logs.join('\n') }}</pre>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+const { createApp, ref, onMounted, onUnmounted } = Vue;
+
+createApp({
+    setup() {
+        const wsConnected = ref(false);
+        const currentTime = ref(new Date().toLocaleTimeString());
+        const activeTab = ref('Overview');
+        const tabs = ['Overview', 'DAG', 'Findings', 'Logs'];
+        const clusterStatus = ref({});
+        const workers = ref([]);
+        const findings = ref([]);
+        const scans = ref([]);
+        const dagNodes = ref([]);
+        const dagScanId = ref('');
+        const dagLoading = ref(false);
+        const logs = ref([]);
+        const newTarget = ref('');
+        const scanStarting = ref(false);
+        const scanMessage = ref('');
+        let ws = null;
+        let timeTimer = null;
+        let refreshTimer = null;
+
+        const shortId = (id) => {
+            const s = String(id || '-');
+            return s.length > 26 ? s.slice(0, 26) + '…' : s;
+        };
+
+        const severityBadge = (s) => {
+            const sv = String(s || '').toLowerCase();
+            return ['critical', 'high'].includes(sv) ? 'badge-busy' : 'badge-idle';
+        };
+
+        const dagClass = (s) => {
+            const sv = String(s || '').toLowerCase();
+            if (['succeeded', 'done', 'success'].includes(sv)) return 'dag-done';
+            if (['running', 'executing'].includes(sv)) return 'dag-running';
+            return 'dag-pending';
+        };
+
+        const loadScans = async () => {
+            try {
+                const resp = await fetch('/api/scans');
+                const data = await resp.json();
+                scans.value = data || [];
+            } catch (e) { scans.value = []; }
+        };
+
+        const loadFindings = async () => {
+            try {
+                const resp = await fetch('/api/findings');
+                const data = await resp.json();
+                findings.value = data || [];
+            } catch (e) { findings.value = []; }
+        };
+
+        const loadDag = async () => {
+            if (!dagScanId.value) return;
+            dagLoading.value = true;
+            try {
+                const resp = await fetch(`/api/dag/${encodeURIComponent(dagScanId.value)}`);
+                const data = await resp.json();
+                dagNodes.value = (data && data.nodes) || [];
+            } catch (e) {
+                dagNodes.value = [];
+            } finally {
+                dagLoading.value = false;
+            }
+        };
+
+        const switchTab = (tab) => {
+            activeTab.value = tab;
+            if (tab === 'DAG') {
+                if (!dagScanId.value && scans.value.length) {
+                    dagScanId.value = scans.value[0].scan_id;
+                }
+                loadDag();
+            }
+        };
+
+        const startScan = async () => {
+            const target = newTarget.value.trim();
+            if (!target) return;
+            scanStarting.value = true;
+            scanMessage.value = '';
+            try {
+                const resp = await fetch('/api/scans', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ target }),
+                });
+                const data = await resp.json();
+                if (data.success) {
+                    scanMessage.value = `${data.message} (${data.scan_id})`;
+                    newTarget.value = '';
+                    loadScans();
+                } else {
+                    scanMessage.value = data.error || '启动扫描失败';
+                }
+            } catch (e) {
+                scanMessage.value = '请求失败: ' + e.message;
+            } finally {
+                scanStarting.value = false;
+            }
+        };
+
+        const connectWS = () => {
+            const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${location.host}/ws`);
+
+            ws.onopen = () => {
+                wsConnected.value = true;
+                logs.value.push(`[${new Date().toLocaleTimeString()}] WebSocket connected`);
+            };
+
+            ws.onmessage = (event) => {
+                const msg = JSON.parse(event.data);
+                if (msg.type === 'status') {
+                    clusterStatus.value = msg.data;
+                    if (msg.data.workers) {
+                        // Fetch worker details
+                        fetch('/api/workers').then(r => r.json()).then(data => {
+                            workers.value = data;
+                        });
+                    }
+                }
+                logs.value.push(`[${new Date().toLocaleTimeString()}] ${JSON.stringify(msg).slice(0, 200)}`);
+                if (logs.value.length > 100) logs.value.shift();
+            };
+
+            ws.onclose = () => {
+                wsConnected.value = false;
+                logs.value.push(`[${new Date().toLocaleTimeString()}] WebSocket disconnected, retrying...`);
+                setTimeout(connectWS, 3000);
+            };
+
+            ws.onerror = () => { ws.close(); };
+        };
+
+        onMounted(() => {
+            connectWS();
+            loadScans();
+            loadFindings();
+            timeTimer = setInterval(() => {
+                currentTime.value = new Date().toLocaleTimeString();
+            }, 1000);
+            refreshTimer = setInterval(() => {
+                loadScans();
+                loadFindings();
+            }, 15000);
+        });
+
+        onUnmounted(() => {
+            if (ws) ws.close();
+            if (timeTimer) clearInterval(timeTimer);
+            if (refreshTimer) clearInterval(refreshTimer);
+        });
+
+        return {
+            wsConnected, currentTime, activeTab, tabs, clusterStatus, workers,
+            findings, scans, dagNodes, dagScanId, dagLoading, logs,
+            newTarget, scanStarting, scanMessage,
+            shortId, severityBadge, dagClass, switchTab, startScan, loadDag
+        };
+    }
+}).mount('#app');
+</script>
+</body>
+</html>

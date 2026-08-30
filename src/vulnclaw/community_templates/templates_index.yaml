@@ -1,0 +1,47 @@
+# 社区模板仓库索引（v105 雏形）
+#
+# 字段说明：
+#   name          模板名称（唯一标识）
+#   author        贡献者
+#   cve           关联 CVE 编号（无则留空）
+#   severity      严重性（critical/high/medium/low/info）
+#   tested        测试状态（true=已验证通过 / false=待验证）
+#   description   模板用途简述
+#
+# 贡献方式：在 templates 下追加条目并补充模板 YAML 到对应分类目录。
+version: 0.1.0
+templates:
+  - name: spring4shell-rce
+    author: community
+    cve: CVE-2022-22965
+    severity: critical
+    tested: true
+    description: Spring Framework RCE (Spring4Shell) 检测
+
+  - name: log4shell-jndi
+    author: community
+    cve: CVE-2021-44228
+    severity: critical
+    tested: true
+    description: Apache Log4j JNDI 注入检测
+
+  - name: grafana-auth-bypass
+    author: community
+    cve: CVE-2023-3128
+    severity: high
+    tested: false
+    description: Grafana 认证绕过检测
+
+  - name: jenkins-unauth-script-console
+    author: community
+    cve: CVE-2024-23897
+    severity: high
+    tested: false
+    description: Jenkins 未授权脚本控制台检测
+
+  - name: kibana-timelion-rce
+    author: community
+    cve: CVE-2019-7609
+    severity: critical
+    tested: false
+    description: Kibana Timelion 原型污染 RCE 检测

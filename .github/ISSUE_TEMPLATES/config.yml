@@ -1,0 +1,18 @@
+# =============================================================================
+# VULNCLAW · GitHub Issue Template Config
+# SPDX-License-Identifier: AGPL-3.0-or-later WITH Classpath-exception-2.0
+# Copyright (c) 2026 VULNCLAW Project <vulnclaw.official@outlook.com>
+# =============================================================================
+blank_issues_enabled: false
+contact_links:
+  - name: 🛡️ 报告安全漏洞 / Security Vulnerability
+    url: https://github.com/AAAAAAAAAA6-FY/VULNCLAW/security/advisories/new
+    about: |
+      请不要公开开 Issue 披露安全漏洞。走私有安全通告（Security Advisories），
+      我们会在 24 小时内响应。英文版 SECURITY 政策见仓库根 SECURITY.md。
+  - name: 💰 商业授权询价 / Commercial License Inquiry
+    url: mailto:vulnclaw.official@outlook.com?subject=%5BCommercial%5D%20License%20Inquiry%20-%20%5BCompany%5D
+    about: 请直接发邮件，1 工作日内回正式报价单（个人/团队/中企/大企业/买断/SaaS/定制）。
+  - name: 💬 社区讨论 / Community Discussion
+    url: https://github.com/AAAAAAAAAA6-FY/VULNCLAW/discussions
+    about: 使用心得、功能构思、AI 安全话题讨论——请到 Discussions，不要开 Issue。

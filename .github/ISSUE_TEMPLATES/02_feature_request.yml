@@ -1,0 +1,92 @@
+---
+# SPDX-License-Identifier: AGPL-3.0-or-later WITH Classpath-exception-2.0
+name: ✨ Feature Request
+description: 提交功能需求、改进建议、新引擎 / 新漏洞类型 / 新集成
+title: "[Feature]: "
+labels: ["enhancement", "needs triage"]
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        欢迎提新想法！Feature Request 越具体越容易被实现。
+        如果你需要 **RBAC / 告警联动 / 私有化面板 / 定制扫描协议** 这类企业级功能，
+        建议直接邮件 `vulnclaw.official@outlook.com` 购买商业授权——闭源实现会更快交付。
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 提交前检查
+      options:
+        - label: 🔎 我已搜索现有 Issues / Discussions，没有重复需求
+          required: true
+        - label: 📦 本功能属于 **开源范围**（个人/社区受益），不是「企业定制功能」
+          required: false
+        - label: 💰 我清楚企业级功能（RBAC/面板/定制协议）走商业授权，会另发邮件
+          required: false
+
+  - type: dropdown
+    id: category
+    validations:
+      required: true
+    attributes:
+      label: 功能类别
+      multiple: false
+      options:
+        - "🔍 新漏洞引擎 / 新 CWE / 新 Payload"
+        - "🤖 AI & 模型（新 Provider / 新 Prompt / 调度策略 / 验证机制）"
+        - "📊 DAG & 调度（节点编排 / 并行度 / 失败重试 / 分布式 Worker）"
+        - "🔗 集成（MCP / Burp / Nuclei / SQLMap / MSF / FFUF / 其他）"
+        - "📝 报告与输出（JSONL / HTML / PDF / CSV / 告警通道）"
+        - "🖥️ CLI / UI / Dashboard / 操作体验"
+        - "🧪 测试 & Benchmark（基准 / 单元 / 端到端）"
+        - "📚 文档 & 教程"
+        - "⚡ 性能 & 并发 & 内存占用"
+        - "🌐 国际化 i18n（多语言翻译）"
+        - "🪜 其他（请在详细描述里说明）"
+
+  - type: textarea
+    id: problem
+    validations:
+      required: true
+    attributes:
+      label: 你遇到什么痛点 / 场景？
+      description: 先讲清楚「你在做什么事情的时候需要这个功能」，而不是先讲「我想加什么按钮」。
+      placeholder: |
+        例 1：我经常在工控环境里扫 Modbus/S7，现引擎只有 HTTP/HTTPS，扫不到设备
+        例 2：AI 交叉验证会把「同一越权不同参数 ID」都当成独立 Issue，最后 findings 里 50% 重复
+        例 3：MCP 接入 Trae 后，复杂的 scan task 会超时 60s，但我想看到进度流式推送
+
+  - type: textarea
+    id: solution
+    validations:
+      required: true
+    attributes:
+      label: 期望实现方式（你设想的方案）
+      description: 能写伪代码 / 模块拆分 / 命令行接口示例 / JSON 输出 schema 最好。
+      placeholder: |
+        例：新增 engines/industrial_engines.py，枚举 common Modbus 寄存器，
+            并把 findings 里新增 `cwe=CWE-200 (info leak)`、`severity=MEDIUM`、
+            `confidence=FIRM` 三类；命令行参数 `--scan-industrial` 默认关。
+
+  - type: dropdown
+    id: priority
+    validations:
+      required: true
+    attributes:
+      label: 你愿意参与贡献吗？（决定我们的优先级）
+      options:
+        - "只提需求（纯想法，没时间写代码）"
+        - "可以写测试用例 / 文档，不会碰引擎本体"
+        - "愿意写部分代码，需要 Review 和文档引导"
+        - "可以独立实现，等我开 PR"
+
+  - type: textarea
+    id: references
+    attributes:
+      label: 参考资料（学术论文 / 同类工具实现 / RFC / CVE）
+      description: |
+        例：
+        - OWASP Industrial Control System (ICS) Top 10 2024
+        - Nuclei 3.5 modbus protocol module 源码
+      render: markdown

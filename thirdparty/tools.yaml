@@ -1,0 +1,131 @@
+# thirdparty/tools.yaml
+# 工具注册表 - 所有外部工具配置
+
+tools:
+  nuclei:
+    executable: nuclei.exe
+    default_args: "-silent -json"
+    timeout: 120
+    output_format: json
+    output_file: true
+    severity_filter: true
+
+  ffuf:
+    executable: ffuf.exe
+    default_args: "-c -t 20 -s"
+    timeout: 120
+    output_format: json
+    output_file: true
+
+  subfinder:
+    executable: subfinder.exe
+    default_args: "-silent -nW -t 10"
+    timeout: 120
+    output_format: text
+    output_file: true
+
+  interactsh-client:
+    executable: interactsh-client.exe
+    default_args: "-silent -o stdout -q"
+    timeout: 8
+    output_format: text
+    output_file: false
+
+  httpx:
+    executable: httpx.exe
+    default_args: "-title -status-code -tech-detect -web-server -json -silent -timeout 15 -retries 1 -fr"
+    timeout: 300
+    output_format: json
+    output_file: true
+
+  nmap:
+    executable: nmap.exe
+    default_args: ""
+    timeout: 180
+    output_format: text
+    output_file: false
+
+  waybackurls:
+    executable: waybackurls.exe
+    default_args: ""
+    timeout: 120
+    output_format: text
+    output_file: false
+
+  gau:
+    executable: gau.exe
+    default_args: ""
+    timeout: 120
+    output_format: text
+    output_file: false
+
+  katana:
+    executable: katana.exe
+    default_args: "-silent -json -depth 5 -js-crawl -timeout 30"
+    timeout: 120
+    output_format: text
+    output_file: false
+
+  arjun:
+    executable: arjun.exe
+    default_args: "-o json --silent -t 5"
+    timeout: 30
+    output_format: text
+    output_file: false
+
+  naabu:
+    executable: naabu.exe
+    default_args: "-silent -json -rate 1000 -retries 1"
+    timeout: 300
+    output_format: json
+    output_file: true
+
+  dalfox:
+    executable: dalfox.exe
+    default_args: "--silence --format json --timeout 30 --delay 100"
+    timeout: 120
+    output_format: json
+    output_file: true
+
+  # Phase 1: 新增工具（2026-08-30）
+  waybackrobots:
+    executable: waybackrobots.exe
+    default_args: ""
+    timeout: 60
+    output_format: text
+    output_file: false
+
+  gospider:
+    executable: gospider.exe
+    default_args: "-q -s"
+    timeout: 120
+    output_format: text
+    output_file: false
+
+  cdncheck:
+    executable: cdncheck.exe
+    default_args: "-json"
+    timeout: 60
+    output_format: json
+    output_file: false
+
+  unfurl:
+    executable: unfurl.exe
+    default_args: "-u"
+    timeout: 30
+    output_format: text
+    output_file: false
+
+  fff:
+    executable: fff.exe
+    default_args: "-o output.fff"
+    timeout: 120
+    output_format: text
+    output_file: true
+
+  anew:
+    executable: anew.exe
+    default_args: ""
+    timeout: 30
+    output_format: text
+    output_file: false

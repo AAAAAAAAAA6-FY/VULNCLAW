@@ -1,0 +1,160 @@
+# ============ 运行时缓存 ============
+_runtime_cache/
+_runtime_cache_*/
+*_runtime_cache_*/
+
+# ============ Python 字节码/缓存（彻底禁止） ============
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg-info/
+.eggs/
+*.egg
+
+# ============ pytest / mypy ============
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ============ IDE ============
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ============ 环境 ============
+.venv/
+venv/
+thirdparty/venv/
+thirdparty/*/.venv/
+.env
+
+# ============ 其他临时 ============
+*.bak
+config/*.bak
+.DS_Store
+Thumbs.db
+*.log
+tmp/
+temp/
+all_code.txt
+filelist.txt
+*.sqlite3
+*.sqlite
+*.db-journal
+*.lock
+*.tmp
+*.temp
+*.pyc
+*~
+
+# ============ A阶段清理新增 ============
+thirdparty/OllamaSetup.exe
+thirdparty/burpsuite_pro.jar
+_runtime_cache/target_repos/
+
+# ============ v103 阶段0 防回退追加 ============
+# IDE（补充 .trae / .codebuddy）
+.trae/
+.codebuddy/
+
+# 测试产物
+pocs_test/
+
+# 打包产物
+*.tar.gz
+*.zip
+*.whl
+dist/
+build/
+
+# ============ 阶段1：src-layout 与归档 ============
+*.tar.gz
+*.tar
+archive_backup*
+pocs_test/
+extracted_scripts*/
+_merge_backup/
+.trae/
+.codebuddy/
+build/
+dist/
+src/vulnclaw.egg-info/
+
+# ============ 清理任务加固 ============
+.coverage
+htmlcov/
+
+# ============ 开源前敏感信息清理（2026-08-30） ============
+# 自动生成的工具注册文件（含本机绝对路径，不应提交）
+thirdparty/tools_auto.yaml
+thirdparty/.config/
+
+# ============================================================================
+#  开源推仓前 P0 版权 / 大体积 / 敏感物全面排除（2026-08-31）
+#  原则：
+#   • 第三方工具的 二进制可执行文件（.exe/.dll/.so/.dylib）一律不入库，
+#     用户首次运行时通过 scripts/entry_bootstrap_smoke.py 自动检查并引导下载（GitHub Release 单文件）
+#   • 第三方 整包源代码仓库（PentestGPT / OneForAll / nyxstrike / sqlmap /
+#     dirsearch / testssl.sh / Ehole / iox / trivy 解压目录 / gitleaks 解压目录）
+#     一律不入库，避免未获明确再分发授权的许可证争议 + 仓库爆仓
+#   • nuclei-templates 官方模板库（1.3 万文件/800+MB） 不入库，
+#     用户运行 nuclei -update-templates 自动拉官方最新版（比你打包的永远更新）
+#   • CA 私钥 / 证书 / 密钥容器 等绝不能进入公开仓库（rad_ca.key 公开
+#     = 任何人能签发 MITM 证书，安全行业常识级错误）
+# ============================================================================
+
+# ---------- 第三方工具二进制：所有平台可执行 / 动态库 ----------
+thirdparty/**/*.exe
+thirdparty/**/*.dll
+thirdparty/**/*.so
+thirdparty/**/*.dylib
+thirdparty/**/*.bin
+
+# 个别顶层目录放置的 exe（防止 **/*.exe 模式在某些 Windows git 版本下漏匹配顶层）
+thirdparty/*.exe
+thirdparty/*.dll
+
+# ---------- 敏感密钥 / 证书 / 凭据（绝不入库） ----------
+thirdparty/**/*.key
+thirdparty/**/*.p12
+thirdparty/**/*.pfx
+thirdparty/**/*.pem
+thirdparty/**/*.crt
+thirdparty/**/*.jks
+thirdparty/**/*.keystore
+thirdparty/rad_ca.*                        # rad（爬虫）自带根 CA 公私钥一对，绝不入库
+
+# ---------- 第三方整包代码仓库（避免再分发许可冲突 + 爆仓） ----------
+thirdparty/nuclei-templates/              # 官方 MIT 但不打整包 818MB
+thirdparty/PentestGPT/                    # 他人项目 + 本地改过 (modified content)
+thirdparty/OneForAll/                     # 他人项目
+thirdparty/nyxstrike/                     # 他人项目 + password_cracking 敏感
+thirdparty/sqlmap/                        # sqlmap 让用户自己下官方
+thirdparty/dirsearch/                     # 让用户自己下 dirsearch
+thirdparty/testssl.sh/                    # testssl.sh 官方整包
+thirdparty/Ehole/                         # Ehole 解压目录
+thirdparty/gitleaks_*/                    # gitleaks 各版本解压目录（已包含 release 的 .exe 在上段）
+thirdparty/iox_*/                         # iox 解压目录
+thirdparty/trivy_*/                       # trivy 各版本解压目录
+thirdparty/rad/                           # rad 爬虫配置（含 CA key / config）
+
+# ---------- 第三/单方大字典 ----------
+thirdparty/routes-large.kite              # 大字典 kite routes（用户可自己从 kite 官方下载，避免 200MB 入仓）
+
+# ---------- 第三方工具说明性文件（不入库的项目的多语 README 等） ----------
+# （保持 thirdparty/VERSIONS.md / LICENSE.md / LICENSE.txt / tools.yaml 入库，
+#   因为这些是你原创的工具索引清单。）
+thirdparty/README.md
+thirdparty/README_*.md
+thirdparty/extensions/BurpExtender_Full.py
+
+# ---------- 遗留过期的 Bridge 扩展文件（已被 VulnclawBridge.java 正式版替代） ----------
+thirdparty/BurpExtender.py                # 老版单文件 Python extender，已淘汰
+thirdparty/extensions/                    # 整个 extensions 旧目录（只有一个 BurpExtender_Full.py，上面已 ignore）
+

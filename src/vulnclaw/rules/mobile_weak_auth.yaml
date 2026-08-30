@@ -1,0 +1,63 @@
+# rules/mobile_weak_auth.yaml
+# 移动端 API 弱认证规则库（v105）
+#
+# 由 engines/mobile_engines.py 的 MobileAPIEngine 加载。
+# 结构：mobile_weak_auth -> section -> [{id, name, severity, description, ...}]
+# 新增 / 调整规则只需编辑本文件，无需改动引擎代码。
+#
+# sections:
+#   weak_auth          弱认证
+#   cleartext          明文传输
+#   broken_object_auth 越权（对象级授权）
+
+mobile_weak_auth:
+  weak_auth:
+    - id: anonymous_access
+      name: "API 匿名可达"
+      severity: high
+      description: >-
+        移动端 API 端点无需任何认证即可访问并返回 JSON 业务数据，
+        攻击者可未授权枚举/调用业务接口。
+      indicators:
+        - "application/json"
+        - "HTTP 200"
+
+    - id: weak_token_hint
+      name: "弱认证令牌使用"
+      severity: medium
+      description: >-
+        API 依赖 X-API-Key / client_secret / apikey 等弱令牌，未采用
+        OAuth2 / JWT / mTLS 等标准认证机制，令牌易被泄露与伪造。
+
+  cleartext:
+    - id: http_transport
+      name: "移动端明文传输"
+      severity: high
+      description: >-
+        API 使用 http 明文协议。若移动端未禁用 iOS ATS /
+        Android usesCleartextTraffic，应用流量可被中间人窃听、篡改。
+      remediation: >-
+        服务端全站升级 HTTPS 并返回 301/308 重定向；客户端开启
+        NSAllowsArbitraryLoads=false / usesCleartextTraffic=false。
+
+    - id: missing_hsts
+      name: "移动端 API 缺少 HSTS"
+      severity: low
+      description: >-
+        HTTPS API 响应未携带 Strict-Transport-Security 头，客户端
+        无法被强制仅使用 HTTPS，存在降级中间人风险。
+      remediation: "响应头添加 Strict-Transport-Security: max-age=31536000; includeSubDomains"
+
+  broken_object_auth:
+    - id: object_id_access
+      name: "对象级越权"
+      severity: high
+      description: >-
+        相邻对象 ID 返回相同资源内容，说明服务端未校验当前用户与
+        资源归属关系，存在 BOLA / IDOR 对象级越权。
+      id_pattern: >-
+        (users?|accounts?|orders?|items?|profiles?|posts?|messages?|
+        files?|devices?|tickets?)/(\d{1,10}|uuid)
+      remediation: >-
+        服务端基于会话校验对象归属（当前用户 ID 与资源 owner_id 比对），
+        拒绝越权访问；统一使用 UUID 并禁止枚举型自增 ID。

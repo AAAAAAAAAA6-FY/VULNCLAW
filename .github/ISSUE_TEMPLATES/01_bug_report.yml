@@ -1,0 +1,103 @@
+---
+# SPDX-License-Identifier: AGPL-3.0-or-later WITH Classpath-exception-2.0
+name: 🐞 Bug Report
+description: 报告 VULNCLAW 运行中的 Bug / 功能异常 / 崩溃 / 非预期行为
+title: "[Bug]: "
+labels: ["bug", "needs triage"]
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢你报告 Bug！请尽量完整填写下面的内容，信息越充分我们定位越快。
+        **注意：不要在公开 Issue 里贴 API Key / 真实扫描目标 URL / 内网 IP**。
+        如涉及安全漏洞（例如 VULNCLAW 自身被利用），请返回并点「报告安全漏洞」链接走私有通告。
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 提交前检查
+      options:
+        - label: 🔎 我已搜索现有 [Issues](https://github.com/AAAAAAAAAA6-FY/VULNCLAW/issues) 与 [Discussions](https://github.com/AAAAAAAAAA6-FY/VULNCLAW/discussions)，没有找到相同问题
+          required: true
+        - label: 🔐 本 Issue **不涉及** 安全漏洞披露（安全漏洞 -> 回首页点「🛡️ 报告安全漏洞」）
+          required: true
+        - label: 🚫 本 Issue **不涉及** 针对未授权目标的扫描结果分享（请遵守当地法律与项目 LICENSE）
+          required: true
+
+  - type: textarea
+    id: expected
+    validations:
+      required: true
+    attributes:
+      label: 期望行为（Expected Behavior）
+      description: 请说明你期望发生什么。
+      placeholder: |
+        例 1：运行 `python scan.py --target http://example.com` 应该返回漏洞 JSONL + 报告
+        例 2：AI 模型 `deepseek-v3` 失败时应该自动 failover 到备用提供商，而非直接崩
+
+  - type: textarea
+    id: actual
+    validations:
+      required: true
+    attributes:
+      label: 实际行为（Actual Behavior）
+      description: 发生了什么？粘贴报错堆栈 / 异常截图 / 非预期输出。
+      render: bash
+
+  - type: textarea
+    id: reproduce
+    validations:
+      required: true
+    attributes:
+      label: 复现步骤（Steps to Reproduce）
+      description: 逐条写清复现操作；含命令参数、关键配置、依赖版本。
+      placeholder: |
+        1. git 处于 commit <SHA>
+        2. 执行 `pip install -e .` 并 `python -m pytest -k xxx`
+        3. 错误出现
+      render: bash
+
+  - type: textarea
+    id: environment
+    validations:
+      required: true
+    attributes:
+      label: 运行环境
+      description: 请填写或粘贴 `python -c "import sys, platform; print(sys.version); print(platform.platform())"` 的结果，并标注是否在 Docker / WSL / 裸机 Windows / Linux / macOS。
+      placeholder: |
+        OS: Windows 11 Pro 23H2 x64 (裸机)
+        Python: 3.12.4 (tags/v3.12.4:... [MSC v.1940 64 bit (AMD64)])
+        VULNCLAW: v0.1.0
+        Burp Bridge: v1.0.8 (如启用)
+        AI Provider: zhipu=ok, aliyun=failover, siliconflow=off
+      render: text
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 相关日志 / 截图（Log / Screenshots）
+      description: |
+        建议粘贴 `_runtime_cache/logs/*.log` 中错误前后 50 行（注意脱敏 API Key/内网 IP/域名）。
+        如果是 DAG 执行失败，附上 `_runtime_cache/reports/report_*.json` 的 dag_status 块。
+      render: text
+
+  - type: dropdown
+    id: severity
+    validations:
+      required: true
+    attributes:
+      label: 严重程度（Severity）
+      options:
+        - "P1 - Blocker: 主功能不可用 / 启动崩 / 全部扫描 0 findings"
+        - "P2 - Major: 某个模块/引擎坏，但主路径仍可跑"
+        - "P3 - Minor: 非功能影响 / 展示小问题 / 文档错 / 警告冗余"
+        - "P4 - Cosmetic: 纯文本 / 拼写 / 注释错误"
+
+  - type: input
+    id: contact
+    attributes:
+      label: 联系邮箱（可选，要商业授权单独发邮件）
+      placeholder: vulnclaw.official@outlook.com
+    validations:
+      required: false
