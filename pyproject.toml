@@ -13,18 +13,25 @@ requires-python = ">=3.11"
 dependencies = [
     "aiohttp>=3.9.0",
     "pydantic>=2.0.0",
-    "pydantic-settings>=2.0.0",
+    # 2.15+ 保证 Field alias / env alias 行为稳定；对应 Dependabot PR #7
+    "pydantic-settings>=2.15.0",
     "python-dotenv>=1.0.0",
-    "pyyaml>=6.0.0",
+    # 6.0.3 含 CVE 安全补丁；对应 Dependabot PR #3
+    "pyyaml>=6.0.3",
     "psutil>=5.9.0",
-    "requests>=2.31.0",
+    # 2.34+ cookie/SSL 默认行为已回归验证；对应 Dependabot PR #4
+    "requests>=2.34.2",
     "aiofiles",
     "beautifulsoup4",
     "dnspython",
     "redis>=5.0",
     "tqdm",
-    "python-whois>=0.9.0",
-    "numpy>=1.24.0",
+    # 0.9.6 修复 TLD 解析边界情况；对应 Dependabot PR #5
+    "python-whois>=0.9.6",
+    # ⚠️ numpy 2.x 存在大量破坏性变更（np.float/np.int 删除、dtype 转型规则变、切片不兼容），
+    #   scikit-learn 1.3.x 也不完整支持 2.x。强锁 <2.0，防止 Dependabot 误开升级 PR。
+    #   等 sklearn 最低依赖基线升级到 1.6+ 再考虑放开。
+    "numpy>=1.24.0,<2.0",
     "scikit-learn>=1.3.0",
     "fastapi>=0.110.0",
 ]
