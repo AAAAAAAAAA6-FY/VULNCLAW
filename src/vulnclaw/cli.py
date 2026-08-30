@@ -188,16 +188,16 @@ def main(argv: list[str] | None = None) -> None:
         # P1-3: python scan.py resume --scan-id xxx -> 转发为 --resume --scan-id xxx
         _run_scan_main(["--resume", *argv[1:]])
         return
-    elif argv[0] not in ("scan", "code", "health", "mcp"):
+    elif argv[0] not in ("scan", "code", "health", "mcp", "setup"):
         # 兼容模式：非子命令 -> 旧 scan.py 风格直接转发（保留全量旧参数行为）
         _run_scan_main(argv)
         return
 
     parser = argparse.ArgumentParser(
         prog="vulnclaw",
-        description="VULNCLAW - AI 驱动的渗透测试平台 v103\n\n支持扫描、代码审计、健康检查三大子命令。",
+        description="VULNCLAW - AI 驱动的渗透测试平台 v103\n\n支持扫描、代码审计、健康检查、安装四大子命令。",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="使用示例:\n  python scan.py scan -t https://example.com\n  python scan.py scan -t https://example.com --deep --dangerous\n  python scan.py code --repo ./myproject\n  python scan.py health",
+        epilog="使用示例:\n  python scan.py setup --download-thirdparty   # 首次使用先跑这个（下载 nuclei/ffuf/...）\n  python scan.py scan -t https://example.com\n  python scan.py code --repo ./myproject\n  python scan.py health",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -261,6 +261,44 @@ def main(argv: list[str] | None = None) -> None:
         "--http2",
         action="store_true",
         help="启用 HTTP/2 多路复用（需目标支持，默认关闭）。可减少连接开销。",
+    )
+    scan_parser.add_argument(
+        "--download-thirdparty",
+        action="store_true",
+        help="扫描前自动补齐缺失的第三方二进制工具（nuclei/ffuf/subfinder/interactsh-client/...）。"
+             "等价于先执行  python scan.py setup --download-thirdparty。",
+    )
+    scan_parser.add_argument(
+        "--force-download-thirdparty",
+        action="store_true",
+        help="扫描前强制重新下载所有第三方工具（对齐版本），含 nuclei 模板更新。",
+    )
+
+    setup_parser = subparsers.add_parser(
+        "setup",
+        help="初始化 / 下载第三方工具",
+        description="下载 VULNCLAW 所需的第三方二进制工具到 thirdparty/ 目录。"
+                    "首次 clone 后强烈建议先跑  python scan.py setup --download-thirdparty。",
+        epilog="示例:\n"
+               "  python scan.py setup --download-thirdparty           只补缺失项（推荐，最快）\n"
+               "  python scan.py setup --download-thirdparty --force   强制重下（版本对齐/损坏修复）\n"
+               "  python scan.py setup --download-thirdparty --no-templates   不自动更新 nuclei 模板",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    setup_parser.add_argument(
+        "--download-thirdparty",
+        action="store_true",
+        help="下载/补齐 thirdparty/ 下的二进制工具（nuclei/ffuf/subfinder/httpx/interactsh-client/assetfinder/trivy）",
+    )
+    setup_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="强制重新下载（即使文件已存在也重下），用于修复损坏或版本升级",
+    )
+    setup_parser.add_argument(
+        "--no-templates",
+        action="store_true",
+        help="下载完成后不自动跑 nuclei -update-templates（默认自动更新）",
     )
 
     code_parser = subparsers.add_parser(
@@ -378,7 +416,28 @@ def main(argv: list[str] | None = None) -> None:
             fwd += ["--metrics-port", str(args.metrics_port)]
         if args.http2:
             fwd += ["--http2"]
+        # 扫描前自动下载工具（按需 / 强制）
+        if getattr(args, "download_thirdparty", False) or getattr(args, "force_download_thirdparty", False):
+            from vulnclaw.core.utils import download_thirdparty_tools
+            only_missing = not getattr(args, "force_download_thirdparty", False)
+            ok, fail = download_thirdparty_tools(only_missing=only_missing, update_nuclei_templates=True)
+            if fail > 0 and not only_missing:
+                # 强制模式下仍有失败，阻断扫描
+                print(f"❌ 强制下载仍有 {fail} 项失败，终止扫描。可单独重试  python scan.py setup --download-thirdparty --force")
+                sys.exit(2)
         _run_scan_main(fwd)
+    elif args.command == "setup":
+        if not getattr(args, "download_thirdparty", False):
+            print("# 没指定操作。用法示例：")
+            print("   python scan.py setup --download-thirdparty            只补缺失项（推荐）")
+            print("   python scan.py setup --download-thirdparty --force    强制重下")
+            print("   python scan.py setup --download-thirdparty --no-templates   下载工具但跳过 nuclei 模板同步")
+            sys.exit(1)
+        from vulnclaw.core.utils import download_thirdparty_tools
+        only_missing = not getattr(args, "force", False)
+        update_tpl = not getattr(args, "no_templates", False)
+        _ok, _fail = download_thirdparty_tools(only_missing=only_missing, update_nuclei_templates=update_tpl)
+        sys.exit(0 if _fail == 0 else 3)
     elif args.command == "code":
         _run_scan_main(["--code", "--repo", args.repo, "--lang", args.lang])
     elif args.command == "health":

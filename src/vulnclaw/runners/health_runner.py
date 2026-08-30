@@ -400,8 +400,9 @@ def run_health_check() -> int:
     if optional_missing:
 
 
-
-        print(f"ℹ️ 可选能力缺失（{len(optional_missing)} 项，对应步骤自动降级 {', '.join(optional_missing)}")
+        print(f"ℹ️  可选能力缺失（{len(optional_missing)} 项）：对应步骤会自动降级或跳过。")
+        print(f"   一键补齐：  python scan.py setup --download-thirdparty")
+        print(f"   详情: {', '.join(optional_missing)}")
 
 
 

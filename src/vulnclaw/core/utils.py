@@ -9,6 +9,7 @@
 统一工具函数模块 - 精简版
 """
 import os
+import sys
 import json
 import random
 import asyncio
@@ -16,6 +17,7 @@ import aiohttp
 import shutil
 import socket
 import re
+import platform
 import urllib.parse
 from pathlib import Path
 from functools import lru_cache
@@ -521,6 +523,368 @@ async def run_cmd_async(cmd: List[str], timeout: int = 120) -> Tuple[int, str, s
 # 工具路径
 # ============================================================
 _TOOL_CACHE = {}
+# 已提示过的缺失工具，避免刷屏
+_TOLD_MISSING = set()
+THIRDPARTY_SETUP_HINT = "运行  python scan.py setup --download-thirdparty  自动下载补齐"
+
+
+# =====================================================================
+# 第三方工具清单：从各自官方 GitHub Release 下载（稳定版 URL）
+#   - url_fmt 里占位符 {ver} {ext}
+#   - Windows ext = zip（绝大多数）；Linux/macOS 用 tar.gz
+#   - bin_map：压缩包里的可执行文件相对路径 -> thirdparty/ 下最终目标文件名
+# =====================================================================
+THIRDPARTY_TOOLS = [
+    {
+        "name": "nuclei",
+        "ver": "3.3.8",
+        "owner": "projectdiscovery",
+        "repo": "nuclei",
+        "bin": {
+            "win": "nuclei.exe",
+            "linux": "nuclei",
+            "darwin": "nuclei",
+        },
+        "post_update_templates": True,
+    },
+    {
+        "name": "subfinder",
+        "ver": "2.6.6",
+        "owner": "projectdiscovery",
+        "repo": "subfinder",
+        "bin": {
+            "win": "subfinder.exe",
+            "linux": "subfinder",
+            "darwin": "subfinder",
+        },
+    },
+    {
+        "name": "httpx",
+        "ver": "1.6.9",
+        "owner": "projectdiscovery",
+        "repo": "httpx",
+        "bin": {
+            "win": "httpx.exe",
+            "linux": "httpx",
+            "darwin": "httpx",
+        },
+    },
+    {
+        "name": "interactsh-client",
+        "ver": "1.1.10",
+        "owner": "projectdiscovery",
+        "repo": "interactsh",
+        "bin": {
+            "win": "interactsh-client.exe",
+            "linux": "interactsh-client",
+            "darwin": "interactsh-client",
+        },
+    },
+    {
+        "name": "ffuf",
+        "ver": "2.1.0",
+        "owner": "ffuf",
+        "repo": "ffuf",
+        "bin": {
+            "win": "ffuf.exe",
+            "linux": "ffuf",
+            "darwin": "ffuf",
+        },
+    },
+    {
+        "name": "assetfinder",
+        "ver": "0.1.0",
+        "owner": "tomnomnom",
+        "repo": "assetfinder",
+        "bin": {
+            "win": "assetfinder.exe",
+            "linux": "assetfinder",
+            "darwin": "assetfinder",
+        },
+    },
+    {
+        "name": "trivy",
+        "ver": "0.59.1",
+        "owner": "aquasecurity",
+        "repo": "trivy",
+        "bin": {
+            "win": "trivy.exe",
+            "linux": "trivy",
+            "darwin": "trivy",
+        },
+    },
+]
+
+
+def _tp_os_key() -> str:
+    if os.name == "nt":
+        return "win"
+    if sys.platform == "darwin":
+        return "darwin"
+    return "linux"
+
+
+def _tp_arch_suffix() -> str:
+    """返回 Release 文件名里常见的 arch 后缀段（不含平台）"""
+    import struct
+    bits = struct.calcsize("P") * 8
+    machine = (os.environ.get("PROCESSOR_ARCHITECTURE") or platform.machine() or "").lower()
+    if bits == 32 or machine in ("x86", "i386", "386"):
+        return "386"
+    # arm64 分支
+    if "arm" in machine or "aarch" in machine:
+        return "arm64"
+    return "amd64"
+
+
+def _tp_release_url(tool: dict) -> tuple[str, str]:
+    """返回 (download_url, archive_ext)。ext 不带点，如 'zip' / 'tar.gz'。"""
+    owner = tool["owner"]
+    repo = tool["repo"]
+    ver = tool["ver"]
+    os_key = _tp_os_key()
+    arch = _tp_arch_suffix()
+
+    # -------- projectdiscovery 统一命名 --------
+    if owner == "projectdiscovery":
+        # 例: https://github.com/projectdiscovery/nuclei/releases/download/v3.3.8/nuclei_3.3.8_windows_amd64.zip
+        os_name = {"win": "windows", "linux": "linux", "darwin": "macOS"}[os_key]
+        ext = "zip" if os_key == "win" else "zip"  # PD 全平台 zip
+        url = (
+            f"https://github.com/{owner}/{repo}/releases/download/"
+            f"v{ver}/{repo}_{ver}_{os_name}_{arch}.{ext}"
+        )
+        return url, ext
+
+    # -------- ffuf --------
+    if owner == "ffuf":
+        # 例: https://github.com/ffuf/ffuf/releases/download/v2.1.0/ffuf_2.1.0_windows_amd64.zip
+        os_name = {"win": "windows", "linux": "linux", "darwin": "darwin"}[os_key]
+        ext = "zip" if os_key in ("win", "darwin") else "tar.gz"
+        if os_key == "darwin":
+            # ffuf 把 darwin 两类拆开
+            url = (
+                f"https://github.com/{owner}/{repo}/releases/download/"
+                f"v{ver}/{repo}_{ver}_{os_name}_{arch}.zip"
+            )
+        else:
+            url = (
+                f"https://github.com/{owner}/{repo}/releases/download/"
+                f"v{ver}/{repo}_{ver}_{os_name}_{arch}.{ext}"
+            )
+        return url, ext
+
+    # -------- assetfinder (tomnomnom) --------
+    if owner == "tomnomnom":
+        # 例: https://github.com/tomnomnom/assetfinder/releases/download/v0.1.0/assetfinder-windows-386-0.1.0.tgz
+        os_name = {"win": "windows", "linux": "linux", "darwin": "darwin"}[os_key]
+        url = (
+            f"https://github.com/{owner}/{repo}/releases/download/"
+            f"v{ver}/{repo}-{os_name}-{arch}-{ver}.tgz"
+        )
+        return url, "tar.gz"
+
+    # -------- trivy --------
+    if owner == "aquasecurity":
+        # 例: https://github.com/aquasecurity/trivy/releases/download/v0.59.1/trivy_0.59.1_windows-64bit.zip
+        if os_key == "win":
+            bits_suffix = "64bit" if arch == "amd64" else arch
+            url = (
+                f"https://github.com/{owner}/{repo}/releases/download/"
+                f"v{ver}/{repo}_{ver}_windows-{bits_suffix}.zip"
+            )
+            return url, "zip"
+        if os_key == "darwin":
+            mac_arch = "ARM64" if arch == "arm64" else "64bit"
+            url = (
+                f"https://github.com/{owner}/{repo}/releases/download/"
+                f"v{ver}/{repo}_{ver}_macOS-{mac_arch}.tar.gz"
+            )
+            return url, "tar.gz"
+        bits_suffix = "64bit" if arch == "amd64" else arch
+        url = (
+            f"https://github.com/{owner}/{repo}/releases/download/"
+            f"v{ver}/{repo}_{ver}_Linux-{bits_suffix}.tar.gz"
+        )
+        return url, "tar.gz"
+
+    raise ValueError(f"未实现 {tool['name']} 的下载 URL 规则")
+
+
+def _tp_progress(rep: str, downloaded: int, total: int | None) -> None:
+    if total:
+        pct = downloaded * 100 // total
+        bar = "#" * (pct // 4) + "-" * (25 - pct // 4)
+        mb = f"{downloaded / 1024 / 1024:5.1f}MB / {total / 1024 / 1024:5.1f}MB"
+        sys.stdout.write(f"\r  [{bar}] {pct:3d}%  {mb}  {rep}")
+    else:
+        mb = f"{downloaded / 1024 / 1024:5.1f}MB"
+        sys.stdout.write(f"\r  {mb}  {rep}")
+    sys.stdout.flush()
+
+
+def _tp_download(url: str, dest: Path, tool_label: str) -> None:
+    import urllib.request
+    # 加 UA，否则一些 GitHub asset CDN 会 403
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "VULNCLAW-setup/0.1 (+https://github.com/AAAAAAAAAA6-FY/VULNCLAW)"},
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        total = resp.headers.get("Content-Length")
+        total_i = int(total) if total and total.isdigit() else None
+        done = 0
+        chunk = 64 * 1024
+        with open(dest, "wb") as f:
+            while True:
+                buf = resp.read(chunk)
+                if not buf:
+                    break
+                f.write(buf)
+                done += len(buf)
+                _tp_progress(tool_label, done, total_i)
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+def _tp_extract(archive: Path, dest_dir: Path, bin_src_name: str, bin_dest: Path) -> None:
+    """从压缩包里只挑出可执行文件 -> bin_dest。"""
+    name = archive.name.lower()
+    import tarfile
+    import zipfile
+
+    matched: Path | None = None
+    if name.endswith(".zip"):
+        with zipfile.ZipFile(archive, "r") as zf:
+            for info in zf.infolist():
+                leaf = os.path.basename(info.filename.replace("\\", "/"))
+                if leaf == bin_src_name:
+                    with zf.open(info) as src, open(bin_dest, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                    matched = bin_dest
+                    break
+    else:
+        # tar.gz / .tgz
+        mode = "r:gz"
+        with tarfile.open(archive, mode) as tf:
+            for member in tf.getmembers():
+                leaf = os.path.basename(member.name.replace("\\", "/"))
+                if leaf == bin_src_name and member.isfile():
+                    src_obj = tf.extractfile(member)
+                    if src_obj is None:
+                        continue
+                    with open(bin_dest, "wb") as dst:
+                        shutil.copyfileobj(src_obj, dst)
+                    matched = bin_dest
+                    break
+
+    if matched is None:
+        raise FileNotFoundError(
+            f"压缩包里没找到 {bin_src_name}，请检查该版本 Release 结构是否变化: {archive}"
+        )
+    try:
+        if os.name != "nt":
+            os.chmod(bin_dest, 0o755)
+    except Exception:
+        pass
+
+
+def download_thirdparty_tools(
+    only_missing: bool = True,
+    update_nuclei_templates: bool = True,
+) -> tuple[int, int]:
+    """
+    下载/补齐 thirdparty/ 下的二进制工具。
+
+    参数:
+        only_missing: True = 只下缺失的；False = 强制重下（升级版本用）
+        update_nuclei_templates: 下完 nuclei 后是否跑 `nuclei -update-templates`
+
+    返回: (ok_count, fail_count)
+    """
+    import subprocess
+    import tempfile
+
+    third_dir = Path(settings.thirdparty_dir)
+    third_dir.mkdir(parents=True, exist_ok=True)
+    os_key = _tp_os_key()
+
+    ok = 0
+    fail = 0
+
+    print("=" * 68)
+    print(f"📦 VULNCLAW 第三方工具自动下载（平台={os_key}/{_tp_arch_suffix()}）")
+    print(f"   目标目录: {third_dir}")
+    print(f"   模式: {'只补齐缺失项' if only_missing else '全部重新下载（版本强制对齐）'}")
+    print("=" * 68)
+
+    with tempfile.TemporaryDirectory(prefix="vulnclaw_setup_") as tmp:
+        tmpdir = Path(tmp)
+        for tool in THIRDPARTY_TOOLS:
+            name = tool["name"]
+            bin_name = tool["bin"][os_key]
+            dest_file = third_dir / bin_name
+            if only_missing and dest_file.exists() and dest_file.stat().st_size > 100 * 1024:
+                print(f"\n✅ {name:<20s} 已存在，跳过（{dest_file}）")
+                ok += 1
+                continue
+
+            try:
+                url, ext = _tp_release_url(tool)
+            except Exception as e:
+                fail += 1
+                print(f"\n❌ {name:<20s} URL 生成失败: {e}")
+                continue
+
+            archive_path = tmpdir / f"{name}-{tool['ver']}.{ext}"
+            print(f"\n⬇️  {name:<20s} v{tool['ver']}  {url}")
+            try:
+                _tp_download(url, archive_path, f"{name} v{tool['ver']}")
+                print(f"   ✔ 下载完成 ({archive_path.stat().st_size / 1024 / 1024:.2f} MB)")
+                print(f"   🗜  提取 {bin_name} -> {dest_file}")
+                _tp_extract(archive_path, tmpdir, bin_name, dest_file)
+                ok += 1
+                # 清缓存，避免后续 get_tool_path 还认为它不存在
+                _TOOL_CACHE.pop(name, None)
+            except Exception as e:
+                fail += 1
+                print(f"   ❌ 失败: {e}")
+                if archive_path.exists():
+                    try:
+                        archive_path.unlink()
+                    except Exception:
+                        pass
+                continue
+
+    # -------- nuclei -update-templates（可选，默认开） --------
+    nuclei_bin = third_dir / "nuclei.exe" if os_key == "win" else third_dir / "nuclei"
+    if update_nuclei_templates and nuclei_bin.exists():
+        print("\n🧬 调用 nuclei -update-templates 拉取最新官方模板（1~3 分钟）…")
+        try:
+            cp = subprocess.run(
+                [str(nuclei_bin), "-update-templates"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=600,
+            )
+            tail = "\n".join(cp.stdout.splitlines()[-6:]) if cp.stdout else ""
+            if cp.returncode == 0:
+                print(f"   ✅ nuclei 模板更新成功\n{tail}")
+            else:
+                print(f"   ⚠️  nuclei 模板更新非 0 退出（exit={cp.returncode}），可之后手动再跑：\n"
+                      f"      {nuclei_bin} -update-templates\n{tail}")
+        except Exception as e:
+            print(f"   ⚠️  nuclei -update-templates 调用失败（{e}）；请之后手动执行。")
+
+    print("=" * 68)
+    print(f"📊 下载完成：成功 {ok} / 失败 {fail}")
+    if fail == 0:
+        print(f"✅ 全部就绪。现在可以直接： python scan.py scan -t https://example.com")
+    else:
+        print(f"ℹ️  失败项会自动降级；可重跑 setup --download-thirdparty（会只补缺失的，很快）。")
+    print("=" * 68)
+    return ok, fail
 
 
 def get_tool_path(tool_name: str) -> Optional[str]:
@@ -544,6 +908,13 @@ def get_tool_path(tool_name: str) -> Optional[str]:
             return third_exe
 
     _TOOL_CACHE[tool_name] = None
+    # 缺失时只提示一次，避免日志刷屏
+    if tool_name not in _TOLD_MISSING:
+        _TOLD_MISSING.add(tool_name)
+        logger.info(
+            f"💡 工具 '{tool_name}' 未在系统 PATH 或 thirdparty/ 中找到。"
+            f"如需补齐，运行：{THIRDPARTY_SETUP_HINT}"
+        )
     return None
 
 
