@@ -589,7 +589,13 @@ oob_confirm(url,param,payload,timeout)：规则引擎全 miss 的无回显假设
 
         # 第二步：请求 AI 生成新计划，优先使用高成功率工具
         # A5.2: 不截断工具清单（CLI 工具入册后总数 >30），由成功率排序决定优先级
-        ordered_tool_names = self._rank_tools(list(self.tools.keys()))
+        # A5.6 工具清单动态裁剪：侦察阶段（尚无计划）隐藏 dangerous 级利用工具（msf/sqlmap 利用等）
+        phase = "recon" if (getattr(self, "_recon_observation", None)
+                            and not getattr(self, "current_plan", None)) else "attack"
+        ordered_tool_names = [
+            n for n in self._rank_tools(list(self.tools.keys()))
+            if not (phase == "recon" and getattr(self.tools[n], "danger_level", "safe") == "dangerous")
+        ]
         tools_desc = []
         for name in ordered_tool_names:
             tool = self.tools[name]
