@@ -4,7 +4,7 @@
 tools:
   nuclei:
     executable: nuclei.exe
-    default_args: "-silent -json"
+    default_args: "-silent -jsonl"
     timeout: 120
     output_format: json
     output_file: true
@@ -26,9 +26,9 @@ tools:
 
   interactsh-client:
     executable: interactsh-client.exe
-    default_args: "-silent -o stdout -q"
-    timeout: 8
-    output_format: text
+    default_args: ""
+    timeout: 15
+    output_format: json
     output_file: false
 
   httpx:

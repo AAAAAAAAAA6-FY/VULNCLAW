@@ -1061,36 +1061,56 @@ class BurpClient:
 
         Burp REST API（v0.1）没有 /collaborator/* 端点，旧代码该调用永远 404；
         旧降级实现还会伪造未注册的 oast.fun 假域名，导致 OOB 检测静默漏报。
-        现在统一委托真实 interactsh-client，失败时明确返回
-        {"domain": None}，由调用方跳过 OOB 检测，不再伪造域名。
+
+        现在统一委托 core.oob_channel.OOBChannel（auto 模式：interactsh 为主，
+        dnslog.cn 为备），interactsh-client 不可用时自动回退 dnslog，不再让
+        主扫描路径在 interactsh 挂掉时直接跳过 OOB——此前与 verify 阶段的
+        OOBVerifier（有 interactsh→dnslog→local 回退）行为不一致，构成能力缺口。
+        两者均不可用才返回 {"domain": None}，由调用方跳过 OOB 检测，不再伪造域名。
         """
         if self._collaborator_domain:
             logger.debug(f"使用缓存的 Collaborator 域名: {self._collaborator_domain}")
             return {"domain": self._collaborator_domain}
 
-        domain = None
         try:
-            from vulnclaw.modules.vuln_scanner.oob_interactsh import get_interactsh_domain_async
-            domain = await asyncio.wait_for(get_interactsh_domain_async(), timeout=15)
-        except Exception as e:
-            logger.debug(f"interactsh 域名获取失败: {e}")
+            from vulnclaw.core.oob_channel import OOBChannel
+            self._oob_channel = OOBChannel(provider="auto")
+            domain = await asyncio.wait_for(self._oob_channel.request_domain(), timeout=20)
+        except asyncio.TimeoutError:
+            logger.warning("⚠️ OOB 通道申请超时（interactsh + dnslog 均未在 20s 内就绪）")
+            domain = None
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"OOB 通道申请异常: {e}")
+            domain = None
 
         if domain and "." in domain:
             self._collaborator_domain = domain
-            logger.info(f"✅ OOB 通道就绪 (interactsh): {domain}")
-            return {"domain": domain}
+            provider = getattr(self._oob_channel, "_resolved_provider", "unknown")
+            logger.info(f"✅ OOB 通道就绪 ({provider}): {domain}")
+            return {"domain": domain, "provider": provider}
 
-        logger.warning("⚠️ 无可用 OOB 通道（interactsh-client 不可用），本轮跳过 OOB 检测")
+        logger.warning("⚠️ 无可用 OOB 通道（interactsh 与 dnslog 均不可用），本轮跳过 OOB 检测")
         return {"domain": None, "error": "no_oob_channel"}
 
     async def collaborator_poll(self, domain: str) -> Dict:
         """轮询 OOB 回调（步骤0 重写）。
 
-        Burp REST API 无 /collaborator/poll 端点，
-        改为轮询真实 interactsh-client 的回调记录。
+        优先复用 collaborator_generate 时创建的 OOBChannel 实例（它知道本次
+        域名来自 interactsh 还是 dnslog，自动路由到对应轮询实现）；若该实例
+        不存在（旧调用路径直接 check），回退到 legacy interactsh 轮询。
         """
         if not domain or "." not in domain:
             return {"results": [], "count": 0}
+        ch = getattr(self, "_oob_channel", None)
+        if ch is not None and getattr(ch, "_domain", None):
+            try:
+                interactions = await ch.poll(timeout=10)
+                results = [i.to_dict() for i in (interactions or [])]
+                return {"results": results, "count": len(results)}
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"OOBChannel 回调轮询失败: {e}")
+                return {"results": [], "count": 0}
+        # legacy 回退：仅 interactsh 域名有效
         try:
             from vulnclaw.modules.vuln_scanner.oob_interactsh import get_interactsh_poll
             interactions = await get_interactsh_poll(domain, timeout=10)
