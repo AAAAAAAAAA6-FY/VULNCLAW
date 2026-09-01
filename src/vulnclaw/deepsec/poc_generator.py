@@ -39,6 +39,94 @@ TEMPLATE_MAP = {
 }
 
 
+# ============================================================
+# A8.2：CVE ↔ PoC 双向索引
+# 命中 CVE 后，按组件/名称映射漏洞类型生成脚本化 PoC，并附 nuclei -id 复现命令；
+# 索引 cve_id -> {vuln_type, nuclei_cmd, poc_script} 同时支持「CVE 查 PoC」与「PoC 溯源 CVE」。
+# ============================================================
+CVE_POC_INDEX: Dict[str, Dict] = {}
+
+# 组件（小写）-> 漏洞类型（对齐 POCGenerator 模板：rce/sqli/lfi/xss/deserialization）
+_COMPONENT_VULN_TYPE: Dict[str, str] = {
+    "struts": "rce", "spring": "rce", "log4j": "rce", "log4shell": "rce",
+    "fastjson": "rce", "shiro": "rce", "weblogic": "rce", "jboss": "rce",
+    "tomcat": "rce", "jenkins": "rce", "viewstate": "deserialization",
+    "drupal": "rce", "joomla": "rce", "wordpress": "sqli", "grafana": "rce",
+    "gitlab": "rce", "confluence": "rce", "solr": "rce", "elasticsearch": "rce",
+    "nacos": "rce", "flink": "rce", "exim": "rce", "oracle": "rce",
+}
+
+
+def _cve_to_vuln_type(cve_id: str, components=None, name: str = "") -> str:
+    """CVE 组件/名称 -> POCGenerator 模板类型。"""
+    text = " ".join([str(c) for c in (components or [])] + [str(name or "")])
+    low = text.lower()
+    for comp, vt in _COMPONENT_VULN_TYPE.items():
+        if comp in low:
+            return vt
+    if "sqli" in low or "sql injection" in low:
+        return "sqli"
+    if "xss" in low or "cross-site" in low:
+        return "xss"
+    if "traversal" in low or "directory" in low or "lfi" in low:
+        return "lfi"
+    if "deserial" in low:
+        return "deserialization"
+    # 高危 CVE 多数可 RCE，默认 rce 模板
+    return "rce"
+
+
+async def build_cve_poc(
+    cve_id: str,
+    finding: Optional[Dict] = None,
+    components=None,
+    name: str = "",
+) -> Dict:
+    """A8.2：为 CVE 生成 PoC（双向索引：CVE -> PoC，PoC 含 CVE 溯源）。
+
+    返回 {cve_id, vuln_type, nuclei_cmd, poc_script}；命中即生成复现命令。
+    """
+    vuln_type = _cve_to_vuln_type(cve_id, components, name)
+    target = ""
+    if finding:
+        target = (
+            finding.get("url") or finding.get("target")
+            or finding.get("matched_at") or ""
+        )
+    # nuclei -id 即该 CVE 的权威 PoC 模板
+    nuclei_cmd = (
+        f"nuclei -id {cve_id} -u {target}" if target
+        else f"nuclei -id {cve_id} -u <target>"
+    )
+    poc_script = ""
+    try:
+        gen = POCGenerator()
+        syn = {
+            "type": vuln_type,
+            "url": target,
+            "parameter": (finding or {}).get("parameter", ""),
+            "payload": (finding or {}).get("matched", ""),
+            "severity": (finding or {}).get("severity", "High"),
+            "evidence": (finding or {}).get("matched", ""),
+        }
+        poc_script = await gen.generate(syn)
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[PoC] CVE={cve_id} 脚本生成失败: {e}")
+    rec = {
+        "cve_id": cve_id,
+        "vuln_type": vuln_type,
+        "nuclei_cmd": nuclei_cmd,
+        "poc_script": poc_script,
+    }
+    CVE_POC_INDEX[cve_id] = rec
+    return rec
+
+
+def get_cve_poc(cve_id: str) -> Optional[Dict]:
+    """按 CVE 查询已生成 PoC（双向索引反向查询）。"""
+    return CVE_POC_INDEX.get(cve_id)
+
+
 class POCGenerator:
     """POC 脚本生成器。
 

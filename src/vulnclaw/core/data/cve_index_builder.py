@@ -501,6 +501,180 @@ def sync_cve_index(index_dir: Optional[str] = None) -> Dict:
     }
 
 
+# ============================================================
+# A8.4：情报源接入（NVD / ExploitDB / GitHub Advisory）
+# 全部由环境变量开关，未配置则静默跳过（不联网、不影响主流程）。
+# 命中后增量写入 extra_records.jsonl，与主索引合并供 _gen_cve_task 检索。
+# ============================================================
+_NVD_API_KEY = os.environ.get("NVD_API_KEY", "").strip()
+_NVD_API_URL = os.environ.get(
+    "NVD_API_URL", "https://services.nvd.nist.gov/rest/json/cves/2.0"
+).strip()
+_GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+_EXPLOITDB_PATH = os.environ.get("EXPLOITDB_PATH", "").strip()
+
+
+def _norm_severity(cvss: Optional[float]) -> str:
+    if cvss is None:
+        return "medium"
+    if cvss >= 9.0:
+        return "critical"
+    if cvss >= 7.0:
+        return "high"
+    if cvss >= 4.0:
+        return "medium"
+    return "low"
+
+
+async def _fetch_nvd(days: int = 7) -> List[CVEEntry]:
+    """从 NVD API 拉取近 days 天新增 CVE，归一化为 CVEEntry（需 NVD_API_KEY）。"""
+    if not _NVD_API_KEY:
+        return []
+    try:
+        import aiohttp
+        from vulnclaw.core.utils import get_shared_session
+        session = await get_shared_session()
+        start = time.strftime(
+            "%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() - days * 86400)
+        )
+        params = {"pubStartDate": start, "resultsPerPage": 500}
+        headers = {"apiKey": _NVD_API_KEY}
+        async with session.get(
+            _NVD_API_URL, params=params, headers=headers,
+            timeout=aiohttp.ClientTimeout(total=60),
+        ) as resp:
+            if resp.status != 200:
+                logger.warning(f"[情报源] NVD 返回 {resp.status}")
+                return []
+            data = await resp.json()
+        out: List[CVEEntry] = []
+        for vuln in (data.get("vulnerabilities") or []):
+            c = vuln.get("cve", {})
+            cid = c.get("id") or ""
+            if not cid:
+                continue
+            descr = ""
+            for d in (c.get("descriptions") or []):
+                if d.get("lang") == "en":
+                    descr = d.get("value", "")
+                    break
+            cvss = None
+            for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+                mm = (c.get("metrics") or {}).get(key)
+                if mm:
+                    cvss = float(mm[0].get("cvssData", {}).get("baseScore", 0))
+                    break
+            out.append(CVEEntry(
+                cve_id=cid, name=cid, severity=_norm_severity(cvss),
+                cvss=cvss, file_path="", description=descr,
+                components=_extract_components(cid + " " + descr, descr),
+                versions=[],
+            ))
+        logger.info(f"[情报源] NVD 拉取 {len(out)} 条近 {days} 天 CVE")
+        return out
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[情报源] NVD 拉取失败: {e}")
+        return []
+
+
+def _scan_exploitdb() -> List[CVEEntry]:
+    """扫描本地 ExploitDB 镜像，抽取 CVE -> exploit 路径，作为 PoC 指针增量收录。"""
+    if not _EXPLOITDB_PATH or not os.path.isdir(_EXPLOITDB_PATH):
+        return []
+    out: List[CVEEntry] = []
+    try:
+        import csv
+        csv_path = os.path.join(_EXPLOITDB_PATH, "files_exploits.csv")
+        if os.path.isfile(csv_path):
+            with open(csv_path, encoding="utf-8", errors="replace") as f:
+                for row in csv.DictReader(f):
+                    desc = row.get("description") or ""
+                    codes = re.findall(r"CVE-\d{4}-\d+", desc, re.IGNORECASE)
+                    path = row.get("path") or row.get("file") or ""
+                    for cid in codes:
+                        cid = cid.upper()
+                        out.append(CVEEntry(
+                            cve_id=cid, name=cid, severity="high", cvss=None,
+                            file_path=os.path.join(_EXPLOITDB_PATH, path) if path else "",
+                            description=f"[ExploitDB] {desc}",
+                            components=_extract_components(cid + " " + desc, desc),
+                            versions=[],
+                        ))
+        logger.info(f"[情报源] ExploitDB 抽取 {len(out)} 条 CVE->exploit 映射")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[情报源] ExploitDB 扫描失败: {e}")
+    return out
+
+
+async def _fetch_github_advisories() -> List[CVEEntry]:
+    """从 GitHub Advisory Database 拉取带 CVE 编号的 advisory（需 GITHUB_TOKEN）。"""
+    if not _GITHUB_TOKEN:
+        return []
+    try:
+        import aiohttp
+        from vulnclaw.core.utils import get_shared_session
+        session = await get_shared_session()
+        headers = {
+            "Authorization": f"Bearer {_GITHUB_TOKEN}",
+            "Accept": "application/vnd.github+json",
+        }
+        url = ("https://api.github.com/advisories?type=reviewed"
+               "&per_page=100&sort=published&direction=desc")
+        async with session.get(
+            url, headers=headers, timeout=aiohttp.ClientTimeout(total=60)
+        ) as resp:
+            if resp.status != 200:
+                logger.warning(f"[情报源] GitHub Advisory 返回 {resp.status}")
+                return []
+            data = await resp.json()
+        out: List[CVEEntry] = []
+        for adv in (data or []):
+            cid = (adv.get("cve_id") or "").upper()
+            if not cid:
+                continue
+            sev = (adv.get("severity") or "medium").lower()
+            desc = adv.get("summary") or adv.get("description") or ""
+            cvss = None
+            try:
+                cvss = float((adv.get("cvss") or {}).get("score") or 0) or None
+            except (TypeError, ValueError):
+                pass
+            out.append(CVEEntry(
+                cve_id=cid, name=cid,
+                severity=sev if sev in _SEVERITY_ORDER else "medium",
+                cvss=cvss, file_path="", description=desc,
+                components=_extract_components(cid + " " + desc, desc),
+                versions=[],
+            ))
+        logger.info(f"[情报源] GitHub Advisory 拉取 {len(out)} 条")
+        return out
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[情报源] GitHub Advisory 拉取失败: {e}")
+        return []
+
+
+async def sync_intel_sources(days: int = 7) -> int:
+    """A8.4：从已配置的情报源增量更新 cve_index，返回新增条数。
+
+    环境变量开关：NVD_API_KEY / EXPLOITDB_PATH / GITHUB_TOKEN。
+    均未配置则直接返回 0（不联网）。
+    """
+    entries: List[CVEEntry] = []
+    nvd = await _fetch_nvd(days)
+    if nvd:
+        entries.extend(nvd)
+    edb = _scan_exploitdb()
+    if edb:
+        entries.extend(edb)
+    gh = await _fetch_github_advisories()
+    if gh:
+        entries.extend(gh)
+    if not entries:
+        return 0
+    return CVEIndex().ingest_records(entries)
+
+
 __all__ = [
     "CVEEntry", "CVEIndex", "build_index", "sync_cve_index", "parse_cve_template",
+    "sync_intel_sources",
 ]

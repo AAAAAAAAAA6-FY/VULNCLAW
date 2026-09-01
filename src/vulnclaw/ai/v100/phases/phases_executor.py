@@ -1037,7 +1037,7 @@ async def _execute_cve_scan(self, task: Dict) -> Optional[Dict]:
             ftype = f"CVE: {item.get('template') or item.get('info') or '未知'}"
             if any(f.get('type') == ftype and f.get('url') == item.get('url', target) for f in self.findings):
                 continue
-            self._add_finding({
+            finding = {
                 "type": ftype,
                 "severity": item.get("severity", "High"),
                 "evidence": item.get("matched", "")[:200],
@@ -1045,7 +1045,18 @@ async def _execute_cve_scan(self, task: Dict) -> Optional[Dict]:
                 "source": "cve_index_nuclei",
                 "confidence": "high",
                 "ai_reason": item.get("ai_reason", ""),
-            })
+            }
+            # A8.2：命中 CVE 即生成 PoC / 复现命令（nuclei -id 即权威 PoC）
+            try:
+                from vulnclaw.deepsec.poc_generator import build_cve_poc
+                cve_id = item.get("template") or item.get("info") or ""
+                poc = await build_cve_poc(cve_id, finding=item)
+                finding["reproduce_cmd"] = poc.get("nuclei_cmd", "")
+                finding["poc"] = poc.get("poc_script", "")
+                finding["cve_poc"] = poc
+            except Exception as pe:  # noqa: BLE001
+                logger.debug(f"🎯 [CVE任务] PoC 生成跳过: {pe}")
+            self._add_finding(finding)
             if hasattr(self, "_nuclei_findings"):
                 self._nuclei_findings += 1
     except asyncio.TimeoutError:

@@ -47,6 +47,14 @@ _OAST_DOMAIN_RE = re.compile(
     r"oast\.(?:pro|live|site|online|fun|me))"
 )
 
+# A1.2：自部署 interactsh server 作为第二主通道。
+# 设置 OOB_INTERACTSH_SERVER（如 https://oob.example.com）后，所有 interactsh
+# 注册/轮询均走该私有服务，摆脱公共 oast.me 的限流与单点故障；未设置则用公共服务器。
+_OOB_INTERACTSH_SERVER = (os.environ.get("OOB_INTERACTSH_SERVER") or "").strip()
+
+# A1.3：支持的带外回调协议（LDAP/RMI/SMB/SMTP + 既有 DNS/HTTP）
+_OOB_PROTOCOLS = ("ldap", "rmi", "smb", "smtp", "dns", "http", "https")
+
 # A1.4：OOB 回调证据链审计（进程内持久化 + 去重）
 # 满足「token→interaction 落库，支持跨轮次复核、去重与事后审计」——
 # 在单次扫描进程内累积全部回调，按 (token,protocol,time,from,raw) 去重，
@@ -132,6 +140,13 @@ class OOBChannel:
         logger.warning("[OOB] 所有带外通道均不可用（无 interactsh-client 且 dnslog 失败）。")
         return None
 
+    @staticmethod
+    def _interactsh_server_args() -> List[str]:
+        """A1.2：自部署 server 参数；未配置返回空列表（走公共服务器）。"""
+        if _OOB_INTERACTSH_SERVER:
+            return ["-server", _OOB_INTERACTSH_SERVER]
+        return []
+
     async def _request_interactsh_domain(self) -> Optional[str]:
         """interactsh-client v1.3.x 注册带外域名（会话文件跨调用复用）。
 
@@ -150,10 +165,13 @@ class OOBChannel:
             tag = secrets.token_hex(4)
             sf = os.path.join(tempfile.gettempdir(), f"itsh_{tag}.yaml")
             ps = os.path.join(tempfile.gettempdir(), f"itsh_{tag}_payload.txt")
+            server_note = f" (server={_OOB_INTERACTSH_SERVER})" if _OOB_INTERACTSH_SERVER else ""
+            logger.info(f"[OOB] 注册 interactsh 域名{server_note}")
             # 短超时注册：即便 8s 后被 kill，注册与会话在服务端持续有效
             result = await run_tool(
                 "interactsh-client",
-                args=["-json", "-sf", sf, "-psf", ps, "-nf", "-pi", "3"],
+                args=self._interactsh_server_args()
+                + ["-json", "-sf", sf, "-psf", ps, "-nf", "-pi", "3"],
                 timeout=8,
             )
             domain = self._extract_itsh_domain(sf, ps, result.get("stdout", ""))
@@ -226,6 +244,40 @@ class OOBChannel:
         return f"{token}.{self._domain}"
 
     # ----------------------------------------------------------
+    # A1.3：多协议回调构造（LDAP/RMI/SMB/SMTP + 既有 DNS/HTTP）
+    # 通道层统一支持这些协议的回调目标串；引擎据此构造对应 payload，
+    # 目标一旦以任一协议回连 <token>.<domain>，interactsh 即记录该协议回调。
+    # ----------------------------------------------------------
+    def protocol_callback(self, token: str, proto: str) -> Optional[str]:
+        """返回指定协议的带外回调目标串（供引擎构造 payload）。无域名返回 None。"""
+        if not self._domain or not token:
+            return None
+        proto = str(proto).lower()
+        if proto == "dns":
+            return f"{token}.{self._domain}"
+        if proto in ("http", "https"):
+            return f"{proto}://{token}.{self._domain}/"
+        if proto == "ldap":
+            return f"ldap://{token}.{self._domain}/"
+        if proto == "rmi":
+            return f"rmi://{token}.{self._domain}/"
+        if proto == "smtp":
+            return f"{token}.{self._domain}"
+        if proto == "smb":
+            # UNC 路径形式：\\<token>.<domain>\share
+            return f"\\\\{token}.{self._domain}\\share"
+        return f"{token}.{self._domain}"
+
+    def protocol_probes(self, token: str) -> Dict[str, str]:
+        """返回全部支持协议的回调目标串，用于一次性发起多协议盲打。"""
+        out: Dict[str, str] = {}
+        for proto in _OOB_PROTOCOLS:
+            cb = self.protocol_callback(token, proto)
+            if cb:
+                out[proto] = cb
+        return out
+
+    # ----------------------------------------------------------
     # 回调查询
     # ----------------------------------------------------------
     async def poll(self, timeout: int = 15) -> List[OOBInteraction]:
@@ -252,7 +304,8 @@ class OOBChannel:
         try:
             # 用同一会话文件重启 interactsh-client，重连并轮询该会话注册期间的回调
             result = await run_tool("interactsh-client",
-                                    args=["-json", "-sf", self._itsh_session_file],
+                                    args=self._interactsh_server_args()
+                                    + ["-json", "-sf", self._itsh_session_file],
                                     timeout=timeout)
         except asyncio.TimeoutError:
             logger.debug("[OOB] interactsh poll 超时")

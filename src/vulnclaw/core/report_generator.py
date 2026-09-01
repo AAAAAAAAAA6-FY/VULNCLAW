@@ -11,7 +11,9 @@
 """
 
 import datetime
+import os
 from pathlib import Path
+from typing import Dict, List, Optional
 
 from vulnclaw.core.logger import logger
 
@@ -99,7 +101,87 @@ def _build_reproduction_steps(vuln: Dict) -> List[str]:
         steps.append("2. 观察响应是否符合漏洞特征（见上方证据）。")
     steps.append("3. 与正常请求对比响应差异，确认漏洞可复现。")
     steps.append("4. 复现成功后，参考『修复建议』评估加固方案。")
+    repro = vuln.get("reproduce_cmd")
+    if repro:
+        steps.append(f"5. 一键复现（nuclei PoC）：`{repro}`")
     return steps
+
+
+# ============================================================
+# A8.3：漏报率回归基线（已知靶场命中率持续监控）
+# 通过环境变量 REGRESSION_BASELINE 指向基线 JSON（{"expect":[{cve_id,url?}...]}），
+# 扫描报告生成时计算漏报率并附段；未设置则完全无副作用。
+# ============================================================
+def _extract_cve_ids(finding: Dict) -> List[str]:
+    """从 finding 抽取包含的 CVE 编号（用于回归基线比对）。"""
+    import re as _re
+    text = " ".join(str(finding.get(k, "")) for k in
+                    ("type", "url", "evidence", "ai_reason", "reproduce_cmd"))
+    poc = finding.get("cve_poc")
+    if isinstance(poc, dict):
+        text += " " + str(poc.get("cve_id", ""))
+    return _re.findall(r"CVE-\d{4}-\d+", text, _re.IGNORECASE)
+
+
+def compute_false_negative(expected: List[Dict], actual: List[Dict]) -> Dict:
+    """已知靶场基线 -> 漏报率统计。
+
+    expected: [{cve_id, url?}, ...]；actual: 本次扫描发现列表。
+    返回 {total, detected, missed, fn_rate, missed_list}。
+    """
+    actual_cves = set()
+    for f in (actual or []):
+        for c in _extract_cve_ids(f):
+            actual_cves.add(c.upper())
+    detected = 0
+    missed = []
+    for e in (expected or []):
+        cid = str(e.get("cve_id") or e.get("cve") or "").upper()
+        if not cid:
+            continue
+        if cid in actual_cves:
+            detected += 1
+        else:
+            missed.append(e)
+    total = len(expected or [])
+    fn_rate = round((total - detected) / total, 4) if total else 0.0
+    return {
+        "total": total, "detected": detected, "missed": len(missed),
+        "fn_rate": fn_rate, "missed_list": missed[:50],
+    }
+
+
+def evaluate_regression_baseline(baseline_path: str, findings: List[Dict]) -> Optional[Dict]:
+    """读基线文件（JSON: {"expect":[...]}），计算漏报率；失败返回 None。"""
+    try:
+        import json
+        with open(baseline_path, encoding="utf-8") as f:
+            data = json.load(f)
+        expect = data.get("expect") or data.get("expected") or []
+        if not isinstance(expect, list):
+            return None
+        return compute_false_negative(expect, findings)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[回归基线] 读取/计算失败: {e}")
+        return None
+
+
+def _regression_block(report_data: Dict) -> str:
+    """A8.3：若设置 REGRESSION_BASELINE，返回漏报率 Markdown 段（否则空串）。"""
+    path = os.environ.get("REGRESSION_BASELINE", "").strip()
+    if not path:
+        return ""
+    findings = report_data.get("vulnerabilities", []) or []
+    metrics = evaluate_regression_baseline(path, findings)
+    if not metrics:
+        return ""
+    return (
+        f"\n## 漏报率回归基线（A8.3）\n"
+        f"- 基线文件: `{path}`\n"
+        f"- 已知漏洞总数: {metrics['total']}\n"
+        f"- 本次命中: {metrics['detected']}\n"
+        f"- 漏报: {metrics['missed']}（漏报率 {metrics['fn_rate'] * 100:.1f}%）\n"
+    )
 
 
 def generate_html_report(report_data, html_file="report.html"):
@@ -108,6 +190,11 @@ def generate_html_report(report_data, html_file="report.html"):
         html_content = render_html(report_data)
         with open(html_file, 'w', encoding='utf-8') as f:
             f.write(html_content)
+        # A8.3：漏报率回归基线（仅当 REGRESSION_BASELINE 设置）
+        reg = _regression_block(report_data)
+        if reg:
+            report_data["regression_baseline"] = reg
+            logger.info(f"📊 [回归基线] {reg.strip().splitlines()[-1]}")
         logger.info(f"📄 HTML 报告已保存至 {html_file}")
         return True
     except Exception as e:
@@ -535,6 +622,12 @@ def generate_markdown_report(report_data, output_path):
             lines.append(f"\n... 共 {len(vulns)} 个漏洞，仅显示前 30 个。请查看 JSON 报告获取完整列表。")
     else:
         lines.append("✅ 未发现安全漏洞。")
+
+    # A8.3：漏报率回归基线段（仅当 REGRESSION_BASELINE 设置）
+    reg = _regression_block(report_data)
+    if reg:
+        lines.append(reg)
+        logger.info(f"📊 [回归基线] {reg.strip().splitlines()[-1]}")
 
     with open(output_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))

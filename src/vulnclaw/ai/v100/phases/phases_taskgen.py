@@ -371,6 +371,20 @@ async def _gen_cve_task(self) -> Optional[Dict]:
         logger.debug(f"[CVE任务] CVE 索引加载失败，跳过: {exc}")
         return None
 
+    # A8.4：情报源增量更新（NVD/ExploitDB/GitHub），仅当配置了相应环境变量才联网。
+    try:
+        import os as _os
+        if (_os.environ.get("NVD_API_KEY") or _os.environ.get("EXPLOITDB_PATH")
+                or _os.environ.get("GITHUB_TOKEN")):
+            from vulnclaw.core.data.cve_index_builder import sync_intel_sources
+            added = await sync_intel_sources()
+            if added:
+                logger.info(f"[CVE任务] 情报源增量更新索引 +{added} 条")
+                idx = CVEIndex()
+                idx.load()
+    except Exception as ie:  # noqa: BLE001
+        logger.debug(f"[CVE任务] 情报源同步失败（忽略）: {ie}")
+
     seen_ids: set = set()
     hits: List = []
     for comp in tech_stack[:8]:
