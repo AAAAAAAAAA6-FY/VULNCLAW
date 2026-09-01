@@ -304,6 +304,116 @@ logger.info(
 )
 
 
+# ==================================================================
+# A6.1 / A6.2 / A5.3: 原生 Agent 工具（浏览器 / 登录 / 受控沙箱）
+# 注：playwright 相关工具延迟导入，缺依赖时注册不报错，execute 时优雅降级。
+# ==================================================================
+class BrowserAgentTool(BaseTool):
+    """A6.1: BrowserAIAgent 注册为 Agent 工具——点击/填表/翻页由 LLM 逐步指令驱动。"""
+
+    name = "browser_explore"
+    description = "AI 驱动的浏览器交互探索：自动点击/填表/翻页，捕获页面与 API 请求。用于 SPA/JS 渲染站点或需交互才能触达的端点。"
+    category = "native"
+    danger_level = "safe"
+    timeout = 120
+    parameters = [
+        {"name": "url", "type": "string", "required": True, "description": "起始 URL"},
+        {"name": "use_profile_b", "type": "string", "required": False,
+         "description": "是否用第二浏览器档案(admin 角色)，true/false"},
+    ]
+
+    async def execute(self, url: str, use_profile_b: str = "false", **kwargs) -> Dict:
+        try:
+            from vulnclaw.core.browser_ai_agent import BrowserAIAgent, HAS_PLAYWRIGHT
+            if not HAS_PLAYWRIGHT:
+                return {"type": "browser_result", "success": False,
+                        "error": "Playwright 未安装（pip install playwright && playwright install chromium）"}
+            agent = BrowserAIAgent()
+            res = await agent.explore(url, use_profile_b=(str(use_profile_b).lower() == "true"))
+            return {"type": "browser_result", "success": True, "data": res}
+        except Exception as e:  # noqa: BLE001
+            return {"type": "browser_result", "success": False, "error": str(e)}
+
+
+class LoginAgentTool(BaseTool):
+    """A6.2: 登录流自动拆解——登录表单识别→账号试填→提交→cookie 回传会话管理。"""
+
+    name = "auto_login"
+    description = "自动登录目标站点并提取 Cookie 回写会话管理（供后续引擎带认证态探测）。需提供账号密码与登录页选择器。"
+    category = "native"
+    danger_level = "guarded"
+    timeout = 120
+    parameters = [
+        {"name": "login_url", "type": "string", "required": True, "description": "登录页 URL"},
+        {"name": "username", "type": "string", "required": True, "description": "账号"},
+        {"name": "password", "type": "string", "required": True, "description": "密码"},
+        {"name": "username_selector", "type": "string", "required": False, "description": "用户名输入框 CSS 选择器"},
+        {"name": "password_selector", "type": "string", "required": False, "description": "密码输入框 CSS 选择器"},
+        {"name": "submit_selector", "type": "string", "required": False, "description": "提交按钮 CSS 选择器"},
+        {"name": "success_indicator", "type": "string", "required": False, "description": "登录成功标识（URL 或页面内容包含）"},
+    ]
+
+    async def execute(self, login_url: str, username: str, password: str,
+                     username_selector: str = "#username", password_selector: str = "#password",
+                     submit_selector: str = "#login-btn", success_indicator: str = "dashboard",
+                     **kwargs) -> Dict:
+        try:
+            from vulnclaw.core.auth.auto_login import auto_login_and_get_cookie, HAS_PLAYWRIGHT
+            if not HAS_PLAYWRIGHT:
+                return {"success": False,
+                        "error": "Playwright 未安装（pip install playwright && playwright install chromium）"}
+            cookies = await auto_login_and_get_cookie(
+                login_url, username, password, username_selector,
+                password_selector, submit_selector, success_indicator,
+            )
+            if not cookies:
+                return {"success": False, "error": "自动登录失败（未检测到成功标识）"}
+            domain = login_url.split("/")[2] if "://" in login_url else login_url
+            try:
+                from vulnclaw.core.auth.session_manager import get_session_manager
+                get_session_manager().add_cookies(domain=domain, cookies=cookies)
+            except Exception as se:  # noqa: BLE001
+                logger.warning(f"[auto_login] cookie 回写会话管理失败: {se}")
+            return {"success": True, "type": "login_result",
+                    "domain": domain, "cookies": list(cookies.keys())}
+        except Exception as e:  # noqa: BLE001
+            return {"success": False, "error": str(e)}
+
+
+class SandboxTool(BaseTool):
+    """A5.3: 受控 shell 沙箱——白名单命令 + 参数校验 + 超时 + 输出截断 + 工作目录隔离。"""
+
+    name = "shell"
+    description = "受控 shell 沙箱：仅允许白名单命令（echo/cat/grep/curl 等），禁止组合/重定向/危险参数，带超时与输出截断。安全辅助命令执行。"
+    category = "native"
+    danger_level = "guarded"
+    timeout = 30
+    parameters = [
+        {"name": "command", "type": "string", "required": True, "description": "白名单命令（如 curl）"},
+        {"name": "args", "type": "string", "required": False, "description": "命令参数，空格分隔"},
+    ]
+
+    async def execute(self, command: str, args: str = "", **kwargs) -> Dict:
+        from vulnclaw.core.sandbox import run_sandboxed
+        arg_list = shlex.split(args) if args else []
+        return await run_sandboxed(command, arg_list, timeout=self.timeout)
+
+
+def _register_native_tools() -> int:
+    registered = 0
+    for ToolClass in (BrowserAgentTool, LoginAgentTool, SandboxTool):
+        try:
+            inst = ToolClass()
+            TOOL_REGISTRY[inst.name] = inst
+            registered += 1
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"⚠️ 原生工具 {ToolClass.__name__} 注册失败: {e}")
+    return registered
+
+
+_register_native_tools()
+
+
 async def execute_tool(name: str, **kwargs) -> Dict:
     if name not in TOOL_REGISTRY:
         return {"error": f"未知工具: {name}"}

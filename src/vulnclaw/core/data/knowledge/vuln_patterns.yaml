@@ -1,0 +1,69 @@
+# A3.3 通用漏洞模式库（指纹 -> 已知弱点速查）
+# 格式：框架名 -> { weaknesses: [已知弱点/典型 CVE] }
+# 由 core/knowledge.py 加载，注入引擎/验证 prompt 减少 LLM 重复推导。
+
+Spring:
+  weaknesses:
+    - "Spring4Shell (CVE-2022-22965) 远程代码执行"
+    - "SpEL 表达式注入"
+    - "Actuator 端点未授权访问"
+    - "CVE-2022-22965 类加载器覆盖"
+
+Struts:
+  weaknesses:
+    - "Struts2 OGNL 注入 (S2-045 / S2-057)"
+    - "远程代码执行 (CVE-2017-5638)"
+    - "REST 插件 XStream 反序列化"
+
+ThinkPHP:
+  weaknesses:
+    - "ThinkPHP5 命令注入 (route/controller 任意调用)"
+    - "反序列化 RCE"
+    - "SQL 注入 (where 注入)"
+
+WordPress:
+  weaknesses:
+    - "插件/主题任意文件上传"
+    - "SQL 注入 (wpdb 误用)"
+    - "XML-RPC 暴力/枚举"
+    - "wp-config.php 泄露"
+
+Tomcat:
+  weaknesses:
+    - "CVE-2017-12615 PUT 方法任意文件上传"
+    - "Manager 后台弱口令"
+    - "CVE-2019-0232 CGI 命令执行"
+
+Nginx:
+  weaknesses:
+    - "配置错误导致的路径遍历/别名绕过"
+    - "error_page 导致的 SSRF"
+    - "CRLF 注入"
+
+Django:
+  weaknesses:
+    - "DEBUG 模式开启导致敏感信息泄露"
+    - "SQL 注入 (ORM 误用 / extra())"
+    - "CSRF 缺失/配置不当"
+
+Laravel:
+  weaknesses:
+    - "CVE-2021-3129 Ignition 反序列化 RCE"
+    - ".env 文件泄露"
+    - "APP_DEBUG 开启泄露"
+
+Flask:
+  weaknesses:
+    - "调试模式开启 (Werkzeug 控制台 RCE)"
+    - "模板注入 (SSTI)"
+    - "session 密钥硬编码"
+
+Fastjson:
+  weaknesses:
+    - "AutoType 反序列化 RCE (多种 gadget)"
+    - "JNDI 注入 (<=1.2.68 通杀绕过)"
+
+Log4j:
+  weaknesses:
+    - "Log4Shell (CVE-2021-44228) JNDI 注入 RCE"
+    - "CVE-2021-45046 / CVE-2021-45105 绕过"
