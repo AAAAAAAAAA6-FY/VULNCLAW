@@ -74,6 +74,26 @@ class DeserializationEngine(BaseEngine):
         (r'marshal\.loads\s*\(', 'Python marshal.loads() 反序列化'),
         (r'gASV', 'Python pickle 协议4 BLOB（base64）'),
     ]
+    # A2 多栈补强：Ruby（Marshal/Psych/YAML）与 Node.js（node-serialize）
+    RUBY_INDICATORS: List[Tuple[str, str]] = [
+        (r'Marshal\.load', 'Ruby Marshal.load 反序列化'),
+        (r'Marshal\.dump', 'Ruby Marshal.dump 序列化'),
+        (r'Psych\.load', 'Ruby Psych(YAML) 反序列化'),
+        (r'ActiveSupport::MessageVerifier', 'Rails MessageVerifier 反序列化'),
+        (r'ActiveSupport::MessageEncryptor', 'Rails MessageEncryptor 反序列化'),
+        (r'Oj\.load', 'Ruby Oj JSON 反序列化'),
+        (r'JSON\.load', 'Ruby JSON.load 反序列化'),
+        (r'Rails\.version', 'Ruby on Rails 框架'),
+    ]
+    NODE_INDICATORS: List[Tuple[str, str]] = [
+        (r'node-serialize', 'Node.js node-serialize 反序列化'),
+        (r'_\$\$ND_FUNC\$\$_', 'Node.js _$$ND_FUNC$$_ 函数注入'),
+        (r'unserialize\s*\(', 'Node.js unserialize() 调用'),
+        (r'require\([\'"]child_process', 'Node.js child_process 调用'),
+        (r'vm\.runInContext', 'Node.js vm 沙箱执行'),
+        (r'new Function\s*\(', 'Node.js Function 构造注入'),
+        (r'express', 'Node.js Express 框架'),
+    ]
 
     # ---------------- 主动 Payload ----------------
     PAYLOADS: List[Tuple[str, str, str]] = [
@@ -90,6 +110,12 @@ class DeserializationEngine(BaseEngine):
         ('cos\nsystem\n(S\'echo deserialization_poc\'\ntR.', 'Python pickle raw 命令执行', 'python'),
         ('gASVGAAAAAAAAACMBG1hcnOUjAVsb2Fkc5STlCmFlFKULg==',
          'Python marshal.loads 反序列化探针', 'python'),
+        # A2 多栈补强：Ruby / Node.js
+        ('\x04\x08o:\x0bVulnClawProbe', 'Ruby Marshal 未定义类探测', 'ruby'),
+        ('--- !ruby/object:VulnClawProbe\nfoo: bar', 'Ruby Psych YAML 未定义类探测', 'ruby'),
+        ('{"rce":"_$$ND_FUNC$$_function (){require(\'child_process\').exec(\'echo deser_test\',function(){});}()"}',
+         'Node node-serialize 函数注入', 'node'),
+        ('{"type":"Buffer","data":[100,101,115,101,114,95,116,101,115,116]}', 'Node Buffer 反序列化探针', 'node'),
     ]
 
     # ---------------- 错误回显信号 ----------------
@@ -109,6 +135,16 @@ class DeserializationEngine(BaseEngine):
         r'unsupported pickle protocol', r'No module named', r'not implemented for this type',
         r'ValueError.*marshal', r'marshal.*error', r'bad marshal data',
     ]
+    RUBY_ERROR_SIGS = [
+        r'Marshal', r'ArgumentError', r'undefined class/module',
+        r'TypeError.*Marshal', r'can\'t dump', r'expected Marshal',
+        r'Psych::', r'bad Marshal', r'RubyGems',
+    ]
+    NODE_ERROR_SIGS = [
+        r'_\$\$ND_FUNC\$\$_', r'node-serialize', r'Unexpected token', r'SyntaxError',
+        r'unserialize', r'TypeError.*serialize', r'is not a function',
+        r'child_process', r'ReferenceError',
+    ]
 
     # ---------------- 实现 ----------------
 
@@ -122,13 +158,17 @@ class DeserializationEngine(BaseEngine):
             stacks.append('php')
         if any(re.search(p, blob) for p, _ in self.PY_INDICATORS) or 'python' in blob_lower or 'wsgi' in blob_lower:
             stacks.append('python')
+        if any(re.search(p, blob) for p, _ in self.RUBY_INDICATORS) or any(k in blob_lower for k in ('ruby', 'rails', 'sinatra', 'rack', 'passenger')):
+            stacks.append('ruby')
+        if any(re.search(p, blob) for p, _ in self.NODE_INDICATORS) or any(k in blob_lower for k in ('node', 'express', 'nestjs', 'koa')):
+            stacks.append('node')
         return stacks
 
     def _passive_check(self, blob: str, source: str) -> List[Dict]:
         hits = []
         if not blob:
             return hits
-        for pattern, desc in self.JAVA_INDICATORS + self.PHP_INDICATORS + self.PY_INDICATORS:
+        for pattern, desc in self.JAVA_INDICATORS + self.PHP_INDICATORS + self.PY_INDICATORS + self.RUBY_INDICATORS + self.NODE_INDICATORS:
             if re.search(pattern, blob):
                 hits.append({"desc": desc, "source": source})
         return hits
@@ -179,7 +219,7 @@ class DeserializationEngine(BaseEngine):
         # ---- 2. 识别技术栈，用于主动 Payload 选择 ----
         stacks = self._detect_stack(blob)
         if not stacks:
-            stacks = ['java', 'php', 'python']
+            stacks = ['java', 'php', 'python', 'ruby', 'node']
 
         # ---- 3. 主动检测：对 URL 参数发送序列化 Payload ----
         params = parse_qs_lite(parsed.query)
@@ -279,6 +319,10 @@ class DeserializationEngine(BaseEngine):
             sigs = self.PHP_ERROR_SIGS
         elif tech == 'python':
             sigs = self.PY_ERROR_SIGS
+        elif tech == 'ruby':
+            sigs = self.RUBY_ERROR_SIGS
+        elif tech == 'node':
+            sigs = self.NODE_ERROR_SIGS
         else:
             return False
         for sig in sigs:
