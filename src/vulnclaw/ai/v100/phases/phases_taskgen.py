@@ -209,7 +209,7 @@ async def _generate_tasks(self):
     for param in all_params:
         skip, reason = self.local_filter.should_skip(self.target, param, "", 0)
         if skip:
-            logger.debug(f"   鈴笍 璺宠繃鍙傛暟 {param}: {reason}")
+            logger.debug(f"   [skip] 跳过参数 {param}: {reason}")
             continue
         is_business = any(kw in param.lower() for kw in business_param_keywords)
         engine_scores = []

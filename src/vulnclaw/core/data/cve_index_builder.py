@@ -44,6 +44,14 @@ _DEFAULT_OUT = os.path.join("thirdparty", "nuclei-templates", "cve_index")
 
 _SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
 
+_CVE_YEAR_RE = re.compile(r"CVE-(\d{4})-", re.IGNORECASE)
+
+
+def _cve_year(cve_id: str) -> int:
+    """从 CVE-YYYY-NNNN 提取年份（越新越可能未打补丁，排序时越靠前），无法解析返回 0。"""
+    m = _CVE_YEAR_RE.match(str(cve_id or ""))
+    return int(m.group(1)) if m else 0
+
 # 常见「漏洞类型/无信息量」词，做组件抽取时剔除（避免把漏洞类型当成组件）
 _VULN_NOISE = {
     "multiple", "cross-site", "scripting", "xss", "injection", "remote", "code",
@@ -421,6 +429,7 @@ class CVEIndex:
         - component 会经别名归一化 + 标题子串匹配（横向放宽，避免漏）。
         - version 存在时仅保留「版本可能命中」或「版本未知」的候选（不误排除）。
         - min_severity 提供严重度阈值下限（critical/high/medium/low/info）。
+        - 返回顺序：全量过滤后按「严重度降序 → CVE 年份倒序」排序，再取前 limit 条。
         """
         if not self.records:
             self.load()
@@ -439,6 +448,10 @@ class CVEIndex:
         version_target = version.strip().lower() if version else None
 
         out = []
+        # 先全量收集通过严重度/版本过滤的候选，再统一排序，最后才截断。
+        # 旧实现在循环内就 `if len(out) >= limit: break`，等于"按索引插入顺序
+        # 取前 N 条再在切片内排序"——高危/新 CVE 会被老 CVE 挤出候选集，
+        # nuclei -id 精扫（phases_executor._execute_cve_scan）因此系统性漏检。
         for i in sorted(candidates):
             rec = self.records[i]
             if _SEVERITY_ORDER.get(rec.severity, -1) < min_rank:
@@ -449,10 +462,13 @@ class CVEIndex:
                                for vt in rec.versions):
                         continue
             out.append(rec)
-            if len(out) >= limit:
-                break
-        out.sort(key=lambda r: _SEVERITY_ORDER.get(r.severity, -1), reverse=True)
-        return out
+        # 排序：严重度降序 → CVE 年份倒序（越新越可能未打补丁）→ ID 稳定兜底
+        out.sort(key=lambda r: (
+            _SEVERITY_ORDER.get(r.severity, -1),
+            _cve_year(r.cve_id),
+            r.cve_id or "",
+        ), reverse=True)
+        return out[:limit]
 
     def search_all(self, max_items: int = -1) -> List[CVEEntry]:
         """全量候选（按严重度降序），max_items<0 表示不限。"""
