@@ -347,11 +347,26 @@ async def _gen_cve_task(self) -> Optional[Dict]:
     if not tech_stack:
         return None
     try:
-        from vulnclaw.core.data.cve_index_builder import CVEIndex
+        from vulnclaw.core.data.cve_index_builder import CVEIndex, build_index
         idx = CVEIndex()
         if not idx.load():
-            logger.debug("[CVE任务] CVE 索引未构建，跳过（可先跑 update_templates.py --sync-cve-index）")
-            return None
+            # A8：索引缺失（全新克隆 / 未构建 / 被 .gitignore 忽略未入库）→ 离线从内置
+            # cves.json 构建一次，闭合「指纹→CVE→nuclei -id」链路，避免静默跳过导致
+            # CVE 专项精扫对所有人永久失效。
+            logger.info("[CVE任务] CVE 索引未构建，尝试离线构建（内置 cves.json）")
+            try:
+                n = build_index()
+                if not n or n <= 0:
+                    logger.debug("[CVE任务] CVE 索引离线构建无数据，跳过")
+                    return None
+                idx = CVEIndex()
+                if not idx.load():
+                    logger.debug("[CVE任务] CVE 索引构建后仍无法加载，跳过")
+                    return None
+                logger.info(f"[CVE任务] CVE 索引离线构建成功（{n} 条）")
+            except Exception as be:
+                logger.debug(f"[CVE任务] CVE 索引离线构建失败，跳过: {be}")
+                return None
     except Exception as exc:
         logger.debug(f"[CVE任务] CVE 索引加载失败，跳过: {exc}")
         return None
