@@ -163,6 +163,7 @@ async def run_nuclei_async(
     tags: Optional[List[str]] = None,
     tech_stack: Optional[List[str]] = None,
     exclude_severity: str = "info",
+    template_ids: Optional[List[str]] = None,
 ) -> List[Dict]:
     """
     异步运行 Nuclei 扫描，返回结果列表。
@@ -170,6 +171,7 @@ async def run_nuclei_async(
       - 输出完整命令、返回码、stdout/stderr、输出文件大小，便于定位 0 结果根因
       - 所有异常升级为 warning 级日志（原来 debug 级在默认日志级别下不可见）
       - 即使 returncode != 0 也尝试解析输出（nuclei 发现漏洞时非 0 退出）
+    Z1.2：新增 template_ids 参数——指定 CVE 模板 ID（-id），用于情报驱动的专项扫描。
     """
     if not load_tool_config("nuclei"):
         logger.warning(f"⚠️ [Nuclei] 未找到 nuclei 可执行文件 (PATH={os.environ.get('PATH','')[:200]}...)，跳过 CVE 扫描")
@@ -195,13 +197,18 @@ async def run_nuclei_async(
             "-retries", "1",
             "-rl", "5",
         ]
-        if tag_list:
+        # Z1.2：指定模板 ID 时用 -id 精确命中（覆盖 tags 无法匹配的 CVE 模板）
+        id_list = [str(i).strip() for i in (template_ids or []) if str(i).strip()]
+        if id_list:
+            args.extend(["-id", ",".join(id_list[:50])])
+        if tag_list and not id_list:
             args.extend(["-tags", ",".join(tag_list)])
         if exclude_severity:
             # P4-3: Info 级模板默认跳过，减少无效噪声
             args.extend(["-exclude-severity", exclude_severity])
         logger.info(
             f"🧬 [Nuclei] 启动: target={target} severity={severity} "
+            f"ids={','.join(id_list[:8]) if id_list else '全部'} "
             f"tags={','.join(tag_list) or '全部'} timeout={timeout}s"
         )
         if tag_list:

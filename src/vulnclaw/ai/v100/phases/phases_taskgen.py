@@ -6,7 +6,9 @@
 
 """Implementation functions for the v100 taskgen phase."""
 import os
+import re
 import time
+from typing import Dict, List, Optional
 from vulnclaw.core.logger import logger
 from vulnclaw.core.session_manager import get_session_manager
 from vulnclaw.ai.v100.batch_processor import BatchProcessor
@@ -188,6 +190,15 @@ async def _generate_tasks(self):
         )
     business_param_keywords = ["amount", "price", "total", "role", "status", "order", "coupon", "ids", "admin"]
     tasks_added = 0
+    # Z1.2（=D2.4）：情报驱动——指纹组件命中 CVE 索引 → 生成高危 CVE 专项任务（数据腿闭环）
+    # 索引：thirdparty/nuclei-templates/cve_index（Z1.1）；只取 critical/high，限定条数。
+    try:
+        cve_task = await self._gen_cve_task()
+        if cve_task:
+            await self.task_queue.add_task(cve_task, cve_task.get("priority", 10))
+            tasks_added += 1
+    except Exception as e:
+        logger.debug(f"[CVE任务] 生成异常（不影响主流程）: {e}")
     enable_engine_bundle = os.getenv("ENABLE_ENGINE_BUNDLE", "true").lower() != "false"
     parameter_tasks = 0
     batch_pending = []  # P1-4: BatchProcessor 收集同参数多引擎任务
@@ -325,4 +336,74 @@ async def _generate_tasks(self):
             }, priority=6)
         tasks_added += 1
     logger.info(f"   📋 总任务数: {tasks_added}")
-__all__ = ['_scan_idor', '_check_default_creds', '_generate_tasks']
+async def _gen_cve_task(self) -> Optional[Dict]:
+    """Z1.2（=D2.4）：读 CVE 索引，按指纹组件生成高危 CVE 专项任务。
+
+    数据腿闭环：cve_index（Z1.1）→ phases_taskgen 读索引 → nuclei 专项扫描（cve_scan）。
+    只取 critical/high，且限定条数（<=12），避免把整个 CVE 库拉进扫描。
+    索引缺失/不可用时静默跳过（不误报、不阻断主流程）。
+    """
+    tech_stack = self._recon_brief.get("tech_stack", []) or []
+    if not tech_stack:
+        return None
+    try:
+        from vulnclaw.core.data.cve_index_builder import CVEIndex
+        idx = CVEIndex()
+        if not idx.load():
+            logger.debug("[CVE任务] CVE 索引未构建，跳过（可先跑 update_templates.py --sync-cve-index）")
+            return None
+    except Exception as exc:
+        logger.debug(f"[CVE任务] CVE 索引加载失败，跳过: {exc}")
+        return None
+
+    seen_ids: set = set()
+    hits: List = []
+    for comp in tech_stack[:8]:
+        if not comp or not str(comp).strip():
+            continue
+        for candidate in (str(comp).strip(),):
+            for rec in idx.search(candidate, min_severity="high", limit=8):
+                if rec.cve_id in seen_ids:
+                    continue
+                seen_ids.add(rec.cve_id)
+                hits.append(rec)
+                if len(hits) >= 12:
+                    break
+            if len(hits) >= 12:
+                break
+        # 复合指纹（如 "Apache/2.4.41 (Ubuntu)"）再按 token 放宽匹配
+        for tok in re.split(r"[^a-zA-Z0-9.\-]+", str(comp)):
+            tok = tok.strip().lower()
+            if len(tok) < 3 or tok in ("http", "https", "version", "server"):
+                continue
+            for rec in idx.search(tok, min_severity="high", limit=5):
+                if rec.cve_id in seen_ids:
+                    continue
+                seen_ids.add(rec.cve_id)
+                hits.append(rec)
+                if len(hits) >= 12:
+                    break
+            if len(hits) >= 12:
+                break
+        if len(hits) >= 12:
+            break
+
+    if not hits:
+        return None
+    cve_ids = [r.cve_id for r in hits]
+    meta = [
+        {"cve_id": r.cve_id, "severity": r.severity, "template": r.file_path}
+        for r in hits
+    ]
+    logger.info(
+        f"🎯 [CVE任务] 指纹→CVE 命中 {len(cve_ids)} 个高危 CVE（{', '.join(cve_ids[:6])}...），生成 nuclei 专项任务"
+    )
+    return {
+        "type": "cve_scan",
+        "target": self.target,
+        "cve_ids": cve_ids,
+        "cve_meta": meta,
+        "priority": 10,
+        "created_at": time.time(),
+    }
+__all__ = ['_scan_idor', '_check_default_creds', '_generate_tasks', '_gen_cve_task']
