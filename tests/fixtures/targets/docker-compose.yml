@@ -1,0 +1,45 @@
+# D7.1 本地靶场矩阵：一键拉起多漏洞靶场，用于 benchmark 检出率验证 (D7.2/D7.4)。
+# 用法：docker compose -f tests/fixtures/targets/docker-compose.yml up -d
+# 验证完成后：docker compose -f tests/fixtures/targets/docker-compose.yml down
+version: "3.8"
+
+services:
+  dvwa:
+    image: vulnerables/web-dvwa
+    container_name: vulnclaw-dvwa
+    ports:
+      - "8081:80"
+    environment:
+      - MYSQL_PASS=dvwa
+    restart: unless-stopped
+
+  juice-shop:
+    image: bkimminich/juice-shop
+    container_name: vulnclaw-juice
+    ports:
+      - "3001:3000"
+    restart: unless-stopped
+
+  webgoat:
+    image: webgoat/webgoat:8.2.2
+    container_name: vulnclaw-webgoat
+    ports:
+      - "8082:8080"
+    restart: unless-stopped
+
+  testphp:
+    image: acgpiano/sqli-vuln-app
+    container_name: vulnclaw-testphp
+    ports:
+      - "8083:80"
+    restart: unless-stopped
+
+  # 认证态靶场：用于 A6.2 登录流 / A6.5 2FA 人工接管验证
+  juice-auth:
+    image: bkimminich/juice-shop
+    container_name: vulnclaw-juice-auth
+    ports:
+      - "3002:3000"
+    environment:
+      - NODE_ENV=test
+    restart: unless-stopped
