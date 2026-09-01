@@ -23,8 +23,11 @@ def get_browser_cookies(domain: str) -> Optional[Dict[str, str]]:
     返回: {"cookie_name": "value", ...} 或 None
     """
     cookie_paths = [
+        os.path.expanduser("~/AppData/Local/Google/Chrome/User Data/Default/Network/Cookies"),
         os.path.expanduser("~/AppData/Local/Google/Chrome/User Data/Default/Cookies"),
+        os.path.expanduser("~/AppData/Local/Microsoft/Edge/User Data/Default/Network/Cookies"),
         os.path.expanduser("~/AppData/Local/Microsoft/Edge/User Data/Default/Cookies"),
+        os.path.expanduser("~/AppData/Local/Google/Chrome/User Data/Profile 1/Network/Cookies"),
         os.path.expanduser("~/AppData/Local/Google/Chrome/User Data/Profile 1/Cookies"),
     ]
 

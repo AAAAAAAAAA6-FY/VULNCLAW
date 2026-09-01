@@ -177,6 +177,17 @@ async def _load_and_filter_cookies(session: aiohttp.ClientSession, target: Optio
 
     cookie_file = _get_cookie_file_path(host)
 
+    # 目标专属文件不存在时，回退到父域名文件（如 app.box.com -> box.com）
+    if not cookie_file.exists():
+        fallback_parts = host.split(".")
+        for i in range(1, len(fallback_parts)):
+            parent = ".".join(fallback_parts[i:])
+            parent_file = _get_cookie_file_path(parent)
+            if parent_file.exists():
+                cookie_file = parent_file
+                logger.info(f"📂 目标 Cookie 文件不存在，回退到父域名文件: {parent}")
+                break
+
     # 兼容旧文件 ~/burp_cookies.json
     old_file = os.path.expanduser("~/burp_cookies.json")
     if not cookie_file.exists() and os.path.exists(old_file):
@@ -230,13 +241,37 @@ async def _load_and_filter_cookies(session: aiohttp.ClientSession, target: Optio
         return
 
     injected_count = 0
+    auth_candidates = {}  # domain -> Authorization 值（已规范化带 Bearer 前缀）
     for domain, cookies in data.items():
         url_obj = URL(f"http://{domain}")
         for key, value in cookies.items():
             session.cookie_jar.update_cookies({key: value}, response_url=url_obj)
+            if key.lower() == "authorization" and isinstance(value, str) and value.strip():
+                candidate = value.strip()
+                if not candidate.startswith(("Bearer ", "Basic ")):
+                    candidate = f"Bearer {candidate}"
+                auth_candidates[domain] = candidate
         injected_count += 1
 
     logger.info(f"✅ 已注入 {injected_count} 个域的凭证")
+
+    # 把 Authorization cookie 提升为 HTTP 请求头（Box 等 OAuth 站点用 Bearer 头认证）
+    if auth_candidates:
+        chosen = None
+        if host in auth_candidates:
+            chosen = auth_candidates[host]
+        else:
+            for d, val in auth_candidates.items():
+                if d == host or d.endswith("." + host) or host.endswith("." + d):
+                    chosen = val
+                    break
+        if chosen is None:
+            chosen = next(iter(auth_candidates.values()))
+        try:
+            session._default_headers["Authorization"] = chosen
+            logger.info("✅ 已将 Authorization 提升为请求头（Bearer 认证生效）")
+        except Exception as e:
+            logger.debug(f"设置 Authorization 头失败: {e}")
 
 
 async def close_shared_session():

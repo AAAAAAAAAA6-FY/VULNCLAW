@@ -17,6 +17,7 @@ from vulnclaw.core.settings import settings
 from vulnclaw.engines.input_engines import BusinessLogicEngine
 from vulnclaw.engines.auxiliary_engines import APIVersionDiffEngine, RequestSmugglingEngine, HTTP2WebSocketEngine
 from vulnclaw.engines.http_engines import CachePoisonEngine
+from vulnclaw.engines.base import annotate_chain_info
 async def _run_business_logic_scan(self):
     try:
         logger.info("🧬 [BusinessLogic] 全局扫描...")
@@ -541,18 +542,20 @@ async def _execute_engine_bundle(self, task: Dict) -> Optional[Dict]:
     ]
     if not local_results:
         return None
+    # A4.3: 工具输出裁剪——每条 evidence 超阈值截断，防止 nuclei/ffuf 千行输出撑爆 LLM token
+    _clip_max = int(getattr(settings, "context_clip_max_chars", 1500))
     evidence = [
         {
             "index": index,
             "engine": item["engine"],
             "type": item["result"].get("type", item["engine"]),
-            "evidence": item["result"].get("evidence", ""),
+            "evidence": str(item["result"].get("evidence", ""))[:_clip_max],
         }
         for index, item in enumerate(local_results)
     ]
     prompt = (
         "请一次性判断以下多个引擎检测结果。只返回 JSON 数组，每项包含 "
-        "index銆乭as_vuln锛坱rue/false锛夈€乧onfidence銆乪vidence銆俓n"
+        "index、has_vuln(true/false)、confidence、evidence。\n"
         f"检测结果\n{json.dumps(evidence, ensure_ascii=False, default=str)}"
     )
     try:
@@ -572,12 +575,434 @@ async def _execute_engine_bundle(self, task: Dict) -> Optional[Dict]:
         else:
             result["ai_verdict"] = "Bundle解析失败，采用规则结果"
         result["bundle_engine"] = item["engine"]
+        # S2.1: 原地标注链信息（_pending_verify 与返回值共享同一 dict，
+        # 拷贝式标注会导致最终报告丢失 chain_info——端到端实测发现）
+        if isinstance(result, dict):
+            try:
+                result["chain_info"] = annotate_chain_info(
+                    result, task.get("url") or self.target, str(task.get("param") or "")
+                ).get("chain_info")
+            except Exception:  # noqa: BLE001
+                pass
+    bundle_results = [item["result"] for item in local_results]
+    # S1.2: 记录 bundle 首次执行结果（供 ReAct 深挖判断"本地判定模糊"）
+    try:
+        param_key = str(task.get("param") or "")
+        if param_key:
+            bucket = getattr(self, "_bundle_results", None)
+            if bucket is None:
+                bucket = {}
+                self._bundle_results = bucket
+            bucket.setdefault(param_key, []).extend(bundle_results)
+    except Exception as _be:  # noqa: BLE001
+        logger.debug(f"   [ReActDive] 记录 bundle 结果失败（不影响扫描）: {_be}")
     return {
         "type": "engine_bundle",
         "engine": engines,
         "param": task.get("param"),
-        "results": [item["result"] for item in local_results],
+        "results": bundle_results,
     }
+
+
+# ------------------------------------------------------------------
+# S1: ReActAgent 深挖阶段 —— V100=批量广度，ReAct=单点深度
+# ------------------------------------------------------------------
+async def _run_react_deep_dive(self):
+    """S1: 深挖阶段——对本地判定模糊的参数启用 ReActAgent 多轮深挖。
+
+    触发条件（S1.2）：engine_bundle 首次执行结果全部 low/info，或该参数无高/中危 finding。
+    复用（S1 设计）：TOOL_REGISTRY 30 工具 + tool_success_rates 排序 + PlanFeedback。
+    定位固化（S1.3）：深挖 finding 标记 source=react_agent 合入主链路。
+    """
+    if not getattr(self, "_ai_enabled", True):
+        logger.info("ℹ️ [ReActDive] 纯引擎模式（AI 未配置），跳过深挖")
+        return
+    if not getattr(settings, "enable_react_dive", False):
+        logger.info("ℹ️ [ReActDive] 未开启（ENABLE_REACT_DIVE=false / 未传 --deep），跳过深挖")
+        return
+    # A2.3: 多 Agent 编排模式（角色化子 Agent + 共享黑板 + 竞争协作）优先
+    if getattr(settings, "enable_agent_roles", False):
+        await self._run_multi_agent_dive()
+        return
+    candidates = self._collect_react_candidates()
+    if not candidates:
+        logger.info("ℹ️ [ReActDive] 无本地判定模糊参数，跳过深挖")
+        return
+    max_params = int(getattr(settings, "react_dive_max_params", 3))
+    max_iters = int(getattr(settings, "react_dive_max_iterations", 5))
+    per_budget = float(getattr(settings, "react_dive_budget", 150.0))
+    logger.info(
+        f"🤖 [ReActDive] 深挖阶段启动：{len(candidates)} 个模糊参数，"
+        f"深挖前 {max_params} 个（每参数 ≤{max_iters} 轮，预算 {per_budget:.0f}s）"
+    )
+    from vulnclaw.ai.dispatcher import ReActAgent
+
+    # S3.2: 唤醒 ClueEngine——用 recon 发现的 URL 预生成线索并注入 Agent 决策候选
+    clue_engine = None
+    if getattr(settings, "enable_clue_engine", True):
+        try:
+            from vulnclaw.ai.core import ClueEngine
+            clue_engine = ClueEngine(self.session, self.target)
+            await asyncio.wait_for(self._generate_clues_for_dive(clue_engine), timeout=45)
+        except Exception as _ce:  # noqa: BLE001
+            logger.debug(f"[ClueEngine] 预生成线索失败（继续深挖）: {_ce}")
+
+    total_merged = 0
+    for param in candidates[:max_params]:
+        try:
+            agent = ReActAgent(self.target, self.session, max_iterations=max_iters, focus_param=param)
+            # S3.2: 注入 ClueEngine，使 _decide_action 读取上下文线索
+            if clue_engine is not None:
+                agent.clue_engine = clue_engine
+            # 复用主链路已初始化的 memory（全局单例），避免二次阻塞初始化
+            if getattr(self, "memory", None) is not None:
+                agent.memory = self.memory
+            report = await asyncio.wait_for(agent.run(), timeout=per_budget)
+            total_merged += self._merge_react_findings(report, param)
+        except asyncio.TimeoutError:
+            logger.warning(f"⏰ [ReActDive] 参数 {param} 深挖超时（{per_budget:.0f}s），跳过")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"⚠️ [ReActDive] 参数 {param} 深挖异常: {exc}")
+    logger.info(f"🤖 [ReActDive] 深挖阶段完成：共合入 {total_merged} 个 finding")
+
+
+def _collect_react_candidates(self) -> List[str]:
+    """S1.2: 收集"本地判定模糊"的参数。
+
+    判定规则：该参数无高/中危 finding，且 bundle 首次执行结果为空或全部 low/info
+    （= 规则引擎与 AI 批量判定都无法形成有效结论，交给 ReAct 单点深挖）。
+    """
+    bundle_results = getattr(self, "_bundle_results", None) or {}
+    if not bundle_results:
+        return []
+    param_has_strong = set()
+    for f in getattr(self, "findings", []) or []:
+        p = f.get("parameter") or f.get("param") or ""
+        sev = str(f.get("severity", "")).lower()
+        if p and sev in ("high", "critical", "严重", "高"):
+            param_has_strong.add(p)
+    candidates = []
+    for param, results in bundle_results.items():
+        if param in param_has_strong:
+            continue
+        if not results:
+            candidates.append(param)
+            continue
+        all_low = all(
+            str(r.get("severity", "low")).lower() in ("low", "info", "低", "信息", "")
+            for r in results
+        )
+        if all_low:
+            candidates.append(param)
+    return candidates
+
+
+def _merge_react_findings(self, report: Dict, param: str) -> int:
+    """S1.3: 把 ReAct 深挖产出的 finding 合入主链路（source=react_agent 定位固化）。"""
+    vulns = (report or {}).get("vulnerabilities") or []
+    merged = 0
+    for v in vulns:
+        if not isinstance(v, dict):
+            continue
+        if not v.get("type"):
+            continue
+        v.setdefault("url", getattr(self, "target", ""))
+        v.setdefault("parameter", param)
+        v.setdefault("source", "react_agent")
+        if not v.get("severity"):
+            v["severity"] = "Medium"
+        self._add_finding(v)
+        merged += 1
+    if merged:
+        logger.info(f"🤖 [ReActDive] 参数 {param} 深挖产出 {merged} 个 finding（source=react_agent）")
+    return merged
+
+
+# ------------------------------------------------------------------
+# S2: 跨引擎攻击链路由（chain_router）
+# ------------------------------------------------------------------
+async def _run_chain_router(self):
+    """S2.2: 跨引擎攻击链路由——基于 S2.1 链信息把已确认发现串成后续动作。
+
+    确定性规则链（LLM 决策链后续叠加）：
+      - SSRF -> 对 evidence 中的内网地址做二次探测；命中 6379/Redis 特征 -> Redis 未授权链
+      - 文件上传 / LFI -> 验证上传产物是否可被服务端解析执行（-> RCE 链）
+    所有链式 finding 标记 source=chain_router。
+    """
+    if not getattr(settings, "enable_chain_router", True):
+        logger.debug("[ChainRouter] 未开启（ENABLE_CHAIN_ROUTER=false），跳过")
+        return
+    findings = getattr(self, "findings", None) or []
+    chained = 0
+    for f in list(findings):
+        if not isinstance(f, dict):
+            continue
+        ftype = str(f.get("type", "")).lower()
+        if "ssrf" in ftype or "ssr" in ftype:
+            chained += await self._chain_ssrf(f)
+        elif any(k in ftype for k in ("upload", "上传", "lfi", "文件包含")):
+            chained += await self._chain_upload(f)
+    if chained:
+        logger.info(f"🔗 [ChainRouter] 攻击链合入 {chained} 个链式 finding（source=chain_router）")
+
+
+async def _chain_ssrf(self, finding: Dict) -> int:
+    """SSRF -> 内网探测 / Redis 未授权链。"""
+    from vulnclaw.core.utils import build_attack_url, async_get
+
+    url = str(finding.get("url", ""))
+    param = str(finding.get("parameter", "") or "")
+    evidence = str(finding.get("evidence", "") or "")
+    if not url or not param:
+        return 0
+    intranet_addrs = re.findall(
+        r"(?:https?://)?(?:127\.0\.0\.1|0\.0\.0\.0|10\.\d{1,3}\.\d{1,3}\.\d{1,3}"
+        r"|192\.168\.\d{1,3}\.\d{1,3}"
+        r"|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})(?::\d{1,5})?(?:[/\w.?&=%-]*)",
+        evidence,
+    )
+    if not intranet_addrs:
+        return 0
+    chained = 0
+    seen = set()
+    for addr in intranet_addrs[:3]:
+        if addr in seen:
+            continue
+        seen.add(addr)
+        try:
+            attack_url = build_attack_url(url, param, addr, "")
+            resp = await async_get(attack_url, session=self.session, timeout=8, no_retry=True)
+            if resp is None or resp[0] == 0:
+                continue
+            status, text = resp[0], str(resp[1] or "")
+            text_head = text[:200]
+            is_redis = bool(
+                re.match(r"^[+-$*:]", text_head)
+                or "redis_version" in text_head
+                or "redis" in text_head.lower()
+            )
+            self._add_finding({
+                "url": url,
+                "parameter": param,
+                "payload": addr,
+                "type": "SSRF-Redis未授权" if is_redis else "SSRF-内网探测",
+                "severity": "Critical" if is_redis else "High",
+                "ai_verdict": "高（SSRF链复测命中）",
+                "confidence": "high",
+                "evidence": f"SSRF 通过 {param} 访问内网 {addr}，状态 {status}"
+                            f"{'，Redis 未授权特征' if is_redis else ''}",
+                "source": "chain_router",
+            })
+            chained += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[ChainRouter] SSRF 探测 {addr} 失败: {exc}")
+    return chained
+
+
+async def _chain_upload(self, finding: Dict) -> int:
+    """文件上传/LFI -> 上传产物可执行性验证（-> RCE 链）。"""
+    from vulnclaw.core.utils import async_get
+
+    evidence = str(finding.get("evidence", "") or "")
+    upload_urls = re.findall(r"https?://\S+", evidence)
+    if not upload_urls:
+        return 0
+    chained = 0
+    for u in upload_urls[:3]:
+        try:
+            resp = await async_get(u, session=self.session, timeout=10, no_retry=True)
+            if resp is None or resp[0] == 0:
+                continue
+            status = resp[0]
+            headers = resp[2] if len(resp) > 2 and isinstance(resp[2], dict) else {}
+            text = str(resp[1] or "")
+            ctype = str(headers.get("content-type", "")).lower() if headers else ""
+            # 可执行判断：非纯静态类型 + 响应体非空（脚本被解析执行返回动态内容）
+            executable = bool(text) and (not ctype or "text/html" in ctype or "text/plain" in ctype)
+            if executable:
+                self._add_finding({
+                    "url": u,
+                    "type": "文件上传-可执行文件",
+                    "severity": "High",
+                    "ai_verdict": "高（上传产物可被解析执行，疑似 RCE 链）",
+                    "confidence": "medium",
+                    "evidence": f"上传产物 {u} 可被访问且内容为 {ctype or '未知类型'}（状态 {status}），"
+                                f"存在被服务端解析执行的可能（-> RCE 链）",
+                    "source": "chain_router",
+                })
+                chained += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[ChainRouter] 上传产物验证 {u} 失败: {exc}")
+    return chained
+
+
+async def _generate_clues_for_dive(self, engine=None):
+    """S3.2: 深挖前用 recon 发现的 URL 预生成 ClueEngine 线索（写入扫描上下文）。
+
+    engine 为空时走 process_url_for_clues 对外接口（自建引擎并带 session/target）。
+    """
+    brief = getattr(self, "_recon_brief", None) or {}
+    url_pool = []
+    for key in ("apis", "js_endpoints", "found_dirs"):
+        for u in brief.get(key, []) or []:
+            if isinstance(u, str) and u.startswith("http"):
+                url_pool.append(u)
+    url_pool = list(dict.fromkeys(url_pool))[:3]
+    if not url_pool:
+        return
+    for u in url_pool:
+        try:
+            normal = await self._fetch_normal_response(u)
+            status, text = normal[0], str(normal[1] or "")
+            headers = normal[2] if len(normal) > 2 else {}
+            if engine is not None:
+                await engine.process_url(u, status, text, headers, 0.0)
+            else:
+                from vulnclaw.ai.core import process_url_for_clues
+                await process_url_for_clues(
+                    u, status, text, headers, 0.0,
+                    attack_status=None, attack_text=None, payload=None, waf_type=None,
+                    session=self.session, target=self.target
+                )
+        except Exception as _ge:  # noqa: BLE001
+            logger.debug(f"[ClueEngine] 线索生成 {u} 失败: {_ge}")
+
+
+async def _persist_scan_memory(self):
+    """S3.1: 扫描收尾——把本次关键发现写入 VectorMemory（跨会话学习）。
+
+    下一次扫描对同指纹目标会自动召回（见 ReActAgent.run() 的 memory.recall）。
+    """
+    try:
+        memory = getattr(self, "memory", None)
+        if memory is None:
+            return
+        written = 0
+        for f in getattr(self, "findings", None) or []:
+            if not isinstance(f, dict):
+                continue
+            vuln_type = str(f.get("type", "") or "")
+            if not vuln_type:
+                continue
+            await memory.add_experience(
+                target=getattr(self, "target", ""),
+                vuln_type=vuln_type,
+                payload=str(f.get("payload", "") or ""),
+                success=True,
+                evidence=str(f.get("evidence", "") or "")[:500],
+            )
+            written += 1
+        if written:
+            logger.info(f"🧠 [ScanMemory] 写入 {written} 条扫描经验到 VectorMemory")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[ScanMemory] 写入失败（不影响扫描）: {exc}")
+
+
+# ------------------------------------------------------------------
+# A2: 多 Agent 协作（角色化子 Agent + 共享黑板 + 竞争协作 + 冲突消解）
+# ------------------------------------------------------------------
+async def _run_multi_agent_dive(self):
+    """A2.3: 主编排者——spawn 角色化子 Agent 并行深挖，共享黑板，父层只做分解与调度。
+
+    A2.4: 竞争协作（enable_agent_race）——同一高价值参数派 2 个不同策略子 Agent，
+          取先确认者（asyncio.wait FIRST_COMPLETED），避免重复成本。
+    A2.5: 结果合并与冲突消解——按证据强度规则（severity 权重 + 证据长度 + payload/AI 判定）取强去重。
+    """
+    if not getattr(self, "_ai_enabled", True):
+        logger.info("ℹ️ [MultiAgent] 纯引擎模式（AI 未配置），跳过")
+        return
+    candidates = self._collect_react_candidates()
+    if not candidates:
+        logger.info("ℹ️ [MultiAgent] 无本地判定模糊参数，跳过")
+        return
+    from vulnclaw.ai.dispatcher import AGENT_ROLES, Blackboard, ReActAgent
+
+    max_params = int(getattr(settings, "multi_agent_max_params", 1))
+    max_iters = int(getattr(settings, "multi_agent_max_iterations", 4))
+    per_budget = float(getattr(settings, "react_dive_budget", 150.0))
+    race = bool(getattr(settings, "enable_agent_race", False))
+    roles = [r for r in ("analysis", "verify") if r in AGENT_ROLES]
+
+    logger.info(
+        f"🤝 [MultiAgent] 编排启动：{len(candidates)} 个候选，角色 {roles}，"
+        f"竞争模式={race}，每角色 ≤{max_iters} 轮"
+    )
+    blackboard = Blackboard()
+    total_merged = 0
+    for param in candidates[:max_params]:
+        try:
+            agents = [
+                ReActAgent(self.target, self.session, max_iterations=max_iters,
+                           focus_param=param, role=r, blackboard=blackboard)
+                for r in roles
+            ]
+            for a in agents:
+                if getattr(self, "memory", None) is not None:
+                    a.memory = self.memory
+
+            if race and len(agents) > 1:
+                # A2.4: 取先确认者，其余取消（控制重复成本）
+                tasks = [asyncio.create_task(a.run()) for a in agents]
+                done, pending = await asyncio.wait(
+                    tasks, timeout=per_budget, return_when=asyncio.FIRST_COMPLETED
+                )
+                for t in pending:
+                    t.cancel()
+                reports = []
+                for t in done:
+                    try:
+                        if not t.cancelled() and not t.exception():
+                            reports.append(t.result())
+                    except Exception:  # noqa: BLE001
+                        continue
+            else:
+                results = await asyncio.gather(*[a.run() for a in agents], return_exceptions=True)
+                reports = [r for r in results if isinstance(r, dict)]
+
+            raw_findings = []
+            for rep in reports:
+                raw_findings.extend((rep or {}).get("vulnerabilities") or [])
+            merged_findings = self._resolve_agent_conflicts(raw_findings)
+            total_merged += self._merge_react_findings({"vulnerabilities": merged_findings}, param)
+        except asyncio.TimeoutError:
+            logger.warning(f"⏰ [MultiAgent] 参数 {param} 编排超时（{per_budget:.0f}s），跳过")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"⚠️ [MultiAgent] 参数 {param} 编排异常: {exc}")
+    logger.info(f"🤝 [MultiAgent] 编排完成：合入 {total_merged} 个 finding")
+
+
+def _resolve_agent_conflicts(self, findings: List[Dict]) -> List[Dict]:
+    """A2.5: 多 Agent 结果合并与冲突消解——同 url+type+param 取证据更强者。
+
+    证据强度 = severity 权重 × 100 + 证据文本长度（上限 300）/10 + payload(20) + AI 判定(10)。
+    """
+    sev_weight = {
+        "critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0,
+        "严重": 4, "高": 3, "中": 2, "低": 1,
+    }
+    best: Dict[tuple, tuple] = {}
+    for f in findings or []:
+        if not isinstance(f, dict) or not f.get("type"):
+            continue
+        key = (
+            str(f.get("url", "")),
+            str(f.get("type", "")).lower(),
+            str(f.get("parameter", "")),
+        )
+        score = sev_weight.get(str(f.get("severity", "")).lower(), 0) * 100
+        score += min(len(str(f.get("evidence", "") or "")), 300) / 10
+        if f.get("payload"):
+            score += 20
+        if f.get("ai_verdict"):
+            score += 10
+        prev = best.get(key)
+        if prev is None or score > prev[0]:
+            best[key] = (score, f)
+    return [v for _, v in best.values()]
 async def _execute_global_scan(self, task: Dict) -> Optional[Dict]:
     engine_name = task.get("engine")
     target = task.get("target", self.target)
@@ -594,6 +1019,12 @@ async def _execute_global_scan(self, task: Dict) -> Optional[Dict]:
         if results:
             for r in results:
                 if not any(f.get('url') == r.get('url') and f.get('type') == r.get('type') for f in self.findings):
+                    # S2.1: 全局扫描路径同样标注链信息（端到端实测：多数 finding 来自该路径）
+                    if isinstance(r, dict):
+                        try:
+                            r["chain_info"] = annotate_chain_info(r, target, str(r.get("parameter", "") or "")).get("chain_info")
+                        except Exception:  # noqa: BLE001
+                            pass
                     self._add_finding(r)
                     logger.info(f"   🌐 {engine_name} 发现: {r.get('type')}")
                     if engine_name == "business_logic":
@@ -668,7 +1099,7 @@ async def _execute_engine_check(self, task: Dict) -> Optional[Dict]:
         if hasattr(engine, 'max_payloads'):
             engine.max_payloads = payload_limit
         kwargs = {}
-        if engine_name == "cmdi" and self._collaborator_domain:
+        if engine_name in ("cmdi", "ssrf") and self._collaborator_domain:
             kwargs["interactsh_domain"] = self._collaborator_domain
         result = await asyncio.wait_for(
             engine.check(
@@ -683,6 +1114,11 @@ async def _execute_engine_check(self, task: Dict) -> Optional[Dict]:
         )
         self._total_engine_calls += 1
         if result:
+            # S2.1: 结构化链信息标注（HTTP状态/可控点/回显特征/可链性），供跨引擎攻击链路由消费
+            try:
+                result = annotate_chain_info(result, target, param)
+            except Exception:  # noqa: BLE001
+                pass
             if 'role' in kwargs and 'response' in kwargs:
                 await self.context.store_role_response(
                     kwargs.get('role', 'default'),
@@ -742,4 +1178,4 @@ async def _execute_engine_check(self, task: Dict) -> Optional[Dict]:
             await self.balancer.record_result(provider_key, success=False, status_code=500)
         logger.debug(f"   ❌ 执行失败: {e}")
         return None
-__all__ = ['_run_business_logic_scan', '_run_api_version_scan', '_run_smuggling_scan', '_run_http2_ws_scan', '_run_cache_poison_scan', '_run_burp_scan', '_execute_with_limiting', '_run_one_task', '_execute_task', '_safe_parse_bundle_json', '_execute_engine_bundle', '_execute_global_scan', '_execute_engine_check']
+__all__ = ['_run_business_logic_scan', '_run_api_version_scan', '_run_smuggling_scan', '_run_http2_ws_scan', '_run_cache_poison_scan', '_run_burp_scan', '_execute_with_limiting', '_run_one_task', '_execute_task', '_safe_parse_bundle_json', '_execute_engine_bundle', '_execute_global_scan', '_execute_engine_check', '_run_react_deep_dive', '_collect_react_candidates', '_merge_react_findings', '_run_chain_router', '_chain_ssrf', '_chain_upload', '_generate_clues_for_dive', '_persist_scan_memory', '_run_multi_agent_dive', '_resolve_agent_conflicts']

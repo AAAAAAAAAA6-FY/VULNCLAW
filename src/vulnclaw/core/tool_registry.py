@@ -31,6 +31,52 @@ _CONFIG_CACHE: Dict[str, Any] = {}
 _PATH_CACHE: Dict[str, Optional[str]] = {}
 _CAPABILITY_CACHE: Dict[str, Dict[str, Any]] = {}
 
+# A5.5: 工具失败替代链——主工具缺失/失败时附降级路径（信息性，不改变 success 语义）
+_TOOL_FALLBACKS: Dict[str, str] = {
+    "nuclei": "本地规则引擎（vulnclaw 30 检测引擎）",
+    "ffuf": "本地目录枚举（engines 目录引擎）",
+    "subfinder": "本地被动子域（crt.sh / DNS 查询）",
+    "waybackurls": "本地 URL 收集（gau/wayback API 直连）",
+    "gau": "本地 URL 收集（Wayback CDX API 直连）",
+    "naabu": "本地端口扫描（python-socket 探测）",
+    "nmap": "本地端口扫描（python-socket 探测）",
+    "katana": "本地爬虫（aiohttp 链接提取）",
+    "dalfox": "本地 XSS 引擎（xss_echo 规则）",
+}
+# 工具调用统计（成功/失败/降级），供 Agent 成功率排序与审计
+_TOOL_CALL_STATS: Dict[str, Dict[str, int]] = {}
+
+
+def record_tool_result(name: str, success: bool, degraded: bool = False) -> None:
+    """A5.5: 记录工具调用结果（成功/失败/降级）。"""
+    stats = _TOOL_CALL_STATS.setdefault(name, {"success": 0, "failure": 0, "degraded": 0})
+    stats["success" if success else "failure"] += 1
+    if degraded:
+        stats["degraded"] += 1
+
+
+def get_tool_stats(name: str = None) -> Dict[str, Any]:
+    """A5.5: 读取工具调用统计。"""
+    if name:
+        return dict(_TOOL_CALL_STATS.get(name, {}))
+    return {k: dict(v) for k, v in _TOOL_CALL_STATS.items()}
+
+
+def _attach_fallback(name: str, result: Dict[str, Any]) -> Dict[str, Any]:
+    """A5.5: 失败结果附降级说明（信息性提示，不改变 success 语义）。"""
+    fb = _TOOL_FALLBACKS.get(name)
+    if fb:
+        result["fallback"] = fb
+        result["fallback_hint"] = f"{name} 不可用时降级为: {fb}"
+    return result
+
+
+def _finalize_failure(name: str, error: str, returncode: int = -1, cmd: str = "") -> Dict[str, Any]:
+    """A5.5: 统一构造失败结果：记录统计 + 附降级说明。"""
+    record_tool_result(name, False)
+    result = {"success": False, "error": error, "returncode": returncode, "cmd": cmd}
+    return _attach_fallback(name, result)
+
 
 def _read_yaml(path: Path) -> Dict[str, Any]:
     if not path.exists():
@@ -267,19 +313,24 @@ async def run_tool(
     if config is None:
         config = await _discover_tool(name)
     if not config:
-        return await asyncio.to_thread(_raw_command, name, args or [], timeout or 60)
+        # A5.5: 无配置（工具未安装）→ 附降级说明
+        return _attach_fallback(name, await asyncio.to_thread(_raw_command, name, args or [], timeout or 60))
 
     # 解析工具路径
     tool_path = resolve_tool_path(config.get("executable", name))
     if not tool_path:
-        return {"success": False, "error": f"未找到工具: {name}"}
+        # A5.5: 工具缺失 → 统一失败构造（记录统计 + 降级说明）
+        return _finalize_failure(name, f"未找到工具: {name}")
 
     # 自动扫描得到的条目在首次调用时补充能力指纹（offload 线程池，不阻塞事件循环）。
     if primary_config is None and "capabilities" not in config:
         capabilities = await asyncio.to_thread(_probe_capabilities, tool_path)
         if capabilities is None:
-            return await asyncio.to_thread(
-                _raw_command, name, (args or []) + (extra_args or []), timeout or 60
+            return _attach_fallback(
+                name,
+                await asyncio.to_thread(
+                    _raw_command, name, (args or []) + (extra_args or []), timeout or 60
+                ),
             )
         config["capabilities"] = capabilities
         config["output_format"] = "json" if capabilities["json"] else "text"
@@ -328,12 +379,7 @@ async def run_tool(
                 proc.kill()
                 await proc.wait()
                 logger.warning(f"⏰ [Tool] {name} 超时 ({timeout}s)")
-                return {
-                    "success": False,
-                    "error": f"Timeout after {timeout}s",
-                    "returncode": -1,
-                    "cmd": cmd_str
-                }
+                return _finalize_failure(name, f"Timeout after {timeout}s", -1, cmd_str)
         else:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -348,12 +394,7 @@ async def run_tool(
                 proc.kill()
                 await proc.wait()
                 logger.warning(f"⏰ [Tool] {name} 超时 ({timeout}s)")
-                return {
-                    "success": False,
-                    "error": f"Timeout after {timeout}s",
-                    "returncode": -1,
-                    "cmd": cmd_str
-                }
+                return _finalize_failure(name, f"Timeout after {timeout}s", -1, cmd_str)
 
         result = {
             "success": proc.returncode == 0,
@@ -364,6 +405,10 @@ async def run_tool(
             "output": None,
             "output_file": None
         }
+        # A5.5: 统一记录调用结果；失败时附降级路径
+        record_tool_result(name, result["success"])
+        if not result["success"]:
+            _attach_fallback(name, result)
 
         # 解析输出
         if output_format == "json" and stdout_text.strip():
@@ -391,7 +436,7 @@ async def run_tool(
 
     except Exception as e:
         logger.error(f"❌ [Tool] {name} 执行失败: {e}")
-        return {"success": False, "error": str(e), "cmd": cmd_str}
+        return _finalize_failure(name, str(e), cmd=cmd_str)
 
 
 def list_tools() -> List[str]:

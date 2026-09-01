@@ -84,7 +84,7 @@ class WebSocketSecurityEngine(BaseEngine):
         }
 
         try:
-            resp = await async_get(ws_url, session=session, timeout=8, no_retry=True, headers=headers)
+            resp = await async_get(ws_url, session=session, timeout=8, no_retry=True, headers=headers, allow_redirects=False)
         except Exception:
             return None
         if not isinstance(resp, tuple) or len(resp) < 2:
@@ -95,6 +95,13 @@ class WebSocketSecurityEngine(BaseEngine):
 
         # 未升级（404/200 普通页面等）→ 不是 WS 端点，直接跳过
         if status != 101:
+            return None
+
+        # 验证 Sec-WebSocket-Accept 头是否正确
+        expected_accept = self._compute_accept_key(headers["Sec-WebSocket-Key"])
+        actual_accept = resp_headers.get("Sec-WebSocket-Accept")
+        if actual_accept != expected_accept:
+            return None
             return None
 
         # 101 Switching Protocols：恶意 Origin 被接受 → CSWSH（真实握手证据）

@@ -15,7 +15,7 @@ from vulnclaw.core.exploit_verify import SafeExploit, safe_verify_vulnerability
 def _severity_verify_plan(severity: str) -> Dict[str, Any]:
     plans = {
         "Critical": {"n_models": 3, "do_http_verify": True, "do_exploit": True, "do_oob_poll": True},
-        "High": {"n_models": 3, "do_http_verify": True, "do_exploit": True, "do_oob_poll": False},
+        "High": {"n_models": 3, "do_http_verify": True, "do_exploit": True, "do_oob_poll": True},
         "Medium": {"n_models": 2, "do_http_verify": True, "do_exploit": False, "do_oob_poll": False},
         "Low": {"n_models": 1, "model": "glm-4-flash", "do_http_verify": False, "do_exploit": False, "do_oob_poll": False},
         "Info": {"n_models": 1, "do_http_verify": False, "do_exploit": False, "do_oob_poll": False},
@@ -231,7 +231,7 @@ async def _verify_all_findings(self):
             severity = vuln.get("severity", "Low")
             plan = self._severity_verify_plan(severity)
             logger.info(
-                f"   [验证计划] 漏洞类型: {vuln.get('type', '未知')}锛屼弗閲嶇▼搴? {severity} → "
+                f"   [验证计划] 漏洞类型: {vuln.get('type', '未知')}，严重程度: {severity} → "
                 f"{plan['n_models']}模型 + "
                 f"{'HTTP' if plan['do_http_verify'] else '无HTTP'} + "
                 f"{'Exploit' if plan['do_exploit'] else '无Exploit'}"
@@ -273,12 +273,19 @@ async def _verify_all_findings(self):
                 if technical_result.get("exploitable"):
                     ai_result["confirmed"] = True
                     ai_result["verification_method"] = technical_result.get("method")
-                elif plan["do_oob_poll"] and technical_result.get("method") == "oob_dns" and self._collaborator_domain:
-                    callback = await self._poll_collaborator_callback()
+                elif plan["do_oob_poll"] and technical_result.get("method") in ("oob_dns", "oob_ssrf", "oob_http", "oob_no_callback", "oob_confirmed") and self._collaborator_domain:
+                    # ⑦ 闭环：用 pending finding 携带的 oob_scan_id 精确配对 Interactsh 回调
+                    scan_id = technical_result.get("oob_scan_id") or vuln.get("oob_scan_id")
+                    callback = await self._poll_collaborator_callback(
+                        expected_scan_id=scan_id,
+                    )
                     ai_result["collaborator_callback"] = callback
                     if callback:
                         ai_result["confirmed"] = True
                         ai_result["verification_method"] = "oob_callback"
+                    elif technical_result.get("oob_confirmed"):
+                        ai_result["confirmed"] = True
+                        ai_result["verification_method"] = "oob_engine_confirmed"
             # 技术验证未确认 → 本地规则兜底（引擎结构化标志 / evidence 关键词）
             if llm_degraded and not ai_result.get("confirmed"):
                 rule_hit = self._local_rule_verify(vuln)
@@ -553,17 +560,33 @@ async def _verify_cross(
     except Exception as e:
         logger.warning(f"AI验证失败: {e}")
         return {"confirmed": False, "votes": [], "severity": "Low"}
-async def _poll_collaborator_callback(self) -> bool:
-    """Poll the configured OOB provider and require an actual interaction."""
+async def _poll_collaborator_callback(self, expected_scan_id: Optional[str] = None):
+    """Poll the configured OOB provider and return the matching interaction.
+
+    若给定 expected_scan_id（SSRF-OOB pending finding 携带的 oob_scan_id），
+    仅返回与该 scan_id 精确配对的交互，避免其他扫描/其他 finding 的
+    OOB 回调造成误配对（⑦ 闭环：DNS/HTTP 命中确认才可升级 High）。
+    """
     if not self._collaborator_domain:
         return False
     try:
         if self.burp_available:
             result = await self.burp.collaborator("check")
             if result and result.get("results"):
-                return True
+                return result.get("results")[0]
         interactions = await get_interactsh_poll(self._collaborator_domain, timeout=5)
-        return bool(interactions)
+        if not interactions:
+            return False
+        if expected_scan_id:
+            for inter in interactions:
+                if not isinstance(inter, dict):
+                    continue
+                raw = str(inter.get("raw-request", ""))
+                detail = str(inter.get("q-type", "")) + " " + str(inter.get("protocol", ""))
+                if expected_scan_id in raw or expected_scan_id in detail:
+                    return inter
+            return False
+        return interactions[0] if interactions else False
     except Exception as e:
         logger.debug(f"Collaborator 鍥炶繛杞失败: {e}")
         return False

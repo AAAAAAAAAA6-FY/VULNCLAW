@@ -897,6 +897,7 @@ class OpenRedirectEngine(BaseEngine):
         ("//0.0.0.0", "0.0.0.0"),
         ("http://0.0.0.0", "0.0.0.0 HTTP"),
     ]
+    payloads = REDIRECT_PAYLOADS
 
     REDIRECT_STATUS_CODES = [301, 302, 303, 307, 308]
 
@@ -1468,72 +1469,66 @@ class CachePoisonEngine(BaseEngine):
     ) -> Optional[Dict]:
         timeout = getattr(settings, 'timeout', 30)
         try:
+            # 第一阶段：带注入头请求（期望缓存Miss）
             headers = {header_name: header_value}
-            resp = await async_get(url, headers=headers, session=session, timeout=timeout)
-            if isinstance(resp, tuple):
-                status, text, resp_headers = resp
+            resp1 = await async_get(url, headers=headers, session=session, timeout=timeout)
+            if isinstance(resp1, tuple):
+                status1, text1, resp_headers1 = resp1
             else:
-                status = resp.status
-                text = await resp.text()
-                resp_headers = dict(resp.headers)
+                status1 = resp1.status
+                text1 = await resp1.text()
+                resp_headers1 = dict(resp1.headers)
 
-            # 准确率修复：泛化值（http/127.0.0.1 等）可能本来就出现在正常页面，
-            # 只有"注入后新出现"的值才算反射
-            if header_value in text and header_value not in normal_text:
+            # 检查是否为缓存Miss（通常状态码为200，但可能包含缓存相关头）
+            cache_control1 = (resp_headers1.get("Cache-Control") or "").lower()
+            cacheable1 = bool(resp_headers1.get("Expires")) or (
+                cache_control1 and "no-store" not in cache_control1 and "private" not in cache_control1
+            )
+            
+            # 如果不可缓存，直接返回（不是缓存投毒场景）
+            if not cacheable1:
+                return None
+
+            # 第二阶段：同URL不带注入头请求，检查是否仍包含注入token
+            resp2 = await async_get(url, session=session, timeout=timeout)
+            if isinstance(resp2, tuple):
+                status2, text2, resp_headers2 = resp2
+            else:
+                status2 = resp2.status
+                text2 = await resp2.text()
+                resp_headers2 = dict(resp2.headers)
+
+            # 检查注入值是否在第二阶段响应中反射
+            if header_value in text2 or header_value in str(resp_headers2.values()):
+                # 确认是缓存投毒（High）
                 return {
                     "type": f"缓存投毒-头反射({header_name})",
                     "url": url,
                     "severity": "High",
-                    "evidence": f"响应体中反射了注入的 {header_name}: {header_value}",
+                    "evidence": f"第一阶段带注入头请求后，第二阶段响应仍反射注入值 {header_value}",
                     "payload": f"{header_name}: {header_value}",
-                    "recommendation": "禁止在响应中反射用户可控的头"
+                    "recommendation": "禁止在响应中反射用户可控的头，或确保缓存键安全"
                 }
 
-            for key, value in resp_headers.items():
-                if header_value in value:
-                    return {
-                        "type": f"缓存投毒-响应头反射({header_name})",
-                        "url": url,
-                        "severity": "High",
-                        "evidence": f"响应头 {key} 反射了注入值: {header_value}",
-                        "payload": f"{header_name}: {header_value}",
-                        "recommendation": "禁止在响应头中反射用户可控的头"
-                    }
-
-            location = resp_headers.get("Location", "")
-            if header_value in location:
-                return {
-                    "type": f"缓存投毒-重定向注入({header_name})",
-                    "url": url,
-                    "severity": "High",
-                    "evidence": f"Location 头包含注入值: {location}",
-                    "payload": f"{header_name}: {header_value}",
-                    "recommendation": "校验重定向地址，禁止基于用户控制头生成 Location"
-                }
-
-            if status != normal_status or abs(len(text) - len(normal_text)) > 100:
-                # 准确率修复：仅长度/状态差异是弱信号（动态页面长度天然波动），
-                # 只有响应确实可被缓存时才有"投毒"意义，否则降级为调试信息
-                cache_control = (resp_headers.get("Cache-Control") or "").lower()
-                cacheable = bool(resp_headers.get("Expires")) or (
+            # 如果第一阶段响应有差异且可缓存，但第二阶段没有反射，可能是Info级别
+            if status1 != normal_status or abs(len(text1) - len(normal_text)) > 100:
+                cache_control = (resp_headers1.get("Cache-Control") or "").lower()
+                cacheable = bool(resp_headers1.get("Expires")) or (
                     cache_control and "no-store" not in cache_control and "private" not in cache_control
                 )
                 if cacheable:
                     return {
                         "type": f"缓存投毒-响应差异({header_name})",
                         "url": url,
-                        "severity": "Medium",
-                        "evidence": f"注入 {header_name} 后响应变化 (状态: {normal_status}->{status})，且响应可缓存 (Cache-Control: {cache_control or 'Expires'})",
+                        "severity": "Info",
+                        "evidence": f"注入 {header_name} 后响应变化，但未确认缓存投毒",
                         "payload": f"{header_name}: {header_value}",
-                        "recommendation": "检查是否有基于用户控制头的缓存键生成"
+                        "recommendation": "进一步验证缓存行为"
                     }
-                logger.debug(
-                    f"头注入 {header_name} 引起响应差异，但响应不可缓存，跳过（防误报）"
-                )
 
         except Exception as e:
-            logger.debug(f"头注入检测失败 {header_name}: {e}")
-
+            logger.debug(f"缓存投毒测试失败: {e}")
+        
         return None
 
     async def _test_cache_deception(

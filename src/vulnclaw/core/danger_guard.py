@@ -32,6 +32,16 @@ DANGEROUS_OPS: Dict[str, str] = {
     "remote_deep_penetrate": "由远程 AI Agent 自主执行单点深度渗透（远程 Agent 实际攻击目标）",
 }
 
+# A5.4: 工具+危险参数注册表（工具级审批粒度，配合 E5.2 联动）
+# 工具名 -> 危险参数子串列表。命中即默认拒绝，可在 DANGEROUS_ALLOW 中以
+# "tool:param" 粒度单独放行（如 "sqlmap:--os-shell"）。
+DANGEROUS_TOOL_PARAMS: Dict[str, tuple] = {
+    "sqlmap": ("--os-shell", "--os-pwn", "--priv-esc", "--file-write", "--file-dest"),
+    "nmap": ("--script", "-sC"),
+    "curl": ("--upload-file", "--data-binary"),
+    "msfconsole": ("-x", "--execute-command"),
+}
+
 _AUDIT_LIMIT = 200
 
 # 模式别名：兼容 .env 里已存在的布尔写法（DANGEROUS_MODE=false/true）
@@ -98,10 +108,42 @@ class DangerGuard:
         except (EOFError, KeyboardInterrupt):
             return False
 
+    def require_tool_approval(self, tool: str, args_text: str, detail: str = "") -> bool:
+        """A5.4: 工具+参数级审批（E5.2 联动）。
+
+        危险判定：工具本身在 DANGEROUS_OPS，或参数命中 DANGEROUS_TOOL_PARAMS 黑名单。
+        DANGEROUS_ALLOW 支持工具级（写工具名）与参数级（写 "tool:param"）两种粒度，
+        在 deny 模式下单独放行。所有决策写入内存审计环。
+        """
+        args_text = str(args_text or "")
+        hit_param = next(
+            (p for p in DANGEROUS_TOOL_PARAMS.get(tool, ()) if p in args_text), None
+        )
+        if not self.is_dangerous(tool) and hit_param is None:
+            return True
+
+        # 允许清单判定：参数级优先（"tool:param"），其次工具级
+        allow_key = f"{tool}:{hit_param}" if hit_param else tool
+        if tool in self._allow_list or allow_key in self._allow_list or self._mode == "allow":
+            allowed = True
+        elif self._mode == "prompt":
+            allowed = self._prompt(tool, f"{detail or ''} 危险参数={hit_param or '(工具级)'}")
+        else:  # deny / 其他
+            allowed = False
+        self._audit.append({
+            "op": tool,
+            "detail": f"{detail} param={hit_param or '(tool-level)'}".strip(),
+            "allowed": allowed,
+            "mode": self._mode,
+        })
+        if len(self._audit) > _AUDIT_LIMIT:
+            self._audit = self._audit[-_AUDIT_LIMIT:]
+        return allowed
+
     def get_audit(self, limit: int = 50) -> List[dict]:
         return list(self._audit[-limit:])
 
 
 guard = DangerGuard()
 
-__all__ = ["DangerGuard", "DANGEROUS_OPS", "guard"]
+__all__ = ["DangerGuard", "DANGEROUS_OPS", "DANGEROUS_TOOL_PARAMS", "guard"]

@@ -2640,6 +2640,22 @@ class BusinessLogicEngine(BaseEngine):
             except BaseException:
                 pass
 
+        # 2FA绕过检测 - 三前置条件
+        # 条件1：站点存在2FA迹象（检测常见2FA相关页面/资源）
+        two_fa_indicators = ["/login", "/auth", "/signin", "/2fa", "/mfa", "/verify", "/security", "/settings/security"]
+        has_two_fa = False
+        for indicator in two_fa_indicators:
+            try:
+                resp = await async_get(base_url + indicator, session=session, timeout=timeout)
+                if resp and resp.status == 200:
+                    has_two_fa = True
+                    break
+            except:
+                continue
+        
+        if not has_two_fa:
+            return findings  # 无2FA迹象，跳过检测
+
         protected_pages = ["/dashboard", "/profile", "/settings", "/admin"]
         for pp in protected_pages:
             test_url = base_url + pp
@@ -2647,16 +2663,31 @@ class BusinessLogicEngine(BaseEngine):
                 resp = await async_get(test_url, session=session, timeout=timeout)
                 status, text = self._parse_response(resp)
                 if status == 200:
-                    sensitive = ["email", "phone", "balance", "order"]
+                    # 条件2：匿名访问确实越权（非SPA壳）
+                    spa_detector = SpaFingerprintDetector(session)
+                    await spa_detector.detect(test_url)
+                    if spa_detector.get_spa_status():
+                        continue  # SPA页面跳过
+                    
+                    # 条件3：关键词排除导航/模板常亮词
+                    exclude_keywords = ["navigation", "template", "layout", "footer", "header", "menu", "sidebar"]
+                    if any(kw in text.lower() for kw in exclude_keywords):
+                        continue
+                    
+                    sensitive = ["email", "phone", "balance", "order", "account", "profile", "settings"]
                     if any(kw in text.lower() for kw in sensitive):
                         findings.append({
                             'url': test_url,
                             'type': '业务逻辑-2FA绕过',
-                            'severity': 'Critical',
-                            'ai_verdict': '高',
-                            'evidence': f'无需2FA即可访问 {pp}，包含敏感信息',
-                            'method': '2fa_bypass'
+                            'severity': 'Medium',  # 降级为Medium，需人工复核
+                            'ai_verdict': '中',
+                            'evidence': f'检测到2FA迹象，匿名访问{pp}页面包含敏感信息，需人工复核',
+                            'method': '2fa_bypass',
+                            'recommendation': '确认该页面是否需要2FA验证，检查用户权限控制'
                         })
+            except Exception as e:
+                logger.debug(f"2FA检测异常: {e}")
+                continue
             except BaseException:
                 pass
 

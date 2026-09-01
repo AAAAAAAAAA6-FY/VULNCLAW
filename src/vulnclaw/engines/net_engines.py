@@ -9,16 +9,14 @@
 功能：SSRF、XXE、GraphQL 漏洞检测
 """
 
-from vulnclaw.core.utils import async_get, async_post
-from vulnclaw.core.utils import async_get, async_post, build_attack_url
 import re
 import asyncio
 import json
-from vulnclaw.core.utils import async_post
+import random
+from vulnclaw.core.utils import async_get, async_post, build_attack_url
 
 from vulnclaw.core.logger import logger
 from vulnclaw.core.settings import settings
-from vulnclaw.core.utils import build_attack_url, async_get
 from vulnclaw.engines.base import BaseEngine
 from typing import Dict, List, Optional, Tuple
 
@@ -215,6 +213,17 @@ class SSRFEngine(BaseEngine):
         if is_static:
             payloads = payloads[:8]
 
+        # ===== 2.5 OOB 盲打通道（Interactsh，⑦）=====
+        # 注入 http://<scanid>.<interactsh-domain>/ 到 url/redirect/file 参数，
+        # DNS/HTTP 轮询命中即确认真 SSRF（不依赖响应回显，天然抗 WAF/CDN 过滤）
+        interactsh_domain = kwargs.get('interactsh_domain', None)
+        if interactsh_domain:
+            oob_finding = await self._test_ssrf_oob(
+                url, param, parsed_query, session, interactsh_domain
+            )
+            if oob_finding:
+                return oob_finding
+
         # ===== 3. 主检测循环 =====
         for payload, desc in payloads:
             if compliant:
@@ -374,6 +383,113 @@ class SSRFEngine(BaseEngine):
             if len(result) >= 5:
                 break
         return '\n'.join(result[:5]) if result else text[:200]
+
+    # ============================================================
+    # OOB 盲打通道（Interactsh，⑦）
+    # ============================================================
+    OOB_PAYLOADS = [
+        ("http://{scan_id}.{domain}/", "OOB-DNS/HTTP外带"),
+        ("http://{scan_id}.{domain}/ssrf-probe", "OOB-HTTP路径探测"),
+        ("http://{scan_id}.{domain}:80/?q=1", "OOB-HTTP带参探测"),
+        ("https://{scan_id}.{domain}/", "OOB-HTTPS外带"),
+    ]
+
+    def _gen_scan_token(self) -> str:
+        """生成短且唯一的 scan_id 用于 OOB 命中配对"""
+        return f"sr{random.randint(100000, 999999)}"
+
+    async def _test_ssrf_oob(
+        self,
+        url: str,
+        param: str,
+        parsed_query: str,
+        session,
+        interactsh_domain: str
+    ) -> Optional[Dict]:
+        """OOB 盲打：向 url/redirect/file 参数注入 http://<scanid>.<interactsh-domain>/
+
+        判定逻辑：
+        1. 注入唯一 scan_id 前缀域名，后端若发起请求会触发 DNS 解析与 HTTP 回调；
+        2. 短轮询 Interactsh，命中（DNS/HTTP 回调包含 scan_id）即确认真 SSRF；
+        3. 未命中返回 None，交由 verify 阶段 do_oob_poll 钩子做长轮询确认。
+        """
+        if not interactsh_domain:
+            return None
+
+        from vulnclaw.modules.vuln_scanner.oob_interactsh import get_interactsh_poll
+
+        scan_id = self._gen_scan_token()
+        # 命中与扫描周期隔离：OOB 命中记录以 scan_id 前缀标识
+        oob_records = []
+
+        for oob_payload, desc in self.OOB_PAYLOADS:
+            oob_url = oob_payload.format(scan_id=scan_id, domain=interactsh_domain)
+            attack_url = build_attack_url(url, param, oob_url, parsed_query)
+            try:
+                resp = await async_get(attack_url, session=session, timeout=10, no_retry=True)
+                # OOB 不依赖响应回显：只要请求被服务端处理即可
+                if isinstance(resp, tuple):
+                    oob_records.append((oob_url, resp[0]))
+            except Exception as e:
+                logger.debug(f"SSRF OOB 请求失败 {oob_url}: {e}")
+
+        if not oob_records:
+            return None
+
+        # 短轮询（复用 verify 阶段的 Interactsh 通道）
+        try:
+            interactions = await asyncio.wait_for(
+                get_interactsh_poll(interactsh_domain, timeout=8), timeout=10
+            )
+        except Exception as e:
+            logger.debug(f"SSRF OOB 轮询失败: {e}")
+            interactions = []
+
+        for inter in interactions:
+            if not isinstance(inter, dict):
+                continue
+            raw = str(inter.get("raw-request", ""))
+            details = str(inter.get("q-type", "")) + " " + str(inter.get("protocol", ""))
+            if scan_id in raw or scan_id in details:
+                return {
+                    'url': url,
+                    'parameter': param,
+                    'payload': oob_url,
+                    'type': f'SSRF-OOB盲打确认({desc})',
+                    'severity': 'High',
+                    'ai_verdict': '高',
+                    'confidence': 'high',
+                    'evidence': (
+                        f"Interactsh 命中 scan_id={scan_id}（{'DNS' if inter.get('q-type') else 'HTTP'}回调）: "
+                        f"{raw[:200]}"
+                    ),
+                    'diff_ratio': 0.9,
+                    'oob_confirmed': True,
+                    'method': 'oob_ssrf'
+                }
+
+        # 短轮询未命中 → 返回 OOB-pending finding，交由 verify 阶段长轮询按 scan_id 配对确认
+        # 只有"请求确实发出成功"的探测才产生 pending（防止不可达参数刷报告）
+        if not oob_records:
+            return None
+        return {
+            'url': url,
+            'parameter': param,
+            'payload': oob_records[0][0],
+            'type': 'SSRF-OOB盲打待确认(DNS/HTTP外带)',
+            'severity': 'Medium',
+            'ai_verdict': '中（待OOB确认）',
+            'confidence': 'low',
+            'evidence': (
+                f"已向参数 {param} 注入 Interactsh 探测域名，等待 DNS/HTTP 回调"
+                f"（scan_id={scan_id}）"
+            ),
+            'diff_ratio': 0.3,
+            'oob_pending': True,
+            'oob_scan_id': scan_id,
+            'oob_domain': interactsh_domain,
+            'method': 'oob_ssrf'
+        }
 
     # ============================================================
     # 内网端口扫描（增强版）

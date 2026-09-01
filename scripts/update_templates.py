@@ -85,12 +85,65 @@ def filter_high_quality(
     return kept, removed, stats
 
 
+def sync_cve_index(
+    template_dir: str | Path | None = None,
+) -> dict:
+    """Z1.3：比对上游新 CVE 模板并增量入库（新模板随后可被 Z1.1 索引收录）。
+
+    复用 Z1.1 的 CVE 索引构建器；幂等，无新增模板时返回 added=0。
+    """
+    project_root = DEFAULT_TEMPLATE_DIR.parent.parent  # 项目根
+    index_dir = DEFAULT_TEMPLATE_DIR / "cve_index"
+    cve_dir = Path(template_dir) if template_dir else (DEFAULT_TEMPLATE_DIR / "http" / "cves")
+
+    # 引导 src 到 path，以便导入 vulnclaw
+    import sys as _sys
+
+    for p in (project_root / "src", project_root / "src" / "vulnclaw"):
+        if str(p) not in _sys.path:
+            _sys.path.insert(0, str(p))
+
+    try:
+        from vulnclaw.core.data import cve_index_builder as _b
+    except Exception as exc:  # pragma: no cover
+        return {"added": 0, "error": f"CVE 索引模块导入失败: {exc}"}
+
+    if cve_dir.is_dir():
+        new_entries = [
+            rec for rec in (_b.parse_cve_template(str(p)) for p in cve_dir.rglob("*.yaml"))
+            if rec is not None
+        ]
+    else:
+        new_entries = []
+
+    idx = _b.CVEIndex(index_dir=str(index_dir))
+    added = idx.ingest_records(new_entries)
+    idx.load()
+    out = {
+        "added": added,
+        "extra_total": len(idx._load_extra_records()),
+        "index_total": idx.count,
+    }
+    print(
+        f"CVE 情报增量同步完成: 扫描模板 {len(new_entries)}，"
+        f"新增入库 {out['added']}，累计增量 {out['extra_total']}，索引总数 {out['index_total']}"
+    )
+    return out
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Nuclei 模板质量过滤（只保留 critical/high/medium）")
     parser.add_argument("--dir", default=str(DEFAULT_TEMPLATE_DIR), help="nuclei 模板根目录")
     parser.add_argument("--apply", action="store_true", help="实际删除低质量模板（默认仅统计）")
     parser.add_argument("--keep", nargs="+", default=list(KEEP_SEVERITIES), help="保留的 severity 集合")
+    parser.add_argument("--sync-cve-index", action="store_true",
+                        help="Z1.3：增量比对上游新 CVE 模板并入库（不执行质量过滤）")
     args = parser.parse_args()
+
+    if args.sync_cve_index:
+        cve_dir = Path(args.dir) / "http" / "cves"
+        sync_cve_index(template_dir=cve_dir)
+        return
 
     root = Path(args.dir)
     if not root.is_dir():

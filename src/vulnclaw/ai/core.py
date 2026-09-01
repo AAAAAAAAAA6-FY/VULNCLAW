@@ -801,30 +801,116 @@ __all__ = [
 # ai/adaptive_ml.py
 import json
 import os
-import numpy as np
-from sklearn.linear_model import LogisticRegression
-from sklearn.feature_extraction.text import CountVectorizer
 from vulnclaw.core.logger import logger
+
+# ======================================================
+# numpy / sklearn 延迟（Lazy）导入策略 —— 为什么必须这样做
+# ------------------------------------------------------
+# Python 3.14（Windows MINGW 构建）+ numpy 1.x 会在 import numpy 的瞬间触发
+# 原生 ACCESS_VIOLATION (0xC0000005) 段错误，这是解释器级 crash，
+# Python 层 try/except **接不住**（进程被操作系统直接 Kill）。
+# 因此：
+#   1) 不在模块顶层写任何 "import numpy" / "from sklearn"。
+#   2) 所有 numpy / sklearn 符号 **全部在函数内部第一次使用时 import**，
+#      且只在调用方明确要求 "启用 ML"（环境变量 VULNCLAW_ENABLE_ML=1）
+#      或者 py 版本安全（< 3.14 或非 Windows 平台）时才允许触发那条路径。
+#   3) 默认情况下 AdaptiveML 退化为 No-Op：predict_success 恒返回 0.5，
+#      不会 crash、不抛异常、完全不影响常规扫描 99% 功能。
+# ======================================================
+_ML_AVAILABLE_CACHED = None  # None=未探测, True=可用, False=不可用
+np = None
+LogisticRegression = None
+CountVectorizer = None
+
+
+def _is_ml_safe_to_attempt() -> bool:
+    """判断"尝试 import numpy"是否值得一做。命中高风险平台直接返回 False，
+    防止触发原生 ACCESS_VIOLATION 段错误把整个进程炸没。"""
+    import sys
+    import platform
+    # 显式开开关：用户自己设置了 VULNCLAW_ENABLE_ML=1 就允许尝试
+    if os.getenv("VULNCLAW_ENABLE_ML", "0").strip() in ("1", "true", "True", "yes"):
+        return True
+    # 显式关开关：最高优先级
+    if os.getenv("VULNCLAW_DISABLE_ML", "0").strip() in ("1", "true", "True", "yes"):
+        return False
+    # 高风险组合：CPython >= 3.13 且 Windows，numpy 1.x MINGW 构建已知崩溃
+    if (
+        sys.platform.startswith("win")
+        and platform.python_implementation() == "CPython"
+        and sys.version_info >= (3, 13)
+    ):
+        return False
+    return True
+
+
+def _try_import_ml():
+    """仅当 _is_ml_safe_to_attempt() 放行时，在函数内部 import numpy/sklearn。
+    已探测过的结果走 _ML_AVAILABLE_CACHED 缓存，避免重复 import。"""
+    global _ML_AVAILABLE_CACHED, np, LogisticRegression, CountVectorizer
+    if _ML_AVAILABLE_CACHED is not None:
+        return _ML_AVAILABLE_CACHED
+    if not _is_ml_safe_to_attempt():
+        _ML_AVAILABLE_CACHED = False
+        logger.debug(
+            "AdaptiveML: 跳过 ML 依赖加载（当前 Python 3.13+/Windows 平台命中高风险 numpy 段错误组合）。"
+            "如需强行启用，设置环境变量 VULNCLAW_ENABLE_ML=1。"
+        )
+        return False
+    try:
+        # 注意：这两行故意放在函数内部 + 缓存判断之后 + 安全平台判断之后
+        import numpy as _np  # noqa: F401
+        from sklearn.linear_model import LogisticRegression as _LR
+        from sklearn.feature_extraction.text import CountVectorizer as _CV
+        np = _np
+        LogisticRegression = _LR
+        CountVectorizer = _CV
+        _ML_AVAILABLE_CACHED = True
+        return True
+    except BaseException as _e:  # 真 import 失败抛异常了（非段错误情况），正常降级
+        _ML_AVAILABLE_CACHED = False
+        logger.warning(
+            f"⚠️  ML 依赖不可用（numpy/sklearn 导入失败），AdaptiveML 将被禁用。"
+            f"原因: {type(_e).__name__}: {str(_e)[:200]}。此问题不影响扫描主功能。"
+        )
+        return False
 
 
 class AdaptiveML:
-    """自适应机器学习模块 - 使用JSON存储模型权重（弃用pickle，防止RCE）"""
+    """自适应机器学习模块 - 使用JSON存储模型权重（弃用pickle，防止RCE）
+    当 numpy/sklearn 不可用（例如 Python 3.14 + numpy 1.x MINGW 段错误环境）时，
+    该类退化为 No-Op：predict_success 恒返回 0.5，不抛出异常，不影响主扫描流程。
+    """
 
     def __init__(self, model_path="./models/waf_bypass_model.json"):
         self.model_path = model_path
         self.model = None
-        self.vectorizer = CountVectorizer(max_features=20)
+        self.vectorizer = None
         self._X_train = []
         self._y_train = []
         self._loaded = False
-        self._load_model()
+        # 注意：__init__ 里**不调用 _try_import_ml()**，防止即使在高风险平台
+        # get_adaptive_ml() 被首次调用时也不会触发 numpy import。
+        # 真正尝试 import 发生在 predict_success / _retrain 等真正要用 ML 的那一瞬间。
+        logger.debug("AdaptiveML: 实例化完成（ML 符号尚未加载，按需延迟初始化）")
+
+    def _ensure_ml(self) -> bool:
+        """内部共用入口：尝试启用 ML。返回 True 代表符号 np/LR/CV 都可用。"""
+        if not _try_import_ml():
+            return False
+        return (
+            np is not None
+            and LogisticRegression is not None
+            and CountVectorizer is not None
+        )
 
     def _load_model(self):
+        if not self._ensure_ml():
+            return
         if os.path.exists(self.model_path):
             try:
                 with open(self.model_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                # 重建模型（简化：仅存储权重，实际应使用joblib）
                 self.model = LogisticRegression(max_iter=100)
                 self.model.coef_ = np.array(data.get('coef', [[]]))
                 self.model.intercept_ = np.array(data.get('intercept', [0]))
@@ -833,10 +919,15 @@ class AdaptiveML:
             except Exception as e:
                 logger.debug(f"ML模型加载失败: {e}")
         if not self._loaded:
-            self.model = LogisticRegression(max_iter=100)
+            try:
+                self.model = LogisticRegression(max_iter=100)
+            except Exception:
+                self.model = None
             self._loaded = False
 
-    def extract_features(self, payload: str, waf_type: str, error_msg: str) -> np.ndarray:
+    def extract_features(self, payload: str, waf_type: str, error_msg: str):
+        if not self._ensure_ml():
+            return None
         features = {
             "len": len(payload),
             "num_chars": sum(c.isdigit() for c in payload),
@@ -852,9 +943,15 @@ class AdaptiveML:
         return np.array(list(features.values())).reshape(1, -1)
 
     def predict_success(self, payload: str, waf_type: str, error_msg: str) -> float:
+        if not self._ensure_ml():
+            return 0.5
+        if not self._loaded or self.model is None:
+            self._load_model()
         if not self._loaded or self.model is None:
             return 0.5
         X = self.extract_features(payload, waf_type, error_msg)
+        if X is None:
+            return 0.5
         try:
             prob = self.model.predict_proba(X)[0][1]
             return float(prob)
@@ -862,18 +959,28 @@ class AdaptiveML:
             return 0.5
 
     def record_feedback(self, payload: str, waf_type: str, error_msg: str, success: bool):
-        features = self.extract_features(payload, waf_type, error_msg).flatten().tolist()
+        if not self._ensure_ml():
+            return
+        feats = self.extract_features(payload, waf_type, error_msg)
+        if feats is None:
+            return
+        try:
+            features = feats.flatten().tolist()
+        except BaseException:
+            return
         self._X_train.append(features)
         self._y_train.append(1 if success else 0)
         if len(self._X_train) % 50 == 0 and len(self._X_train) > 20:
             self._retrain()
 
     def _retrain(self):
+        if not self._ensure_ml():
+            return
         if len(self._X_train) < 10:
             return
-        X = np.array(self._X_train)
-        y = np.array(self._y_train)
         try:
+            X = np.array(self._X_train)
+            y = np.array(self._y_train)
             self.model.fit(X, y)
             data = {
                 'coef': self.model.coef_.tolist(),
@@ -1464,6 +1571,55 @@ VECTORDB_PATH = os.path.join(PROJECT_CACHE_DIR, "vectordb")
 os.makedirs(VECTORDB_PATH, exist_ok=True)
 
 
+# ------------------------------------------------------------------
+# A3.5: 隐私与存储边界——记忆只存授权目标 hash+host，payload/evidence 脱敏敏感值
+# ------------------------------------------------------------------
+def memory_target_key(target: str) -> tuple:
+    """A3.5: 目标键——返回 (hash, host)。只存 hash，不落盘明文完整 URL。
+
+    host 为域名（无路径无参数），隐私风险低且可作召回指纹。
+    """
+    url = str(target or "")
+    host = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", "", url).split("/")[0].split(":")[0]
+    h = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16] if url else ""
+    return h, host
+
+
+def redact_secrets(text: str) -> str:
+    """A3.5: 敏感值脱敏——password/token/secret/api_key/authorization/bearer/cookie 置 [REDACTED]。"""
+    text = str(text or "")
+    text = re.sub(
+        r"(password|passwd|pwd|token|secret|api_key|apikey|access_key)\s*[=:]\s*[^\s&\"']+",
+        r"\1=[REDACTED]", text, flags=re.I
+    )
+    text = re.sub(
+        r"(authorization\s*:\s*(?:bearer\s+)?)[^\s,;]+",
+        r"\1[REDACTED]", text, flags=re.I
+    )
+    text = re.sub(r"(cookie\s*[:=]\s*)[^\s;]+", r"\1[REDACTED]", text, flags=re.I)
+    text = re.sub(r"bearer\s+[A-Za-z0-9._~+/-]+=*", "bearer [REDACTED]", text, flags=re.I)
+    return text
+
+
+def audit_memory_clean(memory=None) -> tuple:
+    """A3.5: 审计——验证记忆存储无明文凭证落盘（返回 (是否干净, 泄露样例列表)）。"""
+    try:
+        mem = memory if memory is not None else get_memory()
+        data = (mem._fallback._data + mem._fallback._fail_data) if getattr(mem, "_fallback_mode", True) else []
+    except Exception:
+        data = []
+    leaked = []
+    for e in data:
+        for k in ("payload", "evidence", "error_msg"):
+            v = str(e.get(k, ""))
+            if re.search(
+                r"(password|token|secret|authorization|bearer)\s*[=:]\s*(?!\[REDACTED\])[^\s]+",
+                v, flags=re.I
+            ):
+                leaked.append((k, v[:60]))
+    return (not leaked), leaked
+
+
 class _MemoryFallback:
     """内存降级模式 - 带大小限制"""
     def __init__(self, max_entries: int = 1000):
@@ -1471,9 +1627,10 @@ class _MemoryFallback:
         self._fail_data = []
         self._max_entries = max_entries
 
-    async def add_experience(self, target, vuln_type, payload, success, evidence, error_msg=""):
+    async def add_experience(self, target, vuln_type, payload, success, evidence, error_msg="", target_host=""):
         entry = {
             "target": target,
+            "target_host": target_host,
             "vuln_type": vuln_type,
             "payload": payload,
             "success": success,
@@ -1492,6 +1649,11 @@ class _MemoryFallback:
     async def recall(self, query, n_results=3, exclude_failures=True):
         if not self._data:
             return []
+        # A3.5: query 若是 URL，提取 host 做精确指纹匹配（存储只含 hash+host，不含明文 URL）
+        try:
+            _, q_host = memory_target_key(query) if isinstance(query, str) else ("", "")
+        except Exception:
+            q_host = ""
         keywords = set(query.lower().split())
         syn_map = {
             'sql': ['sql', 'sqli', '注入', '数据库', 'database'],
@@ -1515,6 +1677,9 @@ class _MemoryFallback:
             vuln_lower = entry["vuln_type"].lower()
             payload_lower = entry["payload"].lower()
             target_lower = entry["target"].lower()
+            # A3.5: 同 host 精确指纹 → 强命中（跨会话学习对同指纹目标生效）
+            if q_host and entry.get("target_host") == q_host:
+                score += 3
             for kw in expanded_keywords:
                 if kw in vuln_lower or kw in payload_lower or kw in target_lower:
                     score += 1
@@ -1535,16 +1700,25 @@ class _MemoryFallback:
         ]
 
     async def recall_failures(self, target, vuln_type=None):
+        # A3.5: 存储用 target hash，查询侧同样 hash 化
+        try:
+            t_hash, _ = memory_target_key(target) if isinstance(target, str) else (str(target or ""), "")
+        except Exception:
+            t_hash = str(target or "")
         results = []
         for e in self._fail_data:
-            if e["target"] == target:
+            if e["target"] == t_hash:
                 if vuln_type is None or vuln_type.lower() in e["vuln_type"].lower():
                     results.append(json.dumps(e, ensure_ascii=False))
         return results
 
     async def clear_failures(self, target=None):
         if target:
-            self._fail_data = [e for e in self._fail_data if e["target"] != target]
+            try:
+                t_hash, _ = memory_target_key(target) if isinstance(target, str) else (str(target or ""), "")
+            except Exception:
+                t_hash = str(target or "")
+            self._fail_data = [e for e in self._fail_data if e["target"] != t_hash]
         else:
             self._fail_data = []
 
@@ -1596,12 +1770,23 @@ class VectorMemory:
         evidence: str,
         error_msg: str = ""
     ):
+        # A3.5: 统一脱敏——目标只存 hash+host，payload/evidence/error_msg 敏感值置 [REDACTED]
+        try:
+            target_hash, target_host = memory_target_key(target)
+            payload = redact_secrets(payload)
+            evidence = redact_secrets(evidence)
+            error_msg = redact_secrets(error_msg)
+        except Exception:
+            target_hash, target_host = str(target or ""), ""
         if self._fallback_mode:
-            await self._fallback.add_experience(target, vuln_type, payload, success, evidence, error_msg)
+            await self._fallback.add_experience(
+                target_hash, vuln_type, payload, success, evidence, error_msg, target_host=target_host
+            )
             return
 
         doc = {
-            "target": target,
+            "target": target_hash,
+            "target_host": target_host,
             "vuln_type": vuln_type,
             "payload": payload,
             "success": success,
@@ -1610,7 +1795,7 @@ class VectorMemory:
         }
 
         doc_str = json.dumps(doc)
-        doc_id = f"{target}_{vuln_type}_{hash(payload + str(success))}"
+        doc_id = f"{target_hash}_{vuln_type}_{hash(payload + str(success))}"
 
         try:
             if success:
@@ -1618,19 +1803,21 @@ class VectorMemory:
                     await asyncio.to_thread(
                         self.collection.add,
                         documents=[doc_str],
-                        metadatas=[{"target": target, "vuln_type": vuln_type, "success": str(success)}],
+                        metadatas=[{"target": target_hash, "target_host": target_host,
+                                    "vuln_type": vuln_type, "success": str(success)}],
                         ids=[doc_id]
                     )
-                logger.debug(f"✅ 记忆存储成功: {vuln_type} @ {target}")
+                logger.debug(f"✅ 记忆存储成功: {vuln_type} @ {target_hash}")
             else:
                 async with _chroma_write_lock:
                     await asyncio.to_thread(
                         self.fail_collection.add,
                         documents=[doc_str],
-                        metadatas=[{"target": target, "vuln_type": vuln_type, "payload": payload[:50]}],
+                        metadatas=[{"target": target_hash, "target_host": target_host,
+                                    "vuln_type": vuln_type, "payload": payload[:50]}],
                         ids=[doc_id]
                     )
-                logger.debug(f"❌ 失败教训存储: {vuln_type} @ {target}")
+                logger.debug(f"❌ 失败教训存储: {vuln_type} @ {target_hash}")
         except Exception as e:
             logger.warning(f"记忆存储失败: {e}，降级到内存")
             self._fallback_mode = True

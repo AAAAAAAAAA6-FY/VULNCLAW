@@ -592,10 +592,6 @@ def main():
 
 
 
-    parser.add_argument('--no-cookie', action='store_true', help='跳过 Cookie 自动获取')
-
-
-
     parser.add_argument('--no-auth', action='store_true', help='使用未认证模式（不加 Cookie）')
 
 
@@ -722,6 +718,13 @@ def main():
     if args.dangerous:
         from vulnclaw.core.danger_guard import guard
         guard.set_mode("allow")
+
+    # --- S1: --deep 开启 ReAct 深挖（对本地判定模糊的参数做 LLM 多轮深度渗透） ---
+    if getattr(args, "deep", False):
+        try:
+            settings.enable_react_dive = True
+        except Exception as _de:  # noqa: BLE001
+            print(f"⚠️ 启用 ReAct 深挖失败（忽略，继续扫描）: {_de}")
 
 
 
@@ -941,18 +944,6 @@ def main():
 
 
                 print(f"⚠️ 读取 Cookie 文件失败: {e}")
-
-
-
-
-
-
-
-    if args.no_cookie:
-
-
-
-        print("ℹ️ 已跳Cookie 自动获取-no-cookie")
 
 
 

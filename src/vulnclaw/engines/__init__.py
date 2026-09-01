@@ -18,6 +18,12 @@ from .base import BaseEngine, CaseInsensitiveDict
 from .container_engines import ContainerSecurityEngine
 from .deserialization import DeserializationEngine
 from .dotnet_deserialization import DotNetDeserializationEngine
+from .framework_zero_day_engines_2 import (
+    AdminConsoleExposureEngine,
+    ContainerPlatformExposureEngine,
+    ShiroRememberMeEngine,
+    SpringCloudGatewayEngine,
+)
 from .http_engines import (
     CachePoisonEngine,
     HostHeaderEngine,
@@ -35,9 +41,21 @@ from .input_engines import (
     InfoLeakEngine,
     LDAPEngine,
 )
+from .logic_leak_engines_2 import (
+    BackupFileLeakEngine,
+    GraphQLIntrospectionEngine,
+    PrometheusMetricsExposureEngine,
+    RateLimitEngine,
+    SwaggerApiDocEngine,
+    VerbTamperingEngine,
+)
 from .mobile_engines import MobileAPIEngine
 from .net_engines import GraphQLEngine, SSRFEngine, XXEEngine
 from .web_engines import CMDIEngine, LFIEngine, NoSQLEngine, RFIEngine, SQLiEngine, SSTIEngine, XSSEngine
+from .http_advanced_engines import CSRFEngine, WebCacheDeceptionEngine
+from .framework_zero_day_engines import FastjsonDeserializationEngine, Log4ShellEngine, Spring4ShellEngine, Struts2OGNLEngine, ViewStateEngine
+from .leak_logic_engines import AuthEnumerationEngine, SourceCodeLeakEngine, SpringActuatorEngine
+from .web_advanced_engines import JSONPHijackingEngine, PrototypePollutionEngine, SSIInjectionEngine, XPathInjectionEngine
 from .websocket_security import WebSocketSecurityEngine
 
 __all__ = [
@@ -80,4 +98,28 @@ __all__ = [
     "APIVersionEngine",
     "RFIEngine",
     "HPPEngine",
+    "XPathInjectionEngine",
+    "SSIInjectionEngine",
+    "PrototypePollutionEngine",
+    "JSONPHijackingEngine",
+    "CSRFEngine",
+    "WebCacheDeceptionEngine",
+    "Log4ShellEngine",
+    "FastjsonDeserializationEngine",
+    "Struts2OGNLEngine",
+    "Spring4ShellEngine",
+    "ViewStateEngine",
+    "SpringActuatorEngine",
+    "SourceCodeLeakEngine",
+    "AuthEnumerationEngine",
+    "ShiroRememberMeEngine",
+    "SpringCloudGatewayEngine",
+    "ContainerPlatformExposureEngine",
+    "AdminConsoleExposureEngine",
+    "BackupFileLeakEngine",
+    "SwaggerApiDocEngine",
+    "GraphQLIntrospectionEngine",
+    "RateLimitEngine",
+    "VerbTamperingEngine",
+    "PrometheusMetricsExposureEngine",
 ]

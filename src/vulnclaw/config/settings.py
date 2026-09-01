@@ -114,6 +114,22 @@ class Settings(BaseSettings):
     agent_max_failures_per_param: int = Field(3, alias="AGENT_MAX_FAILURES_PER_PARAM")
     agent_consecutive_failures_threshold: int = Field(6, alias="AGENT_CONSECUTIVE_FAILURES_THRESHOLD")
     max_paths: int = Field(150, alias="MAX_PATHS")  # 默认提高到150，避免漏扫
+    # ========== S1: ReActAgent 接入 V100 主链路（深挖阶段） ==========
+    enable_react_dive: bool = Field(False, alias="ENABLE_REACT_DIVE")  # --deep 或 env 开启
+    react_dive_max_params: int = Field(3, alias="REACT_DIVE_MAX_PARAMS")  # 每轮最多深挖参数数
+    react_dive_max_iterations: int = Field(5, alias="REACT_DIVE_MAX_ITERATIONS")  # 每参数 ReAct 轮数
+    react_dive_budget: float = Field(150.0, alias="REACT_DIVE_BUDGET")  # 每参数总预算（秒）
+    # ========== S2: 跨引擎攻击链路由（chain_router） ==========
+    enable_chain_router: bool = Field(True, alias="ENABLE_CHAIN_ROUTER")  # SSRF->内网/Redis、上传->RCE
+    # ========== S3: 唤醒闲置资产（VectorMemory/ClueEngine/上下文压缩） ==========
+    enable_clue_engine: bool = Field(True, alias="ENABLE_CLUE_ENGINE")  # ReAct 深挖前预生成线索
+    # ========== A2: 多 Agent 协作（角色化子 Agent + 共享黑板 + 竞争协作） ==========
+    enable_agent_roles: bool = Field(False, alias="ENABLE_AGENT_ROLES")  # 深挖改用多 Agent 编排
+    multi_agent_max_params: int = Field(1, alias="MULTI_AGENT_MAX_PARAMS")
+    multi_agent_max_iterations: int = Field(4, alias="MULTI_AGENT_MAX_ITERATIONS")
+    enable_agent_race: bool = Field(False, alias="ENABLE_AGENT_RACE")  # 竞争协作：取先确认者
+    # ========== A4: 上下文管理（分层/裁剪） ==========
+    context_clip_max_chars: int = Field(1500, alias="CONTEXT_CLIP_MAX_CHARS")  # 工具原始输出裁剪阈值
 
     # ========== Burp 配置 ==========
     burp_api_url: str = Field("http://127.0.0.1:1337", alias="BURP_API_URL")

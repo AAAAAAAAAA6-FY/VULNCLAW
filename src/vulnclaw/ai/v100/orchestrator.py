@@ -85,8 +85,17 @@ class V100Orchestrator:
         self.balancer = get_balancer()
         self._model_to_provider = {}
         self.engines, self.engine_map = _load_engines()
+        # 初始化SPA检测器并传递给所有引擎（detect 延迟到 run() 异步上下文执行，
+        # 修复：__init__ 是同步方法，await 导致 SyntaxError 使整个包无法导入）
+        from vulnclaw.core.detectors.spa_detector import SpaFingerprintDetector
+        spa_detector = SpaFingerprintDetector(self.session)
+
+        for engine in self.engines:
+            engine.spa_detector = spa_detector
+        self._spa_detector = spa_detector
+
         self._ensure_engines()
-        logger.info(f"✅ 加载 {len(self.engines)} 个漏洞检测引擎")
+        logger.info(f"✅ 加载 {len(self.engines)} 个漏洞检测引擎（已配置SPA检测器）")
         self._model_pool = self._get_model_pool()
         self._ai_enabled = bool(self._model_pool)
         self._model_index = 0
@@ -117,6 +126,8 @@ class V100Orchestrator:
         self._recon_brief: Dict = {}
         self._processed_params: set = set()
         self._burp_params: set = set()
+        # S1: engine_bundle 首次执行结果（param -> [result, ...]），供 ReAct 深挖判断模糊参数
+        self._bundle_results: Dict[str, List[Dict]] = {}
         self._start_time = time.time()
         self._total_engine_calls = 0
         self._direct_findings = 0
@@ -971,6 +982,13 @@ class V100Orchestrator:
         try:
             auto_qps, auto_tasks = await self._auto_tune()
 
+            # SPA 检测（延迟到异步上下文执行，不阻塞 __init__）
+            try:
+                if getattr(self, "_spa_detector", None) is not None:
+                    await self._spa_detector.detect(self.target)
+            except Exception as _se:  # noqa: BLE001
+                logger.debug(f"SPA 检测失败（不影响扫描）: {_se}")
+
             self.initial_qps = auto_qps
             self.max_tasks = auto_tasks
 
@@ -1005,6 +1023,15 @@ class V100Orchestrator:
             # 在任务执行之前启动流水线验证后台协程，任务边产出 finding 边验证。
             self._start_stream_verify()
             await self._execute_with_limiting()
+
+            # S2: 跨引擎攻击链路由——基于 S2.1 链信息把已确认发现串成后续动作
+            #（SSRF->内网探测/Redis 未授权，文件上传/LFI->RCE 链）。
+            await self._run_chain_router()
+
+            # S1: ReActAgent 深挖阶段（插桩点：_generate_tasks 之后、全局扫描之前）。
+            # 对 engine_bundle 首次执行结果全部 low/info 或判定模糊的参数，
+            # 用 ReActAgent 做多轮深度渗透（V100=广度覆盖，ReAct=单点深度）。
+            await self._run_react_deep_dive()
 
             # 步骤3：并行提交 Burp 扫描（与下面各全局扫描同时进行，收尾前合并结果）
             self._burp_scan_task = asyncio.create_task(self._run_burp_scan())
@@ -1043,12 +1070,16 @@ class V100Orchestrator:
 
             self._force_gc()
             await self._finalize_nuclei_update()
+            # S3.1: 扫描收尾——把本次关键发现写入 VectorMemory（跨会话学习）
+            await self._persist_scan_memory()
             return await self._generate_report()
         except Exception as e:
             logger.error(f"扫描过程中发生错误: {e}")
             import traceback
             traceback.print_exc()
             await self._finalize_nuclei_update()
+            # S3.1: 扫描收尾——把本次关键发现写入 VectorMemory（跨会话学习）
+            await self._persist_scan_memory()
             return await self._generate_report()
 
     async def _finalize_nuclei_update(self) -> None:

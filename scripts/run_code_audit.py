@@ -40,7 +40,7 @@ def main():
     
     # 3. 运行代码审计（跳过 AI 审计，只跑 Semgrep，避免 LLM 超时）
     print("\n[3/4] 运行代码审计扫描（仅 Semgrep，跳过 AI）...")
-    cmd = f'python scan.py --code "{REPO_DIR}" --no-cookie --skip-ai-audit 2>&1'
+    cmd = f'python scan.py --code "{REPO_DIR}" --skip-ai-audit 2>&1'
     # 注意：如果 --skip-ai-audit 未实现，可以临时修改 code/ai_auditor.py 直接返回空结果，或用环境变量控制
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     print(result.stdout)

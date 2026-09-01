@@ -65,7 +65,6 @@ usage() {
 
 其他:
   --proxy URL             HTTP 代理
-  --no-cookie             跳过 Cookie 自动获取
   --health                仅运行健康检查
   -h, --help              显示本帮助
 EOF
@@ -88,7 +87,6 @@ while [[ $# -gt 0 ]]; do
         --max-tasks)      MODE_ARGS+=("--max-tasks" "$2"); shift 2 ;;
         --initial-qps)    MODE_ARGS+=("--initial-qps" "$2"); shift 2 ;;
         --proxy)          MODE_ARGS+=("--proxy" "$2"); shift 2 ;;
-        --no-cookie)      MODE_ARGS+=("--no-cookie"); shift ;;
         --master)         MODE_ARGS+=("--distributed" "--master"); shift ;;
         --worker)         MODE_ARGS+=("--distributed" "--worker"); shift ;;
         --redis-url)      MODE_ARGS+=("--redis-url" "$2"); shift 2 ;;

@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 
 from vulnclaw.core.logger import logger
 from vulnclaw.core.context import get_scan_context
-from vulnclaw.core.utils import async_get
+from vulnclaw.core.utils import async_get, build_attack_url
 from vulnclaw.core.session_manager import get_session_manager
 from vulnclaw.core.settings import settings
 
@@ -30,12 +30,110 @@ from vulnclaw.ai.core import (
 from vulnclaw.ai.tools import TOOL_REGISTRY, execute_tool
 
 
+# ==================================================================
+# A2.1: 角色化子 Agent 配置——窄 prompt + 窄工具集，替代单一大 prompt
+# ==================================================================
+AGENT_ROLES: Dict[str, Dict[str, object]] = {
+    "recon": {
+        "system": (
+            "你是渗透测试【侦察Agent】。目标是发现攻击面：URL 参数、隐藏端点、技术栈指纹、"
+            "API 差异与头部线索。只做信息收集与推断，不做攻击性验证。"
+        ),
+        "tools": [
+            "info_leak", "security_headers", "api_version_diff", "cors",
+            "host_header", "crlf", "graphql", "session",
+            # A5.2: CLI 侦察工具（本机已注册才可见）
+            "httpx", "katana", "subfinder", "gau", "waybackurls", "nmap",
+        ],
+    },
+    "analysis": {
+        "system": (
+            "你是渗透测试【分析Agent】。基于已知端点与参数，推断最可能存在的漏洞类型，"
+            "给出验证优先级并逐个验证。优先高价值参数（id/file/url/callback）。"
+        ),
+        "tools": [
+            "sqli", "xss", "lfi", "cmdi", "ssti", "idor", "ssrf", "xxe", "open_redirect",
+        ],
+    },
+    "exploit": {
+        "system": (
+            "你是渗透测试【利用Agent】。对高置信候选漏洞构造利用载荷验证实际影响，"
+            "禁止破坏性操作（不删数据、不写 shell、不外传数据），只做最小化影响验证。"
+        ),
+        "tools": [
+            "sqli", "cmdi", "ssti", "el_injection", "deserialization",
+            "dotnet_deserialization", "nosql", "file_upload", "jwt",
+        ],
+    },
+    "verify": {
+        "system": (
+            "你是渗透测试【验证Agent】。复核候选漏洞的证据强度，剔除误报（如 WAF 拦截、"
+            "通用错误页、时间波动），只保留可稳定复现的确认漏洞。"
+        ),
+        "tools": [
+            "sqli", "xss", "lfi", "cmdi", "race_condition",
+            "business_logic", "session", "jwt", "ldap",
+        ],
+    },
+}
+
+
+class Blackboard:
+    """A2.2: 共享黑板——子 Agent 之间通过结构化 state 通信（端点/漏洞/证据），
+    而非自然语言全量互传。带轻量 schema 校验（非法字段/类型直接拒绝写入）。
+    """
+
+    _SCHEMA = ("endpoints", "vulns", "evidence", "notes")
+
+    def __init__(self) -> None:
+        self._state: Dict[str, object] = {"endpoints": [], "vulns": [], "evidence": [], "notes": {}}
+
+    def publish(self, key: str, value) -> bool:
+        """写入黑板：列表字段追加、notes 字段合并；schema 不合法则拒绝。"""
+        if key not in self._SCHEMA:
+            logger.warning(f"[Blackboard] 非法字段 {key}，拒绝写入")
+            return False
+        if key in ("endpoints", "vulns", "evidence"):
+            if not isinstance(value, list):
+                logger.warning(f"[Blackboard] {key} 必须是 list，拒绝写入")
+                return False
+            self._state[key].extend(value)
+            return True
+        if key == "notes":
+            if not isinstance(value, dict):
+                logger.warning("[Blackboard] notes 必须是 dict，拒绝写入")
+                return False
+            self._state["notes"].update(value)
+            return True
+        return False
+
+    def read(self, key: str = None):
+        if key:
+            return self._state.get(key)
+        return dict(self._state)
+
+    def digest(self, limit: int = 200) -> str:
+        """生成注入 prompt 的结构化摘要（非自然语言全量互传）。"""
+        eps = [str(e)[:40] for e in self._state["endpoints"][:5]]
+        vulns = [
+            f"{v.get('type', '')}/{v.get('severity', '')}" if isinstance(v, dict) else str(v)[:30]
+            for v in self._state["vulns"][:5]
+        ]
+        text = (
+            f"endpoints={eps}; vulns={vulns}; "
+            f"evidence_count={len(self._state['evidence'])}"
+        )
+        return text[:limit]
+
+
 class ReActAgent:
     """推理-行动-观察循环 Agent - 计划执行版"""
 
-    def __init__(self, target: str, session, max_iterations: int = None):
+    def __init__(self, target: str, session, max_iterations: int = None, focus_param: str = "", role: str = "", blackboard=None):
         self.target = target
         self.session = session
+        # S1: 聚焦单个参数深挖（V100 主链路回落时传入），空串=全参数模式
+        self.focus_param = str(focus_param or "").strip()
 
         # 从 .env 读取硬编码配置
         self.max_iterations = max_iterations or getattr(settings, 'agent_max_iterations', 15)
@@ -47,6 +145,16 @@ class ReActAgent:
         self.context = get_scan_context()
         self.rule_engine = get_rule_engine() # 从 ai.core 获取
         self.tools = TOOL_REGISTRY
+
+        # A2.1: 角色化子 Agent——窄 prompt + 窄工具集（未知角色/未配置则保持全工具集）
+        self.role = str(role or "").strip().lower()
+        role_cfg = AGENT_ROLES.get(self.role) or {}
+        self.role_system = str(role_cfg.get("system", "") or "")
+        role_tools = role_cfg.get("tools")
+        if role_tools:
+            self.tools = {k: v for k, v in TOOL_REGISTRY.items() if k in role_tools}
+        # A2.2: 共享黑板（子 Agent 间结构化通信；未传入则自建独立黑板）
+        self.blackboard = blackboard if blackboard is not None else Blackboard()
 
         self.history: List[Dict] = []
         self.findings: List[Dict] = []
@@ -74,6 +182,25 @@ class ReActAgent:
         self._cache_hit_count: int = 0
         self._cache_miss_count: int = 0
         self._ensure_shared_knowledge()
+
+        # S3.2: ClueEngine 线索引擎（由 V100 主链路深挖阶段注入）
+        self.clue_engine = None
+        # S3.1: 跨会话记忆召回缓存（run() 中召回一次）
+        self._memory_recalled = False
+        self._memory_note = ""
+        # S3.3: 上下文压缩阈值（超过后历史滚动压缩为结构化纪要）
+        self._compress_threshold = 15
+        self._compressed_summary = ""
+        # A1.2: Plan-then-Act——分阶段计划（recon/assume/verify/exploit）与消费游标。
+        # 修复：current_plan/plan_step 此前未在 __init__ 初始化（零调用=零实战藏 bug），
+        # _decide_action 直接读 self.current_plan[self.plan_step] 会 AttributeError。
+        self.current_plan: List[Dict] = []
+        self.plan_step = 0
+        # A1.3: 反思循环——连续失败计数与策略切换次数
+        self._consecutive_failures = 0
+        self._strategy_switched = 0
+        # Z3.4: OOB 盲打假设验证去重（target|param|payload 模板），每假设只打一次
+        self._oob_attempted: set = set()
 
     def _ensure_shared_knowledge(self) -> Dict:
         shared = getattr(self.context, self._shared_knowledge_key, None)
@@ -210,6 +337,19 @@ class ReActAgent:
         self.history.append({"phase": "recon", "observation": observation})
         self._recon_observation = observation
 
+        # S3.1: 跨会话记忆召回（一次）——历史成功/失败经验注入决策，长程学习
+        try:
+            recalled = await self.memory.recall(self.target, n_results=3)
+            if recalled:
+                self._memory_note = ";\n".join(str(r)[:120] for r in recalled[:3])
+                logger.info(f"🧠 [ScanMemory] 召回 {len(recalled)} 条历史经验")
+        except Exception as _me:  # noqa: BLE001
+            logger.debug(f"[ScanMemory] 召回失败: {_me}")
+        self._memory_recalled = True
+
+        # A1.2: Plan-then-Act——执行前先产出 JSON 分阶段计划
+        await self._generate_plan()
+
         for self.iteration in range(self.max_iterations):
             logger.info(f"🔄 ReAct 第 {self.iteration + 1}/{self.max_iterations} 轮")
 
@@ -224,6 +364,17 @@ class ReActAgent:
 
             is_valid = await self._verify_action(action, result)
             self.history.append({"iteration": self.iteration, "valid": is_valid})
+
+            # A1.3: 反思循环——连续失败计数，≥2 次自动切换策略（_decide_action 会读到状态）
+            if is_valid:
+                self._consecutive_failures = 0
+            else:
+                self._consecutive_failures += 1
+                if self._consecutive_failures >= 2:
+                    self._strategy_switched += 1
+                    logger.warning(
+                        f"🔄 [Reflect] 连续失败 {self._consecutive_failures} 次，要求切换策略"
+                    )
 
             observation = await self._observe(result)
             self.history.append({"iteration": self.iteration, "observation": observation})
@@ -260,6 +411,9 @@ class ReActAgent:
             headers = {}
 
         params = self._extract_params(self.target, text)
+        # S1: 聚焦模式——把目标参数强制注入侦察结果，保证深挖命中
+        if self.focus_param and self.focus_param not in params:
+            params.append(self.focus_param)
         self.context.total_urls = 1
 
         session_mgr = get_session_manager()
@@ -299,6 +453,9 @@ class ReActAgent:
                 if any(kw in p_lower for kw in keywords):
                     priority = level
                     break
+            # S1: 聚焦参数强制最高优先级，深挖不会偏离目标参数
+            if self.focus_param and p == self.focus_param:
+                priority = 'high'
             result.append({"param": p, "priority": priority})
 
         result.sort(key=lambda x: 0 if x['priority'] == 'high' else 1 if x['priority'] == 'medium' else 2)
@@ -362,22 +519,25 @@ class ReActAgent:
             return self._scene_cache[cache_key]
 
         prompt = f"""
-你是渗透测试AI Agent。请分析当前状态，规划下一步行动。
+{self._global_context()}
 
-【当前目标】{self.target}
+【目标层摘要（A4.1 资产/经验，非全量）】
+{self._target_context()}
 
-【当前观察】
+【局部观察（A4.1 本轮全量）】
 - 状态码: {observation.get('status', '未知')}
 - 技术栈: {', '.join(observation.get('tech_stack', []))}
 - 所有参数: {', '.join(all_param_names) if all_param_names else '无'}
 - 高价值参数: {', '.join(high_priority) if high_priority else '无'}
 - 中价值参数: {', '.join(medium_priority) if medium_priority else '无'}
 - 已发现漏洞: {len(self.findings)} 个
-- 已执行轮次: {self.iteration + 1}/{self.max_iterations}
 - 已失败参数: {', '.join(self._failed_params) if self._failed_params else '无'}
 
 【可用工具（共{len(self.tools)}个）】
 {self._format_tools()}
+
+【特殊动作（Z3.4 盲打假设验证）】
+oob_confirm(url,param,payload,timeout)：规则引擎全 miss 的无回显假设验证——注入带外地址并轮询回调，回调=Critical 实锤。payload 为载荷模板，用 {{{{OBS_DNS}}}}（DNS 外带）或 {{{{OBS_HTTP}}}}（HTTP 外带）占位，例如 ${{jndi:ldap://{{{{OBS_DNS}}}}/a}}、http://{{{{OBS_DNS}}}}/probe。适合 log4shell/fastjson/struts2-ognl/ssrf/xxe 等盲打场景。
 
 请思考：
 1. 当前最有价值的攻击面是什么？
@@ -387,7 +547,8 @@ class ReActAgent:
             # 强制开启 wrap_data 防止提示词注入
             result = await self.llm.ask(
                 prompt,
-                system="你是渗透测试AI Agent，擅长推理决策。",
+                # A2.1: 角色化子 Agent 使用各自窄 system prompt
+                system=self.role_system or "你是渗透测试AI Agent，擅长推理决策。",
                 temperature=0.3,
                 wrap_data=True
             )
@@ -426,7 +587,8 @@ class ReActAgent:
             self.current_plan = []
 
         # 第二步：请求 AI 生成新计划，优先使用高成功率工具
-        ordered_tool_names = self._rank_tools(list(self.tools.keys())[:20])
+        # A5.2: 不截断工具清单（CLI 工具入册后总数 >30），由成功率排序决定优先级
+        ordered_tool_names = self._rank_tools(list(self.tools.keys()))
         tools_desc = []
         for name in ordered_tool_names:
             tool = self.tools[name]
@@ -441,8 +603,28 @@ class ReActAgent:
 【思考】
 {thought}
 
+【历史纪要（S3.3 长程压缩）】
+{self._compress_history()[:400]}
+
+【线索（S3.2 ClueEngine）】
+{self._get_review_clues()}
+
+【历史经验（S3.1 跨会话记忆）】
+{self._get_memory_experiences()}
+
+【共享黑板（A2.2 子 Agent 结构化 state）】
+{self.blackboard.digest() if self.blackboard else '无'}
+
+【计划进度（A1.2 Plan-then-Act）】
+{self._format_plan_progress()}
+
+【策略状态（A1.3 反思循环）】
+连续失败 {self._consecutive_failures} 次，累计切换策略 {self._strategy_switched} 次。
+{'⚠️ 连续失败≥2次，必须更换工具/参数/攻击思路，禁止重试相同动作。' if self._consecutive_failures >= 2 else '可继续当前策略。'}
+
 【可用工具】
 {chr(10).join(tools_desc)}
+- oob_confirm(score=0.95)(url,param,payload,timeout): Z3.4 无回显盲打假设验证——注入带外地址轮询回调，回调=Critical 实锤。payload 模板含 {{{{OBS_DNS}}}}/{{{{OBS_HTTP}}}} 占位。规则引擎全 miss 时对 log4shell/fastjson/ssrf/xxe 等盲打使用（可作 current_action）。
 
 【当前状态】
 - 已发现漏洞: {len(self.findings)}
@@ -583,6 +765,12 @@ class ReActAgent:
             logger.info(f"🏁 Agent决定结束: {reason}")
             return {"status": "finished", "reason": reason}
 
+        # Z3.4: 内置 OOB 盲打假设验证——规则引擎全 miss 时对无回显 0day/复杂漏洞
+        # 假设做带外实锤（log4shell/fastjson/ssrf/xxe/ognl 等盲打场景）。
+        # 不注册进 TOOL_REGISTRY，避免与工具层改动冲突；由 Agent 按需调用。
+        if tool_name == "oob_confirm":
+            return await self._execute_oob_confirm(params)
+
         if tool_name not in self.tools:
             logger.warning(f"⚠️ 未知工具: {tool_name}")
             return {"error": f"未知工具: {tool_name}"}
@@ -595,11 +783,35 @@ class ReActAgent:
             params["url"] = self.target
 
         param = params.get("param", "")
+        # S1: 聚焦模式缺省参数回退到 focus_param
+        if not param and self.focus_param:
+            param = self.focus_param
+            params["param"] = param
         if param and param in self._failed_params:
             logger.info(f"⏭️ 跳过参数 {param}（已失败 {self._param_fail_count.get(param, 0)} 次）")
             return {"error": f"参数 {param} 已失败多次，跳过"}
 
         logger.info(f"🔧 执行: {tool_name} {params} - {reason}")
+
+        # A1.6: Human-in-the-loop——危险操作走 DangerGuard 审批
+        #（prompt 模式交互确认，deny 模式拒绝，allow 模式放行）
+        # 说明：当前 30 个注册工具均为检测引擎，DANGEROUS_OPS 里的真实利用操作
+        #（exploit_chain / msf_exploit / msf_shell_write / exploit_verify）已在
+        # deepsec/exploit_chain.py、deepsec/msf_rpc.py、core/exploit_verify.py 内各自
+        # require_approval。此处按 DANGEROUS_OPS 注册表做通用判定，是工具集扩展后
+        # ReAct 直接调利用类工具时的防御性预留，不会误伤正常检测工具。
+        try:
+            from vulnclaw.core.danger_guard import DANGEROUS_OPS, guard
+            _op = tool_name if tool_name in DANGEROUS_OPS else None
+            if _op is None and "msf" in tool_name.lower():
+                _op = "msf_exploit"
+            if _op and not guard.require_approval(_op, f"{tool_name} @ {self.target}"):
+                logger.warning(
+                    f"🚫 [DangerGuard] 危险操作「{_op}」未获批准，跳过 {tool_name}（拒绝执行）"
+                )
+                return {"error": f"危险操作 {_op} 未获批准（DangerGuard deny）", "guard_denied": True}
+        except Exception as _ge:  # noqa: BLE001
+            logger.debug(f"[DangerGuard] 检查失败（放行兜底）: {_ge}")
 
         try:
             result = await execute_tool(tool_name, **params)
@@ -624,6 +836,91 @@ class ReActAgent:
         except Exception as e:
             logger.error(f"❌ 工具执行失败: {e}")
             return {"error": str(e)}
+
+    async def _execute_oob_confirm(self, params: Dict) -> Dict:
+        """Z3.4: OOB 盲打假设验证（内置动作，非 TOOL_REGISTRY 工具）。
+
+        场景：规则引擎对某参数全部 miss（无带内回显），Agent 可据此对 0day/复杂
+        漏洞（log4shell/fastjson/struts2-ognl/ssrf/xxe 等）做"假设验证式"盲打：
+        注入带外地址 → 轮询回调 → 命中即 Critical 实锤。
+
+        参数（LLM 调用）：
+          url     : 目标（缺省 self.target）
+          param   : 注入参数（缺省 self.focus_param）
+          payload : 载荷模板，含 {OBS_DNS} 或 {OBS_HTTP} 占位符，例如
+                    '${jndi:ldap://{OBS_DNS}/a}' / 'http://{OBS_DNS}/probe'
+          timeout : 回调等待秒数（默认 12）
+
+        低误报铁律：OOB 通道不可用 / 超时无回调 → 一律返回 None 语义（不误报）；
+        回调须 token 精确匹配，拒绝假 oast 域名（由 core.oob_channel 保证）。
+        """
+        url = str(params.get("url") or self.target or "")
+        param = str(params.get("param") or self.focus_param or "")
+        payload_tpl = str(params.get("payload", "") or "")
+        timeout = int(params.get("timeout", 12) or 12)
+        if not url:
+            return {"error": "oob_confirm 缺少目标 url"}
+        if not payload_tpl:
+            return {"error": "oob_confirm 需要 payload 模板（含 {OBS_DNS} 或 {OBS_HTTP}）"}
+
+        # 每 (目标|参数|模板) 只盲打一次，控制开销与请求突刺
+        dedup_key = f"{url}|{param}|{payload_tpl}"
+        if dedup_key in self._oob_attempted:
+            return {"info": f"OOB 假设已尝试过，跳过（{dedup_key[:80]}）", "dedup": True}
+        self._oob_attempted.add(dedup_key)
+
+        from vulnclaw.core.oob_channel import OOBChannel
+
+        ch = OOBChannel()
+        try:
+            probe = await ch.make_probe("https")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[OOBConfirm] 通道异常: {exc}")
+            return {"error": f"OOB 通道异常: {exc}"}
+        if not probe:
+            logger.info("ℹ️ [OOBConfirm] OOB 通道不可用（interactsh/dnslog 均失败），盲打跳过（不误报）")
+            return {"info": "OOB 通道不可用，盲打跳过（不误报）"}
+
+        token = probe["token"]
+        obs_dns = probe["dns"]
+        obs_http = probe["url"]
+        payload = payload_tpl.replace("{OBS_HTTP}", obs_http).replace("{OBS_DNS}", obs_dns)
+        attack_url = build_attack_url(url, param, payload) if param else (
+            (url + ("&" if "?" in url else "?") + payload)
+        )
+        logger.info(f"🧪 [OOBConfirm] 盲打 {param or 'URL'} -> {obs_dns}（token={token}）")
+
+        try:
+            await async_get(attack_url, session=self.session, timeout=settings.timeout, no_retry=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[OOBConfirm] 注入请求失败: {exc}")
+
+        hits = await ch.wait_for_interaction(token, timeout=max(4, min(timeout, 25)))
+        if not hits:
+            return {"info": f"OOB 探测未收到回调（{timeout}s），未确认（不误报）", "probe": obs_dns, "token": token}
+
+        proto = hits[0].protocol
+        callback = f"{proto}://{obs_dns}/ 于 {hits[0].time or '-'}"
+        finding = {
+            "url": attack_url,
+            "parameter": param,
+            "payload": payload,
+            "type": f"ReAct-OOB盲打实锤({payload_tpl[:40]})",
+            "severity": "Critical",
+            "ai_verdict": "高",
+            "confidence": "high",
+            "evidence": (
+                f"Agent 对无回显参数 `{param or 'URL'}` 注入带外载荷后，捕获 token 精确匹配的 "
+                f"{proto} 回调 {callback} —— 盲打假设验证成立，可能可 RCE/SSRF 外带",
+            ),
+            "oob_confirmed": True,
+            "oob_token": token,
+            "oob_provider": probe.get("provider", ""),
+            "source": "react_agent",
+            "recommendation": "人工复核回调证据，确认利用链后按漏洞类型升级组件版本",
+        }
+        logger.info(f"✅ [OOBConfirm] token={token} 回调实锤 → Critical")
+        return finding
 
     async def _verify_action(self, action: Dict, result: Any) -> bool:
         if not result or isinstance(result, Exception):
@@ -664,6 +961,12 @@ class ReActAgent:
 
     async def _observe(self, result: Any) -> Dict:
         if isinstance(result, dict):
+            # A4.3: 工具输出裁剪（原始 stdout 千行只入日志，喂 LLM 用摘要）
+            result = self._clip_tool_output(result)
+            # A2.2: 端点写入共享黑板（结构化 state，非自然语言全量互传）
+            if result.get("url"):
+                self._publish_blackboard({"endpoints": [str(result["url"])]})
+
             if result.get("status") == "finished":
                 return {"type": "finish", "message": result.get("reason", "完成")}
 
@@ -672,23 +975,27 @@ class ReActAgent:
 
             if "type" in result and ("漏洞" in result.get("type", "") or "注入" in result.get("type", "")):
                 self.findings.append(result)
+                self._publish_blackboard({"vulns": [result]})
                 return {"type": "finding", "message": f"发现 {result.get('type')}", "data": result}
 
             if "vulnerabilities" in result:
                 vulns = result.get("vulnerabilities", [])
                 if vulns:
                     self.findings.extend(vulns)
+                    self._publish_blackboard({"vulns": vulns})
                     return {"type": "findings", "message": f"发现 {len(vulns)} 个漏洞", "data": vulns}
 
             for key in ["sqli", "xss", "lfi", "cmdi", "ssti", "ssrf", "xxe", "idor", "jwt"]:
                 if key in result and result[key]:
                     self.findings.extend(result[key])
+                    self._publish_blackboard({"vulns": result[key]})
                     return {"type": "findings", "message": f"在 {key} 检测中发现漏洞", "data": result[key]}
 
             return {"type": "info", "message": "工具执行完成，无异常发现", "data": result}
 
         if isinstance(result, list) and result:
             self.findings.extend(result)
+            self._publish_blackboard({"vulns": result})
             return {"type": "findings", "message": f"发现 {len(result)} 个漏洞", "data": result}
 
         return {"type": "info", "message": "工具执行完成，无异常发现", "data": result}
@@ -787,6 +1094,159 @@ class ReActAgent:
                 obs = h.get("observation", {})
                 lines.append(f"  - 观察: {obs.get('message', '')[:40]}")
         return "\n".join(lines) if lines else "无"
+
+    # ---------------- S3: 唤醒闲置资产 ----------------
+    def _compress_history(self, keep_last: int = 3) -> str:
+        """S3.3: 上下文压缩——超过阈值后把 history 滚动压缩为结构化纪要（对标 Strix MemoryCompressor）。
+
+        长程多轮场景（ReAct 深挖 max_iterations 较大）下，对话不断累积，
+        若不压缩会导致 prompt 膨胀、token 成本上升。压缩只保留动作骨架，
+        最近 keep_last 轮保留全量细节。
+        """
+        if not self.history:
+            return "无"
+        if len(self.history) <= self._compress_threshold:
+            return self._format_history()
+        compact_entries = self.history[:-keep_last]
+        parts = []
+        for h in compact_entries:
+            if "thought" in h:
+                parts.append(f"思考:{str(h.get('thought', ''))[:50]}")
+            elif "action" in h:
+                a = h.get("action", {})
+                if isinstance(a, dict):
+                    parts.append(f"行动:{a.get('tool')}({str(a.get('reason', ''))[:25]})")
+            elif "result" in h:
+                r = h.get("result")
+                if isinstance(r, dict):
+                    parts.append(f"结果:{r.get('type')}/{r.get('severity', '')}/valid={h.get('valid')}")
+                else:
+                    parts.append(f"结果:{str(r)[:30]}/valid={h.get('valid')}")
+        body = "; ".join(parts) if parts else "[无可压缩内容]"
+        self._compressed_summary = f"[已压缩{len(compact_entries)}轮] {body[:300]}"
+        return f"{self._compressed_summary} ... 【最近】{self._format_history()}"
+
+    def _get_review_clues(self) -> str:
+        """S3.2: 从扫描上下文读取 ClueEngine 线索，作为 ReAct 决策候选。"""
+        try:
+            if self.clue_engine is not None and hasattr(self.context, "get_review_clues_sorted"):
+                clues = self.context.get_review_clues_sorted()
+            else:
+                clues = []
+        except Exception:  # noqa: BLE001
+            clues = []
+        if not clues:
+            return "无"
+        lines = []
+        for c in clues[:5]:
+            if isinstance(c, dict):
+                lines.append(
+                    f"  - [{c.get('priority', '?')}] {c.get('type', '?')}: "
+                    f"{str(c.get('evidence', ''))[:80]}"
+                )
+        return "\n".join(lines) if lines else "无"
+
+    def _get_memory_experiences(self) -> str:
+        """S3.1: 读取跨会话记忆召回结果（run() 已召回一次并缓存）。"""
+        return self._memory_note if self._memory_recalled and self._memory_note else "无"
+
+    def _publish_blackboard(self, payload: Dict) -> None:
+        """A2.2: 把结构化结果写入共享黑板（写入失败不影响主流程）。"""
+        if not self.blackboard:
+            return
+        try:
+            for key, value in (payload or {}).items():
+                self.blackboard.publish(key, value)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ---------------- A4: 上下文管理 ----------------
+    def _global_context(self) -> str:
+        """A4.1: 全局层——任务目标与角色定位（摘要，每次 LLM 调用都带）。"""
+        role_label = self.role.upper() if self.role else "通用"
+        return (
+            f"【全局目标】{self.target} | 角色={role_label} | "
+            f"阶段={self.iteration + 1}/{self.max_iterations}"
+        )
+
+    def _target_context(self) -> str:
+        """A4.1: 目标层——已知资产/经验/统计摘要（黑板+记忆+统计，非全量互传）。
+
+        设计：LLM 调用只带全局摘要 + 局部全量，目标层用摘要避免 token 膨胀。
+        """
+        parts = []
+        obs = self._recon_observation or {}
+        if obs.get("tech_stack"):
+            parts.append(f"技术栈={','.join(str(t) for t in obs['tech_stack'][:3])}")
+        parts.append(f"已发现漏洞={len(self.findings)}")
+        if self._failed_params:
+            parts.append(f"已失败参数={','.join(list(self._failed_params)[:5])}")
+        if self.blackboard:
+            parts.append(f"黑板={self.blackboard.digest(150)}")
+        if self._memory_recalled and self._memory_note:
+            parts.append(f"历史经验={self._memory_note[:120]}")
+        return " | ".join(parts) if parts else "无"
+
+    def _clip_tool_output(self, result: Any) -> Any:
+        """A4.3: 工具输出裁剪——原始 stdout/stderr/output 超阈值只入日志，喂 LLM 用裁剪摘要。
+
+        防止 nuclei/ffuf 千行原始输出进入 prompt 撑爆 token。结构化字段（type/severity/
+        evidence/url）原样保留。
+        """
+        if not isinstance(result, dict):
+            return result
+        max_chars = int(getattr(settings, "context_clip_max_chars", 1500))
+        for raw_key in ("stdout", "stderr", "raw_output", "output"):
+            raw = result.get(raw_key)
+            if isinstance(raw, str) and len(raw) > max_chars:
+                logger.debug(
+                    f"[Clip] {raw_key} 原始 {len(raw)} 字符超阈值，喂 LLM 用裁剪摘要"
+                )
+                result[raw_key] = raw[:max_chars] + f"...[已裁剪，原始 {len(raw)} 字符见日志]"
+        return result
+
+    async def _generate_plan(self) -> None:
+        """A1.2: Plan-then-Act——执行前先产出分阶段计划（recon→assume→verify→exploit）。
+
+        current_plan 为按阶段排序的工具名列表（与 _decide_action 的消费逻辑兼容）；
+        LLM 不可用/失败时降级为动态决策。
+        """
+        if not self.llm:
+            return
+        obs = self._recon_observation or {}
+        params = obs.get("params") or []
+        param_names = ", ".join(
+            p.get("param", "") if isinstance(p, dict) else str(p) for p in params[:10]
+        )
+        known_tools = " ".join(list(self.tools.keys())[:25])
+        prompt = (
+            "你是渗透测试规划Agent。基于侦察信息，为单个目标制定分阶段渗透计划。\n"
+            f"【侦察】target={obs.get('target')} status={obs.get('status')} "
+            f"tech_stack={obs.get('tech_stack')} params={param_names}\n"
+            f"【可选工具】{known_tools}\n"
+            "【要求】输出 JSON 数组，按 侦察/假设/验证/利用 四阶段顺序排列，"
+            "每项仅含工具名（必须来自可选工具）。数量 3-6 个。只输出 JSON 数组。"
+        )
+        try:
+            resp = await self.llm.ask(prompt, temperature=0.3, max_tokens=400)
+            data = json.loads(resp)
+            if isinstance(data, list) and data:
+                plan = [str(t) for t in data if str(t) in self.tools]
+                if plan:
+                    self.current_plan = plan
+                    self.plan_step = 0
+                    logger.info(f"🗺️ [Plan] 预生成 {len(plan)} 步计划: {plan}")
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[Plan] 计划预生成失败，降级为动态决策: {e}")
+
+    def _format_plan_progress(self) -> str:
+        """A1.2: 展示计划中尚未消费的步骤（供 _decide_action 参考）。"""
+        if not self.current_plan:
+            return "无计划（动态决策）"
+        pending = self.current_plan[self.plan_step:]
+        if not pending:
+            return "计划已全部执行"
+        return " -> ".join(str(t) for t in pending[:5])
 
     def _format_tools(self) -> str:
         names = list(self.tools.keys())

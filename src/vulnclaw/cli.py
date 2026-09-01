@@ -247,11 +247,6 @@ def main(argv: list[str] | None = None) -> None:
         help="HTTP/HTTPS 代理地址，例如 http://127.0.0.1:8080 （用于通过 Burp 等工具转发流量）。",
     )
     scan_parser.add_argument(
-        "--no-cookie",
-        action="store_true",
-        help="跳过 Cookie 自动获取。默认会自动获取目标站点的 Cookie 以保持会话。",
-    )
-    scan_parser.add_argument(
         "--metrics-port",
         type=int,
         default=0,
@@ -410,8 +405,6 @@ def main(argv: list[str] | None = None) -> None:
             fwd += ["--dangerous"]
         if args.proxy:
             fwd += ["--proxy", args.proxy]
-        if args.no_cookie:
-            fwd += ["--no-cookie"]
         if args.metrics_port:
             fwd += ["--metrics-port", str(args.metrics_port)]
         if args.http2:

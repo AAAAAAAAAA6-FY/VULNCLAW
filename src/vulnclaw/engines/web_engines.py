@@ -1004,21 +1004,13 @@ class SQLiEngine(BaseEngine):
                                 'method': 'time_based'
                             }
                     elif elapsed > 8.0:
-                        return {
-                            'url': url,
-                            'parameter': param,
-                            'payload': payload,
-                            'type': f'SQL注入-时间盲注疑似({desc})',
-                            'severity': 'Medium',
-                            'ai_verdict': '中',
-                            'confidence': 'medium',
-                            'evidence': f'响应延迟 {elapsed:.1f}s，但对比验证失败',
-                            'diff_ratio': 0.5,
-                            'time_based': True,
-                            'elapsed': elapsed,
-                            'db_type': db_type,
-                            'method': 'time_based_suspect'
-                        }
+                        # ⑧ 三层漏斗：单次大延时未过第二层（A/B逆命题延时复核），
+                        #     不满足第三层"AND返回空或超时"的可复现确认 → 疑似不进报告
+                        self.log_debug(
+                            f"参数 {param} 单次响应延迟 {elapsed:.1f}s 但无 A/B 延时复核，"
+                            f"按⑧策略跳过疑似时间盲注"
+                        )
+                        continue
 
                 has_diff, diff_ratio = self.has_response_diff(
                     normal_resp,
@@ -1034,20 +1026,72 @@ class SQLiEngine(BaseEngine):
                             parsed_query, session, normal_resp
                         )
                         if ab_result.get('verified', False):
+                            # ⑧ 第二层补充：A/B逆命题通过后，重放攻击请求做稳定性复核，
+                            #    防止一次性抖动通过A/B（SPA/CDN随机差异）
+                            try:
+                                rresp = await async_get(attack_url, session=session, timeout=timeout, no_retry=True)
+                            except BaseException:
+                                rresp = None
+                            if isinstance(rresp, tuple) and len(rresp) >= 2:
+                                r_status, r_text = rresp[0], rresp[1] or ""
+                                if r_status in (0, 429) or r_status >= 500:
+                                    self.log_debug(
+                                        f"参数 {param} 重放响应不稳定 (HTTP {r_status})，按⑧跳过"
+                                    )
+                                    continue
+                                r_has, r_diff = self.has_response_diff(
+                                    normal_resp,
+                                    (r_status, self.strip_payload_reflection(r_text, payload), {}),
+                                    threshold=0.15
+                                )
+                                if not r_has or r_diff < 0.15:
+                                    self.log_debug(
+                                        f"参数 {param} A/B通过但重放差异消失 ({r_diff:.1%})，"
+                                        f"判定为响应抖动，按⑧跳过"
+                                    )
+                                    continue
+                            # ⑥ 反射证据验证：注入唯一12位token，剥离基线后确认反射，
+                            #    有反射才可报 High；无反射一律降级（抗SPA噪声/参数化误报）
+                            reflected, reflect_evidence = await self.reflective_validator.validate_reflection(
+                                url, param, payload, parsed_query, session,
+                                baseline_resp=normal_resp
+                            )
+                            if reflected:
+                                return {
+                                    'url': url,
+                                    'parameter': param,
+                                    'payload': payload,
+                                    'type': f'SQL注入-布尔盲注({desc})',
+                                    'severity': 'High' if diff_ratio > 0.3 else 'Medium',
+                                    'ai_verdict': '高' if diff_ratio > 0.3 else '中',
+                                    'confidence': 'high' if diff_ratio > 0.3 else 'medium',
+                                    'evidence': f'响应差异 {diff_ratio:.1%}, A/B验证通过, {reflect_evidence}',
+                                    'diff_ratio': diff_ratio,
+                                    'elapsed': elapsed,
+                                    'db_type': db_type,
+                                    'method': 'boolean_based',
+                                    'ab_verified': True,
+                                    'reflection_verified': True
+                                }
+                            self.log_debug(
+                                f"参数 {param} A/B 差异稳定但无 token 反射，"
+                                f"疑似 SPA/参数化噪声，布尔盲注降级为疑似"
+                            )
                             return {
                                 'url': url,
                                 'parameter': param,
                                 'payload': payload,
-                                'type': f'SQL注入-布尔盲注({desc})',
-                                'severity': 'High' if diff_ratio > 0.3 else 'Medium',
-                                'ai_verdict': '高' if diff_ratio > 0.3 else '中',
-                                'confidence': 'high' if diff_ratio > 0.3 else 'medium',
-                                'evidence': f'响应差异 {diff_ratio:.1%}, A/B验证通过',
+                                'type': f'SQL注入-布尔盲注疑似({desc})',
+                                'severity': 'Medium',
+                                'ai_verdict': '中',
+                                'confidence': 'low',
+                                'evidence': f'响应差异 {diff_ratio:.1%}, A/B验证通过但无唯一token反射',
                                 'diff_ratio': diff_ratio,
                                 'elapsed': elapsed,
                                 'db_type': db_type,
-                                'method': 'boolean_based',
-                                'ab_verified': True
+                                'method': 'boolean_based_suspect',
+                                'ab_verified': True,
+                                'reflection_verified': False
                             }
                     elif diff_ratio > 0.3:
                         # 准确率修复：无法构造逆命题做 A/B 验证时的双重噪声对照
@@ -1093,21 +1137,16 @@ class SQLiEngine(BaseEngine):
                                     f"判定为响应抖动，跳过疑似布尔盲注"
                                 )
                                 continue
-                        return {
-                            'url': url,
-                            'parameter': param,
-                            'payload': payload,
-                            'type': f'SQL注入-疑似布尔盲注({desc})',
-                            'severity': 'Medium',
-                            'ai_verdict': '中',
-                            'confidence': 'medium',
-                            'evidence': f'响应长度/状态码差异 ({diff_ratio:.1%})',
-                            'diff_ratio': diff_ratio,
-                            'elapsed': elapsed,
-                            'db_type': db_type,
-                            'method': 'boolean_based',
-                            'ab_verified': False
-                        }
+                        # ⑧ 参数级三层漏斗：疑似层（仅响应差异，无A/B逆命题行为确认）不进报告
+                        # ① 布尔/时间探针 → suspect
+                        # ② A/B逆命题 + 稳定性复核 → probable
+                        # ③ 真实注入确认（OR正常/AND空或超时/UNION回显/报错/反射token 五选二）→ confirmed
+                        # 仅第三层进报告：疑似层一律跳过，杜绝假404与抖动噪声
+                        self.log_debug(
+                            f"参数 {param} 响应差异 {diff_ratio:.1%} 但未过三层漏斗第二层"
+                            f"（无A/B逆命题+稳定性复核），按⑧策略跳过疑似布尔盲注"
+                        )
+                        continue
 
                 if 'UNION' in payload.upper() and attack_status == 200:
                     # 准确率修复：

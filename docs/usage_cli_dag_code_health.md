@@ -42,7 +42,6 @@ python scan.py -t http://testphp.vulnweb.com --dag --agents 6
 | `--deep` | `store_true` | `False` | 深度模式（Sprint3 引入，对应 `test_sprint3.py::test_deep_arg_in_help`）：额外启用 collectors 静态端点迭代 / 更细的 ffuf 字典 / 更多 AI 任务分配轮次。 |
 | `--dangerous` | `store_true` | `False` | ⚠️ **危险模式开关（Sprint4）**：默认 **严格关闭**。需同时满足 (1) `.env:DANGEROUS_MODE=true` 或命令行 `--dangerous`，(2) 确认「对目标有合法授权」后才会解锁：高破坏性引擎、交互式 payload、长耗时字典爆破、Broken Access Control 的垂直权限提升、Spring Actuator 上传利用等。**未授权目标请永远不要启用**。 |
 | `--proxy` | `str` | 未设置 | HTTP/HTTPS 代理（`http://127.0.0.1:8080`）；会同步写入全局 requests Session + aiohttp trace_configs + 子进程 env。 |
-| `--no-cookie` | `store_true` | `False` | 跳过「本机浏览器 Cookie → CookieManager 注入」「Burp 插件载入」步骤；目标需要登录态时不要加此参数。 |
 
 ### 2.1 DAG Dashboard 观察方法（`--dag --agents N` 必看）
 - 每 5 秒打印一次 `[DAG Dashboard] [TICK]` 日志行。
@@ -108,7 +107,7 @@ python scan.py --health
 | 批量多目标（每行一个 URL，上下文隔离） | `python scan.py -l .\targets.txt --dag --agents 6` |
 | 代码审计（本地 Python 项目） | `python scan.py code --repo .\src\vulnclaw\code --lang python` |
 | 健康检查 | `python scan.py health` |
-| 带代理 + 跳过 Cookie 注入（无痕测试） | `python scan.py -t <URL> --proxy http://127.0.0.1:8080 --no-cookie` |
+| 带代理走 Burp（观察/验证流量） | `python scan.py -t <URL> --proxy http://127.0.0.1:8080` |
 | ⚠️ **授权前提下**打开危险模式（破坏性 payload 解锁） | `python scan.py -t <AUTHORIZED_TARGET> --dangerous` |
 
 ---

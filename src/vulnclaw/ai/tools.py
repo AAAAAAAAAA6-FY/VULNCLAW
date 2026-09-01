@@ -13,6 +13,8 @@ AI 工具注册表 - 动态注册所有引擎
 修复：从合并文件导入所有引擎
 """
 
+import re
+import shlex
 
 from vulnclaw.core.logger import logger
 from vulnclaw.core.utils import async_get, get_shared_session
@@ -42,13 +44,31 @@ from vulnclaw.engines.dotnet_deserialization import DotNetDeserializationEngine
 
 
 class BaseTool:
-    """工具基类"""
+    """工具基类（A5.1 统一 Tool Schema）"""
     name: str = ""
     description: str = ""
     parameters: List[Dict] = [
         {"name": "url", "type": "string", "required": True, "description": "目标URL"},
         {"name": "param", "type": "string", "required": False, "description": "要测试的参数名（可选，不提供则执行全局检测）"},
     ]
+    # A5.1: 统一 Tool Schema 元数据——参数/危险级/超时/输出裁剪规则/类别
+    #   safe=常规检测 / guarded=主动侦察或注入验证 / dangerous=真实利用（需 DangerGuard）
+    danger_level: str = "safe"
+    timeout: int = 60                  # 执行超时（秒）
+    category: str = "engine"           # engine=内置检测引擎 / cli=外部工具
+    clip_fields: tuple = ("stdout", "stderr", "summary")  # 喂 LLM 前需裁剪的字段
+
+    def get_schema(self) -> Dict:
+        """A5.1: 声明式统一 Schema——注册即入 Agent 可用清单，新增工具零改 dispatcher。"""
+        return {
+            "name": self.name,
+            "description": self.description,
+            "parameters": self.parameters,
+            "danger_level": self.danger_level,
+            "timeout": self.timeout,
+            "category": self.category,
+            "clip_fields": list(self.clip_fields),
+        }
 
     async def execute(self, **kwargs) -> Dict:
         raise NotImplementedError
@@ -155,7 +175,133 @@ for engine_class, custom_name, custom_desc in ENGINE_CONFIGS:
     tool_instance = ToolClass()
     TOOL_REGISTRY[tool_instance.name] = tool_instance
 
-logger.info(f"✅ 已注册 {len(TOOL_REGISTRY)} 个检测工具")
+# ==================================================================
+# A5.2: 安全工具全集入册——外部 CLI 工具包装为 Agent 可运行时点选（非固定阶段）
+# ==================================================================
+def _host_of(url: str) -> str:
+    """从 URL 提取主机名（供 nmap/naabu/subfinder 等主机级工具）。"""
+    u = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", "", str(url or ""))
+    return u.split("/")[0].split(":")[0]
+
+
+def _split_extra(extra: str) -> List[str]:
+    """把 Agent 传的附加参数字符串安全拆分为 argv 列表（shlex，支持引号）。"""
+    extra = str(extra or "").strip()
+    return shlex.split(extra) if extra else []
+
+
+class CLITool(BaseTool):
+    """A5.2: 外部 CLI 工具——经 core.tool_registry.run_tool 执行。
+
+    参数为"tools.yaml default_args + 传入 args"追加模式；Agent 可传 extra_args 微调。
+    危险参数黑名单（A5.4 参数级门禁雏形）在执行前拒绝并有审计日志。
+    """
+
+    def __init__(self, tool_name, description, arg_builder,
+                 danger_level="safe", timeout=120, blocked_patterns=()):
+        self.name = tool_name
+        self.description = description
+        self.parameters = [
+            {"name": "url", "type": "string", "required": True, "description": "目标URL"},
+            {"name": "extra_args", "type": "string", "required": False,
+             "description": "附加命令行参数（如 '-p 80,443'）"},
+        ]
+        self.danger_level = danger_level
+        self.timeout = timeout
+        self.category = "cli"
+        self._arg_builder = arg_builder
+        self._blocked_patterns = tuple(blocked_patterns or ())
+
+    async def execute(self, url: str, extra_args: str = None, **kwargs) -> Dict:
+        from vulnclaw.core.tool_registry import run_tool
+
+        extra = str(extra_args or "")
+        # A5.4: 工具+参数级 DangerGuard 审批（deny 拒绝 / prompt 交互确认 / allow 放行）。
+        # 黑名单（_blocked_patterns）是绝对禁止，优先于 guard（guard 可被 DANGEROUS_ALLOW 放行）。
+        for pat in self._blocked_patterns:
+            if pat in extra:
+                logger.warning(f"🚫 [CLITool] {self.name} 拒绝危险参数: {pat}")
+                return {"error": f"参数 {pat} 被拒绝（危险参数黑名单）", "guard_denied": True}
+
+        try:
+            args = self._arg_builder(url, extra)
+        except Exception as e:
+            return {"error": f"构造命令参数失败: {e}"}
+
+        try:
+            from vulnclaw.core.danger_guard import guard
+            if not guard.require_tool_approval(self.name, " ".join(args), f"{self.name} @ {url}"):
+                logger.warning(f"🚫 [DangerGuard] 工具 {self.name} 未获审批（工具级门禁）")
+                return {"error": f"工具 {self.name} 未获审批（DangerGuard 工具级门禁）", "guard_denied": True}
+        except Exception as _ge:  # noqa: BLE001
+            logger.debug(f"[DangerGuard] 工具级检查失败（放行兜底）: {_ge}")
+
+        result = await run_tool(self.name, args=args, timeout=self.timeout)
+        ok = bool(result.get("success"))
+        stdout = str(result.get("stdout", "") or "")
+        stderr = str(result.get("stderr", "") or "")
+        return {
+            "tool": self.name,
+            "type": "cli_result",
+            "success": ok,
+            "returncode": result.get("returncode"),
+            "summary": stdout[:500] if ok else stderr[:300],
+            "error": None if ok else f"工具 {self.name} 执行失败 rc={result.get('returncode')}",
+        }
+
+
+def _register_cli_tools() -> int:
+    """A5.2: 注册本机可用的安全工具（仅探测命中才入册，避免 Agent 选到必然失败的工具）。
+
+    危险级：nmap/naabu=guarded（主动网络扫描）；sqlmap=guarded（注入利用，危险参数黑名单）。
+    """
+    from vulnclaw.core.utils import get_tool_path
+
+    specs = [
+        ("nuclei", "Nuclei 模板漏洞扫描（thirdparty/nuclei-templates 模板库）",
+         lambda url, extra: ["-u", url] + _split_extra(extra), "safe", 180, ()),
+        ("httpx", "HTTP 存活探测与标题/技术栈指纹",
+         lambda url, extra: ["-u", url] + _split_extra(extra), "safe", 60, ()),
+        ("katana", "主动爬虫发现端点与参数",
+         lambda url, extra: ["-u", url] + _split_extra(extra), "safe", 120, ()),
+        ("ffuf", "目录/路径模糊枚举（Fuzz）",
+         lambda url, extra: ["-u", url.rstrip("/") + "/FUZZ"] + _split_extra(extra), "safe", 120, ()),
+        ("dalfox", "XSS 参数扫描与 Payload 验证",
+         lambda url, extra: ["url", url] + _split_extra(extra), "safe", 120, ()),
+        ("gau", "从公开数据集（Wayback/CommonCrawl）拉取已知 URL",
+         lambda url, extra: [_host_of(url)] + _split_extra(extra), "safe", 90, ()),
+        ("waybackurls", "Wayback Machine 历史 URL 收集",
+         lambda url, extra: [_host_of(url)] + _split_extra(extra), "safe", 90, ()),
+        ("subfinder", "子域名被动枚举",
+         lambda url, extra: ["-d", _host_of(url)] + _split_extra(extra), "safe", 120, ()),
+        ("naabu", "端口快速扫描",
+         lambda url, extra: ["-host", _host_of(url)] + _split_extra(extra), "guarded", 180, ()),
+        ("nmap", "端口与服务版本扫描（网络侦察）",
+         lambda url, extra: ["-Pn", _host_of(url)] + _split_extra(extra or "-sV --top-ports 100"),
+         "guarded", 300, ()),
+        ("sqlmap", "SQL 注入深度验证（注入利用工具）",
+         lambda url, extra: ["-u", url, "--batch"] + _split_extra(extra), "guarded", 300,
+         ("--os-shell", "--os-pwn", "--priv-esc", "--file-write", "--file-dest")),
+        ("curl", "原始 HTTP 请求工具",
+         lambda url, extra: ["-sS", "-i", url] + _split_extra(extra), "safe", 30, ()),
+    ]
+    registered = 0
+    for name, desc, builder, level, timeout, blocked in specs:
+        try:
+            if not get_tool_path(name):
+                continue
+        except Exception:
+            continue
+        TOOL_REGISTRY[name] = CLITool(name, desc, builder, level, timeout, blocked)
+        registered += 1
+    return registered
+
+
+_cli_registered = _register_cli_tools()
+logger.info(
+    f"✅ 已注册 {len(TOOL_REGISTRY) - _cli_registered} 个检测工具"
+    f" + {_cli_registered} 个 CLI 工具（A5.2 安全工具全集入册）"
+)
 
 
 async def execute_tool(name: str, **kwargs) -> Dict:

@@ -29,6 +29,7 @@ from vulnclaw.config import PROJECT_CACHE_DIR, settings
 from vulnclaw.core.logger import logger
 from vulnclaw.core.utils import close_shared_session, get_shared_session
 from vulnclaw.runners.code_audit_runner import run_code_audit
+from vulnclaw.core.detectors.spa_detector import SpaFingerprintDetector
 
 COOKIE_DIR = Path(PROJECT_CACHE_DIR) / "cookies"
 REPORT_DIR = Path(PROJECT_CACHE_DIR) / "reports"
@@ -870,7 +871,7 @@ async def auto_fetch_cookie(target_url: str, domain: str) -> bool:
 
     return await _manual_cookie_input(domain)
 
-async def extract_target_cookies(target_url: str, no_cookie: bool = False):
+async def extract_target_cookies(target_url: str):
 
 
 
@@ -883,18 +884,6 @@ async def extract_target_cookies(target_url: str, no_cookie: bool = False):
 
 
     """
-
-
-
-    if no_cookie:
-
-
-
-        print("ℹ️ 已跳Cookie 自动获取-no-cookie")
-
-
-
-        return
 
 
 
@@ -932,6 +921,16 @@ async def extract_target_cookies(target_url: str, no_cookie: bool = False):
 
     target_file = _get_cookie_file_path(host)
 
+    # 目标专属文件不存在时回退到父域名文件（app.box.com -> box.com.json）
+    if not target_file.exists():
+        parts = host.split(".")
+        for _i in range(1, len(parts)):
+            parent = ".".join(parts[_i:])
+            candidate = _get_cookie_file_path(parent)
+            if candidate.exists():
+                target_file = candidate
+                print(f"📂 使用父域名 Cookie 文件: {candidate}")
+                break
 
 
     old_file = os.path.expanduser("~/burp_cookies.json")
@@ -1192,9 +1191,7 @@ async def main_async(args):
 
     if args.target:
 
-
-
-        await extract_target_cookies(target, args.no_cookie)
+        await extract_target_cookies(target)
 
 
 

