@@ -375,6 +375,7 @@ class LLMClient:
         max_tokens: int = 2048,
         retries: int = 3,
         models: Optional[List[str]] = None,
+        task_type: Optional[str] = None,
         force_json: bool = False,
         wrap_data: bool = False,
         use_cache: bool = False,  # P1-2: 语义缓存（1h TTL，命中直接返回）
@@ -433,6 +434,10 @@ class LLMClient:
 
         if models is not None:
             models_to_use = resolve_model_aliases(models)
+        elif task_type is not None:
+            # A4.4 任务分层模型路由：按 task_type 选模型档位
+            # （便宜快模型做分类/粗筛，贵模型做验证/计划），复用 ModelRouter + settings.ai_task_allocation
+            models_to_use = ModelRouter().get_models_for_task(task_type)
         else:
             models_to_use = self.models.copy()
 
@@ -1133,7 +1138,11 @@ def _get_task_model_mapping() -> Dict[str, Dict]:
         "model_scoring": {"recommended": ["glm-4-flash"], "fallback": ["glm-4.7"], "description": "模型打分"},
         "vote_participant": {"recommended": ["glm-4-flash", "glm-4.7"], "fallback": ["qwen-plus-2025-07-28", "deepseek-ai/DeepSeek-V3.1-Terminus"], "description": "投票参与"},
         "clue_analysis": {"recommended": ["glm-4-flash"], "fallback": ["glm-4.7"], "description": "线索分析"},
-        "default": {"recommended": ["glm-4-flash", "glm-4.7"], "fallback": ["qwen-plus-2025-07-28"], "description": "默认任务"}
+        "default": {"recommended": ["glm-4-flash", "glm-4.7"], "fallback": ["qwen-plus-2025-07-28"], "description": "默认任务"},
+        # A4.4 任务分层模型路由档位
+        "filter": {"recommended": ["glm-4-flash"], "fallback": ["glm-4.7"], "description": "粗筛/分类（便宜快模型）"},
+        "classify": {"recommended": ["glm-4-flash"], "fallback": ["glm-4.7"], "description": "分类"},
+        "plan": {"recommended": ["glm-4.7", "glm-4-flash"], "fallback": ["qwen-plus-2025-07-28"], "description": "计划/策略生成（贵模型）"}
     }
     custom = getattr(settings, 'ai_task_allocation', {})
     if custom:

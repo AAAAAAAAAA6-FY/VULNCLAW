@@ -550,7 +550,8 @@ oob_confirm(url,param,payload,timeout)：规则引擎全 miss 的无回显假设
                 # A2.1: 角色化子 Agent 使用各自窄 system prompt
                 system=self.role_system or "你是渗透测试AI Agent，擅长推理决策。",
                 temperature=0.3,
-                wrap_data=True
+                wrap_data=True,
+                task_type="plan"
             )
             self._scene_cache[cache_key] = result.strip()
             self._cache_miss_count += 1
@@ -656,7 +657,8 @@ oob_confirm(url,param,payload,timeout)：规则引擎全 miss 的无回显假设
                     prompt,
                     system="你是渗透测试AI Agent，只输出JSON。",
                     temperature=0.2,
-                    wrap_data=True
+                    wrap_data=True,
+                    task_type="plan"
                 )
                 match = re.search(r'\{.*\}', result, re.DOTALL)
                 if match:
@@ -1228,7 +1230,7 @@ oob_confirm(url,param,payload,timeout)：规则引擎全 miss 的无回显假设
             "每项仅含工具名（必须来自可选工具）。数量 3-6 个。只输出 JSON 数组。"
         )
         try:
-            resp = await self.llm.ask(prompt, temperature=0.3, max_tokens=400)
+            resp = await self.llm.ask(prompt, temperature=0.3, max_tokens=400, task_type="plan")
             data = json.loads(resp)
             if isinstance(data, list) and data:
                 plan = [str(t) for t in data if str(t) in self.tools]
