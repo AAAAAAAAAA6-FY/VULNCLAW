@@ -16,6 +16,7 @@ import base64
 import hashlib
 import os
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 from vulnclaw.core.logger import logger
 from vulnclaw.core.utils import async_get
@@ -69,18 +70,35 @@ class WebSocketSecurityEngine(BaseEngine):
             except Exception as exc:
                 logger.debug(f"[websocket_security] 探测 {ws_url} 异常: {exc}")
 
+        # A7 增强：明文 ws:// 检测（仅 HTTPS 站点对比 wss vs ws）
+        parsed = urlparse(target)
+        if parsed.scheme == "https":
+            clear_base = "ws://" + parsed.netloc
+            own_origin = f"https://{parsed.netloc}"
+            for ws_path in self.WS_PATHS:
+                clear_url = clear_base + ws_path
+                try:
+                    finding = await self._probe_cleartext(clear_url, session, own_origin)
+                    if finding:
+                        findings.append(finding)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.debug(f"[websocket_security] 明文探测 {clear_url} 异常: {exc}")
+
         logger.info(f"WebSocketSecurityEngine: {len(findings)} findings")
         return findings
 
-    async def _probe_ws_endpoint(self, ws_url: str, session) -> Optional[Dict[str, Any]]:
+    async def _probe_ws_endpoint(self, ws_url: str, session, evil_origin: str = None) -> Optional[Dict[str, Any]]:
         """对单个端点发送带恶意 Origin 的 WebSocket 升级请求，依据真实响应判定。"""
+        evil = evil_origin or self.EVIL_ORIGIN
         sec_key = base64.b64encode(os.urandom(16)).decode("utf-8")
         headers = {
             "Upgrade": "websocket",
             "Connection": "Upgrade",
             "Sec-WebSocket-Key": sec_key,
             "Sec-WebSocket-Version": "13",
-            "Origin": self.EVIL_ORIGIN,
+            "Origin": evil,
         }
 
         try:
@@ -97,32 +115,80 @@ class WebSocketSecurityEngine(BaseEngine):
         if status != 101:
             return None
 
-        # 验证 Sec-WebSocket-Accept 头是否正确
+        # 验证 Sec-WebSocket-Accept 头是否正确（不符合 RFC 6455 不判 CSWSH）
         expected_accept = self._compute_accept_key(headers["Sec-WebSocket-Key"])
         actual_accept = resp_headers.get("Sec-WebSocket-Accept")
         if actual_accept != expected_accept:
             return None
-            return None
 
         # 101 Switching Protocols：恶意 Origin 被接受 → CSWSH（真实握手证据）
-        return self._build_finding(
+        finding = self._build_finding(
             ws_url,
             {
                 "type": "websocket_cswsh",
                 "severity": "high",
                 "title": "WebSocket CSWSH（跨站 WebSocket 劫持）",
                 "description": (
-                    f"WebSocket 端点接受任意 Origin（{self.EVIL_ORIGIN}）的升级请求并返回 101，"
+                    f"WebSocket 端点接受任意 Origin（{evil}）的升级请求并返回 101，"
                     "未做 Origin 白名单校验，攻击者页面可建立跨站 WebSocket 连接冒充用户。"
                 ),
                 "remediation": "服务端校验 Origin 头，仅允许白名单域名发起握手",
-                "payload": f"Origin: {self.EVIL_ORIGIN}",
+                "payload": f"Origin: {evil}",
                 "cvss": 8.5,
             },
             sec_key=sec_key,
             resp_headers=resp_headers,
             status=status,
         )
+        # A7 增强：Origin 反射检测（Access-Control-Allow-Origin == 我们发送的恶意 Origin）
+        acao = next((str(v) for k, v in (resp_headers or {}).items()
+                     if str(k).lower() == "access-control-allow-origin"), None)
+        if acao and acao.strip() == evil:
+            finding["evidence"] += f"；响应回显 Access-Control-Allow-Origin={acao}（Origin 反射），CSWSH 实锤性更高"
+            finding["origin_reflected"] = True
+        return finding
+
+    async def _probe_cleartext(self, ws_url: str, session, own_origin: str) -> Optional[Dict[str, Any]]:
+        """A7 增强：检测 HTTPS 站点是否同时接受明文 ws:// 升级（未强制 TLS）。"""
+        sec_key = base64.b64encode(os.urandom(16)).decode("utf-8")
+        headers = {
+            "Upgrade": "websocket",
+            "Connection": "Upgrade",
+            "Sec-WebSocket-Key": sec_key,
+            "Sec-WebSocket-Version": "13",
+            "Origin": own_origin,
+        }
+        try:
+            resp = await async_get(ws_url, session=session, timeout=8, no_retry=True, headers=headers, allow_redirects=False)
+        except Exception:
+            return None
+        if not isinstance(resp, tuple) or len(resp) < 2:
+            return None
+        status = resp[0]
+        resp_headers = resp[2] if len(resp) > 2 else {}
+        if status != 101:
+            return None
+        expected_accept = self._compute_accept_key(sec_key)
+        actual_accept = resp_headers.get("Sec-WebSocket-Accept")
+        if actual_accept != expected_accept:
+            return None
+        return {
+            "url": ws_url,
+            "parameter": "",
+            "type": "websocket_cleartext",
+            "severity": "medium",
+            "title": "WebSocket 明文传输（ws:// 未强制 TLS）",
+            "description": (
+                f"HTTPS 站点上的 WebSocket 端点同时接受明文 ws:// 升级（101），"
+                "未强制使用 wss://，攻击者可对 WebSocket 流量实施中间人窃听/篡改。"
+            ),
+            "remediation": "对所有 WebSocket 端点强制使用 wss://（TLS）",
+            "payload": f"Origin: {own_origin}",
+            "evidence": f"HTTP {status} (101 Switching Protocols) 于明文 ws:// 端点",
+            "confidence": "high",
+            "method": "GET",
+            "cvss": 6.0,
+        }
 
     def _build_finding(
         self,
