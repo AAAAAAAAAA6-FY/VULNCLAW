@@ -1,5 +1,6 @@
 from typing import Optional
-import requests
+import asyncio
+import aiohttp
 import re
 import random
 import string
@@ -32,40 +33,49 @@ class SpaFingerprintDetector:
                 features.append(pattern)
         return '|'.join(features)
     
-    def detect(self, url: str) -> bool:
-        """检测目标是否为SPA应用"""
+    async def detect(self, url: str) -> bool:
+        """检测目标是否为SPA应用（基于传入的 aiohttp ClientSession，须 await）
+
+        注意：构造时传入的 session 是 aiohttp ClientSession（orchestrator 与
+        input_engines 均如此），因此这里必须用 await 发起异步请求。早期实现误用
+        同步 requests 语义（session.get 返回协程却不 await，再访问 .status_code
+        抛 AttributeError 被静默吞掉，且泄漏未 await 协程）——SPA 检测形同虚设。
+        """
         try:
             # 获取首页内容作为基线
-            resp = self.session.get(url, timeout=10)
-            if resp.status_code != 200:
-                return False
-                
-            self.homepage_content = resp.text
+            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    return False
+                self.homepage_content = await resp.text()
             homepage_fingerprint = self._extract_fingerprint(self.homepage_content)
-            
+
             # 随机路径探测（3个不同路径）
             random_paths = [
                 f"/{_get_random_path_token(8)}",
                 f"/api/{_get_random_path_token(6)}",
-                f"/_next/{_get_random_path_token(10)}"
+                f"/_next/{_get_random_path_token(10)}",
             ]
-            
+
             for path in random_paths:
                 test_url = f"{url.rstrip('/')}{path}"
                 try:
-                    resp = self.session.get(test_url, timeout=5, allow_redirects=False)
-                    if resp.status_code == 200:
-                        test_fingerprint = self._extract_fingerprint(resp.text)
-                        # 如果指纹与首页相同，判定为SPA
-                        if test_fingerprint == homepage_fingerprint:
-                            self.is_spa = True
-                            return True
-                except requests.RequestException:
+                    async with self.session.get(
+                        test_url,
+                        timeout=aiohttp.ClientTimeout(total=5),
+                        allow_redirects=False,
+                    ) as resp:
+                        if resp.status == 200:
+                            test_fingerprint = self._extract_fingerprint(await resp.text())
+                            # 如果指纹与首页相同，判定为SPA
+                            if test_fingerprint == homepage_fingerprint:
+                                self.is_spa = True
+                                return True
+                except (aiohttp.ClientError, asyncio.TimeoutError):
                     continue
-            
+
             return False
-            
-        except requests.RequestException:
+
+        except (aiohttp.ClientError, asyncio.TimeoutError):
             return False
     
     def get_spa_status(self) -> Optional[bool]:
