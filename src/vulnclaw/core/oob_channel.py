@@ -47,6 +47,13 @@ _OAST_DOMAIN_RE = re.compile(
     r"oast\.(?:pro|live|site|online|fun|me))"
 )
 
+# A1.4：OOB 回调证据链审计（进程内持久化 + 去重）
+# 满足「token→interaction 落库，支持跨轮次复核、去重与事后审计」——
+# 在单次扫描进程内累积全部回调，按 (token,protocol,time,from,raw) 去重，
+# 供引擎/verify/报告侧事后审计，避免重复计数与串台误读。进程级单例，无需新建文件。
+_OOB_AUDIT: List["OOBInteraction"] = []
+_OOB_AUDIT_SEEN: set = set()
+
 
 @dataclass
 class OOBInteraction:
@@ -222,14 +229,16 @@ class OOBChannel:
     # 回调查询
     # ----------------------------------------------------------
     async def poll(self, timeout: int = 15) -> List[OOBInteraction]:
-        """拉取所有回调（未过滤）。无通道或失败返回空列表。"""
+        """拉取所有回调（未过滤），并落入进程内审计链（A1.4）。无通道或失败返回空列表。"""
+        items: List[OOBInteraction] = []
         if not self._domain:
-            return []
+            return items
         if self._resolved_provider == "interactsh":
-            return await self._poll_interactsh(timeout)
-        if self._resolved_provider == "dnslog":
-            return await self._poll_dnslog(timeout)
-        return []
+            items = await self._poll_interactsh(timeout)
+        elif self._resolved_provider == "dnslog":
+            items = await self._poll_dnslog(timeout)
+        self.record_interactions(items)  # A1.4：回调证据链持久化 + 去重
+        return items
 
     async def _poll_interactsh(self, timeout: int) -> List[OOBInteraction]:
         if not load_tool_config("interactsh-client"):
@@ -373,12 +382,53 @@ class OOBChannel:
             "dns": self.dns_label(token),
         }
 
+    # ----------------------------------------------------------
+    # A1.4：回调证据链审计 / 去重 / 复核
+    # ----------------------------------------------------------
+    def _record_interaction(self, it: "OOBInteraction") -> None:
+        """单条回调去重入库（进程内）。"""
+        key = (it.token, it.protocol, it.time, it.from_addr, it.raw_protocol)
+        if key in _OOB_AUDIT_SEEN:
+            return
+        _OOB_AUDIT_SEEN.add(key)
+        _OOB_AUDIT.append(it)
+
+    def record_interactions(self, items: List["OOBInteraction"]) -> None:
+        """批量入库（忽略非 OOBInteraction）。"""
+        for it in (items or []):
+            if isinstance(it, OOBInteraction):
+                self._record_interaction(it)
+
+    def get_audit(self, token: Optional[str] = None) -> List["OOBInteraction"]:
+        """查询审计链：不传 token 返回全部；传 token 仅返回该 token 的回调。"""
+        if not token:
+            return list(_OOB_AUDIT)
+        t = token.strip().lower()
+        return [it for it in _OOB_AUDIT if it.token and it.token.lower() == t]
+
+    @staticmethod
+    def audit_size() -> int:
+        """当前审计链条数。"""
+        return len(_OOB_AUDIT)
+
 
 async def make_oob_probe(scheme: str = "https") -> Optional[Dict]:
     """模块级便捷入口：engine 内一行拿到 OOB 探测地址。"""
     return await OOBChannel().make_probe(scheme)
 
 
+def get_oob_audit(token: Optional[str] = None) -> List["OOBInteraction"]:
+    """模块级审计查询：跨 OOBChannel 实例汇总（A1.4）。
+
+    供非引擎侧（verify、报告聚合、事后审计）直接读取进程内累积的全部 OOB 回调，
+    无需持有具体通道实例。
+    """
+    if not token:
+        return list(_OOB_AUDIT)
+    t = token.strip().lower()
+    return [it for it in _OOB_AUDIT if it.token and it.token.lower() == t]
+
+
 __all__ = [
-    "OOBChannel", "OOBInteraction", "make_oob_probe",
+    "OOBChannel", "OOBInteraction", "make_oob_probe", "get_oob_audit",
 ]
