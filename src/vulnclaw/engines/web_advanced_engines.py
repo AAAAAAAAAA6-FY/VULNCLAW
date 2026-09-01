@@ -10,6 +10,7 @@
 XPathInjectionEngine / SSIInjectionEngine / PrototypePollutionEngine / JSONPHijackingEngine
 设计原则：报错签名 + 布尔 A/B + 唯一 Token 回显，至少一段证据命中才判定，控制误报。
 """
+import json
 import re
 import secrets
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
@@ -17,7 +18,7 @@ from typing import Dict, List, Optional, Tuple
 
 from vulnclaw.core.logger import logger
 from vulnclaw.core.settings import settings
-from vulnclaw.core.utils import async_get, build_attack_url
+from vulnclaw.core.utils import async_get, async_post, build_attack_url
 from vulnclaw.engines.base import BaseEngine, enrich_finding
 
 
@@ -272,6 +273,16 @@ class PrototypePollutionEngine(BaseEngine):
         ("__proto__.polluted=vlcpp", "proto-polluted-点号"),
         ("constructor[prototype][polluted]=vlcpp", "constructor-prototype"),
         ("constructor.prototype.polluted=vlcpp", "constructor-prototype-点号"),
+        ("__proto__[polluted][0]=vlcpp", "proto-polluted-嵌套数组"),
+        ("[__proto__][polluted]=vlcpp", "proto-方括号键"),
+    ]
+
+    # JSON 体污染向量（Node/Express body-parser 为主战场，原引擎零覆盖）
+    json_payloads: List[Tuple[Dict, str]] = [
+        ({"__proto__": {"polluted": "vlcpp"}}, "json-__proto__"),
+        ({"constructor": {"prototype": {"polluted": "vlcpp"}}}, "json-constructor.prototype"),
+        ({"__proto__": {"constructor": {"prototype": {"polluted": "vlcpp"}}}}, "json-deep"),
+        ({"data": 1, "__proto__": {"polluted": "vlcpp"}}, "json-__proto__+字段"),
     ]
 
     def _build_query_url(self, url: str, param: str, key_payload: str, marker_value: str) -> str:
@@ -291,41 +302,101 @@ class PrototypePollutionEngine(BaseEngine):
         session,
         **kwargs
     ) -> Optional[Dict]:
-        if not param:
-            return None
         normal_text = self.get_normal_text(normal_resp) or ""
-        marker = "vlcpp" + secrets.token_hex(4)
-        proto_hint = re.compile(r"(?:__proto__|prototype|\[object Object\])", re.I)
+        marker = "vlc_polluted_" + secrets.token_hex(6)
+        proto_hint = re.compile(r"(?:__proto__|prototype\s*[:=]|\[object Object\])", re.I)
 
-        for template, desc in self.payloads:
-            attack_url = self._build_query_url(url, param, template, marker)
-            try:
-                resp = await async_get(attack_url, session=session, timeout=settings.timeout, no_retry=True)
-                if resp is None:
+        # 1) 查询串向量（param 驱动，保留原保守判定）
+        if param:
+            for template, desc in self.payloads:
+                attack_url = self._build_query_url(url, param, template, marker)
+                try:
+                    resp = await async_get(attack_url, session=session, timeout=settings.timeout, no_retry=True)
+                    if resp is None:
+                        continue
+                    status, text = resp[0], resp[1] or ""
+                except Exception as e:
+                    self.log_debug(f"原型污染检测异常 {param}: {e}")
                     continue
-                status, text = resp[0], resp[1] or ""
-            except Exception as e:
-                self.log_debug(f"原型污染检测异常 {param}: {e}")
-                continue
 
+                if not isinstance(text, str):
+                    continue
+                if marker not in text or marker in normal_text:
+                    continue
+                if proto_hint.search(text):
+                    finding = self._make_finding(attack_url, param, f"{template}(value={marker})", desc, "Low", "low", status)
+                    verified = await self._verify_pollution(url, marker, normal_text, session)
+                    if verified:
+                        finding = self._upgrade(finding, verified)
+                    return enrich_finding(finding)
+
+        # 2) JSON 体向量（Node/Express body-parser 为主战场，原引擎零覆盖）
+        for body_tmpl, desc in self.json_payloads:
+            body = self._fill_marker(body_tmpl, marker)
+            try:
+                resp = await async_post(
+                    url, json=body, headers={"Content-Type": "application/json"},
+                    session=session, timeout=settings.timeout, no_retry=True,
+                )
+                status = resp[0] if resp else 0
+            except Exception as e:
+                self.log_debug(f"原型污染(JSON)检测异常: {e}")
+                continue
+            # JSON 注入难以在响应直接回显，依赖落地验证（二次请求看 marker 是否泄漏）
+            verified = await self._verify_pollution(url, marker, normal_text, session)
+            if verified:
+                finding = self._make_finding(url, param or "(json-body)", f"JSON {desc}(value={marker})", desc, "Medium", "medium", status)
+                finding = self._upgrade(finding, verified)
+                return enrich_finding(finding)
+        return None
+
+    def _fill_marker(self, tmpl: Dict, marker: str) -> Dict:
+        """把模板 JSON 中的 vlcpp 占位符替换为唯一 marker。"""
+        return json.loads(json.dumps(tmpl).replace("vlcpp", marker))
+
+    def _make_finding(self, url, param, payload, desc, severity, confidence, status) -> Dict:
+        return {
+            'url': url,
+            'parameter': param,
+            'payload': payload,
+            'type': f'原型链污染-疑似({desc})',
+            'severity': severity,
+            'ai_verdict': '中' if severity in ('Low', 'Medium') else '高',
+            'confidence': confidence,
+            'evidence': f'注入键值 `{payload}` 触发原型链污染特征（黑盒局限，需人工/白盒复核）',
+            'status_code': status,
+            'recommendation': '对 JSON/查询解析后的对象做键名白名单过滤（拒绝 __proto__/constructor/prototype），并使用 Object.create(null) 存储',
+        }
+
+    def _upgrade(self, finding: Dict, verified_url: str) -> Dict:
+        finding['severity'] = 'Medium'
+        finding['ai_verdict'] = '高'
+        finding['confidence'] = 'medium'
+        finding['type'] = finding['type'].replace('疑似', '已验证')
+        finding['evidence'] = (finding.get('evidence', '') +
+            f'；落地验证：污染 marker 在后续请求 `{verified_url}` 响应中复现，'
+            f'说明属性已通过原型链泄漏，污染成立可能性高')
+        return finding
+
+    async def _verify_pollution(self, url: str, marker: str, normal_text: str, session) -> Optional[str]:
+        """落地验证（A6 核心补强）：注入后再次请求目标/常见 API 路径，
+        若唯一 marker 出现在非基线响应中，说明污染属性已借原型链泄漏到后续响应（强证据）。
+        无泄漏则返回 None，不误报。"""
+        parsed = urlparse(url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        probes = [url, origin + "/api", origin + "/api/user", origin + "/api/me"]
+        for p in probes:
+            try:
+                resp = await async_get(p, session=session, timeout=settings.timeout, no_retry=True)
+            except Exception:
+                continue
+            if not resp:
+                continue
+            text = resp[1] or ""
             if not isinstance(text, str):
                 continue
-            if marker not in text or marker in normal_text:
-                continue
-            if proto_hint.search(text):
-                finding = {
-                    'url': attack_url,
-                    'parameter': param,
-                    'payload': f"{template}(value={marker})",
-                    'type': f'原型链污染-疑似({desc})',
-                    'severity': 'Low',
-                    'ai_verdict': '中',
-                    'confidence': 'low',
-                    'evidence': f'注入键值 `{marker}` 被回显且响应包含原型链痕迹（黑盒局限，需人工/白盒复核）',
-                    'status_code': status,
-                    'recommendation': '对 JSON 解析后的对象做键名白名单过滤（拒绝 __proto__/constructor/prototype）',
-                }
-                return enrich_finding(finding)
+            if marker in text and marker not in normal_text:
+                return p
         return None
 
 
