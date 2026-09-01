@@ -426,7 +426,9 @@ class SSRFEngine(BaseEngine):
             oob_url = oob_payload.format(scan_id=scan_id, domain=interactsh_domain)
             attack_url = build_attack_url(url, param, oob_url, parsed_query)
             try:
-                resp = await async_get(attack_url, session=session, timeout=10, no_retry=True)
+                # 禁跟随重定向：目标若把 url/redirect 参数反射进 Location，
+                # 扫描器自身跟随 302 会主动请求 OOB 地址，产生"自回调"并误判实锤。
+                resp = await async_get(attack_url, session=session, timeout=10, no_retry=True, allow_redirects=False)
                 # OOB 不依赖响应回显：只要请求被服务端处理即可
                 if isinstance(resp, tuple):
                     oob_records.append((oob_url, resp[0]))

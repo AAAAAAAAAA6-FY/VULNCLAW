@@ -52,6 +52,10 @@ async def _run_oob_scan(
     """统一 OOB 盲打：注入外带载荷 → 轮询回调 → 命中即返回 Critical finding。
 
     只读探测（DNS/HTTP 回调），绝不写文件；无 OOB 通道或超时都返回 None（不产生误报）。
+
+    防自回调误报：payload 内含 http://<token>.<oob>/ 这类「期望被目标请求」的地址，
+    若 async_get 跟随重定向，目标一旦把该地址反射进 Location，扫描器自己就会去请求它，
+    自产 DNS/HTTP 回调并被 token 命中，误判为 Critical 实锤。故全程 allow_redirects=False。
     """
     key = f"{engine_name}:{_origin_of(url)}"
     dedup = _OOB_ATTEMPTED.setdefault(engine_name, set())
@@ -79,7 +83,7 @@ async def _run_oob_scan(
         payload = template.replace("{OBS_HTTP}", obs_http).replace("{OBS_DNS}", obs_dns)
         attack_url = build_attack_url(url, param, payload, parsed_query)
         try:
-            await async_get(attack_url, session=session, timeout=settings.timeout, no_retry=True)
+            await async_get(attack_url, session=session, timeout=settings.timeout, no_retry=True, allow_redirects=False)
         except Exception:  # noqa: BLE001
             pass
         await asyncio.sleep(0.4)

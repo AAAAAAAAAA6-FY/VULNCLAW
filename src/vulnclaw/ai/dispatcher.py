@@ -899,7 +899,9 @@ oob_confirm(url,param,payload,timeout)：规则引擎全 miss 的无回显假设
         logger.info(f"🧪 [OOBConfirm] 盲打 {param or 'URL'} -> {obs_dns}（token={token}）")
 
         try:
-            await async_get(attack_url, session=self.session, timeout=settings.timeout, no_retry=True)
+            # 禁跟随重定向：目标若把 payload 里的 OOB 地址反射进 Location，
+            # 扫描器自身跟随 302 会主动请求它，自产回调并被 token 命中 → 误判实锤。
+            await async_get(attack_url, session=self.session, timeout=settings.timeout, no_retry=True, allow_redirects=False)
         except Exception as exc:  # noqa: BLE001
             logger.debug(f"[OOBConfirm] 注入请求失败: {exc}")
 
