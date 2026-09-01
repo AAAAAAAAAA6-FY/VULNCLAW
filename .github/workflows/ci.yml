@@ -33,6 +33,15 @@ jobs:
       - name: Run tests
         run: pytest tests/ -q --tb=no --cov=src/vulnclaw --cov-report=term
 
+      - name: Detection benchmark gate (D7.4)
+        # 对照基线报告与剧本红线（检出率 recall）验证引擎不退化；
+        # 真实靶场报告可由 D7.1 docker-compose 拉起后由 scan.py 生成并替换 --report
+        run: |
+          python scripts/benchmark.py --mode eval \
+            --scenarios-dir scripts/benchmarks \
+            --report scripts/benchmarks/baseline_report.json \
+            --min-recall 0.8
+
       - name: Health check
         run: |
           echo "AI_MODEL_CONFIGS={\"zhipu\":{\"api_key\":\"test\"}}" > .env

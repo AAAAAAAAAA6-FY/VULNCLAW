@@ -1,0 +1,15 @@
+{
+  "engine": "framework_zero_day_engines._run_oob_scan",
+  "kwargs": {
+    "engine_name": "Log4Shell",
+    "url": "https://target.example/app",
+    "param": "p",
+    "parsed_query": "p=x",
+    "payload_templates": [],
+    "type_label": "Log4Shell",
+    "evidence_note": "log4shell fixture negative",
+    "recommendation": "升级 Log4j",
+    "oob_wait": 1
+  },
+  "expected": {"not_none": false}
+}

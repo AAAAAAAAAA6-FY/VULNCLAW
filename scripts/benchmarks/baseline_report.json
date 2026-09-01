@@ -1,0 +1,8 @@
+{
+  "findings": [
+    {"type": "XSS", "severity": "High", "target": "http://localhost:8081"},
+    {"type": "SQL Injection", "severity": "Critical", "target": "http://localhost:8081"},
+    {"type": "File Upload", "severity": "High", "target": "http://localhost:8081"},
+    {"type": "Info Disclosure", "severity": "Medium", "target": "http://localhost:8081"}
+  ]
+}

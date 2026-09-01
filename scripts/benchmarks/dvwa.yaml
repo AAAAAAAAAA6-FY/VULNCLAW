@@ -1,0 +1,8 @@
+# D7.2 检出率基准剧本：DVWA 靶场期望检出项
+# 由 benchmark.py --mode eval 消费，与扫描报告比对计算 recall
+- name: dvwa
+  target: http://localhost:8081
+  expected_vulns:
+    - XSS
+    - SQL Injection
+    - File Upload
