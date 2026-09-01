@@ -1471,6 +1471,99 @@ class GraphQLEngine(BaseEngine):
             pass
         return None
 
+    async def test_suggestions_leak(
+        self,
+        endpoint: str,
+        session,
+    ) -> Optional[Dict]:
+        """A5-2：字段建议泄漏（suggestions）——未知字段报错若回显 suggestions / Did you mean，
+        可辅助攻击者枚举 Schema，属信息泄露。"""
+        query = "query { nonexistentfieldzzz }"
+        try:
+            resp = await async_post(endpoint, json={"query": query}, session=session, timeout=10)
+            if isinstance(resp, tuple):
+                status, text = resp[0], resp[1]
+            else:
+                status, text = resp.status, await resp.text()
+            if status != 200 or not isinstance(text, str):
+                return None
+            data = json.loads(text)
+            for err in (data.get("errors") or []):
+                suggestions = (err.get("extensions") or {}).get("suggestions")
+                message = str(err.get("message", ""))
+                if suggestions:
+                    return {
+                        'url': endpoint,
+                        'type': 'GraphQL 字段建议泄漏(suggestions)',
+                        'severity': 'Low',
+                        'ai_verdict': '中',
+                        'confidence': 'medium',
+                        'evidence': f'未知字段报错回显 suggestions: {suggestions[:5]} —— 可辅助枚举 Schema',
+                        'recommendation': '关闭 GraphQL 错误中的字段建议（禁止回显 suggestions/Did you mean）',
+                    }
+                if 'did you mean' in message.lower():
+                    return {
+                        'url': endpoint,
+                        'type': 'GraphQL 字段建议泄漏(suggestions)',
+                        'severity': 'Low',
+                        'ai_verdict': '中',
+                        'confidence': 'low',
+                        'evidence': f'未知字段报错包含字段建议提示: {message[:120]}',
+                        'recommendation': '关闭 GraphQL 错误中的字段建议（禁止回显 suggestions/Did you mean）',
+                    }
+        except Exception:
+            pass
+        return None
+
+    async def test_mutation_idor(
+        self,
+        endpoint: str,
+        session,
+        introspection_result: Dict = None,
+    ) -> Optional[Dict]:
+        """A5-4：alias-based mutation 滥用面检测。仅当内省暴露 update/create/delete 类 mutation 字段时，
+        尝试单次请求内用两个 alias 复用同一 mutation（不同标量参数，非破坏性——无效参数在执行前被校验拒绝），
+        若两者均被返回且无错误，说明存在单请求批量变更/限流绕过面，需人工确认授权。"""
+        if not introspection_result or not introspection_result.get('enabled'):
+            return None
+        mutation_fields = introspection_result.get('mutation_fields') or []
+        target = next((f for f in mutation_fields
+                       if any(k in f.lower() for k in ('update', 'create', 'delete', 'add', 'remove', 'set'))),
+                      None)
+        if not target:
+            return None
+        query = (
+            "mutation {"
+            f" a: {target}(dummy: 1) {{ __typename }}"
+            f" b: {target}(dummy: 2) {{ __typename }}"
+            " }"
+        )
+        try:
+            resp = await async_post(endpoint, json={"query": query}, session=session, timeout=10)
+            if isinstance(resp, tuple):
+                status, text = resp[0], resp[1]
+            else:
+                status, text = resp.status, await resp.text()
+            if status != 200 or not isinstance(text, str):
+                return None
+            data = json.loads(text)
+            if 'errors' in data:
+                return None
+            mut = data.get('data', {}).get(target)
+            if isinstance(mut, dict) and 'a' in mut and 'b' in mut:
+                return {
+                    'url': endpoint,
+                    'type': 'GraphQL alias 批量变更(越权/限流绕过面)',
+                    'severity': 'Low',
+                    'ai_verdict': '中',
+                    'confidence': 'low',
+                    'evidence': f'单次请求内两个 alias 复用 mutation `{target}` 均被执行，存在批量操作/限流绕过面，需人工确认授权',
+                    'recommendation': '对 mutation 做单请求操作数限制与逐操作授权校验',
+                }
+        except Exception:
+            pass
+        return None
+
     async def scan(
         self,
         target: str,
@@ -1520,6 +1613,14 @@ class GraphQLEngine(BaseEngine):
                     findings.append(result)
 
             result = await self.test_deep_nesting(endpoint, session)
+            if result:
+                findings.append(result)
+
+            result = await self.test_suggestions_leak(endpoint, session)
+            if result:
+                findings.append(result)
+
+            result = await self.test_mutation_idor(endpoint, session, introspection)
             if result:
                 findings.append(result)
 

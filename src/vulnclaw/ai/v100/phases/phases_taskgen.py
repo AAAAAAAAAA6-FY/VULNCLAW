@@ -315,7 +315,7 @@ async def _generate_tasks(self):
     global_engines = [
         "api_version_diff", "request_smuggling", "http2_ws",
         "cache_poison", "info_leak", "mobile_api",
-        "websocket_security", "api_version",
+        "websocket_security", "api_version", "graphql",
     ]
     for engine_name in global_engines:
         # 修复：info_leak 扫描路径数提升至 150
