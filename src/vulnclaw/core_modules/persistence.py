@@ -400,6 +400,20 @@ class ScanState:
         data = self.load_latest_checkpoint()
         return data.get('pending_stages', [])
 
+    # ===== A4.6 断点续扫 =====
+    def resume(self) -> tuple:
+        """返回 (should_resume, checkpoint)。
+
+        若检查点不存在/过期/损坏或无待处理任务，则 should_resume=False；
+        否则 True，调用方据此跳过已完成阶段、恢复 pending_urls/stages。
+        """
+        ckpt = self.load_latest_checkpoint()
+        if not ckpt:
+            return (False, {})
+        if not (ckpt.get('pending_urls') or ckpt.get('pending_stages')):
+            return (False, ckpt)
+        return (True, ckpt)
+
 
 class IncrementalSaver:
     """增量数据保存器 - 瓶颈5版：合并写入 & 攒批落盘
@@ -522,6 +536,19 @@ class IncrementalSaver:
     def get_all(self) -> Dict:
         self._load_index()
         return self._index.copy()
+
+    # ===== A3.2 目标画像持久化 =====
+    async def save_target_profile(self, target: str, profile: Dict) -> None:
+        """持久化目标画像（指纹/资产/上次结论），复用 save_partial 增量合并。"""
+        key = f"target_profile::{target}"
+        await self.save_partial(key, {"profile": profile, "updated_at": time.time()}, merge=True)
+
+    def load_target_profile(self, target: str) -> Optional[Dict]:
+        """加载目标画像；无则返回 None。"""
+        data = self.get_partial(f"target_profile::{target}")
+        if isinstance(data, dict) and "profile" in data:
+            return data["profile"]
+        return None
 
     async def clear(self):
         async with self._write_lock:
