@@ -142,19 +142,19 @@ class AsyncExecutor:
                 try:
                     child.terminate()
                 except psutil.NoSuchProcess:
-                    pass
+                    logger.debug("suppressed exception (core audit)")
             try:
                 parent.terminate()
             except psutil.NoSuchProcess:
-                pass
+                logger.debug("suppressed exception (core audit)")
             gone, alive = psutil.wait_procs(children + [parent], timeout=3)
             for p in alive:
                 try:
                     p.kill()
                 except psutil.NoSuchProcess:
-                    pass
+                    logger.debug("suppressed exception (core audit)")
         except psutil.NoSuchProcess:
-            pass
+            logger.debug("suppressed exception (core audit)")
         except Exception as e:
             logger.warning(f"清理进程树失败: {e}")
         # Windows 回退：taskkill 同步调用（保持在同步函数内，避免阻塞事件循环）
@@ -163,13 +163,13 @@ class AsyncExecutor:
                 subprocess.run(['taskkill', '/F', '/T', '/PID', str(proc.pid)],
                                capture_output=True, timeout=5)
             except BaseException:
-                pass
+                logger.debug("suppressed exception (core audit)")
         else:
             try:
                 subprocess.run(['kill', '-9', '-{}'.format(proc.pid)],
                                capture_output=True, timeout=5)
             except BaseException:
-                pass
+                logger.debug("suppressed exception (core audit)")
 
     async def _kill_process_tree(self, proc):
         """异步入口：将同步实现放到线程池执行，避免阻塞事件循环"""

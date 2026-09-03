@@ -388,6 +388,271 @@ class PrometheusMetricsExposureEngine(BaseEngine):
         return None
 
 
+class JsLibraryCveEngine(BaseEngine):
+    """前端 JS 依赖版本识别与已知漏洞匹配（CWE-1104 使用有漏洞组件）
+
+    从首页 HTML / 脚本引用中提取前端库名与版本号，
+    与内置已知漏洞版本区间比对，命中即报组件漏洞。
+    """
+
+    name = "js_library_cve"
+    description = "前端 JS 库版本识别与已知 CVE 匹配（组件漏洞）"
+
+    # (库名, 版本提取正则)
+    LIBRARY_PATTERNS = (
+        ("jQuery", r"jquery[.-](\d+\.\d+(?:\.\d+)?)"),
+        ("jQuery UI", r"jquery[-.]ui[.-](\d+\.\d+(?:\.\d+)?)"),
+        ("React", r"react(?:\.production|\.development)?[.-](\d+\.\d+(?:\.\d+)?)"),
+        ("Vue", r"vue(?:\.runtime|\.min)?[.-](\d+\.\d+(?:\.\d+)?)"),
+        ("AngularJS", r"angular(?:\.min)?[.-](\d+\.\d+(?:\.\d+)?)"),
+        ("Bootstrap", r"bootstrap(?:\.min)?[.-](\d+\.\d+(?:\.\d+)?)"),
+        ("lodash", r"lodash(?:\.min)?[.-](\d+\.\d+(?:\.\d+)?)"),
+        ("moment", r"moment(?:\.min)?[.-](\d+\.\d+(?:\.\d+)?)"),
+        ("Handlebars", r"handlebars(?:\.min)?[.-](\d+\.\d+(?:\.\d+)?)"),
+        ("D3", r"d3(?:\.min)?[.-](\d+\.\d+(?:\.\d+)?)"),
+    )
+
+    # (库名, 受影响最低版本, 受影响最高版本, CVE, 严重度, 风险说明)
+    KNOWN_VULNERABLE_RANGES = (
+        ("jQuery", (1, 0, 0), (3, 5, 0), "CVE-2020-11022 / CVE-2020-11023", "Medium",
+         "html() 等方法处理不可信 HTML 时可导致 XSS"),
+        ("jQuery UI", (1, 10, 0), (1, 12, 1), "CVE-2021-41184", "Low",
+         "对话框 title 选项未转义导致 XSS"),
+        ("lodash", (0, 0, 0), (4, 17, 20), "CVE-2021-23337", "High",
+         "template 处理不可信输入可导致命令注入"),
+        ("moment", (0, 0, 0), (2, 29, 1), "CVE-2022-31129", "Medium",
+         "路径遍历与 ReDoS 风险"),
+        ("Handlebars", (0, 0, 0), (4, 7, 6), "CVE-2021-23369", "High",
+         "模板编译过程可被利用执行任意代码（RCE）"),
+        ("AngularJS", (1, 0, 0), (1, 8, 2), "CVE-2024-21490", "Medium",
+         "$sanitize 正则绕过导致 XSS"),
+        ("Bootstrap", (0, 0, 0), (4, 1, 2), "CVE-2019-8331", "Low",
+         "tooltip/popover 的 data 属性可导致 XSS"),
+    )
+
+    async def check(
+        self,
+        url: str, param: str, normal_resp: Tuple[int, str, Dict], parsed_query: str, session, **kwargs
+    ) -> Optional[Dict]:
+        return None
+
+    async def scan(self, target: str, session, **kwargs) -> List[Dict]:
+        from vulnclaw.config.settings import settings as _st
+        if not _st.component_cve_check:
+            return []
+
+        """扫描首页引用的前端 JS 库，匹配已知漏洞版本。"""
+        findings: List[Dict] = []
+        try:
+            resp = await async_get(target, session=session, timeout=settings.timeout, no_retry=True)
+            if isinstance(resp, tuple):
+                status, text = resp[0], resp[1] or ""
+            else:
+                status, text = resp.status, (await resp.text()) or ""
+        except Exception:
+            return findings
+        if status != 200 or not text:
+            return findings
+
+        detected: Dict[str, str] = {}
+        for lib_name, pattern in self.LIBRARY_PATTERNS:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                detected[lib_name] = match.group(1)
+
+        if not detected:
+            return findings
+
+        logger.info(f"🔍 [JsLibCVE] 识别到前端库: {detected}")
+
+        for lib_name, version in detected.items():
+            parsed_version = self._parse_version(version)
+            if not parsed_version:
+                continue
+            for (name, low, high, cve, severity, risk) in self.KNOWN_VULNERABLE_RANGES:
+                if name != lib_name:
+                    continue
+                if low <= parsed_version <= high:
+                    findings.append({
+                        'url': target,
+                        'parameter': '',
+                        'type': f'前端组件漏洞：{lib_name} {version}',
+                        'severity': severity,
+                        'ai_verdict': '高',
+                        'confidence': 'medium',
+                        'evidence': (
+                            f'页面引用 {lib_name} {version}，落在 {cve} 受影响版本区间 '
+                            f'[{self._fmt(low)} - {self._fmt(high)}]，{risk}'
+                        ),
+                        'recommendation': f'将 {lib_name} 升级到 {self._fmt(high)} 之后的安全版本',
+                        'remediation': f'升级 {lib_name} 至不受影响版本，并锁定依赖版本（SCA 持续监控）',
+                        'method': 'GET',
+                        'cvss': 7.5 if severity == 'High' else (5.4 if severity == 'Medium' else 3.7),
+                    })
+                    break
+
+        logger.info(f"   ✅ JsLibCVE 完成，发现 {len(findings)} 个问题")
+        return findings
+
+    @staticmethod
+    def _parse_version(version: str):
+        try:
+            parts = [int(p) for p in str(version).split(".")[:3]]
+            while len(parts) < 3:
+                parts.append(0)
+            return tuple(parts[:3])
+        except Exception:
+            return None
+
+    @staticmethod
+    def _fmt(version) -> str:
+        return ".".join(str(p) for p in version)
+
+
+
+
+# ============================================================
+# BackendComponentFingerprintEngine（B8：后端组件指纹 + 精简 CVE 匹配）
+# 从响应头(Server/X-Powered-By)与 HTML 中的框架特征识别后端组件版本，
+# 命中内置"过时/高危版本区间"表即报组件漏洞（不依赖 nuclei，闭环自足）。
+# ============================================================
+class BackendComponentFingerprintEngine(BaseEngine):
+    """后端组件版本指纹与已知 CVE 匹配（CWE-1104 有漏洞组件）。
+
+    数据来源：
+    1. HTTP 响应头 Server / X-Powered-By / Via
+    2. HTML 中的生成器 meta 标签（meta name=generator）
+    3. 常见框架暴露的特征串（如 WordPress /wp-content、Express、Django 错误页）
+
+    仅当解析出版本号且落在精简映射表内才报，未版本化不报（低误报）。
+    """
+
+    name = "backend_component_cve"
+    description = "后端组件版本指纹与已知 CVE 匹配（CWE-1104）"
+
+    # (组件名, 版本正则(作用于 headers/html), CVE, 受影响最低版本, 受影响最高版本, 严重度, 说明)
+    BACKEND_RULES = (
+        ("Apache", r"Apache/(\d+\.\d+(?:\.\d+)?)", "CVE-2021-41773 / CVE-2021-42013",
+         (2, 4, 49), (2, 4, 50), "Critical", "Apache 2.4.49/50 路径穿越与 RCE"),
+        ("Apache", r"Apache/(\d+\.\d+(?:\.\d+)?)", "CVE-2017-15715",
+         (2, 4, 0), (2, 4, 34), "Medium", "换行解析差异导致文件上传绕过"),
+        ("Nginx", r"nginx/(\d+\.\d+(?:\.\d+)?)", "CVE-2021-23017",
+         (0, 6, 18), (1, 20, 0), "High", "DNS 响应处理内存损坏 RCE"),
+        ("PHP", r"PHP/(\d+\.\d+(?:\.\d+)?)", "CVE-2019-11043",
+         (7, 1, 0), (7, 1, 28), "High", "PHP-FPM + 特定配置远程代码执行"),
+        ("ASP.NET", r"ASP\.NET/?(\d+\.\d+(?:\.\d+)?)?", "CVE-2022-21986",
+         (4, 0, 0), (4, 8, 0), "Medium", "ASP.NET 凭据泄露相关加固问题"),
+        ("OpenSSL", r"OpenSSL/(\d+\.\d+(?:\.\d+)?)", "CVE-2014-3566 / CVE-2016-6309",
+         (1, 0, 1), (1, 0, 2), "High", "历史 SSL/TLS 已知漏洞"),
+        ("Jetty", r"Jetty/(\d+\.\d+\.\d+)", "CVE-2021-28164",
+         (9, 4, 0), (9, 4, 37), "High", "Jetty 路径信息泄露"),
+    )
+    # HTML generator/meta 特征补充（组件 -> 正则）
+    HTML_GENERATOR_RE = re.compile(
+        r'<meta[^>]+name=["'']generator["''][^>]+content=["'']([^"'']+)',
+        re.I,
+    )
+    # 若无版本但组件过度暴露本身即问题（仅框架指纹，属于 Info 提示，非 CVE）
+    FRAMEWORK_FINGERPRINTS = (
+        ("WordPress", r"/wp-content/|wp-includes"),
+        ("Express", r"express global|powered by express"),
+        ("Django", r"django.core|csrftoken|django/"),
+    )
+
+    async def scan(self, target: str, session, **kwargs) -> List[Dict]:
+        from vulnclaw.config.settings import settings as _st
+        if not _st.component_cve_check:
+            return []
+
+        findings: List[Dict] = []
+        headers: Dict = {}
+        body = ""
+        try:
+            resp = await async_get(target, session=session, timeout=settings.timeout, no_retry=True)
+            if isinstance(resp, tuple):
+                status, body, headers = resp[0], resp[1] or "", resp[2] or {}
+            else:
+                status, body = resp.status, (await resp.text()) or ""
+                headers = dict(resp.headers)
+        except Exception:
+            return findings
+        if status not in (200, 301, 302, 403, 500):
+            return findings
+
+        # 收集要匹配的文本（头 + 体）
+        header_text = " ".join(f"{k}: {v}" for k, v in (headers or {}).items())
+        haystack = header_text + "\n" + body
+
+        # 1) 后端组件版本 CVE 匹配（头）
+        for name, pat, cve, low, high, sev, risk in self.BACKEND_RULES:
+            m = re.search(pat, haystack, re.I)
+            if not m or len(m.groups()) < 1:
+                continue
+            ver = m.group(1)
+            pv = self._parse_version(ver)
+            if not pv:
+                continue
+            if low <= pv <= high:
+                findings.append(self._mk(target, f"后端组件漏洞：{name} {ver}", sev, cve, risk, ver))
+                break  # 每组件只报最严重一条，避免重复
+
+        # 2) HTML generator meta（后端生成框架版本）
+        gm = self.HTML_GENERATOR_RE.search(body or "")
+        if gm:
+            meta_val = gm.group(1).strip()
+            # 尝试抽取其中的版本号
+            vm = re.search(r"(\d+\.\d+(?:\.\d+)?)", meta_val)
+            if vm:
+                findings.append(self._mk(
+                    target, f"后端框架指纹：{meta_val[:60]}", "Info",
+                    "", "", meta_val[:100]))
+            else:
+                findings.append(self._mk(
+                    target, f"生成器泄露：{meta_val[:80]}", "Info",
+                    "", "", meta_val[:100]))
+
+        # 3) 框架指纹（无版本，仅 Info 暴露提示）
+        for fname, fpat in self.FRAMEWORK_FINGERPRINTS:
+            if re.search(fpat, body or "", re.I):
+                findings.append(self._mk(
+                    target, f"后端框架指纹：{fname}", "Info", "", "", fname))
+                break
+
+        # 去重
+        seen = set()
+        uniq = []
+        for f in findings:
+            k = (f.get("type"), f.get("url"))
+            if k in seen:
+                continue
+            seen.add(k)
+            uniq.append(f)
+        return uniq
+
+    @staticmethod
+    def _parse_version(version: str):
+        try:
+            parts = [int(p) for p in str(version).split(".")[:3]]
+            while len(parts) < 3:
+                parts.append(0)
+            return tuple(parts[:3])
+        except Exception:
+            return None
+
+    def _mk(self, url: str, title: str, sev: str, cve: str, risk: str, ver: str) -> Dict:
+        return {
+            "url": url, "parameter": "", "type": title,
+            "severity": sev,
+            "ai_verdict": {"Critical": "严重", "High": "高", "Medium": "中", "Info": "信息"}.get(sev, "中"),
+            "confidence": "medium",
+            "evidence": f"指纹 {ver!r} 命中{'已知漏洞 ' + cve + (' —— ' + risk) if cve else '暴露面（无版本，仅提示）'}",
+            "recommendation": "升级受影响组件至安全版本，并移除/收紧 Server 与 generator 指纹暴露",
+        }
+
+    async def check(self, url, param, normal_resp, parsed_query, session, **kwargs) -> Optional[Dict]:
+        return None
+
+
 __all__ = [
     'BackupFileLeakEngine',
     'SwaggerApiDocEngine',
@@ -395,4 +660,6 @@ __all__ = [
     'RateLimitEngine',
     'VerbTamperingEngine',
     'PrometheusMetricsExposureEngine',
+    'JsLibraryCveEngine',
+    'BackendComponentFingerprintEngine',
 ]

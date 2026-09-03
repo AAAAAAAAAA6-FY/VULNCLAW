@@ -178,7 +178,7 @@ class ScanContext:
                         if isinstance(parsed, (dict, list)):
                             keys.update(self._flatten_keys(parsed, full_key, max_depth - 1, max_chars))
                     except BaseException:
-                        pass
+                        logger.debug("suppressed exception (core audit)")
         elif isinstance(obj, list):
             for i, item in enumerate(obj[:100]):
                 if isinstance(item, (dict, list)):
@@ -189,7 +189,7 @@ class ScanContext:
                         if isinstance(parsed, (dict, list)):
                             keys.update(self._flatten_keys(parsed, prefix, max_depth - 1, max_chars))
                     except BaseException:
-                        pass
+                        logger.debug("suppressed exception (core audit)")
         return keys
 
     async def find_anomalous_fields(self) -> List[Dict]:

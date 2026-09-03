@@ -43,7 +43,7 @@ class DotNetDeserializationEngine(BaseEngine):
             if pooled:
                 self.PAYLOADS = pooled
         except Exception:
-            pass
+            logger.debug("suppressed exception (engine audit)")
 
     # ---------------- 被动特征 ----------------
     DOTNET_INDICATORS: List[Tuple[str, str]] = [

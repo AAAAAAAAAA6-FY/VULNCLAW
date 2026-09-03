@@ -12,6 +12,8 @@ from typing import Dict, List, Optional
 from vulnclaw.core.logger import logger
 from vulnclaw.core.session_manager import get_session_manager
 from vulnclaw.ai.v100.batch_processor import BatchProcessor
+from vulnclaw.core.settings import settings
+from vulnclaw.core.utils import cap
 
 # 性能优化1：静态资源扩展名（源头丢弃，不进入引擎检测流程）
 STATIC_RESOURCE_EXTENSIONS = frozenset({
@@ -37,6 +39,25 @@ def _is_static_resource_url(url: str) -> bool:
     return any(path.endswith(ext) for ext in STATIC_RESOURCE_EXTENSIONS)
 
 
+# 凭据类参数提示词：命中即视为鉴权/密钥材料，不应进入通用注入模糊循环
+# （fuzzing API key / token 值做 SQLi/XSS 收益极低且易触发 WAF；token 类
+# 专用引擎仍可在其自身逻辑里覆盖必要场景）。
+CREDENTIAL_PARAM_HINTS = (
+    "password", "passwd", "pwd", "secret", "token", "apikey", "api_key",
+    "api-key", "authorization", "auth_token", "auth-token", "cookie",
+    "session", "credential", "private_key", "access_key", "accesskey",
+    "client_secret", "bearer", "jwt", "csrf_token", "xsrf_token",
+)
+
+
+def _is_credential_param(param: str) -> bool:
+    """判断参数名是否属于凭据/密钥类，应跳过通用注入模糊。"""
+    if not param:
+        return False
+    p = param.lower()
+    return any(hint in p for hint in CREDENTIAL_PARAM_HINTS)
+
+
 async def _scan_idor(self):
     try:
         from vulnclaw.modules.vuln_scanner import scan_idor
@@ -50,7 +71,7 @@ async def _scan_idor(self):
         if not all_params:
             all_params = ["id", "user", "page", "file"]
         idor_findings = []
-        for param in all_params[:10]:
+        for param in cap(all_params, settings.max_idor_params):
             test_url = self.target
             if '?' not in test_url:
                 test_url += f"?{param}=1"
@@ -60,7 +81,7 @@ async def _scan_idor(self):
                 results = await scan_idor(test_url, session_mgr, roles)
                 idor_findings.extend(results)
             except Exception:
-                pass
+                logger.debug("suppressed exception (core audit)")
         for f in idor_findings:
             self._add_finding(f)
             self._idor_findings += 1
@@ -94,7 +115,7 @@ async def _generate_tasks(self):
     ))
     if not all_params:
         all_params = ["id", "page", "user", "file", "q", "s", "cat", "product", "order", "view"]
-    all_params = all_params[:30]
+    all_params = cap(all_params, settings.max_url_params)
     tech_stack = self._recon_brief.get("tech_stack", [])
     tech_lower = ' '.join(tech_stack).lower()
     engine_priority = {
@@ -151,7 +172,7 @@ async def _generate_tasks(self):
         "admin_console_exposure": 6 if any(t in tech_lower for t in ["java","tomcat","jboss","weblogic","jenkins"]) else 4,
         "backup_file_leak": 6,
         "swagger_api_doc": 7 if "/api" in str(self._recon_brief.get('apis', [])) else 5,
-        "graphql_introspection": 6 if "/graphql" in str(self._recon_brief.get('apis', [])) else 4,
+        # 合并去重: graphql_introspection 为 graphql 引擎端点级内省探测的子集, 由 graphql 统一承接(见 net_engines.py GraphQLEngine.scan)
         "prometheus_metrics": 6 if ("spring" in tech_lower or "go" in tech_lower) else 4,
         "rate_limit": 5,
         "verb_tampering": 5
@@ -161,7 +182,7 @@ async def _generate_tasks(self):
     intel_hints = [str(h).lower() for h in (intel.get("service_hints") or [])]
     intel_ports = set(intel.get("ports") or [])
     intel_vuln_count = len(intel.get("vulns") or [])
-    if intel_hints or intel_ports:
+    if getattr(settings, "tci_adaptive_planning", True) and (intel_hints or intel_ports):
         def _bump(engine: str, delta: int, cap: int = 10) -> None:
             engine_priority[engine] = min(cap, engine_priority.get(engine, 5) + delta)
         if intel_ports & {3306, 5432, 1433, 1521, 27017} or any(
@@ -206,10 +227,18 @@ async def _generate_tasks(self):
     # 现改为 top-3 核心引擎 + 按参数序号轮换 1 个次优引擎（rotation），
     # 30 个参数即可让全部 32 类参数级引擎都获得至少一次执行机会。
     rotation_offset = 0
+    self._rotation_offset = 0
+    # B: 业务流建模/竞争条件总开关——关闭时从引擎池移除 business_logic/race_condition
+    if not getattr(settings, "business_flow_modeling", True):
+        engine_priority.pop("business_logic", None)
+        engine_priority.pop("race_condition", None)
     for param in all_params:
         skip, reason = self.local_filter.should_skip(self.target, param, "", 0)
         if skip:
             logger.debug(f"   [skip] 跳过参数 {param}: {reason}")
+            continue
+        if _is_credential_param(param):
+            logger.debug(f"   [skip] 凭据类参数不进通用注入队列: {param}")
             continue
         is_business = any(kw in param.lower() for kw in business_param_keywords)
         engine_scores = []
@@ -217,12 +246,13 @@ async def _generate_tasks(self):
             priority = base_priority
             if is_business and engine_name == "business_logic":
                 priority = 10
-            if 'java' in tech_lower and engine_name in ['el_injection', 'xxe']:
-                priority += 2
-            if 'php' in tech_lower and engine_name in ['lfi', 'ssti']:
-                priority += 2
-            if 'python' in tech_lower and engine_name == 'ssti':
-                priority += 2
+            if getattr(settings, "tci_adaptive_planning", True):
+                if 'java' in tech_lower and engine_name in ['el_injection', 'xxe']:
+                    priority += 2
+                if 'php' in tech_lower and engine_name in ['lfi', 'ssti']:
+                    priority += 2
+                if 'python' in tech_lower and engine_name == 'ssti':
+                    priority += 2
             engine_scores.append((engine_name, priority))
         engine_scores.sort(key=lambda x: x[1], reverse=True)
         top_engines = engine_scores[:3]
@@ -276,7 +306,7 @@ async def _generate_tasks(self):
         logger.info(f"📦 [Batch] 合并 {len(batch_pending)} 个单引擎任务 → {len(merged)} 个（节省 {saved_n} 次 AI 调用）")
         logger.info(f"   ✅生成 {tasks_added} 个参数级派生任务")
     static_skipped = 0
-    for api in self._recon_brief.get("apis", [])[:10]:
+    for api in cap(self._recon_brief.get("apis", []), settings.max_api_endpoints):
         if _is_static_resource_url(api):
             static_skipped += 1
             continue
@@ -293,22 +323,90 @@ async def _generate_tasks(self):
             }
             await self.task_queue.add_task(task_data, 8)
             tasks_added += 1
-    for js_api in self._recon_brief.get("js_endpoints", [])[:10]:
-        if isinstance(js_api, str) and js_api.startswith('/'):
+    for js_api in cap(self._recon_brief.get("js_endpoints", []), settings.max_js_endpoints):
+        if not isinstance(js_api, str) or not js_api:
+            continue
+        if js_api.startswith('http'):
+            full_api = js_api
+        elif js_api.startswith('/'):
             full_api = self.target.rstrip('/') + js_api
-            if _is_static_resource_url(full_api):
-                static_skipped += 1
+        else:
+            continue
+        if _is_static_resource_url(full_api):
+            static_skipped += 1
+            continue
+        # 从端点自身 query 派生参数（修复 /xss?s=hello 的 s 永不被探测）；无 query 退化为 id
+        _jq = full_api.split('?', 1)[1] if '?' in full_api else ''
+        _jparams = [p.split('=')[0] for p in _jq.split('&') if '=' in p] or ["id"]
+        _jl = full_api.lower()
+        if '/api' in _jl or '/graphql' in _jl:
+            _jengine = "sqli"
+        elif re.search(r'/sqli|/sql|/inject', _jl):
+            _jengine = "sqli"
+        elif re.search(r'/xss|csp|/reflect', _jl):
+            _jengine = "xss"
+        else:
+            _jengine = "xss"
+        for _jp in cap(_jparams, settings.max_test_params_per_endpoint):
+            if _is_credential_param(_jp):
                 continue
             task_data = {
                 "type": "api_check",
-                "engine": "sqli" if 'api' in js_api else "xss",
-                "target": full_api,
-                "param": "id",
+                "engine": _jengine,
+                "target": full_api.split('?')[0],
+                "param": _jp,
                 "priority": 7,
                 "payload_limit": 8,
                 "created_at": time.time()
             }
             await self.task_queue.add_task(task_data, 7)
+            tasks_added += 1
+    # B: 同源链接爬虫发现的端点 → 喂进引擎循环（target=端点URL，param=端点自带参数）
+    _crawled = self._recon_brief.get("crawled_endpoints", []) or []
+    for _item in cap(_crawled, settings.max_crawl_endpoints):
+        _ep_url = _item.get("url") if isinstance(_item, dict) else _item
+        _ep_params = _item.get("params") if isinstance(_item, dict) else None
+        if not _ep_url or _is_static_resource_url(_ep_url):
+            continue
+        _etarget = _ep_url.split('?')[0]  # 去掉 query，由 param 注入（避免 query 重复）
+        _ep_params = [p for p in (_ep_params or []) if p and isinstance(p, str)]
+        _test_params = cap(_ep_params, settings.max_test_params_per_endpoint) or ["id"]
+        _el = _etarget.lower()
+        _hint = []
+        if re.search(r'/sqli|/sql|/inject', _el):
+            _hint.append("sqli")
+        if re.search(r'/xss|csp|/reflect', _el):
+            _hint.append("xss")
+        if re.search(r'/upload|/file', _el):
+            _hint.append("file_upload")
+        if re.search(r'/lfi|/include|/path', _el):
+            _hint.append("lfi")
+        for _p in _test_params:
+            _skip, _reason = self.local_filter.should_skip(_etarget, _p, "", 0)
+            if _skip:
+                continue
+            if _is_credential_param(_p):
+                continue
+            _es = sorted(engine_priority.items(), key=lambda x: x[1], reverse=True)
+            _sel = [e for e, _ in cap(_es, settings.max_engines_per_param)]
+            for _h in _hint:
+                if _h not in _sel and _h in engine_priority:
+                    _sel.append(_h)
+            _remain = [e for e, _ in _es[3:] if e not in _sel]
+            if _remain:
+                _sel.append(_remain[self._rotation_offset % len(_remain)])
+                self._rotation_offset += 1
+            task_data = {
+                "type": "engine_bundle",
+                "engines": _sel,
+                "target": _etarget,
+                "param": _p,
+                "priority": engine_priority.get(_sel[0], 8),
+                "payload_limit": 10,
+                "created_at": time.time(),
+                "source": "crawl",
+            }
+            await self.task_queue.add_task(task_data, task_data["priority"])
             tasks_added += 1
     if static_skipped:
         logger.info(f"   🗑️ [静态资源过滤] 源头丢弃 {static_skipped} 个静态资源 URL")
@@ -316,6 +414,10 @@ async def _generate_tasks(self):
         "api_version_diff", "request_smuggling", "http2_ws",
         "cache_poison", "info_leak", "mobile_api",
         "websocket_security", "api_version", "graphql",
+        "tls_security", "dns_security", "js_library_cve",
+        "mass_assignment", "weak_credential",
+        "password_reset", "cloud_container_exposure", "backend_component_cve",
+        "open_redirect", "cors", "idor", "jwt", "oauth", "deserialization",
     ]
     for engine_name in global_engines:
         # 修复：info_leak 扫描路径数提升至 150

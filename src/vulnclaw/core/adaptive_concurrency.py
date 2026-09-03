@@ -29,10 +29,16 @@ class AdaptiveConcurrency:
 
     def __init__(
         self,
-        initial: int = 3,
-        min_val: int = 1,
-        max_val: int = 20,
+        initial: Optional[int] = None,
+        min_val: Optional[int] = None,
+        max_val: Optional[int] = None,
     ):
+        if initial is None:
+            initial = settings.adaptive_concurrency_initial
+        if min_val is None:
+            min_val = settings.adaptive_concurrency_min
+        if max_val is None:
+            max_val = settings.adaptive_concurrency_max
         self.initial = initial
         self.min_val = min_val
         self.max_val = max_val

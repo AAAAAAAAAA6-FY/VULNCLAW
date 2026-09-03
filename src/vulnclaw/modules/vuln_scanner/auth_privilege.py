@@ -167,7 +167,7 @@ class IDORScanner:
                 mutations.append("0")
                 mutations.append("-1")
             except BaseException:
-                pass
+                logger.debug("suppressed exception (core audit)")
 
         elif re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', original_id, re.I):
             mutations.append(str(uuid.uuid4()))
@@ -196,7 +196,7 @@ class IDORScanner:
                     if new_encoded != original_id:
                         mutations.append(new_encoded)
             except BaseException:
-                pass
+                logger.debug("suppressed exception (core audit)")
 
         elif re.match(r'^[0-9a-f]{32,64}$', original_id, re.I):
             if original_id[-1].isdigit():
@@ -229,7 +229,7 @@ class IDORScanner:
                     except BaseException:
                         continue
             except BaseException:
-                pass
+                logger.debug("suppressed exception (core audit)")
 
         mutations.append('null')
         mutations.append('undefined')
@@ -1000,7 +1000,7 @@ async def _smart_discover_login_pages(target_url: str, session, timeout: int = 1
                     })
                     logger.debug(f"发现登录入口: {test_url}")
         except BaseException:
-            pass
+            logger.debug("suppressed exception (core audit)")
 
     # 方法2：从首页提取链接（AI 辅助）
     try:
@@ -1030,7 +1030,7 @@ async def _smart_discover_login_pages(target_url: str, session, timeout: int = 1
                                         'status': status2
                                     })
                             except BaseException:
-                                pass
+                                logger.debug("suppressed exception (core audit)")
     except Exception as e:
         logger.debug(f"首页链接提取失败: {e}")
 

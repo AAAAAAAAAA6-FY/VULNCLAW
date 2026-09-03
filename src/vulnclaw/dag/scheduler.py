@@ -89,7 +89,7 @@ class DAGScheduler:
                 try:
                     await self._dashboard_task
                 except asyncio.CancelledError:
-                    pass
+                    logger.debug("suppressed exception (core audit)")
 
     async def _run_loop(self) -> Dict[str, Any]:
         pending: Dict[str, asyncio.Task] = {}
@@ -121,7 +121,7 @@ class DAGScheduler:
                         try:
                             task.result()
                         except Exception:
-                            pass
+                            logger.debug("suppressed exception (core audit)")
                         break
 
             await asyncio.sleep(0.01)
@@ -251,7 +251,7 @@ class DAGScheduler:
                     try:
                         await self._context.record_node_retry(node_id)
                     except Exception:
-                        pass
+                        logger.debug("suppressed exception (core audit)")
             if node.status == NodeStatus.FAILED:
                 self._results[node_id] = None
                 # P1-3: 超限节点写入死信队列 _runtime_cache/dag_dead_letter/{scan_id}.jsonl

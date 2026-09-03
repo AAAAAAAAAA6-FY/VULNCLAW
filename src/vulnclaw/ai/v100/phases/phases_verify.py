@@ -78,6 +78,42 @@ def _local_rule_verify(self, vuln: Dict) -> str:
         if "<script" in ev or "onerror" in ev:
             return "xss_echo_marker"
     return ""
+def _technical_signal_present(vuln: Dict) -> bool:
+    """判断 finding 是否携带引擎侧技术证据，避免被 LLM 一票否决后静默丢弃。
+
+    命中任一即视为'有技术依据'，在 LLM 未确认时仍保留为待人工复核，
+    而非直接丢弃。仅看结构化标志与 evidence 关键词，零网络成本。
+    """
+    if vuln.get("file_read") or vuln.get("dir_listing") or vuln.get("base64_encoded"):
+        return True
+    if vuln.get("has_response_diff") or vuln.get("echo_feature") is True:
+        return True
+    if vuln.get("technical_confirmed") or vuln.get("oob_confirmed"):
+        return True
+    vuln_type = str(vuln.get("type", "")).lower()
+    evl = str(vuln.get("evidence", "")).lower()
+    if "sql" in vuln_type or "注入" in vuln_type:
+        if any(k in evl for k in ("sql", "syntax", "mysql", "postgres", "sqlite",
+                                  "odbc", "ora-", "near \"", "sqlstate", "unclosed", "error")):
+            return True
+    if "xss" in vuln_type or "跨站" in vuln_type:
+        if any(k in evl for k in ("<script", "onerror", "alert(", "<img", "<svg")):
+            return True
+    if "lfi" in vuln_type or "path" in vuln_type or "文件" in vuln_type:
+        if any(k in evl for k in ("root:", "etc/passwd", "index of", "directory listing", "/bin/")):
+            return True
+    if any(k in vuln_type for k in ("cmdi", "command", "rce", "命令")):
+        if any(k in evl for k in ("uid=", "whoami", "root:", "id=", "bin/bash")):
+            return True
+    if "ssti" in vuln_type:
+        if any(k in evl for k in ("49", "777", "jinja", "{{", "freemarker", "gotcha")):
+            return True
+    if "ssrf" in vuln_type:
+        if any(k in evl for k in ("127.0.0.1", "localhost", "169.254", "metadata", "internal")):
+            return True
+    return False
+
+
 async def _verify_cross_batch(self, group: list) -> Optional[Dict[int, Dict]]:
     """优化7: 同 (url, param) 的 findings 合并为一次 AI 调用批量判定。
 
@@ -150,6 +186,37 @@ async def _verify_cross_batch(self, group: list) -> Optional[Dict[int, Dict]]:
                 "batch_reason": str(item.get("reason", ""))[:300],
             }
     return parsed or None
+
+
+def _downgrade_unconfirmed_verdict(vuln: Dict) -> Dict:
+    """降误报：反射型 XSS / 报错型 SQLi 缺少真实回显/响应证据时不判"真实漏洞"。
+
+    当 finding 的 ai_verdict 为"真实漏洞"，但 chain_info 显示
+    http_status 为空（未捕获到 HTTP 响应）或 echo_feature 为 False（payload 未回显）时，
+    引擎的"真实漏洞"判定缺乏技术证据，降级为待人工复核，避免启发式猜测被当作
+    已确认漏洞输出。仅作用于反射/报错类（盲注/时间盲注本就无回显，不降级）。
+    """
+    vt = str(vuln.get("type", "")).lower()
+    if not any(k in vt for k in ("xss", "反射", "跨站", "报错", "error", "回显")):
+        return vuln
+    verdict = str(vuln.get("ai_verdict", ""))
+    if "真实漏洞" not in verdict:
+        return vuln
+    ci = vuln.get("chain_info") or {}
+    if not isinstance(ci, dict):
+        return vuln
+    http_status = vuln.get("http_status", ci.get("http_status"))
+    echo = ci.get("echo_feature")
+    no_evidence = (http_status in (None, "", 0)) or (echo is False)
+    if no_evidence:
+        vuln["ai_verdict_original"] = verdict
+        vuln["ai_verdict"] = "待人工复核（无回显/无响应证据）"
+        vuln["confidence"] = "中（无回显证据，待人工复核）"
+        logger.info(
+            f"   ⬇️ 降级误报候选: {vuln.get('type', '?')} (参数: {vuln.get('parameter', '')}) "
+            f"— http_status={http_status}, echo_feature={echo}"
+        )
+    return vuln
 
 
 async def _verify_all_findings(self):
@@ -352,7 +419,7 @@ async def _verify_all_findings(self):
         if action == "skip_low":
             vuln['ai_verdict'] = '低优先级，已跳过验证'
             vuln['confidence'] = 'low'
-            self._add_finding(vuln)
+            self._add_finding(_downgrade_unconfirmed_verdict(vuln))
             logger.info(f"   ⏭️ 跳过低优先级验证： {vuln_type} (参数： {vuln_param})")
             continue
         if action == "bundle":
@@ -360,14 +427,14 @@ async def _verify_all_findings(self):
                 logger.debug(f"   ❌ Bundle 判定未确认： {vuln_type} (参数： {vuln_param})")
                 continue
             vuln["confidence"] = "high" if vuln.get("ai_verdict") == "真实漏洞" else "medium (rule fallback)"
-            self._add_finding(vuln)
+            self._add_finding(_downgrade_unconfirmed_verdict(vuln))
             verified_count += 1
             logger.info(f"   ✅ Bundle 保留结果： {vuln_type} (参数： {vuln_param})")
             continue
         if action == "skip_budget":
             vuln['ai_verdict'] = '待人工复核（AI验证预算已满）'
             vuln['confidence'] = '中'
-            self._add_finding(vuln)
+            self._add_finding(_downgrade_unconfirmed_verdict(vuln))
             logger.info(f"   ⏭️ 跳过验证（预算已满）： {vuln_type} (参数： {vuln_param})")
             continue
         outcome = result_by_index[idx]
@@ -397,16 +464,24 @@ async def _verify_all_findings(self):
                 vuln["confidence"] = "高"
                 vuln["votes"] = ai_result.get("votes", [])
                 vuln["burp_verified"] = burp_verified
-                self._add_finding(vuln)
+                self._add_finding(_downgrade_unconfirmed_verdict(vuln))
                 verified_count += 1
                 logger.info(f"   ✅ 确认漏洞： {vuln_type} (参数： {vuln_param})")
             else:
                 evidence = vuln.get('evidence', '')
                 if 'SQL' in vuln_type and ('error' in evidence.lower() or 'syntax' in evidence.lower()):
                     vuln['confidence'] = 'medium (rule fallback)'
-                    self._add_finding(vuln)
+                    self._add_finding(_downgrade_unconfirmed_verdict(vuln))
                     verified_count += 1
                     logger.warning(f"   ⚠️ AI判定非漏洞，但存在SQL错误特征，保留： {vuln_type}")
+                elif _technical_signal_present(vuln):
+                    # 防御性保留：引擎已产出结构化/响应证据（报错回显、响应差分、
+                    # XSS 回显等），不应被 LLM 一票否决而静默丢弃。保留为待人工复核。
+                    vuln["ai_verdict"] = "待人工复核（引擎证据充分，LLM未确认）"
+                    vuln["confidence"] = "中（引擎证据，待人工复核）"
+                    self._add_finding(_downgrade_unconfirmed_verdict(vuln))
+                    verified_count += 1
+                    logger.warning(f"   ⚠️ LLM未确认但引擎证据充分，保守保留待复核: {vuln_type}")
                 else:
                     logger.info(f"   [未确认] {vuln_type} (参数: {vuln_param})")
                     # 本地兜底：降级模式下未确认 != 非漏洞（LLM 投票不可信），
@@ -414,7 +489,7 @@ async def _verify_all_findings(self):
                     if ai_result.get("verification_method") == "local_fallback":
                         vuln["ai_verdict"] = "待人工复核（LLM降级，本地兜底未命中）"
                         vuln["confidence"] = "中（本地兜底保留）"
-                        self._add_finding(vuln)
+                        self._add_finding(_downgrade_unconfirmed_verdict(vuln))
                         verified_count += 1
                         logger.warning(f"   LLM降级且本地规则未命中，保守保留待复核: {vuln_type}")
         except asyncio.CancelledError:
@@ -423,7 +498,7 @@ async def _verify_all_findings(self):
             logger.error(f"   ❌ 验证异常： {e}")
             if vuln.get('ai_verdict') in ['高', '高（WAF绕过）']:
                 vuln['confidence'] = '中（验证异常兜底）'
-                self._add_finding(vuln)
+                self._add_finding(_downgrade_unconfirmed_verdict(vuln))
                 verified_count += 1
                 logger.warning(f"   ⚠️ AI验证失败，但置信度高，保留： {vuln_type}")
     logger.info(f"   Cross verification complete: {verified_count}/{total} confirmed ({MAX_AI_VERIFY} AI quota)")
@@ -594,4 +669,84 @@ async def _verify_with_burp_repeater(self, vuln: Dict) -> Dict:
     # Burp Repeater 功能暂不可用，直接返回未确认
     logger.debug("Burp Repeater 未实现，跳过验证")
     return {"confirmed": False}
-__all__ = ['_severity_verify_plan', '_should_upgrade_low_info', '_llm_degraded', '_local_rule_verify', '_verify_all_findings', '_verify_cross', '_poll_collaborator_callback', '_verify_with_burp_repeater']
+# ============================================================
+# C9 / C10: AI 后处理 —— LLM-as-Judge 去重 + 幻觉抑制
+# 这两个能力此前只有 settings 开关（llm_as_judge_dedup /
+# hallucination_suppression），从未被消费。此处接入验证后、出报告前的
+# 收尾链路（orchestrator 在 _verify_all_findings 之后调用）。
+# ============================================================
+_SEV_RANK = {"Critical": 5, "High": 4, "Medium": 3, "Low": 2, "Info": 1}
+
+
+async def llm_judge_dedup(orch, findings: list) -> list:
+    """C9: 同 type+url 且参数不同的多条 finding，用模型二次判定是否同一底层漏洞，
+    合并降噪（保留最高档位，证据合并；不丢弃漏洞信息）。"""
+    if not getattr(settings, "llm_as_judge_dedup", False):
+        return findings
+    if len(findings) < 2:
+        return findings
+    groups: dict = {}
+    for i, f in enumerate(findings):
+        groups.setdefault((f.get("type", ""), f.get("url", "")), []).append(i)
+    result = list(findings)
+    changed = False
+    for (ftype, furl), idxs in groups.items():
+        if len(idxs) < 2:
+            continue
+        if len({findings[i].get("parameter", "") for i in idxs}) < 2:
+            continue  # 参数相同已被 _add_finding 去重，跳过
+        try:
+            from vulnclaw.core.utils import clean_ai_json
+            summary = "\n".join(
+                f"[{i}] param={findings[i].get('parameter', '')} sev={findings[i].get('severity', '')} "
+                f"evidence={str(findings[i].get('evidence', ''))[:100]}"
+                for i in idxs)
+            prompt = ("以下多条漏洞类型与 URL 相同、仅参数不同，请判断是否为同一个底层漏洞的重复报告。"
+                      "若是，返回需保留的唯一条目下标 JSON 数组（如 [0]）；若不是同一漏洞返回 []。\n" + summary)
+            resp = await orch._ask_ai(prompt, compress=True, task_type="verify")
+            import json as _json
+            try:
+                keep = _json.loads(clean_ai_json(resp))
+            except Exception:
+                keep = []
+            if isinstance(keep, list) and keep:
+                keepset = {int(x) for x in keep if str(x).isdigit()}
+                drop = [i for i in idxs if i not in keepset]
+                if drop:
+                    base = findings[keepset.pop()] if keepset else findings[idxs[0]]
+                    base = dict(base)
+                    extras = " | ".join(str(findings[i].get("evidence", ""))[:200] for i in drop)
+                    if extras:
+                        base["evidence"] = (str(base.get("evidence", "")) + " [合并自同URL同类型报告] " + extras)[:2000]
+                    result[idxs[0]] = base
+                    for i in drop:
+                        result[i] = None
+                    changed = True
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[C9] 去重判定失败，保留全部: {e}")
+    if changed:
+        result = [f for f in result if f is not None]
+    return result
+
+
+def hallucination_suppress(orch, findings: list) -> list:
+    """C10: 幻觉抑制。丢弃被模型明确判定为'非漏洞/误报/幻觉'的 finding（清理 LLM
+    误报产生的噪音），但 Critical/High 一律保留以免漏报。"""
+    if not getattr(settings, "hallucination_suppression", False):
+        return findings
+    out = []
+    dropped = 0
+    for f in findings:
+        sev = f.get("severity", "Low")
+        verdict = str(f.get("ai_verdict", ""))
+        is_nonvuln = ("非漏洞" in verdict) or ("误报" in verdict) or ("幻觉" in verdict)
+        if is_nonvuln and sev not in ("Critical", "High"):
+            dropped += 1
+            continue
+        out.append(f)
+    if dropped:
+        logger.info(f"🧹 [C10] 幻觉抑制丢弃 {dropped} 条非漏洞/误报 finding")
+    return out
+
+
+__all__ = ['_severity_verify_plan', '_should_upgrade_low_info', '_llm_degraded', '_local_rule_verify', '_verify_all_findings', '_verify_cross', '_poll_collaborator_callback', '_verify_with_burp_repeater', 'llm_judge_dedup', 'hallucination_suppress']

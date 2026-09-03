@@ -158,7 +158,7 @@ async def update_nuclei_templates(timeout: int = 300) -> bool:
 
 async def run_nuclei_async(
     target: str,
-    severity: str = "critical,high,medium",
+    severity: str = "critical,high,medium,low",
     timeout: int = 120,
     tags: Optional[List[str]] = None,
     tech_stack: Optional[List[str]] = None,
@@ -182,6 +182,20 @@ async def run_nuclei_async(
     if not tag_list and settings.nuclei_tags_from_stack and tech_stack:
         tag_list = build_tags_from_tech(tech_stack)
 
+    # E2: nuclei 模板分档 —— 按 nuclei_template_tier 收窄默认 severity，控制扫描耗时。
+    # 仅当调用方沿用默认全量 severity 时才应用档位；显式指定窄 severity 的调用
+    # （如定向 CVE 复扫 severity="critical,high"）保持原样，不受影响。
+    if severity == "critical,high,medium,low":
+        _tier_sev = {
+            "fast": "critical,high",
+            "balanced": "critical,high,medium",
+            "full": "critical,high,medium,low",
+        }.get(str(getattr(settings, "nuclei_template_tier", "balanced") or "balanced").lower(),
+              "critical,high,medium")
+        if _tier_sev and _tier_sev != severity:
+            severity = _tier_sev
+            logger.info(f"🧬 [Nuclei] 按模板档位 {settings.nuclei_template_tier} 收窄 severity -> {severity}")
+
     # 创建临时输出文件
     with tempfile.NamedTemporaryFile(mode='w+', suffix='.json', delete=False) as f:
         output_file = f.name
@@ -193,9 +207,9 @@ async def run_nuclei_async(
             "-u", target,
             "-severity", severity,
             "-o", output_file,
-            "-timeout", str(timeout),
-            "-retries", "1",
-            "-rl", "5",
+            "-timeout", str(settings.nuclei_per_host_timeout),
+            "-retries", str(settings.nuclei_retries),
+            "-rl", str(settings.nuclei_rate_limit),
         ]
         # Z1.2：指定模板 ID 时用 -id 精确命中（覆盖 tags 无法匹配的 CVE 模板）
         id_list = [str(i).strip() for i in (template_ids or []) if str(i).strip()]
@@ -269,7 +283,7 @@ async def run_nuclei_async(
             try:
                 os.unlink(output_file)
             except BaseException:
-                pass
+                logger.debug("suppressed exception (core audit)")
 
 
 # ============================================================

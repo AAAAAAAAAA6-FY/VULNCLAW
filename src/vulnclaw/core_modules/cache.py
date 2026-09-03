@@ -70,7 +70,7 @@ class FileCache(CacheBackend):
                 if data.get("expire", 0) > time.time():
                     return data.get("value")
             except BaseException:
-                pass
+                logger.debug("suppressed exception (core audit)")
         return None
 
     def set(self, key: str, value: Any, ttl: int = 7200):
@@ -175,7 +175,7 @@ class SQLiteCache(CacheBackend):
                 self._conn.execute("DELETE FROM kv WHERE key=?", (key,))
                 self._conn.commit()
         except BaseException:
-            pass
+            logger.debug("suppressed exception (core audit)")
 
     def stats(self) -> Dict[str, Any]:
         total = self._hits + self._misses
@@ -189,7 +189,7 @@ class SQLiteCache(CacheBackend):
         try:
             self._conn.close()
         except BaseException:
-            pass
+            logger.debug("suppressed exception (core audit)")
 
 
 def get_cache():
@@ -208,7 +208,7 @@ try:
     from vulnclaw.core.container import get_container
     get_container().register("cache", cache)
 except Exception:  # noqa: BLE001
-    pass
+    logger.debug("suppressed exception (core audit)")
 
 
 __all__ = ['CacheBackend', 'MemoryCache', 'FileCache', 'SQLiteCache', 'get_cache', 'cache']

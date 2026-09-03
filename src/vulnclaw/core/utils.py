@@ -33,6 +33,35 @@ _SHARED_SESSION: Optional[aiohttp.ClientSession] = None
 _SHARED_SESSION_LOCK = asyncio.Lock()
 _LAST_TARGET: Optional[str] = None
 
+# 漏洞大类映射：早停机制按“大类”而非整参数生效，
+# 避免同参数上 XSS 被确认后把 SQLi/SSTI/LFI/CMDi 等正交漏洞大类一并误杀。
+_VULN_CATEGORY_RULES = (
+    ('xss', 'xss'),
+    ('sqli', 'sqli'), ('sql注入', 'sqli'),
+    ('ssti', 'ssti'), ('模板', 'ssti'), ('el_injection', 'ssti'), ('ssi', 'ssti'),
+    ('lfi', 'lfi'), ('path_traversal', 'lfi'), ('traversal', 'lfi'),
+    ('文件包含', 'lfi'), ('file_include', 'lfi'),
+    ('cmdi', 'cmdi'), ('command', 'cmdi'), ('rce', 'cmdi'), ('命令', 'cmdi'),
+    ('nosql', 'nosql'),
+    ('ldap', 'ldap'),
+    ('ssrf', 'ssrf'),
+    ('xxe', 'xxe'),
+    ('deser', 'deser'), ('反序列化', 'deser'), ('fastjson', 'deser'), ('jackson', 'deser'),
+    ('redirect', 'redirect'), ('开放重定向', 'redirect'),
+    ('cors', 'cors'),
+    ('leak', 'info'), ('泄露', 'info'), ('info', 'info'),
+)
+
+
+def vuln_category(name: str) -> str:
+    """将引擎名/漏洞类型归到粗略大类，供早停时不跨类互相阻塞。"""
+    n = (name or '').lower()
+    for needle, cat in _VULN_CATEGORY_RULES:
+        if needle in n:
+            return cat
+    return 'misc'
+
+
 # ============================================================
 # 文件锁（用于跨进程写入保护）
 # ============================================================
@@ -65,7 +94,7 @@ def _atomic_write_json(file_path: Path, data: Dict) -> bool:
             try:
                 shutil.copy2(file_path, bak_path)
             except Exception:
-                pass
+                logger.debug("suppressed exception (core audit)")
         # 写入临时文件
         with open(tmp_path, 'w', encoding='utf-8') as f:
             if HAS_PORTALOCKER:
@@ -81,7 +110,7 @@ def _atomic_write_json(file_path: Path, data: Dict) -> bool:
                         f.flush()
                         os.fsync(f.fileno())
                     except Exception:
-                        pass
+                        logger.debug("suppressed exception (core audit)")
             else:
                 json.dump(data, f, indent=2, ensure_ascii=False)
                 f.flush()
@@ -97,7 +126,7 @@ def _atomic_write_json(file_path: Path, data: Dict) -> bool:
             if bak_path.exists():
                 shutil.copy2(bak_path, file_path)
         except Exception:
-            pass
+            logger.debug("suppressed exception (core audit)")
         return False
 
 
@@ -115,6 +144,13 @@ async def get_shared_session(target: Optional[str] = None) -> aiohttp.ClientSess
       - connector 使用更大的 TCP 连接池 & keepalive 复用，避免每次握手。
     """
     global _SHARED_SESSION, _LAST_TARGET
+
+    # reuse_shared_session=False 时禁止会话复用：关闭并置空，强制每次新建
+    if not settings.reuse_shared_session and _SHARED_SESSION is not None:
+        if not _SHARED_SESSION.closed:
+            await _SHARED_SESSION.close()
+        _SHARED_SESSION = None
+        _LAST_TARGET = None
 
     # --- fast path: 绝大多数请求走这里，零锁等待 ---
     if (
@@ -425,7 +461,7 @@ async def _read_response(resp: aiohttp.ClientResponse) -> Tuple[int, str, Dict]:
                 text += "\n... [截断: 响应体过大]"
                 return resp.status, text, dict(resp.headers)
         except BaseException:
-            pass
+            logger.debug("suppressed exception (core audit)")
 
     try:
         raw = await resp.content.read(MAX_RESPONSE_SIZE + 1)
@@ -821,7 +857,7 @@ def _tp_extract(archive: Path, dest_dir: Path, bin_src_name: str, bin_dest: Path
         if os.name != "nt":
             os.chmod(bin_dest, 0o755)
     except Exception:
-        pass
+        logger.debug("suppressed exception (core audit)")
 
 
 def download_thirdparty_tools(
@@ -888,7 +924,7 @@ def download_thirdparty_tools(
                     try:
                         archive_path.unlink()
                     except Exception:
-                        pass
+                        logger.debug("suppressed exception (core audit)")
                 continue
 
     # -------- nuclei -update-templates（可选，默认开） --------
@@ -932,7 +968,17 @@ def get_tool_path(tool_name: str) -> Optional[str]:
         return path
 
     third = os.path.join(settings.thirdparty_dir, tool_name)
-    if os.path.exists(third):
+    if os.path.isdir(third):
+        # 目录型分发（如 thirdparty/sqlmap/sqlmap.py）：定位内部可执行/脚本
+        for cand in (
+            os.path.join(third, tool_name + ".py"),
+            os.path.join(third, tool_name + ".exe"),
+            os.path.join(third, tool_name),
+        ):
+            if os.path.exists(cand):
+                _TOOL_CACHE[tool_name] = cand
+                return cand
+    elif os.path.exists(third):
         _TOOL_CACHE[tool_name] = third
         return third
 
@@ -1078,8 +1124,20 @@ def generate_mutated_requests(
     return unique_mutations
 
 
+def ensure_scheme(url: str, default_scheme: str = "https") -> str:
+    """给缺 scheme 的 URL 补默认 scheme（audible.com -> https://audible.com）。
+    已带 scheme 的原样返回。修复无协议 URL 导致请求/复现命令失败的问题。
+    """
+    if not url:
+        return url
+    if "://" in url:
+        return url
+    return f"{default_scheme}://{url.lstrip('/')}"
+
+
 def build_attack_url(base_url: str, param: str, payload: str, original_query: str = '') -> str:
     from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+    base_url = ensure_scheme(base_url, "https")  # 补全 scheme，避免无协议 URL 使请求失败
     parsed = urlparse(base_url)
     qs = parse_qs(parsed.query) if parsed.query else {}
     if original_query and not qs:
@@ -1121,6 +1179,14 @@ def limit_response_size(text: str, max_len: int = 2000) -> str:
     return text[:half] + "\n...[响应已截断]...\n" + text[-half:]
 
 
+def cap(seq, limit: int):
+    """按上限截断序列；limit<=0 表示不限制（最强模式默认）。"""
+    _lst = list(seq)
+    if not limit or limit <= 0:
+        return _lst
+    return _lst[:limit]
+
+
 def compress_http_response(response_text: str, max_len: int = 1500) -> str:
     if not response_text:
         return ""
@@ -1143,7 +1209,7 @@ def clean_ai_json(text: str) -> str:
         json.loads(text)
         return text
     except json.JSONDecodeError:
-        pass
+        logger.debug("suppressed exception (core audit)")
 
     # 尝试修复尾部逗号等常见问题
     fixed = re.sub(r"'([^']+)':", r'"\1":', text)
@@ -1170,7 +1236,7 @@ def clean_ai_json(text: str) -> str:
         # 成功解析第一个对象，直接返回它
         return json.dumps(obj, ensure_ascii=False)
     except BaseException:
-        pass
+        logger.debug("suppressed exception (core audit)")
 
     # 方法2：贪婪匹配单个顶层对象（兼容旧逻辑）
     match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', subset, re.DOTALL)
@@ -1179,7 +1245,7 @@ def clean_ai_json(text: str) -> str:
             obj = json.loads(match.group())
             return json.dumps(obj, ensure_ascii=False)
         except BaseException:
-            pass
+            logger.debug("suppressed exception (core audit)")
 
     # 方法3：贪婪匹配数组
     match = re.search(r'\[[^\[\]]*(?:\[[^\[\]]*\][^\[\]]*)*\]', subset, re.DOTALL)
@@ -1188,7 +1254,7 @@ def clean_ai_json(text: str) -> str:
             obj = json.loads(match.group())
             return json.dumps(obj, ensure_ascii=False)
         except BaseException:
-            pass
+            logger.debug("suppressed exception (core audit)")
 
     return "{}"
 
@@ -1200,8 +1266,14 @@ def obfuscate_payload(payload: str, level: int = 1) -> str:
     result = payload
     rand = random.random
 
+    # 重要：本函数必须输出“原始字符”，不得做任何百分号预编码。
+    # payload 最终会经 build_attack_url() 的 urlencode 统一编码一次；若此处预先把
+    # '|' 编成 '%7c'、空格编成 '%0a'，urlencode 会把 '%' 再编成 '%25' → 双重编码
+    # （'%257c'），服务端收到的是字面量 '%7c' 而非 '|'，注入直接失效。
+    # 实测：混淆 payload 被服务端原样回显、返回正常行数；未混淆的 "'" 才正常触发
+    # 500 + SQLite 报错。故此处只做“语义级”混淆，编码交给传输层做且只做一次。
     if rand() > 0.2:
-        choices = ['/**/', '%0a', '%0d', '%09', '/*!*/', '/*!50000*/']
+        choices = ['/**/', '\n', '\r', '\t', '/*!*/', '/*!50000*/']
         result = result.replace(' ', random.choice(choices))
 
     if rand() > 0.3:
@@ -1217,18 +1289,6 @@ def obfuscate_payload(payload: str, level: int = 1) -> str:
         result = result.replace('OR', '||')
         result = result.replace('AND', '&&')
         result = result.replace('<script>', '<scr<script>ipt>')
-        result = result.replace('alert(', 'alert%28')
-        result = result.replace(';', '%3b')
-        result = result.replace('|', '%7c')
-
-    if rand() > 0.6:
-        encoded = ''
-        for c in result:
-            if c.isalnum() or c in ['/', '.', '-', '_']:
-                encoded += c
-            else:
-                encoded += urllib.parse.quote(c)
-        result = encoded
 
     return result
 
@@ -1243,7 +1303,7 @@ def load_cookie_file(cookie_path: str) -> Dict[str, str]:
                     k, v = line.split('=', 1)
                     cookies[k.strip()] = v.strip()
     except BaseException:
-        pass
+        logger.debug("suppressed exception (core audit)")
     return cookies
 
 

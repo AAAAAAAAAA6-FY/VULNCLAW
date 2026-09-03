@@ -638,7 +638,7 @@ async def _fetch_github_advisories() -> List[CVEEntry]:
             try:
                 cvss = float((adv.get("cvss") or {}).get("score") or 0) or None
             except (TypeError, ValueError):
-                pass
+                logger.debug("suppressed exception (core audit)")
             out.append(CVEEntry(
                 cve_id=cid, name=cid,
                 severity=sev if sev in _SEVERITY_ORDER else "medium",

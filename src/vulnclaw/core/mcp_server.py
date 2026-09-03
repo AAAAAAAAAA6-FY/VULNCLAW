@@ -1433,7 +1433,7 @@ class MCPHttpServer:
             if server is not None and getattr(server, "sockets", None):
                 self._actual_port = server.sockets[0].getsockname()[1]
         except Exception:  # noqa: BLE001
-            pass
+            logger.debug("suppressed exception (core audit)")
 
         scope = "本机（外网不可达）" if is_local_host(self._host) else "外部网络"
         logger.info(f"MCP HTTP Server 已启动: http://{self._host}:{self.actual_port}/mcp")
@@ -1447,7 +1447,7 @@ class MCPHttpServer:
             while True:
                 await asyncio.sleep(3600)
         except asyncio.CancelledError:
-            pass
+            logger.debug("suppressed exception (core audit)")
         finally:
             await self._runner.cleanup()
 

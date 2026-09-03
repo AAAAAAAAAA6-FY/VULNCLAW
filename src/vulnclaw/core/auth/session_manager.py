@@ -211,7 +211,7 @@ class SessionManager:
             asyncio.get_running_loop()
             return
         except RuntimeError:
-            pass
+            logger.debug("suppressed exception (core audit)")
 
         try:
             loop = asyncio.get_event_loop()
@@ -227,7 +227,7 @@ class SessionManager:
         try:
             loop.run_until_complete(_noop())
         except Exception:
-            pass
+            logger.debug("suppressed exception (core audit)")
 
         return loop
 
@@ -449,7 +449,7 @@ class SessionManager:
             try:
                 await self._reload_task
             except asyncio.CancelledError:
-                pass
+                logger.debug("suppressed exception (core audit)")
             self._reload_task = None
             logger.info("🔄 后台 Cookie 重载已停止")
 
@@ -665,7 +665,7 @@ class SessionManager:
             try:
                 await session.close()
             except BaseException:
-                pass
+                logger.debug("suppressed exception (core audit)")
         logger.info("🔒 所有会话已关闭")
 
     # ============================================================

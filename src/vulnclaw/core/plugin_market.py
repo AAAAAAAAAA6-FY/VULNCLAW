@@ -288,7 +288,7 @@ def list_available_plugins() -> List[Dict]:
     Raises:
         DownloadError: 网络错误、超时、HTTP 403 限流等。
     """
-    repo = getattr(settings, "PLUGIN_MARKET_REPO", "vulnclaw/plugins")
+    repo = getattr(settings, "plugin_market_repo", "vulnclaw/plugins")
     url = GITHUB_API.format(repo=repo)
     try:
         resp = requests.get(url, timeout=15, headers={"Accept": "application/vnd.github+json"})

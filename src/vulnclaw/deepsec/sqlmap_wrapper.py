@@ -15,9 +15,10 @@
 import asyncio
 import json
 import os
+import sys
 import tempfile
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import aiohttp
 
@@ -25,6 +26,17 @@ from vulnclaw.core.logger import logger
 from vulnclaw.core.settings import settings
 from vulnclaw.core.utils import get_tool_path
 from urllib.parse import urlparse
+
+
+def _invoke(tool_path: str) -> List[str]:
+    """构造调用命令：.py 脚本用 python 解释器，否则直接可执行。
+
+    get_tool_path 现在会把目录型 Python 工具（如 thirdparty/sqlmap/sqlmap.py）
+    解析为脚本路径；Windows 下直接 exec .py 会失败，必须前置 python。
+    """
+    if tool_path and str(tool_path).endswith(".py"):
+        return [sys.executable, tool_path]
+    return [tool_path] if tool_path else []
 
 
 # ============================================================
@@ -112,7 +124,7 @@ class SQLMapAPIClient:
                 timeout=aiohttp.ClientTimeout(total=5),
             )
         except Exception:  # noqa: BLE001
-            pass
+            logger.debug("suppressed exception (core audit)")
 
     async def delete(self, taskid: str) -> None:
         """P4-4: 扫描结束后清理任务，避免服务端堆积。"""
@@ -123,7 +135,7 @@ class SQLMapAPIClient:
                 timeout=aiohttp.ClientTimeout(total=5),
             )
         except Exception:  # noqa: BLE001
-            pass
+            logger.debug("suppressed exception (core audit)")
 
     async def run(self, url: str, options: Dict, timeout: int = 300) -> Dict:
         """完整一次检测：new → start → 轮询 status → data → delete。"""
@@ -178,8 +190,9 @@ class SQLMapAPIDaemon:
         host, port = cls._host_port()
         sqlmapapi = get_tool_path("sqlmapapi") or "sqlmapapi"
         try:
+            inv = _invoke(sqlmapapi) or ["sqlmapapi"]
             cls._process = await asyncio.create_subprocess_exec(
-                sqlmapapi,
+                *inv,
                 "-s",
                 "-H",
                 host,
@@ -215,14 +228,14 @@ class SQLMapAPIDaemon:
             try:
                 cls._process.terminate()
             except ProcessLookupError:
-                pass
+                logger.debug("suppressed exception (core audit)")
             try:
                 await asyncio.wait_for(cls._process.wait(), timeout=5)
             except Exception:  # noqa: BLE001
                 try:
                     cls._process.kill()
                 except Exception:  # noqa: BLE001
-                    pass
+                    logger.debug("suppressed exception (core audit)")
             logger.info("💉 [SQLMap] API 服务已停止")
         cls._process = None
 
@@ -376,8 +389,7 @@ class SQLMapWrapper:
         output_file = os.path.join(self._output_dir, "result.json")
 
         # 构建 SQLMap 命令
-        cmd = [
-            sqlmap,
+        cmd = _invoke(sqlmap) + [
             "-u", url,
             "--level", str(self.level),
             "--risk", str(self.risk),
@@ -474,7 +486,7 @@ class SQLMapWrapper:
                 # TODO: 根据 SQLMap JSON 格式解析完整结果
                 result["raw"] = raw
             except (json.JSONDecodeError, OSError):
-                pass
+                logger.debug("suppressed exception (core audit)")
 
         return result
 
@@ -520,7 +532,7 @@ class SQLMapWrapper:
             {"has_waf": bool, "waf_type": str}
         """
         sqlmap = self._get_sqlmap_path()
-        cmd = [sqlmap, "-u", url, "--batch", "--identify-waf"]
+        cmd = _invoke(sqlmap) + ["-u", url, "--batch", "--identify-waf"]
 
         try:
             process = await asyncio.create_subprocess_exec(
@@ -543,6 +555,235 @@ class SQLMapWrapper:
             return {"has_waf": has_waf, "waf_type": waf_type}
         except Exception:
             return {"has_waf": False, "waf_type": "", "error": "check failed"}
+
+    async def confirm(
+        self,
+        url: str,
+        parameter: str,
+        data: str = None,
+        method: str = "GET",
+        level: int = 2,
+        risk: int = 1,
+        timeout: int = 120,
+    ) -> Dict:
+        """轻量注入确认（POC 级，不提取数据）：仅验证注入点是否存在。
+
+        用于把引擎检出的 SQLi 升级为 sqlmap 实锤；失败不影响原检测结果。
+        """
+        sqlmap = self._get_sqlmap_path()
+        cookie = self._get_cookie()
+        cmd = _invoke(sqlmap) + [
+            "-u", url,
+            "--level", str(level),
+            "--risk", str(risk),
+            "--batch",
+            "--timeout", "30",
+        ]
+        if parameter:
+            cmd.extend(["-p", parameter])
+        if method == "POST" and data:
+            cmd.extend(["--data", data])
+        if cookie:
+            cmd.extend(["--cookie", cookie])
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)
+            out = (stdout or b"").decode(errors="replace")
+            confirmed = ("is vulnerable" in out.lower()) or ("appears to be" in out.lower())
+            return {
+                "confirmed": confirmed,
+                "parameter": parameter,
+                "evidence": (out[-500:] if not confirmed else "sqlmap 确认注入点存在"),
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"💉 [SQLMap] 轻量确认失败: {exc}")
+            return {"confirmed": False, "parameter": parameter, "evidence": str(exc)}
+
+    async def extract(
+        self,
+        url: str,
+        parameter: str,
+        data: str = None,
+        method: str = "GET",
+        timeout: int = 180,
+    ) -> Dict:
+        """SQLi 实锤后的最小化数据提取（只取数据库指纹，不导出业务数据表）。
+
+        获取 DBMS banner / 当前库名 / 当前用户 / 是否 DBA，
+        用于把“疑似注入”升级为“已验证可利用”，不做表数据 dump。
+        """
+        import re as _re
+
+        sqlmap = self._get_sqlmap_path()
+        cookie = self._get_cookie()
+        cmd = _invoke(sqlmap) + [
+            "-u", url,
+            "--batch",
+            "--level", "2",
+            "--risk", "1",
+            "--timeout", "30",
+            "--banner",
+            "--current-db",
+            "--current-user",
+            "--is-dba",
+            "--union-check",
+            "--tables",
+        ]
+        if parameter:
+            cmd.extend(["-p", parameter])
+        if method == "POST" and data:
+            cmd.extend(["--data", data])
+        if cookie:
+            cmd.extend(["--cookie", cookie])
+
+        def _grab(text: str, label: str) -> str:
+            match = _re.search(label + r"\s*:?\s*'?([^\n']+)'?", text, _re.IGNORECASE)
+            return match.group(1).strip() if match else ""
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)
+            out = (stdout or b"").decode(errors="replace")
+            banner = _grab(out, "banner")
+            current_db = _grab(out, "current database")
+            current_user = _grab(out, "current user")
+            is_dba = (
+                "current user is dba: true" in out.lower()
+                or "is dba: true" in out.lower()
+            )
+            # B4: --tables 仅取表名（不分页 dump 业务数据），并解析 UNION 回显位
+            tables = self._parse_tables_only(out, current_db)
+            union_pos = self._parse_union_position(out)
+            return {
+                "extracted": bool(banner or current_db or current_user),
+                "banner": banner,
+                "current_db": current_db,
+                "current_user": current_user,
+                "is_dba": is_dba,
+                "tables": tables,
+                "union_position": union_pos,
+                "raw_tail": out[-600:],
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[SQLMap] 数据提取失败: {exc}")
+            return {"extracted": False, "evidence": str(exc)}
+
+
+
+
+    def _parse_tables_only(self, out: str, current_db: str) -> List[str]:
+        """从 sqlmap 输出解析数据库表名列表（仅表名，不涉及行/列数据）。"""
+        import re as _re
+        names: List[str] = []
+        # sqlmap 表格输出形如: | Table      | ... 或 `[x table(s)]`
+        for line in out.splitlines():
+            if "table" not in line.lower():
+                continue
+            # 匹配 " | tablename | " 单元格
+            cells = [c.strip() for c in line.split("|") if c.strip()]
+            for cell in cells:
+                if _re.fullmatch(r"[A-Za-z0-9_\-]+", cell) and len(cell) <= 64:
+                    names.append(cell)
+        # 去重保序
+        seen = set()
+        uniq = []
+        for n in names:
+            if n not in seen:
+                seen.add(n)
+                uniq.append(n)
+        return uniq[:50]
+
+    def _parse_union_position(self, out: str) -> str:
+        """从 sqlmap 输出提取 UNION 回显位（如 'position: 2'）。"""
+        import re as _re
+        m = _re.search(r"position[^0-9]{0,4}([0-9]+)", out, _re.IGNORECASE)
+        if m:
+            return m.group(1)
+        m = _re.search(r"column[^0-9]{0,4}([0-9]+)", out, _re.IGNORECASE)
+        if m:
+            return m.group(1)
+        return ""
+
+    async def enumerate_columns(
+        self,
+        url: str,
+        parameter: str,
+        data: str = None,
+        method: str = "GET",
+        db: str = "",
+        timeout: int = 180,
+    ) -> Dict:
+        """B4: 列枚举 —— ORDER BY 二分探测列数 + UNION 冒烟回显位，不 dump 任何业务数据。
+
+        验证注入面：通过 sqlmap 的 --columns -D <db> 仅枚举表列名（structure 而非数据）。
+        为控制时间与流量，默认由调用方在已确认注入后主动触发（extract 不做 --columns，
+        extract 只做 --tables 表名）。本方法供上层按需调用。
+        """
+        import re as _re
+        sqlmap = self._get_sqlmap_path()
+        cookie = self._get_cookie()
+        cmd = _invoke(sqlmap) + [
+            "-u", url,
+            "--batch",
+            "--level", "2",
+            "--risk", "1",
+            "--timeout", "30",
+            "--columns",
+            "--union-check",
+        ]
+        if db:
+            cmd.extend(["-D", db])
+        else:
+            cmd.extend(["--current-db"])
+        if parameter:
+            cmd.extend(["-p", parameter])
+        if method == "POST" and data:
+            cmd.extend(["--data", data])
+        if cookie:
+            cmd.extend(["--cookie", cookie])
+
+        def _grab_cols(text: str) -> List[str]:
+            names: List[str] = []
+            for line in text.splitlines():
+                if "column" not in line.lower():
+                    continue
+                cells = [c.strip() for c in line.split("|") if c.strip()]
+                for cell in cells:
+                    if _re.fullmatch(r"[A-Za-z0-9_\-]+", cell) and len(cell) <= 64:
+                        names.append(cell)
+            seen = set()
+            out = []
+            for n in names:
+                if n not in seen:
+                    seen.add(n)
+                    out.append(n)
+            return out[:50]
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)
+            out = (stdout or b"").decode(errors="replace")
+            return {
+                "extracted": bool(out.strip()),
+                "columns": _grab_cols(out),
+                "union_position": self._parse_union_position(out),
+                "raw_tail": out[-800:],
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[SQLMap] 列枚举失败: {exc}")
+            return {"extracted": False, "evidence": str(exc)}
 
 
 # ============================================================

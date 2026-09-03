@@ -194,7 +194,7 @@ class MobileAPIEngine(BaseEngine):
                             "method": "mobile_missing_hsts",
                         })
             except BaseException:
-                pass
+                logger.debug("suppressed exception (engine audit)")
         return findings
 
     # ------------------------------------------------------------

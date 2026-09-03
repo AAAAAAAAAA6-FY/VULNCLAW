@@ -204,7 +204,7 @@ class JSDeepAnalyzer:
                                 if src.endswith('.js'):
                                     self.findings["dependencies"].append(src)
                         except BaseException:
-                            pass
+                            logger.debug("suppressed exception (core audit)")
         except Exception as e:
             logger.debug(f"SourceMap获取失败: {e}")
 
@@ -681,7 +681,7 @@ async def discover_hidden_params(
                 found.append(param)
                 logger.debug(f"   [+] 发现参数: {param}")
         except BaseException:
-            pass
+            logger.debug("suppressed exception (core audit)")
 
     logger.info(f"🔍 发现 {len(found)} 个隐藏参数: {found[:10]}")
     return found
@@ -753,7 +753,7 @@ async def scan_403_bypass(
                 })
                 logger.warning(f"🚨 403 Bypass 成功: {test_url} -> {status}")
         except BaseException:
-            pass
+            logger.debug("suppressed exception (core audit)")
 
     return results
 
@@ -878,7 +878,7 @@ async def scan_prototype_pollution(
                 })
                 break
         except BaseException:
-            pass
+            logger.debug("suppressed exception (core audit)")
 
     return results
 
@@ -913,7 +913,7 @@ async def scan_cors_misconfig(url: str, session: aiohttp.ClientSession) -> List[
                 "evidence": f"ACAO: {acao}, ACAC: {acac}"
             })
     except BaseException:
-        pass
+        logger.debug("suppressed exception (core audit)")
 
     return results
 
@@ -944,7 +944,7 @@ async def discover_graphql_endpoint(
                     found.append(test_url)
                     logger.info(f"   🎯 发现 GraphQL 端点: {test_url}")
         except BaseException:
-            pass
+            logger.debug("suppressed exception (core audit)")
 
     return found
 
@@ -987,7 +987,7 @@ async def scan_log4j(
                 })
                 break
         except BaseException:
-            pass
+            logger.debug("suppressed exception (core audit)")
 
     return results
 
@@ -1024,7 +1024,7 @@ async def scan_nosql_injection(
                 })
                 break
         except BaseException:
-            pass
+            logger.debug("suppressed exception (core audit)")
 
     return results
 
@@ -1081,7 +1081,7 @@ async def active_scan_plus(
                         "evidence": "Response contains 49 (7*7 result)"
                     })
             except BaseException:
-                pass
+                logger.debug("suppressed exception (core audit)")
 
     return results
 
@@ -1131,7 +1131,7 @@ async def run_all_burp_plugins_checks(
             results["403_bypass"] = await scan_403_bypass(url, session)
             logger.info(f"   🔓 403 Bypass: {len(results['403_bypass'])} 种绕过方式发现")
     except BaseException:
-        pass
+        logger.debug("suppressed exception (core audit)")
 
     if jwt_token:
         results["jwt_issues"] = scan_jwt_vulnerabilities(jwt_token)
@@ -1257,7 +1257,7 @@ class APISpecParser:
             except ImportError:
                 logger.debug("⚠️ PyYAML 未安装")
             except BaseException:
-                pass
+                logger.debug("suppressed exception (core audit)")
 
             # 如果都失败，标记为已加载（空数据），不在此处调用 AI
             self.spec_data = None

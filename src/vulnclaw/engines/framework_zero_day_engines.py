@@ -91,15 +91,18 @@ async def _run_oob_scan(
     # A1.3：多协议盲打探针（LDAP/RMI/SMB/SMTP）。引擎特定 payload 已覆盖 JNDI/DNS；
     # 这里中心化补发其余协议回调目标，目标以任一协议回连 <token>.<domain> 即被
     # interactsh 记录（协议字段被 OOBChannel 捕获并进入 A1.4 证据链），实现多协议实锤。
-    for _proto, _cb in (ch.protocol_probes(token) or {}).items():
-        if _proto in ("dns", "http", "https"):
-            continue  # 已由 obs_dns / obs_http 覆盖
-        _probe_url = build_attack_url(url, param, _cb, parsed_query)
-        try:
-            await async_get(_probe_url, session=session, timeout=settings.timeout, no_retry=True, allow_redirects=False)
-        except Exception:  # noqa: BLE001
-            pass
-        await asyncio.sleep(0.2)
+    # 防御式：并非所有 OOB 通道都支持多协议探针（如测试假通道），缺失时安全跳过。
+    _proto_probes = getattr(ch, "protocol_probes", None)
+    if _proto_probes is not None:
+        for _proto, _cb in (_proto_probes(token) or {}).items():
+            if _proto in ("dns", "http", "https"):
+                continue  # 已由 obs_dns / obs_http 覆盖
+            _probe_url = build_attack_url(url, param, _cb, parsed_query)
+            try:
+                await async_get(_probe_url, session=session, timeout=settings.timeout, no_retry=True, allow_redirects=False)
+            except Exception:  # noqa: BLE001
+                pass
+            await asyncio.sleep(0.2)
 
     hits = await ch.wait_for_interaction(token, timeout=oob_wait)
     if not hits:

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from vulnclaw.core.logger import logger
+from vulnclaw.core.utils import ensure_scheme
 
 CONFIDENCE_ORDER = {"Critical": 0, "High": 1, "Medium": 3, "Low": 5, "Info": 7}
 SEVERITY_COLORS = {
@@ -76,17 +77,43 @@ OWASP_REMEDIATION = {
 
 
 def _build_curl_command(vuln: Dict) -> str:
-    """P2-5: 由 finding 字段生成可执行的 curl 复现命令。"""
+    """P2-5/B5: 由 finding 字段生成可执行的 curl 复现命令（支持 method/body/headers）。"""
     url = str(vuln.get("url", ""))
+    url = ensure_scheme(url)
     param = str(vuln.get("parameter", "") or "")
     payload = str(vuln.get("payload", "") or vuln.get("attack_payload", "") or "")
+    method = str(vuln.get("method", "") or "GET").upper()
+    parts = ["curl", "-s", "-i"]
+    if method and method != "GET":
+        parts += ["-X", method]
+    headers = vuln.get("headers") or {}
+    if isinstance(headers, dict):
+        for k, v in headers.items():
+            parts.append('-H "{}: {}"'.format(k, v))
     if param and payload:
         from urllib.parse import quote
         sep = "&" if "?" in url else "?"
-        target = f"{url}{sep}{param}={quote(payload, safe='')}"
+        target = url + sep + param + "=" + quote(payload, safe="")
     else:
         target = url
-    return f'curl -s -i "{target}"'
+    parts.append('"{}"'.format(target))
+    data = vuln.get("data")
+    if data is not None and method in ("POST", "PUT", "PATCH"):
+        parts.append("--data " + _json_body(data))
+    return " ".join(parts)
+
+
+def _json_body(data) -> str:
+    """把 data 序列化为可嵌入 curl --data 的字符串。"""
+    import json as _json
+    if isinstance(data, str):
+        if data.strip().startswith(("{", "[")):
+            try:
+                return _json.dumps(_json.loads(data), ensure_ascii=False, default=str)
+            except Exception:
+                return _json.dumps(data, ensure_ascii=False, default=str)
+        return _json.dumps(data, ensure_ascii=False, default=str)
+    return _json.dumps(data, ensure_ascii=False, default=str)
 
 
 def _build_reproduction_steps(vuln: Dict) -> List[str]:
@@ -219,18 +246,95 @@ def generate_html_report(report_data, html_file="report.html"):
         return False
 
 
+# ===== 报告预处理：跨引擎去重 + 严重度排序（提升报告可用性）=====
+SEVERITY_RANK = {
+    'critical': 0, 'high': 1, 'medium': 2, 'low': 3, 'info': 4,
+    '严重': 0, '高': 1, '中': 2, '低': 3, '信息': 4,
+}
+
+
+def normalize_vulns(vulns):
+    """渲染前统一处理漏洞列表。
+
+    1) 去重：按 (url, type, parameter) 去重，避免多引擎对同一点位重复刷屏；
+    2) 排序：按严重度（Critical > High > Medium > Low > Info）升序 + CVSS 降序，
+       保证高危问题排在报告最前面，便于优先处置。
+    """
+    seen = set()
+    unique = []
+    for v in vulns or []:
+        key = (
+            str(v.get('url', '')),
+            str(v.get('type', '')),
+            str(v.get('parameter', '') or ''),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(v)
+
+    def rank(v):
+        severity = str(v.get('severity', '')).strip().lower()
+        try:
+            cvss = float(v.get('cvss') or 0)
+        except (TypeError, ValueError):
+            cvss = 0.0
+        return (SEVERITY_RANK.get(severity, 5), -cvss)
+
+    unique.sort(key=rank)
+    return unique
+
+
+def _is_pending_review(vuln: Dict) -> bool:
+    """判定 finding 是否处于“待人工复核”状态（验证层未能 AI 确认但保留）。"""
+    text = " ".join(str(vuln.get(k, "")) for k in
+                    ("ai_verdict", "confidence", "verification_method"))
+    return any(k in text for k in ("待人工复核", "待复核", "已跳过验证", "预算已满"))
+
+
+def render_pending_review_section(vulns: List[Dict]) -> str:
+    """渲染“待人工复核”分组：把验证层保留但未 AI 确认的漏洞集中列出，便于人工判别。"""
+    pending = [v for v in vulns if _is_pending_review(v)]
+    if not pending:
+        return "<p>✅ 无待人工复核项（所有保留漏洞均已确认或已排除）。</p>"
+    import html as html_escape
+    parts = [f"<p>共 <strong>{len(pending)}</strong> 条待人工复核（验证层保留但 AI/技术验证未能 100% 确认，需人工判别是否真实漏洞）：</p>", "<ul>"]
+    for v in pending:
+        vt = html_escape.escape(str(v.get("type", "未知")))
+        vu = html_escape.escape(str(v.get("url", "")))
+        vp = html_escape.escape(str(v.get("parameter", "") or ""))
+        verdict = html_escape.escape(str(v.get("ai_verdict", "") or v.get("confidence", "")))
+        ev = str(v.get("evidence", ""))
+        if len(ev) > 600:
+            ev = ev[:600] + "\n... [证据过长，请查看 JSON 报告]"
+        ev = html_escape.escape(ev)
+        parts.append(f'''
+        <li style="border-left:4px solid #fd7e14; padding-left:10px; margin:8px 0;">
+            <div><strong>类型:</strong> {vt} &nbsp; <strong>严重性:</strong> {html_escape.escape(str(v.get('severity', '')))}</div>
+            <div><strong>URL:</strong> <a href="{vu}" target="_blank">{vu}</a></div>
+            {f'<div><strong>参数:</strong> {vp}</div>' if vp else ''}
+            <div><strong>复核原因:</strong> {verdict}</div>
+            <div><strong>证据:</strong>
+                <pre style="background:#f8f9fa; padding:6px; border-radius:4px; overflow-x:auto; white-space:pre-wrap; word-wrap:break-word; max-height:150px; font-size:12px; margin:4px 0;">{ev}</pre>
+            </div>
+        </li>''')
+    parts.append("</ul>")
+    return "".join(parts)
+
+
 def render_html(enhanced_report):
     """渲染 HTML 报告内容 - 修复：证据截断"""
     import html as html_escape
 
     target = enhanced_report.get('target', '')
-    vulns = enhanced_report.get('vulnerabilities', [])
+    vulns = normalize_vulns(enhanced_report.get('vulnerabilities', []))
     vuln_count = len(vulns)
     critical = len([v for v in vulns if v.get('severity') == 'Critical'])
     high = len([v for v in vulns if v.get('severity') == 'High'])
     medium = len([v for v in vulns if v.get('severity') == 'Medium'])
     low = len([v for v in vulns if v.get('severity') == 'Low'])
     info = len([v for v in vulns if v.get('severity') == 'Info'])
+    pending_review = len([v for v in vulns if _is_pending_review(v)])
 
     # 漏洞类型分布（Chart.js 饼图数据，Top 8）
     import json
@@ -347,6 +451,7 @@ def render_html(enhanced_report):
             <div class="summary-card"><div class="number" style="color:orange">{medium}</div>中</div>
             <div class="summary-card"><div class="number">{low}</div>低</div>
             <div class="summary-card"><div class="number">{info}</div>信息</div>
+            <div class="summary-card"><div class="number" style="color:#fd7e14">{pending_review}</div>待人工复核</div>
         </div>
 
         <h2>📊 可视化统计</h2>
@@ -382,6 +487,9 @@ def render_html(enhanced_report):
             <span id="filterCount" style="margin-left:12px; color:#666;"></span>
         </div>
         <div id="vulnList">{vuln_section}</div>
+
+        <h2>🟠 待人工复核漏洞</h2>
+        {render_pending_review_section(vulns)}
 
         <h2>🧑‍💻 人工审核清单</h2>
         {render_review_section(enhanced_report)}
@@ -596,10 +704,10 @@ def generate_markdown_report(report_data, output_path):
     lines.append("")
     lines.append(f"- **子域名总数**: {len(report_data.get('subdomains', []))}")
     lines.append(f"- **存活资产**: {report_data.get('alive', 0)}")
-    lines.append(f"- **漏洞总数**: {len(report_data.get('vulnerabilities', []))}")
+    lines.append(f"- **漏洞总数**: {len(normalize_vulns(report_data.get('vulnerabilities', [])))}")
     lines.append("")
 
-    vulns = report_data.get("vulnerabilities", [])
+    vulns = normalize_vulns(report_data.get("vulnerabilities", []))
     if vulns:
         lines.append("## 漏洞明细")
         for v in vulns[:30]:
@@ -623,6 +731,17 @@ def generate_markdown_report(report_data, output_path):
     else:
         lines.append("✅ 未发现安全漏洞。")
 
+    pending = [v for v in vulns if _is_pending_review(v)]
+    if pending:
+        lines.append("")
+        lines.append(f"## 🟠 待人工复核漏洞（{len(pending)} 条）")
+        lines.append("")
+        lines.append("验证层保留但 AI/技术验证未能 100% 确认，需人工判别是否真实漏洞：")
+        for v in pending[:30]:
+            lines.append(f"- **{v.get('type', '未知')}** @ `{v.get('url', '')}` "
+                         f"(参数: {v.get('parameter', '') or '-'}) — "
+                         f"{v.get('ai_verdict', v.get('confidence', ''))}")
+
     # A8.3：漏报率回归基线段（仅当 REGRESSION_BASELINE 设置）
     reg = _regression_block(report_data)
     if reg:
@@ -635,8 +754,199 @@ def generate_markdown_report(report_data, output_path):
     logger.info(f"📄 Markdown 报告已保存至 {output_path}")
 
 
+
+
+# ============================================================
+# B5: 高危跨平台可运行 PoC 脚本（不依赖 curl，python 内置库）
+# ============================================================
+def _build_poc_python(vuln: Dict) -> str:
+    """B5/H1: 高危漏洞必带可运行 Python PoC 脚本（urllib 实现，规避 curl/环境依赖）。"""
+    url = ensure_scheme(str(vuln.get("url", "")))
+    param = str(vuln.get("parameter", "") or "")
+    payload = str(vuln.get("payload", "") or vuln.get("attack_payload", "") or "")
+    method = str(vuln.get("method", "") or "GET").upper()
+    target = url
+    if param and payload:
+        from urllib.parse import quote, urlsplit, urlunsplit
+        parts = urlsplit(url)
+        sep = "&" if parts.query else "?"
+        target = urlsplit(url)._replace(query=parts.query + sep + urllib_quote(param) + "=" + quote(payload, safe="")).geturl()
+    return _POC_TEMPLATE.format(
+        method=method,
+        target=target,
+        note=payload or param or url,
+    )
+
+
+def urllib_quote(s):
+    from urllib.parse import quote as _q
+    return _q(s, safe="")
+
+
+_POC_TEMPLATE = """import sys
+import urllib.request
+import urllib.error
+
+# Auto-generated functional PoC by VULNCLAW (B5). Run: python poc.py
+TARGET = {target!r}
+METHOD = {method!r}
+NOTE = {note!r}
+
+def main():
+    req = urllib.request.Request(TARGET, method=METHOD)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            print("STATUS:", resp.status)
+            print("HAS_MARKER:", NOTE in body or TARGET in body)
+            print(body[:2000])
+    except urllib.error.HTTPError as e:
+        print("HTTP_ERROR:", e.code)
+    except Exception as exc:
+        print("ERROR:", exc)
+
+if __name__ == "__main__":
+    main()
+"""
+
+
+# ============================================================
+# B5/H2: SARIF 2.1.0 输出（持续集成/DevSecOps 消费）
+# ============================================================
+def generate_sarif(report_data: Dict, out_path: str = "") -> Dict:
+    """把报告漏洞列表转换为 SARIF 2.1.0 JSON 结构，可写入 out_path（若提供）。"""
+    import json as _json
+    rule_ids = {}
+    sarif_rules = []
+    results = []
+    vulns = normalize_vulns(report_data.get("vulnerabilities", [])) or []
+    for idx, v in enumerate(vulns[:200]):
+        vtype = str(v.get("type", "Vulnerability") or "Vulnerability")
+        if vtype not in rule_ids:
+            rule_ids[vtype] = len(rule_ids) + 1
+            sarif_rules.append({
+                "id": "VULNCLAW-{:04d}".format(rule_ids[vtype]),
+                "name": vtype,
+                "shortDescription": {"text": vtype[:200]},
+                "fullDescription": {"text": (v.get("description") or v.get("evidence") or "")[:500]},
+                "help": {"text": (v.get("remediation") or "Please review and remediate.")[:500]},
+                "properties": {"severity": str(v.get("severity", "Medium"))},
+            })
+        results.append({
+            "ruleId": "VULNCLAW-{:04d}".format(rule_ids[vtype]),
+            "level": _sarif_level(str(v.get("severity", "Medium"))),
+            "message": {"text": str(v.get("evidence") or vtype)[:500]},
+            "locations": [{
+                "physicalLocation": {
+                    "artifactLocation": {"uri": str(v.get("url", ""))},
+                    "region": {"startLine": 1, "snippet": {"text": str(v.get("parameter") or v.get("payload") or "")[:200]}},
+                }
+            }],
+            "properties": {"confidence": str(v.get("confidence", "") or ""),
+                           "cvss": v.get("cvss", 0) or 0, "type": vtype},
+        })
+    sarif = {
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {"driver": {"name": "VULNCLAW", "version": "1.0",
+                                "informationUri": "https://github.com/vulnclaw",
+                                "rules": sarif_rules}},
+            "results": results,
+        }],
+    }
+    if out_path:
+        with open(out_path, "w", encoding="utf-8") as f:
+            _json.dump(sarif, f, ensure_ascii=False, indent=2)
+        logger.info("[SARIF] 已输出至 %s", out_path)
+    return sarif
+
+
+def _sarif_level(severity: str) -> str:
+    sev = str(severity).lower()
+    if sev in ("critical", "high"):
+        return "error"
+    if sev == "medium":
+        return "warning"
+    return "note"
+
+
+# ============================================================
+# B5/H3: 代码级修复片段（按漏洞类型给最小加固示例）
+# ============================================================
+def build_fix_snippet(vuln: Dict) -> str:
+    """B5/H3: 按漏洞类型返回可落地的代码级修复示例（文本片段，供报告展示）。"""
+    vtype = str(vuln.get("type", "") or "").lower()
+    code = _FIX_SNIPPETS.get("default")
+    for key in _FIX_SNIPPETS:
+        if key != "default" and key in vtype:
+            code = _FIX_SNIPPETS[key]
+            break
+    if not code:
+        code = _FIX_SNIPPETS["default"]
+    return code
+
+
+_FIX_SNIPPETS = {
+    "sql": "# 参数化查询（禁止字符串拼接）\ncur = db.execute('SELECT * FROM users WHERE id = ?', (user_id,))",
+    "xss": "# 上下文输出编码 + CSP\n输出前 {{{{ value | escape }}}}；并设 CSP header: default-src 'self'",
+    "ssrf": "def fetch(url):\n    if not is_allowlisted(hostname(url)): raise Blocked()\n    # 再发起请求",
+    "cmdi": "import subprocess\nsubprocess.run([cmd, arg], shell=False)  # 不要 join + shell=True",
+    "command_injection": "import subprocess\nsubprocess.run([cmd, arg], shell=False)",
+    "lfi": "path = ALLOW_MAP.get(user_input, None)\nif not path: raise Blocked()\nopen(EXPAND(path), 'rb')",
+    "文件": "ALLOW_MAP 白名单映射 + os.path.realpath 规范化，禁止直接拼接用户输入",
+    "idor": "if obj.owner_id != current_user.id: raise PermissionDenied()\nreturn obj",
+    "越权": "服务端逐资源校验 owner/ACL，勿信任前端传入的角色字段",
+    "jwt": "验签算法白名单校验，禁止 alg:none；kid 仅允许白名单公钥；密钥高熵定期轮换",
+    "oauth": "redirect_uri 必须与注册值精确匹配；校验 state；scope 最小化",
+    "session": "登录成功后 session.regenerate_id(); Cookie.HttpsOnly + Secure + SameSite=Strict",
+    "csrf": "<input type=hidden name=csrf value={{{{ csrf_token }}}}> + SameSite=Cookie",
+    "xxe": "parser = lxml.etree.XMLParser(resolve_entities=False, no_network=True)",
+    "deserialization": "对不可信输入禁用 native 反序列化，改用安全格式(如 JSON schema 校验)或加签名",
+    "default": "# 依据具体漏洞类型，参考 OWASP ASVS / WSTG 给出针对性加固代码",
+}
+
+
+
+# ============================================================
+# B5/H4: 两次扫描结果 diff（新增/已修复/持续存在）
+# ============================================================
+def diff_reports(baseline: Dict, current: Dict) -> Dict:
+    """对比两次扫描报告，输出新增 / 已修复 / 持续存在三类差异（含基线回归提示）。"""
+    def keylist(data):
+        out = {}
+        for v in normalize_vulns((data or {}).get("vulnerabilities", []) or []):
+            k = (str(v.get("url", "")), str(v.get("type", "")), str(v.get("parameter", "") or ""))
+            out[k] = v
+        return out
+    old = keylist(baseline)
+    new = keylist(current)
+    old_keys = set(old)
+    new_keys = set(new)
+    added_keys = sorted(new_keys - old_keys)
+    fixed_keys = sorted(old_keys - new_keys)
+    common_keys = sorted(new_keys & old_keys)
+    return {
+        "added": [new[k] for k in added_keys],
+        "fixed": [old[k] for k in fixed_keys],
+        "unchanged": [old[k] for k in common_keys],
+        "summary": {
+            "baseline_total": len(old),
+            "current_total": len(new),
+            "added_count": len(added_keys),
+            "fixed_count": len(fixed_keys),
+            "still_count": len(common_keys),
+        },
+    }
+
+
 __all__ = [
     "generate_markdown_report",
     "generate_html_report",
     "render_html",
+    "generate_sarif",
+    "diff_reports",
+    "build_fix_snippet",
+    "_build_poc_python",
+    "_build_curl_command",
 ]

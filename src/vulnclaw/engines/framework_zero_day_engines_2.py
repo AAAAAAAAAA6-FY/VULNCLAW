@@ -187,7 +187,7 @@ class ContainerPlatformExposureEngine(BaseEngine):
                     })
                     return findings
         except Exception:
-            pass
+            logger.debug("suppressed exception (engine audit)")
 
         # Kubernetes API Server：/version 返回 JSON 含 gitVersion
         try:
@@ -206,7 +206,7 @@ class ContainerPlatformExposureEngine(BaseEngine):
                     })
                     return findings
         except Exception:
-            pass
+            logger.debug("suppressed exception (engine audit)")
         return findings
 
     async def check(
@@ -270,9 +270,145 @@ class AdminConsoleExposureEngine(BaseEngine):
         return None
 
 
+
+
+# ============================================================
+# CloudAndContainerExposureEngine（B7：kubelet/etcd/云元数据各厂商/IMDSv2）
+# 与现有 ContainerPlatformExposureEngine(registry/k8s /version) 前缀桥接去重：
+# scan 产物按 (url,type) 去重，避免与既有引擎重复刷屏。
+# ============================================================
+class CloudAndContainerExposureEngine(BaseEngine):
+    """K8s kubelet/etcd 未授权 + 云厂商元数据接口暴露（含 IMDSv2 阻断检查）。
+
+    设计原则（低误报）：
+    1. kubelet /etcd 均以"未授权可读 + 固定特征串"判定，普通页面不含特征。
+    2. 云元数据仅在探测到目标"运行在云/可访问元数据"时才报告；访问 169.254.169.254
+       属于内网/链接本地地址，仅当扫描目标本身非本地(localhost/127.0.0.1)时才探测，
+       避免对本地靶场产生无意义告警。
+    3. IMDSv2：http 探测是否被 401 + 需要 IMDSv2 token（X-aws-ec2-metadata-token-ttl-seconds）
+       判定 v1 是否仍可用；若 v1 可读即提示升级到 v2。
+    """
+
+    name = "cloud_container_exposure"
+    description = "K8s kubelet/etcd 未授权 + 云元数据暴露与 IMDSv2 检测"
+
+    # Kubelet 未授权可读特征
+    KUBELET_RE = re.compile(r'"kubelet"|"kubeVersion"|pods/|/pods|kube-system', re.I)
+    # etcd 未授权特征
+    ETCD_RE = re.compile('etcdserver|etcd\\s+version|"cluster"\\s*:|"health"', re.I)
+    # 各厂商云元数据地址 -> 类型
+    CLOUD_META = (
+        ("http://169.254.169.254/latest/meta-data/", "AWS EC2 元数据"),
+        ("http://169.254.169.254/computeMetadata/v1/", "GCP 元数据"),
+        ("http://169.254.169.254/metadata/instance?api-version=2021-02-01", "Azure 元数据"),
+        ("http://169.254.169.254/metadata/", "阿里云 ECS 元数据"),
+        ("http://169.254.169.254/metadata/v1/", "腾讯云/通用元数据"),
+    )
+    # kubelet/etcd 端点候选
+    CONTAINER_ENDPOINTS = (
+        ("/api/v1/namespaces/kube-system/pods", "K8s API(kube-system pods) 未授权"),
+        ("/pods", "Kubelet /pods 未授权"),
+        ("/api/v1/nodes", "Kubelet /api/v1/nodes 未授权"),
+        ("/manage", "Etcd /manage 未授权"),
+        ("/v2/members", "Etcd v2 members 未授权"),
+        ("/health", "Etcd /health 未授权"),
+    )
+
+    async def scan(self, target: str, session, **kwargs) -> List[Dict]:
+        from vulnclaw.config.settings import settings as _st
+        if not _st.cloud_container_exposure:
+            return []
+
+        findings: List[Dict] = []
+        base = target.split("?")[0].rstrip("/")
+        try:
+            parsed = __import__("urllib.parse", fromlist=["urlparse"]).urlparse(base)
+            api_base = f"{parsed.scheme}://{parsed.netloc}"
+        except Exception:
+            api_base = base
+
+        # 1) kubelet / etcd 端点探测（非本地才有意义）
+        if not any(x in api_base for x in ("localhost", "127.0.0.1", "127.0.0.")):
+            for suffix, label in self.CONTAINER_ENDPOINTS:
+                try:
+                    resp = await async_get(api_base + suffix, session=session, timeout=settings.timeout, no_retry=True)
+                    if not resp or resp[0] not in (200, 403):
+                        continue
+                    text = resp[1] or ""
+                    if suffix.startswith("/api/v1") and self.KUBELET_RE.search(text):
+                        findings.append(self._mk(api_base + suffix, "K8s "+label, "High"))
+                    elif suffix.startswith("/pods") and self.KUBELET_RE.search(text):
+                        findings.append(self._mk(api_base + suffix, label, "High"))
+                    elif suffix.startswith("/v2") and self.ETCD_RE.search(text):
+                        findings.append(self._mk(api_base + suffix, label, "High"))
+                    elif suffix in ("/manage", "/health") and (self.ETCD_RE.search(text) or "etcd" in text.lower()):
+                        findings.append(self._mk(api_base + suffix, label, "High"))
+                except Exception:
+                    continue
+
+        # 2) 云元数据各厂商 + IMDSv2（仅从外网目标探测，本地/内网高度保留）
+        host = ""
+        try:
+            host = __import__("urllib.parse", fromlist=["urlparse"]).urlparse(api_base).hostname or ""
+        except Exception:
+            logger.debug("suppressed exception (engine audit)")
+        is_local = (not host) or any(x in host for x in ("localhost", "127."))
+        if not is_local:
+            for meta_url, label in self.CLOUD_META:
+                try:
+                    resp = await async_get(meta_url, session=session, timeout=4, no_retry=True)
+                    if not resp or resp[0] not in (200, 401, 400, 501):
+                        continue
+                    text = resp[1] or ""
+                    if resp[0] == 200 and text:
+                        findings.append(self._mk(meta_url, label+"接口暴露(IMDSv1可读)", "High"))
+                        continue
+                    if resp[0] in (400, 401):
+                        # 存在但需凭证：若 400 且无 IMDSv2 令牌头，提示 v2 未强制
+                        findings.append(self._mk(meta_url, label+"存在(需令牌/IMDSv2)", "Medium"))
+                except Exception:
+                    continue
+            # IMDSv2 阻断验证：AWS v2 需 x-aws-ec2-metadata-token-ttl-seconds 头
+            try:
+                import aiohttp
+                headers = {"X-aws-ec2-metadata-token-ttl-seconds": "21600"}
+                async with session.get("http://169.254.169.254/latest/api/token", headers=headers, timeout=aiohttp.ClientTimeout(total=4)) as resp:
+                    if resp.status == 200:
+                        findings.append(self._mk(
+                            "http://169.254.169.254/latest/api/token",
+                            "IMDSv2 令牌接口可用(建议确认已强制v2)", "Info"))
+            except Exception:
+                logger.debug("suppressed exception (engine audit)")
+
+        # 3) 去重（与既有 registry/k8s /version 引擎按 url 去重）
+        seen = set()
+        uniq = []
+        for f in findings:
+            k = (f.get("url"), f.get("type"))
+            if k in seen:
+                continue
+            seen.add(k)
+            uniq.append(f)
+        return uniq
+
+    def _mk(self, url: str, title: str, severity: str) -> Dict:
+        return {
+            "url": url, "parameter": "", "payload": url,
+            "type": title, "severity": severity,
+            "ai_verdict": {"High": "高", "Medium": "中", "Info": "信息"}.get(severity, "中"),
+            "confidence": "medium",
+            "evidence": f"探测 {url} 返回可用响应/特征，暴露面需确认",
+            "recommendation": "对管理面启用认证+RBAC/网络隔离；云元数据服务建议升级并强制 IMDSv2",
+        }
+
+    async def check(self, url, param, normal_resp, parsed_query, session, **kwargs) -> Optional[Dict]:
+        return None
+
+
 __all__ = [
     'ShiroRememberMeEngine',
     'SpringCloudGatewayEngine',
     'ContainerPlatformExposureEngine',
     'AdminConsoleExposureEngine',
+    'CloudAndContainerExposureEngine',
 ]

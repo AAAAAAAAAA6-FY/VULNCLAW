@@ -7,10 +7,30 @@
 import asyncio, json, os, re, time
 from urllib.parse import urlparse
 from vulnclaw.core.logger import logger
-from vulnclaw.core.utils import async_get, limit_response_size
+from vulnclaw.core.utils import async_get, limit_response_size, cap
 from vulnclaw.core.session_manager import get_session_manager
+from vulnclaw.core.settings import settings
 from vulnclaw.modules.vuln_scanner import run_arjun
 from typing import Dict, List, Optional
+def _host_is_ip(target: str) -> bool:
+    """判断目标 host 是否为 IP 地址（IP 靶机无需做子域枚举等外部侦察）。"""
+    try:
+        from urllib.parse import urlparse
+        import ipaddress
+        netloc = urlparse(target).netloc
+        if netloc.startswith('['):  # IPv6 字面量 [addr]:port
+            end = netloc.find(']')
+            host = netloc[1:end] if end != -1 else netloc[1:]
+        else:
+            host = netloc.split(':')[0]
+        if not host:
+            return False
+        ipaddress.ip_address(host)
+        return True
+    except Exception:
+        return False
+
+
 async def _recon(self):
     logger.info("🔍 [侦察] 收集目标信息...")
     brief = {
@@ -19,7 +39,7 @@ async def _recon(self):
         "has_auth": False, "apis": [], "burp_params": [],
         "burp_cookies": {}, "burp_tokens": {}, "subdomains": [],
         "alive_assets": [], "nuclei_results": [], "js_endpoints": [],
-        "open_ports": [], "found_dirs": [],
+        "crawled_endpoints": [], "open_ports": [], "found_dirs": [],
     }
     try:
         resp = await async_get(self.target, session=self.session, timeout=15)
@@ -31,7 +51,7 @@ async def _recon(self):
                 if '=' in part:
                     brief["url_params"].append(part.split('=')[0])
         inputs = re.findall(r'<input[^>]+name=["\']([^"\']+)["\']', text, re.I)
-        brief["forms"] = list(set(inputs))[:30]
+        brief["forms"] = cap(list(set(inputs)), settings.max_forms)
         api_patterns = [
             r'["\'](/api/[^"\']+)["\']',
             r'["\'](/v[0-9]+/[^"\']+)["\']',
@@ -57,6 +77,42 @@ async def _recon(self):
             logger.info(f"   Arjun found hidden parameters: {len(arjun_params)}")
     except Exception as e:
         logger.debug(f"Arjun 执行失败: {e}")
+    # B: 同源链接爬虫，补 endpoint 覆盖率（默认深度2/上限80，同源+静态过滤+超时+去重）。
+    # 让 /sqli /xss 等真实漏洞端点进入引擎扫描队列（深度侦察里的盲点击爬虫仅 deep 模式才跑）。
+    try:
+        from vulnclaw.modules.recon import crawl_same_origin
+        _render = bool(getattr(getattr(self, "_spa_detector", None), "is_spa", False))
+        _crawl_session = self.session
+        if settings.crawl_authed:
+            logger.info("   🔐 认证后爬取: 已启用（使用认证会话爬取）")
+        _ws = set()
+        _crawled = await crawl_same_origin(
+            self.target, session=_crawl_session, max_depth=2, max_urls=80, render=_render,
+            crawl_hash_routing=settings.crawl_hash_routing,
+            crawl_websocket=settings.crawl_websocket,
+            ws_endpoints=_ws,
+        )
+        if _crawled:
+            # D5: URL 价值排序——带参数/API/敏感路径的端点优先进入扫描队列
+            def _rank(u: str) -> int:
+                _l = u.lower(); _s = 0
+                if '?' in _l:
+                    _s += 3
+                if any(k in _l for k in ('/api/', '/admin', '/login', '/console', '/config', '/user', '/account', '/dashboard', '/manage')):
+                    _s += 2
+                if _l.endswith(('.js', '.json', '.php', '.asp', '.aspx', '.jsp')):
+                    _s += 1
+                return _s + min(_l.count('/'), 5)
+            _eps = [{"url": u, "params": p} for u, p in _crawled.items()]
+            _eps.sort(key=lambda e: _rank(e["url"]), reverse=True)
+            brief["crawled_endpoints"] = _eps
+            logger.info(f"   🕷️ 同源链接爬虫发现 {len(_crawled)} 个可注入端点（已按价值排序）")
+        if _ws:
+            brief["ws_endpoints"] = sorted(_ws)
+            logger.info(f"   🔌 发现 {len(_ws)} 个 WebSocket 端点（已纳入全局 WS 安全扫描）")
+    except Exception as e:
+        logger.debug(f"同源链接爬虫失败（不影响主流程）: {e}")
+        brief["crawled_endpoints"] = []
     session_mgr = get_session_manager()
     if session_mgr:
         cookies = session_mgr.get_cookies_for_url(self.target)
@@ -78,6 +134,7 @@ async def _recon(self):
     logger.info(f"   Alive assets: {len(brief.get('alive_assets', []))}")
     logger.info(f"   Nuclei findings: {len(brief.get('nuclei_results', []))}")
     logger.info(f"   JS endpoints: {len(brief.get('js_endpoints', []))}")
+    logger.info(f"   🕷️ Crawled endpoints: {len(brief.get('crawled_endpoints', []))}")
     logger.info(f"   Open ports: {len(brief.get('open_ports', []))}")
     if brief.get("intel", {}).get("ports"):
         logger.info(
@@ -110,6 +167,9 @@ async def _deep_recon_internal(self, brief: Dict, domain: str):
     async def recon_subdomains():
         try:
             from vulnclaw.modules.recon import get_subdomains_async
+            if _host_is_ip(self.target):
+                logger.info("      📥 [1/10] 目标为 IP 地址，跳过子域名枚举（无意义且会挂起外部 API）")
+                return []
             logger.info(f"      📥 [1/10] 收集子域名... start_ts={time.time():.3f}")
             return await asyncio.wait_for(
                 get_subdomains_async(domain, compliant=False),
@@ -165,9 +225,9 @@ async def _deep_recon_internal(self, brief: Dict, domain: str):
             from vulnclaw.modules.vuln_scanner import run_nuclei_async, verify_nuclei_with_ai_async
             logger.info(f"      🔬 [3/10] Nuclei CVE 扫描... start_ts={time.time():.3f}")
             results = await asyncio.wait_for(run_nuclei_async(
-                self.target, severity="critical,high,medium", timeout=120,
+                self.target, severity="critical,high,medium,low", timeout=120,
                 tech_stack=brief.get("tech_stack", [])), timeout=150)
-            brief["nuclei_results"] = results[:20]
+            brief["nuclei_results"] = cap(results, settings.max_nuclei_results)
             if results:
                 logger.info(f"      🔬 AI正在过滤 {len(results)} 条nuclei结果...")
                 for item in await verify_nuclei_with_ai_async(results, self.target):
@@ -193,8 +253,8 @@ async def _deep_recon_internal(self, brief: Dict, domain: str):
             resp = await async_get(self.target, session=self.session, timeout=10)
             text = resp[1] if isinstance(resp, tuple) else await resp.text()
             text = limit_response_size(text, 50000) if len(text) > 50000 else text
-            js_urls = [u for u in re.findall(r'<script[^>]+src=["\']([^"\']+)', text)
-                       if u and not u.startswith("data:")][:5]
+            js_urls = cap([u for u in re.findall(r'<script[^>]+src=["\']([^"\']+)', text)
+                       if u and not u.startswith("data:")], settings.max_js_files)
             semaphore = asyncio.Semaphore(4)
             async def analyze_one(js_url):
                 async with semaphore:
@@ -203,18 +263,33 @@ async def _deep_recon_internal(self, brief: Dict, domain: str):
                         js_resp = await async_get(full_url, session=self.session, timeout=10)
                         content = js_resp[1] if isinstance(js_resp, tuple) else await js_resp.text()
                         content = limit_response_size(content, 50000) if len(content) > 50000 else content
-                        result = await asyncio.wait_for(
+                        return await asyncio.wait_for(
                             analyze_js_deep(content, base_url=self.target, source_url=full_url), timeout=25)
-                        return list(result.get("api_endpoints", []))
                     except asyncio.TimeoutError:
                         logger.debug(f"         ⚠️ JS 分析超时（单JS）: {js_url[:100]}")
-                        return []
+                        return {}
                     except Exception as e:
                         logger.debug(f"         ⚠️ JS 分析失败 {js_url[:100]}: {e}")
-                        return []
+                        return {}
             results = await asyncio.gather(*(analyze_one(u) for u in js_urls))
-            brief["js_endpoints"] = list({ep for result in results for ep in result})[:30]
+            brief["js_endpoints"] = cap(
+                list({ep for r in results for ep in (r.get("api_endpoints") or [])}), settings.max_js_endpoints)
             logger.info(f"         ✅发现 {len(brief['js_endpoints'])} 个 API 端点")
+            # D3: 将泄露的 SourceMap URL 上报为信息泄露类 finding。
+            # 此前 JSDeepAnalyzer 仅 logger.info 打印 source_map_url，未进入最终报告，导致该暴露被漏报。
+            sm_urls = {r.get("source_map_url") for r in results if r.get("source_map_url")}
+            for sm in sm_urls:
+                self._add_finding({
+                    "url": sm, "parameter": "", "method": "GET",
+                    "type": "信息泄露-SourceMap泄露", "severity": "Low",
+                    "title": "前端 SourceMap 文件可公开访问",
+                    "description": f"JS 资源暴露 sourceMappingURL={sm}，攻击者可据此还原前端源码"
+                                   f"（路由、接口、硬编码密钥/令牌等敏感信息）。",
+                    "evidence": f"sourceMappingURL: {sm}", "confidence": "high",
+                    "source": "js_deep_analysis",
+                })
+            if sm_urls:
+                logger.info(f"         🗺️ 发现 {len(sm_urls)} 个泄露的 SourceMap（已上报信息泄露）")
         except Exception as e:
             logger.warning(f"      ⚠️ JS 分析失败: {e}")
     async def recon_ports():
@@ -237,8 +312,8 @@ async def _deep_recon_internal(self, brief: Dict, domain: str):
             from vulnclaw.modules.vuln_scanner import run_ffuf_async
             logger.info(f"      📂 [6/10] 目录爆破... start_ts={time.time():.3f}")
             dirs = await asyncio.wait_for(run_ffuf_async(self.target, concurrency=20), timeout=120)
-            brief["found_dirs"] = dirs[:50]
-            for item in dirs[:20]:
+            brief["found_dirs"] = cap(dirs, settings.max_found_dirs)
+            for item in cap(dirs, settings.max_found_dirs):
                 path = item.get("path") or item.get("url") or item.get("endpoint") if isinstance(item, dict) else item
                 if path and len(path) > 2:
                     self._add_finding({
@@ -271,13 +346,13 @@ async def _deep_recon_internal(self, brief: Dict, domain: str):
                 target_domain=domain,
                 subdomains=brief.get("subdomains", []),
                 js_endpoints=brief.get("js_endpoints", []),
-                max_subdomains=30
+                max_subdomains=settings.max_subdomains or 1000000
             )
             unique_endpoints = list(endpoints)
             logger.info(f"      📊 静态收割完成: {len(unique_endpoints)} 个唯一端点")
             if unique_endpoints:
                 existing = brief.get("js_endpoints", [])
-                brief["js_endpoints"] = list(set(existing + unique_endpoints[:1000]))
+                brief["js_endpoints"] = cap(list(set(existing + unique_endpoints)), settings.max_js_endpoints)
                 logger.info(f"      📤 导入 {len(unique_endpoints[:1000])} 个静态端点注入迭代子池")
             auto_import = os.getenv("ENABLE_BURP_IMPORT", "false").lower() == "true"
             if self.burp_available and self.burp_client and auto_import:
@@ -293,26 +368,26 @@ async def _deep_recon_internal(self, brief: Dict, domain: str):
         except Exception as e:
             logger.warning(f"      ⚠️ 静态收割失败: {e}")
     async def recon_iterative():
-        logger.info("      📦 [9/10] 启动盲点击多轮迭代（3轮，纯HTTP）...")
+        logger.info("      📦 [9/10] 启动盲点击多轮迭代（多轮，纯HTTP）...")
         try:
             seed_urls = [self.target]
             if brief.get("js_endpoints"):
-                seed_urls.extend([ep for ep in brief["js_endpoints"] if ep.startswith('/') or ep.startswith('http')][:10])
+                seed_urls.extend(cap([ep for ep in brief["js_endpoints"] if ep.startswith('/') or ep.startswith('http')], settings.max_crawl_seed_urls))
             if brief.get("apis"):
-                seed_urls.extend([ep for ep in brief["apis"] if ep.startswith('/') or ep.startswith('http')][:10])
+                seed_urls.extend(cap([ep for ep in brief["apis"] if ep.startswith('/') or ep.startswith('http')], settings.max_crawl_seed_urls))
             if brief.get("found_dirs"):
                 def _dp(d):
                     if isinstance(d, dict): return d.get('path') or d.get('url') or d.get('endpoint') or ''
                     return d if isinstance(d, str) else str(d)
                 seed_urls.extend([
                     self.target.rstrip('/') + ('/' + p if not p.startswith('/') else p)
-                    for d in brief["found_dirs"][:5]
+                    for d in cap(brief["found_dirs"], settings.max_found_dirs)
                     for p in [_dp(d)] if p
                 ])
-            seed_urls = list(set(seed_urls))[:15]
-            iterative_urls = await self._iterative_api_explorer(seed_urls, max_rounds=3)
+            seed_urls = cap(list(set(seed_urls)), settings.max_crawl_seed_urls)
+            iterative_urls = await self._iterative_api_explorer(seed_urls, max_rounds=settings.max_crawl_rounds)
             if iterative_urls:
-                brief["js_endpoints"] = list(set(brief.get("js_endpoints", []) + iterative_urls))[:100]
+                brief["js_endpoints"] = cap(list(set(brief.get("js_endpoints", []) + iterative_urls)), settings.max_iterative_urls)
                 logger.info(f"         ✅迭代发现 {len(iterative_urls)} 个新端点")
             else:
                 logger.info("         ⛔ 迭代未发现新端点")
@@ -327,7 +402,7 @@ async def _deep_recon_internal(self, brief: Dict, domain: str):
         if isinstance(result, Exception):
             logger.warning(f"      ⚠️ 步骤 {index} 异常（不影响主流程）: {result}")
     logger.info(f"      ✅ [并发组2] 完成，耗时 {time.time() - group2_start:.2f}s")
-async def _iterative_api_explorer(self, seed_urls: List[str], max_rounds: int = 3) -> List[str]:
+async def _iterative_api_explorer(self, seed_urls: List[str], max_rounds: int = 8) -> List[str]:
     discovered = set()
     queue = list(seed_urls)
     round_num = 0; visited = set()
@@ -335,7 +410,7 @@ async def _iterative_api_explorer(self, seed_urls: List[str], max_rounds: int = 
     while queue and round_num < max_rounds:
         round_num += 1
         next_queue = []
-        batch = queue[:30]
+        batch = cap(queue, settings.max_crawl_batch)
         logger.info(f"      💚 第{round_num} 轮：处理 {len(batch)} 个URL")
         for url in batch:
             if url in visited:
@@ -373,7 +448,7 @@ async def _iterative_api_explorer(self, seed_urls: List[str], max_rounds: int = 
                                     if detail_url not in visited:
                                         next_queue.append(detail_url)
                 except BaseException:
-                    pass
+                    logger.debug("suppressed exception (core audit)")
                 if isinstance(resp, tuple) and len(resp) > 2:
                     location = resp[2].get('Location', '')
                     if location and location.startswith('/'):
@@ -382,7 +457,7 @@ async def _iterative_api_explorer(self, seed_urls: List[str], max_rounds: int = 
                             next_queue.append(full)
             except Exception as e:
                 logger.debug(f"         ⚠️ 探索 {url} 失败: {e}")
-        queue = list(set(next_queue))[:30]
+        queue = cap(list(set(next_queue)), settings.max_crawl_batch)
         logger.info(f"      ✅第{round_num} 轮完成！发现 {len(queue)} 个新URL")
     logger.info(f"   ✅ [多轮迭代] 完成，共发现 {len(discovered)} 个唯一URL")
     return list(discovered)
@@ -436,7 +511,7 @@ async def _fetch_from_burp(self, brief: Dict):
                     logger.info(f"      🍪 Burp获取 {len(cookie_dict)} 个Cookie")
                     break
     except Exception:
-        pass
+        logger.debug("suppressed exception (core audit)")
     try:
         tokens = await self.burp_client.get_tokens_from_history(limit=100)
         if tokens:
@@ -447,7 +522,7 @@ async def _fetch_from_burp(self, brief: Dict):
                     logger.info(f"      🔑 Burp获取 {len(token_dict)} 个Token")
                     break
     except Exception:
-        pass
+        logger.debug("suppressed exception (core audit)")
     # 步骤2 修复：原逻辑把 Burp 知识库的 issue 类型定义（静态目录）
     # 当作目标漏洞加入 findings，属于严重误报，已移除。
     # 真实的 Burp 扫描结果应通过 send_to_scanner 提交后用
@@ -461,7 +536,7 @@ async def _get_collaborator_domain(self) -> Optional[str]:
             self.burp._interactsh_domain = result["domain"]
             return result["domain"]
     except Exception:
-        pass
+        logger.debug("suppressed exception (core audit)")
     return None
 async def _check_collaborator_callback(self):
     if not self._collaborator_domain:

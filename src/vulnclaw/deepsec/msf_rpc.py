@@ -225,7 +225,7 @@ class MsfRpcClient:
         try:
             await self._call("session.stop", str(session_id))
         except Exception:  # noqa: BLE001
-            pass
+            logger.debug("suppressed exception (core audit)")
 
 
 def suggest_module(finding: Dict, tech_stack: Optional[List[str]] = None) -> Optional[str]:

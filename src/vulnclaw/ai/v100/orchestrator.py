@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 from vulnclaw.core.logger import logger
 from vulnclaw.core.context import get_scan_context
 from vulnclaw.core.settings import settings
-from vulnclaw.core.utils import async_get
+from vulnclaw.core.utils import async_get, vuln_category
 from vulnclaw.core.scanner import _load_engines
 from vulnclaw.core.session_manager import get_session_manager
 from vulnclaw.ai.core import get_llm_client, get_memory
@@ -126,10 +126,31 @@ class V100Orchestrator:
         self._recon_brief: Dict = {}
         self._processed_params: set = set()
         self._burp_params: set = set()
+        # E4: 早停——参数已确认高危/严重漏洞则跳过剩余引擎（减少无效调用）
+        self._confirmed_params: set = set()
+        self._confirmed_categories: Dict = {}
+        # E1: 增量扫描——记录已扫 (engine, target, param)，下次运行跳过
+        self._incremental_scanned: set = set()
+        try:
+            import os as _os
+            import json as _json
+            if getattr(settings, "incremental_scan", False):
+                _ip = getattr(settings, "incremental_state_file", "") or ""
+                if _ip and _os.path.exists(_ip):
+                    with open(_ip, "r", encoding="utf-8") as _f:
+                        _loaded = _json.load(_f)
+                    for _k in _loaded:
+                        if isinstance(_k, (list, tuple)) and len(_k) == 3:
+                            self._incremental_scanned.add(tuple(_k))
+        except Exception:
+            logger.debug("suppressed exception (core audit)")
         # S1: engine_bundle 首次执行结果（param -> [result, ...]），供 ReAct 深挖判断模糊参数
         self._bundle_results: Dict[str, List[Dict]] = {}
         self._start_time = time.time()
         self._total_engine_calls = 0
+        # G4 可观测性：每引擎统计（调用/命中/超时/错误/耗时）+ 每阶段耗时
+        self._engine_metrics: Dict[str, Dict] = {}
+        self._phase_timings: Dict[str, float] = {}
         self._direct_findings = 0
         self._burp_findings = 0
         self._burp_scan_task = None  # 步骤3：并行 Burp 扫描任务句柄
@@ -314,7 +335,7 @@ class V100Orchestrator:
                     logger.info("🔌 Burp 将在首次 API 调用时自动检测")
                     return
             except RuntimeError:
-                pass
+                logger.debug("suppressed exception (core audit)")
 
             self.burp_available = asyncio.run(self.burp_client.get_status())
         except Exception as e:
@@ -592,7 +613,7 @@ class V100Orchestrator:
                 return
             logger.info("ℹ️ 未检测到多角色会话，IDOR检测将跳过")
         except Exception:
-            pass
+            logger.debug("suppressed exception (core audit)")
 
     def _finding_verify_key(self, finding: Dict) -> tuple:
         """去重 key：与 _verify_all_findings / _add_finding 口径一致。"""
@@ -678,7 +699,7 @@ class V100Orchestrator:
             try:
                 await asyncio.wait_for(task, timeout=10.0)
             except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
-                pass
+                logger.debug("suppressed exception (core audit)")
         logger.info(
             "🧪 [StreamVerify] 已停止: %s 条/%s 批处理, 去重集大小=%s, 错误=%s",
             self._stream_processed_count,
@@ -708,11 +729,11 @@ class V100Orchestrator:
                 try:
                     await asyncio.wait_for(self._stream_event.wait(), timeout=self._stream_timeout_s)
                 except asyncio.TimeoutError:
-                    pass
+                    logger.debug("suppressed exception (core audit)")
                 except asyncio.CancelledError:
                     raise
                 except Exception:  # pragma: no cover - 事件 wait 本身不该抛
-                    pass
+                    logger.debug("suppressed exception (core audit)")
                 # 清 event 后执行一次增量 flush；如果 pending 仍然不够阈值，
                 # flush 内部会按"至少取 1 条 + 已经 >= timeout_s" 的策略决定是否实际验证。
                 self._stream_event.clear()
@@ -813,13 +834,23 @@ class V100Orchestrator:
             except Exception as exc:  # noqa: BLE001
                 logger.debug(f"finding 后处理跳过: {exc}")
             self.findings.append(finding)
+            # E4: 记录已确认高危/严重漏洞的参数（按大类），供早停跳过“同类”剩余引擎
+            try:
+                if str(finding.get('severity', '')).lower() in ('high', 'critical'):
+                    _cp = (finding.get('url', ''), finding.get('parameter', ''))
+                    self._confirmed_params.add(_cp)
+                    self._confirmed_categories.setdefault(_cp, set()).add(
+                        vuln_category(finding.get('type', '') or finding.get('engine', ''))
+                    )
+            except Exception:
+                logger.debug("suppressed exception (core audit)")
             try:
                 get_metrics().inc_vuln(
                     str(finding.get('severity', 'unknown')) or 'unknown',
                     str(finding.get('type', 'unknown')) or 'unknown',
                 )
             except Exception:
-                pass
+                logger.debug("suppressed exception (core audit)")
 
     # ------------------------------------------------------------------
     # 轨道2 2.1: PoC 复现信息（reproduction_steps + curl_command）
@@ -894,13 +925,13 @@ class V100Orchestrator:
             if isinstance(burp_cookies, dict):
                 cookies.update({str(k): str(v) for k, v in burp_cookies.items()})
         except Exception:  # noqa: BLE001
-            pass
+            logger.debug("suppressed exception (core audit)")
         try:
             if self.session is not None and getattr(self.session, "cookies", None):
                 for k, v in self.session.cookies.items():
                     cookies.setdefault(str(k), str(v))
         except Exception:  # noqa: BLE001
-            pass
+            logger.debug("suppressed exception (core audit)")
         return "; ".join(f"{k}={v}" for k, v in cookies.items())
 
     def _build_curl_command(self, finding: Dict, attack_url: str) -> str:
@@ -970,6 +1001,85 @@ class V100Orchestrator:
             finding.setdefault("cross_confirmed", False)
         return finding
 
+    def _record_engine_metric(self, name: str, elapsed: float, hit: bool, timeout: bool = False, error: bool = False) -> None:
+        m = self._engine_metrics.setdefault(
+            name, {"calls": 0, "hits": 0, "timeouts": 0, "errors": 0, "total_time": 0.0}
+        )
+        m["calls"] += 1
+        m["total_time"] += elapsed
+        if hit:
+            m["hits"] += 1
+        if timeout:
+            m["timeouts"] += 1
+        if error:
+            m["errors"] += 1
+
+    def _emit_metrics(self, report: Optional[Dict] = None) -> None:
+        """G4 可观测性：扫描结束输出指标（落盘 _runtime_cache/metrics/ + 日志摘要）。"""
+        try:
+            import time as _t
+            from vulnclaw.paths import RUNTIME_DIR
+            from pathlib import Path
+            from vulnclaw.core.utils import _atomic_write_json
+            metrics_dir = Path(str(RUNTIME_DIR)) / "metrics"
+            metrics_dir.mkdir(parents=True, exist_ok=True)
+            metrics = {
+                "target": self.target,
+                "scan_duration_s": round(_t.time() - self._start_time, 2),
+                "total_engine_calls": self._total_engine_calls,
+                "total_findings": len(self.findings),
+                "ai_cost_usd": self._ai_cost_usd(),
+                "engine_metrics": self._engine_metrics,
+                "phase_timings": self._phase_timings,
+                "model_stats": self._model_stats,
+            }
+            _atomic_write_json(metrics_dir / f"metrics_{_t.strftime('%Y%m%d_%H%M%S')}.json", metrics)
+            logger.info(
+                f"📊 扫描指标已落盘 metrics/: 引擎调用 {metrics['total_engine_calls']} 次 / "
+                f"命中 {metrics['total_findings']} / 耗时 {metrics['scan_duration_s']}s"
+            )
+        except Exception as _me:
+            logger.debug(f"指标落盘失败（不影响扫描）: {_me}")
+
+    def _ai_cost_usd(self) -> float:
+        """C1 成本核算：从 LLM 客户端单例的 TokenBudget 取累计成本（美元）。"""
+        try:
+            from vulnclaw.ai.core import get_llm_client
+            client = get_llm_client()
+            return round(float(getattr(client.budget, "cost_estimate", 0.0)), 4)
+        except Exception:
+            return 0.0
+
+    def _maybe_trip_cost_breaker(self) -> None:
+        """C3: AI 成本预算熔断。扫描阶段累计成本超预算则降级为纯引擎模式（ai_mode=0），防失控。"""
+        if not getattr(settings, "ai_cost_circuit_breaker", True):
+            return
+        try:
+            cost = self._ai_cost_usd()
+        except Exception:
+            return
+        if cost > getattr(settings, "ai_cost_budget_usd", 0.5):
+            logger.warning(
+                f"💸 [C3 熔断] AI 累计成本 ${cost:.4f} 超预算 "
+                f"${getattr(settings, 'ai_cost_budget_usd', 0.5):.4f}，降级为纯引擎模式（ai_mode=0）"
+            )
+            settings.ai_mode = 0
+
+    def _save_incremental_state(self) -> None:
+        """E1: 增量扫描——把本次已扫 (engine, target, param) 落盘，供下次运行跳过。"""
+        try:
+            if not getattr(settings, "incremental_scan", False):
+                return
+            _ip = getattr(settings, "incremental_state_file", "") or ""
+            if not _ip:
+                return
+            from pathlib import Path
+            from vulnclaw.core.utils import _atomic_write_json
+            _data = [list(k) for k in self._incremental_scanned]
+            _atomic_write_json(Path(_ip), _data)
+        except Exception as _e:  # noqa: BLE001
+            logger.debug(f"   [增量] 状态保存失败（忽略）: {_e}")
+
     async def run(self) -> Dict:
         # P4-3: 后台更新 Nuclei 模板（不阻塞扫描启动，收尾时回收）
         self._nuclei_update_task = None
@@ -1018,11 +1128,20 @@ class V100Orchestrator:
                 logger.warning("⚠️ ChromaDB 初始化超时，降级到内存模式")
                 self.memory = None
 
+            _pt = time.monotonic()
             await self._recon()
+            self._phase_timings['recon'] = time.monotonic() - _pt
+            _pt = time.monotonic()
             await self._generate_tasks()
+            self._phase_timings['taskgen'] = time.monotonic() - _pt
             # 在任务执行之前启动流水线验证后台协程，任务边产出 finding 边验证。
             self._start_stream_verify()
+            _pt = time.monotonic()
             await self._execute_with_limiting()
+            self._phase_timings['scan'] = time.monotonic() - _pt
+
+            # C3: 成本预算熔断——扫描阶段累计 AI 成本超预算则降级纯引擎模式，防失控
+            self._maybe_trip_cost_breaker()
 
             # S2: 跨引擎攻击链路由——基于 S2.1 链信息把已确认发现串成后续动作
             #（SSRF->内网探测/Redis 未授权，文件上传/LFI->RCE 链）。
@@ -1066,13 +1185,28 @@ class V100Orchestrator:
 
             # 等所有流式 verify 把存量 pending 跑完；再收尾剩余未被流式 pick 的。
             await self._stop_stream_verify(wait_pending=True)
+            _pt = time.monotonic()
             await self._verify_all_findings()
+            # C9/C10: AI 去重 + 幻觉抑制（配置默认开启；异常则保留原始结果，绝不阻断出报告）
+            try:
+                if getattr(settings, "llm_as_judge_dedup", False) or getattr(settings, "hallucination_suppression", False):
+                    from vulnclaw.ai.v100.phases.phases_verify import llm_judge_dedup, hallucination_suppress
+                    self.findings = await llm_judge_dedup(self, self.findings)
+                    self.findings = hallucination_suppress(self, self.findings)
+            except Exception as _ce:  # noqa: BLE001
+                logger.warning(f"⚠️ C9/C10 后处理异常，保留原始 findings: {_ce}")
+            self._phase_timings['verify'] = time.monotonic() - _pt
 
             self._force_gc()
             await self._finalize_nuclei_update()
             # S3.1: 扫描收尾——把本次关键发现写入 VectorMemory（跨会话学习）
             await self._persist_scan_memory()
-            return await self._generate_report()
+            self._save_incremental_state()
+            _pt = time.monotonic()
+            report = await self._generate_report()
+            self._phase_timings['report'] = time.monotonic() - _pt
+            self._emit_metrics(report)
+            return report
         except Exception as e:
             logger.error(f"扫描过程中发生错误: {e}")
             import traceback
@@ -1080,6 +1214,11 @@ class V100Orchestrator:
             await self._finalize_nuclei_update()
             # S3.1: 扫描收尾——把本次关键发现写入 VectorMemory（跨会话学习）
             await self._persist_scan_memory()
+            self._save_incremental_state()
+            try:
+                self._emit_metrics()
+            except Exception:
+                logger.debug("suppressed exception (core audit)")
             return await self._generate_report()
 
     async def _finalize_nuclei_update(self) -> None:

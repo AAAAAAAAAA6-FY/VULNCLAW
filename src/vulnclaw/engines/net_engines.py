@@ -10,10 +10,24 @@
 """
 
 import re
+import ssl
+import time
 import asyncio
+import datetime
 import json
 import random
+from urllib.parse import urlparse
+
 from vulnclaw.core.utils import async_get, async_post, build_attack_url
+
+try:  # dnspython 为可选依赖：缺失时 DNS/邮件安全引擎自动跳过，不影响其它检测
+    import dns.resolver
+    import dns.query
+    import dns.zone
+
+    DNS_AVAILABLE = True
+except Exception:  # pragma: no cover - 环境未安装 dnspython
+    DNS_AVAILABLE = False
 
 from vulnclaw.core.logger import logger
 from vulnclaw.core.settings import settings
@@ -328,7 +342,7 @@ class SSRFEngine(BaseEngine):
             if any(kw in text.lower() for kw in url_keywords):
                 return True
         except BaseException:
-            pass
+            logger.debug("suppressed exception (engine audit)")
 
         return True
 
@@ -547,7 +561,7 @@ class SSRFEngine(BaseEngine):
                         'diff_ratio': 0.5
                     })
             except BaseException:
-                pass
+                logger.debug("suppressed exception (engine audit)")
 
         return findings
 
@@ -594,7 +608,7 @@ class SSRFEngine(BaseEngine):
 # ============================================================
 # 导出
 # ============================================================
-__all__ = ['SSRFEngine']
+__all__ = ['SSRFEngine', 'XXEEngine', 'GraphQLEngine', 'TlsSecurityEngine', 'DnsSecurityEngine']
 
 
 # ============================================================
@@ -822,7 +836,7 @@ class XXEEngine(BaseEngine):
             if 'xml' in content_type.lower() or 'soap' in content_type.lower():
                 return True
         except BaseException:
-            pass
+            logger.debug("suppressed exception (engine audit)")
 
         if normal_text and ('<?xml' in normal_text or '<soap' in normal_text.lower()):
             return True
@@ -1050,7 +1064,7 @@ class GraphQLEngine(BaseEngine):
             if status == 200 and ('__typename' in text or 'data' in text):
                 return True
         except Exception:
-            pass
+            logger.debug("suppressed exception (engine audit)")
         return False
 
     async def discover_endpoints(
@@ -1090,8 +1104,21 @@ class GraphQLEngine(BaseEngine):
                         endpoints.append(test_url)
                         logger.info(f"🎯 发现 GraphQL 端点: {test_url}")
             except Exception:
-                pass
+                logger.debug("suppressed exception (engine audit)")
         return endpoints
+
+    def _introspection_queries(self) -> List[str]:
+        """F: GraphQL 查询深度上限（settings.graphql_max_depth）。
+        在原有查询基础上追加一个按上限深度展开的内省查询，避免无界深递归导致目标过载。"""
+        from vulnclaw.config.settings import settings
+        queries = list(self.INTROSPECTION_QUERIES)
+        depth = int(getattr(settings, "graphql_max_depth", 8) or 8)
+        depth = max(1, min(depth, 12))
+        layer = "type { name kind }"
+        for _ in range(depth - 1):
+            layer = f"type {{ name kind ofType {{ {layer} }} }}"
+        queries.insert(0, f"query {{ __schema {{ types {{ name {layer} }} }} }}")
+        return queries
 
     async def test_introspection(
         self,
@@ -1108,7 +1135,7 @@ class GraphQLEngine(BaseEngine):
             "subscription_fields": []
         }
 
-        for query in self.INTROSPECTION_QUERIES:
+        for query in self._introspection_queries():
             try:
                 resp = await async_post(
                     endpoint,
@@ -1167,9 +1194,9 @@ class GraphQLEngine(BaseEngine):
                             logger.info(f"   📊 内省开启: {result['type_count']} 个类型, {result['field_count']} 个查询字段")
                             break
                     except BaseException:
-                        pass
+                        logger.debug("suppressed exception (engine audit)")
             except Exception:
-                pass
+                logger.debug("suppressed exception (engine audit)")
         return result
 
     async def test_alias_collision(
@@ -1227,7 +1254,7 @@ class GraphQLEngine(BaseEngine):
                 'recommendation': '限制别名数量，启用查询超时'
             }
         except Exception:
-            pass
+            logger.debug("suppressed exception (engine audit)")
         return None
 
     async def test_recursive_query(
@@ -1298,7 +1325,7 @@ class GraphQLEngine(BaseEngine):
                 'recommendation': '设置最大查询深度限制'
             }
         except Exception:
-            pass
+            logger.debug("suppressed exception (engine audit)")
         return None
 
     async def test_batch_field_extraction(
@@ -1358,7 +1385,7 @@ class GraphQLEngine(BaseEngine):
                             'recommendation': '限制单次查询返回字段数量，使用查询复杂度分析'
                         }
         except Exception:
-            pass
+            logger.debug("suppressed exception (engine audit)")
         return None
 
     async def test_sensitive_field_extraction(
@@ -1418,7 +1445,7 @@ class GraphQLEngine(BaseEngine):
                                 'recommendation': '禁止查询敏感字段，使用权限控制'
                             }
             except Exception:
-                pass
+                logger.debug("suppressed exception (engine audit)")
         return None
 
     async def test_deep_nesting(
@@ -1468,7 +1495,7 @@ class GraphQLEngine(BaseEngine):
                 'recommendation': '设置最大查询深度限制'
             }
         except Exception:
-            pass
+            logger.debug("suppressed exception (engine audit)")
         return None
 
     async def test_suggestions_leak(
@@ -1512,7 +1539,7 @@ class GraphQLEngine(BaseEngine):
                         'recommendation': '关闭 GraphQL 错误中的字段建议（禁止回显 suggestions/Did you mean）',
                     }
         except Exception:
-            pass
+            logger.debug("suppressed exception (engine audit)")
         return None
 
     async def test_mutation_idor(
@@ -1561,8 +1588,55 @@ class GraphQLEngine(BaseEngine):
                     'recommendation': '对 mutation 做单请求操作数限制与逐操作授权校验',
                 }
         except Exception:
-            pass
+            logger.debug("suppressed exception (engine audit)")
         return None
+
+    async def test_without_introspection(
+        self,
+        endpoint: str,
+        session,
+    ) -> Optional[Dict]:
+        """内省关闭时：基于常见字段名清单做字段猜解，探测可访问的隐藏字段。
+
+        内省关闭(data-fetching 或 __schema 返回错误)时无法枚举 schema，攻击者仍可
+        通过猜解 get/currentUser/user/me/admin/secret 等常见字段名探测暴露面。本方法
+        复用猜解清单逐一构造最小查询，能成功且返回 data 即暴露可猜解字段。"""
+        guess_fields = [
+            "me", "user", "currentUser", "viewer", "admin", "users", "usersList",
+            "account", "profile", "config", "settings", "debug", "secret",
+            "token", "apiKey", "invite", "login", "register", "logout",
+            "health", "version", "status", "info",
+        ]
+        probes = []
+        for field in guess_fields:
+            query = f"{{ {field} {{ __typename }} }}"
+            try:
+                resp = await async_post(endpoint, json={"query": query}, session=session, timeout=8)
+                if isinstance(resp, tuple):
+                    status, text = resp[0], resp[1]
+                else:
+                    status, text = resp.status, await resp.text()
+                if status != 200 or not isinstance(text, str):
+                    continue
+                data = json.loads(text)
+                # 无 data 键(内省关闭返回) 或 data 为 null 都不是可访问字段
+                node = (data.get("data") or {}).get(field)
+                if isinstance(node, dict) and node.get("__typename"):
+                    probes.append(field)
+            except Exception:
+                continue
+        if not probes:
+            return None
+        return {
+            "url": endpoint,
+            "type": "GraphQL 内省关闭-字段猜解暴露",
+            "severity": "Medium",
+            "ai_verdict": "中",
+            "confidence": "medium",
+            "evidence": "内省已关闭但通过常见字段名猜解命中可访问字段: " + ", ".join(sorted(probes)),
+            "recommendation": "对 GraphQL 字段做白名单授权控制，避免暴露敏感查询字段",
+            "guessed_fields": sorted(probes),
+        }
 
     async def scan(
         self,
@@ -1624,5 +1698,855 @@ class GraphQLEngine(BaseEngine):
             if result:
                 findings.append(result)
 
+            if not introspection.get('enabled'):
+                result = await self.test_without_introspection(endpoint, session)
+                if result:
+                    findings.append(result)
+
         logger.info(f"✅ GraphQL 扫描完成，发现 {len(findings)} 个问题")
         return findings
+
+
+# ============================================================
+# TLS/SSL 传输层安全检测引擎
+# 说明：传输层配置与 URL 参数无关，属全局引擎（由 V100 global_scan 调度）。
+# 检测面（CWE-295/326/327）：
+#   1. 服务端支持的最高协议版本（SSLv3 / TLSv1.0 / TLSv1.1 均已废弃）
+#   2. 是否仍接受已废弃协议握手（RFC 8996 要求禁用）
+#   3. 协商出的加密套件是否为弱套件（RC4/3DES/NULL/EXPORT/anon/MD5）
+#   4. 证书有效性：过期 / 自签名 / 主机名不匹配 / 链不完整 / 即将过期
+# ============================================================
+
+
+class TlsSecurityEngine(BaseEngine):
+    """TLS/SSL 传输层安全配置检测引擎"""
+
+    name = "tls_security"
+    description = "TLS/SSL 传输层安全检测（废弃协议 / 弱加密套件 / 证书无效或过期）"
+
+    # 弱/废弃密码套件特征（对套件名做小写包含匹配）
+    WEAK_CIPHER_KEYWORDS = (
+        "rc4", "3des", "des-cbc", "null", "export", "anon", "md5", "idea", "seed",
+    )
+    # 命中即视为严重（无加密 / 可降级到导出级 / 匿名）
+    CRITICAL_CIPHER_KEYWORDS = ("null", "export", "anon")
+    # 已废弃协议（RFC 8996 要求禁用）
+    LEGACY_PROTOCOLS = ("TLSv1", "TLSv1.1")
+
+    EXPIRE_WARN_DAYS = 30
+    CONNECT_TIMEOUT = 8
+
+    _VERSION_RANK = {
+        "SSLv2": 0, "SSLv3": 1, "TLSv1": 2,
+        "TLSv1.1": 3, "TLSv1.2": 4, "TLSv1.3": 5,
+    }
+
+    async def check(
+        self,
+        url: str,
+        param: str,
+        normal_resp: Tuple[int, str, Dict],
+        parsed_query: str,
+        session,
+        **kwargs
+    ) -> Optional[Dict]:
+        """参数级入口：TLS 配置与 URL 参数无关，统一走 scan() 全局扫描。"""
+        return None
+
+    async def scan(self, target: str, session, **kwargs) -> List[Dict]:
+        """扫描目标 TLS/SSL 配置（目标级；host:443 不可达时静默跳过，避免误报）。"""
+        findings: List[Dict] = []
+        host, port = self._resolve_endpoint(target)
+        if not host:
+            return findings
+
+        try:
+            negotiated = await asyncio.wait_for(
+                self._handshake(host, port), timeout=self.CONNECT_TIMEOUT
+            )
+        except Exception as exc:
+            # 目标未提供 TLS 服务（纯 HTTP / 端口未开放）属正常情况，不产生误报
+            logger.info(f"TLS 检测跳过：{host}:{port} 无可用 TLS 服务（{exc}）")
+            return findings
+
+        version = negotiated.get("version") or ""
+        cipher = negotiated.get("cipher") or ""
+        highest, legacy_supported = await self._probe_protocol_support(host, port)
+
+        if highest and self._version_rank(highest) < self._version_rank("TLSv1.2"):
+            findings.append(self._finding(
+                target,
+                "tls_legacy_only",
+                "TLS 最高协议版本过低（仅支持废弃协议）",
+                "High",
+                7.4,
+                f"服务端支持的最高 TLS 版本为 {highest}，低于 TLSv1.2，"
+                f"暴露 BEAST/POODLE 等已知协议缺陷攻击面。",
+                f"服务端最高支持协议: {highest}",
+                "禁用 SSLv3/TLSv1.0/TLSv1.1，仅启用 TLSv1.2 及以上（优先 TLSv1.3）。",
+            ))
+
+        if legacy_supported:
+            findings.append(self._finding(
+                target,
+                "tls_legacy_protocol_enabled",
+                "服务端仍接受已废弃 TLS 协议",
+                "Medium",
+                5.9,
+                f"服务端仍可与以下已废弃协议完成握手: {', '.join(legacy_supported)}，"
+                f"RFC 8996 已要求禁用 TLSv1.0/TLSv1.1。",
+                f"可接受废弃协议: {', '.join(legacy_supported)}；当前协商协议: {version}",
+                "关闭 TLSv1.0/TLSv1.1（如 Nginx: ssl_protocols TLSv1.2 TLSv1.3;）。",
+            ))
+
+        lowered = cipher.lower()
+        weak_hits = [k for k in self.WEAK_CIPHER_KEYWORDS if k in lowered]
+        if weak_hits:
+            critical = any(k in lowered for k in self.CRITICAL_CIPHER_KEYWORDS)
+            findings.append(self._finding(
+                target,
+                "tls_weak_cipher",
+                "TLS 协商使用弱加密套件",
+                "High" if critical else "Medium",
+                7.4 if critical else 5.9,
+                f"协商出的加密套件 {cipher} 命中弱算法特征: {', '.join(weak_hits)}。"
+                + ("（NULL/EXPORT/匿名套件等同未加密通信，可被直接解密或降级。）" if critical else ""),
+                f"协商套件: {cipher}（协议 {version}）",
+                "禁用 NULL/EXPORT/RC4/3DES 等弱套件，优先 AEAD 套件（AES-GCM / ChaCha20-Poly1305）。",
+            ))
+
+        findings.extend(await self._verify_certificate(host, port, target))
+
+        logger.info(
+            f"TLS 安全检测完成：{host}:{port} 协商 {version}/{cipher}，"
+            f"最高支持 {highest or 'N/A'}，发现 {len(findings)} 个问题"
+        )
+        return findings
+
+    # ---------- 内部实现 ----------
+
+    def _resolve_endpoint(self, target: str) -> Tuple[str, int]:
+        """解析出用于 TLS 握手的 host/port（统一探测 443，除非目标显式指定了端口）。"""
+        raw = (target or "").strip()
+        if not raw:
+            return "", 0
+        if "://" not in raw:
+            raw = "https://" + raw
+        parsed = urlparse(raw)
+        host = parsed.hostname or ""
+        if not host:
+            return "", 0
+        return host, parsed.port or 443
+
+    async def _handshake(
+        self,
+        host: str,
+        port: int,
+        verify: bool = False,
+        minimum=None,
+        maximum=None,
+        allow_legacy: bool = False,
+    ) -> Dict:
+        """与服务端完成一次 TLS 握手，返回协商出的协议版本 / 套件 / 证书信息。
+
+        verify=True 时使用系统默认信任库做完整证书链校验；
+        minimum/maximum 用于探测服务端对特定协议版本的支持情况；
+        allow_legacy=True 时降低 OpenSSL 安全级别（SECLEVEL=0），
+        避免本地 OpenSSL 策略拦掉对 TLSv1.0/1.1 的探测（否则废弃协议永远检不出）。
+        """
+        if verify:
+            ctx = ssl.create_default_context()
+        else:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        if allow_legacy:
+            try:
+                ctx.set_ciphers("DEFAULT@SECLEVEL=0")
+            except Exception:
+                logger.debug("suppressed exception (engine audit)")
+        if minimum is not None:
+            ctx.minimum_version = minimum
+        if maximum is not None:
+            ctx.maximum_version = maximum
+
+        _reader, writer = await asyncio.open_connection(
+            host, port, ssl=ctx, server_hostname=host
+        )
+        try:
+            sslobj = writer.get_extra_info("ssl_object")
+            if sslobj is None:
+                transport = getattr(writer, "transport", None)
+                sslobj = transport.get_extra_info("ssl_object") if transport else None
+            version = sslobj.version() if sslobj else ""
+            cipher_info = sslobj.cipher() if sslobj else None
+            cert = sslobj.getpeercert() if sslobj else None
+            return {
+                "version": version or "",
+                "cipher": (cipher_info[0] if cipher_info else "") or "",
+                "cert": cert or {},
+                "der": (sslobj.getpeercert(binary_form=True) if sslobj else b"") or b"",
+            }
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                logger.debug("suppressed exception (engine audit)")
+
+    async def _probe_protocol_support(self, host: str, port: int) -> Tuple[str, List[str]]:
+        """逐版本探测：返回（支持的最高协议, 仍可成功握手的废弃协议列表）。"""
+        highest = ""
+        legacy: List[str] = []
+        candidates = (
+            ("TLSv1.3", getattr(ssl.TLSVersion, "TLSv1_3", None)),
+            ("TLSv1.2", ssl.TLSVersion.TLSv1_2),
+            ("TLSv1.1", ssl.TLSVersion.TLSv1_1),
+            ("TLSv1", ssl.TLSVersion.TLSv1),
+        )
+        for label, ver in candidates:
+            if ver is None:
+                continue
+            try:
+                await asyncio.wait_for(
+                    self._handshake(
+                        host, port, minimum=ver, maximum=ver,
+                        allow_legacy=label in self.LEGACY_PROTOCOLS,
+                    ),
+                    timeout=self.CONNECT_TIMEOUT,
+                )
+            except Exception:
+                # 该版本不被服务端支持，或被本地 OpenSSL 安全策略禁用
+                continue
+            if not highest:
+                highest = label
+            if label in self.LEGACY_PROTOCOLS:
+                legacy.append(label)
+        return highest, legacy
+
+    async def _verify_certificate(self, host: str, port: int, url: str) -> List[Dict]:
+        """校验服务器证书：过期 / 即将过期 / 自签名 / 主机名不匹配 / 链不可信。
+
+        优先解析证书真实字段（cryptography，无则回退 CPython 内置解码器），
+        避免只依赖 OpenSSL 错误文案 —— 链错误会掩盖“证书已过期”这类真实问题。
+        """
+        findings: List[Dict] = []
+        info = await self._cert_info(host, port)
+
+        not_after_ts = info.get("not_after_ts")
+        if not_after_ts is not None:
+            days_left = (not_after_ts - time.time()) / 86400.0
+            if days_left <= 0:
+                findings.append(self._finding(
+                    url, "tls_cert_expired", "TLS 证书已过期", "High", 7.4,
+                    "服务端证书已过有效期，客户端无法验证服务身份，存在中间人攻击风险。",
+                    f"{host}:{port} 证书有效期截止: {info.get('not_after_text') or 'N/A'}",
+                    "立即续签并部署有效证书，配置到期前自动轮换。",
+                ))
+            elif days_left <= self.EXPIRE_WARN_DAYS:
+                findings.append(self._finding(
+                    url, "tls_cert_expiring", "TLS 证书即将过期", "Low", 3.7,
+                    f"证书将在 {days_left:.0f} 天内过期，需提前安排续签以避免服务中断。",
+                    f"{host}:{port} 证书有效期截止: {info.get('not_after_text') or 'N/A'}"
+                    f"（剩余 {days_left:.0f} 天）",
+                    "在到期前完成证书续签，建议配置自动轮换与到期告警。",
+                ))
+
+        if info.get("self_signed"):
+            findings.append(self._finding(
+                url, "tls_cert_self_signed", "TLS 证书为自签名", "Medium", 5.9,
+                "服务端使用自签名证书，无法建立可信身份，通信易被中间人劫持。",
+                f"{host}:{port} 证书的签发者(issuer)与主体(subject)相同，为自签名证书",
+                "改用受信任 CA 签发的证书（内网可使用私有 CA 并下发根证书）。",
+            ))
+
+        sans = info.get("sans") or []
+        if sans and not self._host_matches(host, sans):
+            findings.append(self._finding(
+                url, "tls_cert_hostname_mismatch", "TLS 证书主机名不匹配", "Medium", 5.9,
+                "证书绑定的域名与访问主机名不一致，证书校验无法通过。",
+                f"访问主机 {host} 未出现在证书 SAN 列表中: {', '.join(sans[:8])}",
+                "为实际访问域名签发包含正确 SAN 的证书。",
+            ))
+
+        # 已定位到具体证书问题时不叠加“链不可信”（后者通常是这些问题的结果）
+        if any(f["type"] != "tls_cert_expiring" for f in findings):
+            return findings
+
+        chain_error = await self._chain_verify_error(host, port)
+        if not chain_error:
+            return findings
+
+        msg = chain_error.lower()
+        if "expired" in msg:
+            ftype, title, severity, cvss = "tls_cert_expired", "TLS 证书已过期", "High", 7.4
+            desc = "服务端证书不在有效期内，客户端无法验证服务身份。"
+            fix = "及时续签并部署有效证书，配置到期前自动轮换。"
+        elif "self" in msg and "sign" in msg:
+            ftype, title = "tls_cert_self_signed", "TLS 证书为自签名"
+            severity, cvss = "Medium", 5.9
+            desc = "服务端使用自签名证书，无法建立可信身份。"
+            fix = "改用受信任 CA 签发的证书。"
+        elif "hostname" in msg or "match" in msg or "altname" in msg:
+            ftype, title = "tls_cert_hostname_mismatch", "TLS 证书主机名不匹配"
+            severity, cvss = "Medium", 5.9
+            desc = "证书绑定的域名与访问主机名不一致。"
+            fix = "为实际访问域名签发包含正确 SAN 的证书。"
+        else:
+            ftype, title = "tls_cert_untrusted", "TLS 证书链校验失败（不受信任或不完整）"
+            severity, cvss = "Medium", 5.9
+            desc = ("证书链无法校验通过（缺少中间证书或根证书不受信任），"
+                    "客户端会被拦截或被迫忽略证书校验。")
+            fix = "补全中间证书链，使用受信任 CA 签发的证书。"
+        findings.append(self._finding(
+            url, ftype, title, severity, cvss, desc,
+            f"{host}:{port} 证书校验失败: {chain_error}", fix,
+        ))
+        return findings
+
+    async def _cert_info(self, host: str, port: int) -> Dict:
+        """取回证书 DER 并解析出有效期 / 是否自签名 / SAN 列表。"""
+        try:
+            info = await asyncio.wait_for(
+                self._handshake(host, port), timeout=self.CONNECT_TIMEOUT
+            )
+        except Exception:
+            return {}
+        return self._decode_cert(info.get("der") or b"")
+
+    async def _chain_verify_error(self, host: str, port: int) -> Optional[str]:
+        """用系统信任库做完整校验，返回错误描述；校验通过返回 None。"""
+        try:
+            await asyncio.wait_for(
+                self._handshake(host, port, verify=True), timeout=self.CONNECT_TIMEOUT
+            )
+        except ssl.SSLCertVerificationError as exc:
+            return str(getattr(exc, "verify_message", "") or exc)
+        except Exception:
+            return None
+        return None
+
+    @classmethod
+    def _decode_cert(cls, der: bytes) -> Dict:
+        """解析 DER 证书：优先 cryptography，其次内置最小 ASN.1 解析（均无则空）。"""
+        if not der:
+            return {}
+        try:
+            from cryptography import x509  # type: ignore
+
+            cert = x509.load_der_x509_certificate(der)
+            try:
+                not_after = cert.not_valid_after_utc
+            except AttributeError:  # cryptography < 42
+                not_after = cert.not_valid_after
+            try:
+                san_ext = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+                sans = san_ext.value.get_values_for_type(x509.DNSName)
+            except Exception:
+                sans = []
+            return {
+                "not_after_ts": not_after.timestamp(),
+                "not_after_text": not_after.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "self_signed": cert.issuer == cert.subject,
+                "sans": list(sans),
+            }
+        except Exception:
+            logger.debug("suppressed exception (engine audit)")
+
+        # 2) 纯标准库兜底：最小 ASN.1 解析提取有效期（无 cryptography 时仍能判断过期）
+        not_after_ts = cls._der_extract_validity(der)
+        if not_after_ts is None:
+            return {}
+        try:
+            text = datetime.datetime.fromtimestamp(
+                not_after_ts, datetime.timezone.utc
+            ).strftime("%Y-%m-%d %H:%M:%S UTC")
+        except Exception:
+            text = ""
+        return {
+            "not_after_ts": not_after_ts,
+            "not_after_text": text,
+            "self_signed": False,
+            "sans": [],
+        }
+
+    @staticmethod
+    def _der_read_tlv(data: bytes, offset: int):
+        """读取一个 ASN.1 TLV，返回 (tag, value, next_offset)。"""
+        if offset + 2 > len(data):
+            return None, b"", offset
+        tag = data[offset]
+        length = data[offset + 1]
+        offset += 2
+        if length & 0x80:  # 长格式长度
+            nbytes = length & 0x7F
+            if nbytes == 0 or offset + nbytes > len(data):
+                return None, b"", offset
+            length = int.from_bytes(data[offset:offset + nbytes], "big")
+            offset += nbytes
+        if offset + length > len(data):
+            return None, b"", offset
+        return tag, data[offset:offset + length], offset + length
+
+    @staticmethod
+    def _der_parse_time(raw: bytes) -> Optional[float]:
+        """解析 ASN.1 UTCTime / GeneralizedTime 为 UTC 时间戳。"""
+        try:
+            text = raw.decode("ascii").strip()
+        except Exception:
+            return None
+        if text.endswith("Z"):
+            text = text[:-1]
+        # 去掉结尾 Z 之后的长度：UTCTime=12(YYMMDDHHMMSS)，GeneralizedTime=14(YYYYMMDDHHMMSS)
+        if len(text) == 12:
+            fmt = "%y%m%d%H%M%S"
+        elif len(text) == 14:
+            fmt = "%Y%m%d%H%M%S"
+        elif len(text) == 10:
+            fmt = "%y%m%d"
+        elif len(text) == 8:
+            fmt = "%Y%m%d"
+        else:
+            return None
+        try:
+            dt = datetime.datetime.strptime(text, fmt).replace(tzinfo=datetime.timezone.utc)
+            return dt.timestamp()
+        except Exception:
+            return None
+
+    @classmethod
+    def _der_extract_validity(cls, der: bytes) -> Optional[float]:
+        """从 DER 证书提取 notAfter 时间戳（无第三方依赖的最小 ASN.1 解析）。
+
+        tbsCertificate 顶层字段顺序：
+          [0]version(可选) / serialNumber / signature(SEQ) / issuer(SEQ) /
+          validity(SEQ) / subject(SEQ) ...
+        其中 validity = SEQUENCE { notBefore, notAfter }
+        """
+        try:
+            tag, cert_body, _ = cls._der_read_tlv(der, 0)
+            if tag != 0x30:
+                return None
+            tag, tbs, _ = cls._der_read_tlv(cert_body, 0)
+            if tag != 0x30:
+                return None
+
+            top_sequences: List[bytes] = []
+            offset = 0
+            while offset < len(tbs) and len(top_sequences) < 6:
+                t, value, nxt = cls._der_read_tlv(tbs, offset)
+                if t is None or nxt <= offset:
+                    break
+                if t == 0x30:
+                    top_sequences.append(value)
+                offset = nxt
+
+            # top_sequences: [signature, issuer, validity, subject, ...]
+            if len(top_sequences) < 3:
+                return None
+
+            times: List[Optional[float]] = []
+            offset = 0
+            while offset < len(top_sequences[2]):
+                t, value, nxt = cls._der_read_tlv(top_sequences[2], offset)
+                if t is None or nxt <= offset:
+                    break
+                if t in (0x17, 0x18):  # UTCTime / GeneralizedTime
+                    times.append(cls._der_parse_time(value))
+                offset = nxt
+
+            if len(times) >= 2:
+                return times[1]
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _host_matches(host: str, sans: List[str]) -> bool:
+        """主机名与证书 SAN 匹配（支持通配证书，如 *.example.com）。"""
+        host_l = (host or "").lower().rstrip(".")
+        for name in sans:
+            name_l = str(name).lower().rstrip(".")
+            if name_l == host_l:
+                return True
+            if name_l.startswith("*.") and host_l.endswith(name_l[1:]):
+                return True
+        return False
+
+
+# ============================================================
+# DNS / 邮件安全检测引擎
+# 说明：面向域名资产的目标级全局引擎（由 V100 global_scan 调度）。
+# 检测面：
+#   1. 邮件安全：SPF / DMARC / DKIM 记录缺失或策略过宽（可被邮件伪造、钓鱼）
+#   2. DNS 区域传送（AXFR）未受限导致整域记录泄露
+#   3. 子域名接管（CNAME 指向云服务但资源已释放）
+#   4. DNSSEC 未启用
+# 依赖：dnspython（可选）；阻塞 DNS 调用统一放入线程池，避免阻塞事件循环。
+# ============================================================
+
+
+class DnsSecurityEngine(BaseEngine):
+    """DNS 与邮件安全检测引擎"""
+
+    name = "dns_security"
+    description = "DNS/邮件安全检测（SPF/DKIM/DMARC、AXFR 区域传送、子域名接管、DNSSEC）"
+
+    DNS_TIMEOUT = 5
+    HTTP_TIMEOUT = 6
+    MAX_NS = 4
+    DNS_CONCURRENCY = 10
+
+    # 常见 DKIM 选择器（命中任一即认为已配置 DKIM）
+    DKIM_SELECTORS = ("default", "selector1", "selector2", "google")
+
+    # 子域名接管： (CNAME 关键字, 接管后页面指纹, 服务名)
+    TAKEOVER_FINGERPRINTS = (
+        ("github.io", ("There isn't a GitHub Pages site here",), "GitHub Pages"),
+        ("herokuapp.com", ("No such app", "There's nothing here, yet"), "Heroku"),
+        ("s3.amazonaws.com", ("NoSuchBucket", "The specified bucket does not exist"), "AWS S3"),
+        ("azurewebsites.net", ("Error 404 - Web app not found",), "Azure App Service"),
+        ("netlify.app", ("Not Found - Request ID",), "Netlify"),
+        ("vercel.app", ("The deployment could not be found", "404: NOT_FOUND"), "Vercel"),
+        ("pantheonsite.io", ("404 error unknown site",), "Pantheon"),
+        ("zendesk.com", ("Help Center Closed",), "Zendesk"),
+        ("readme.io", ("Project doesnt exist",), "Readme.io"),
+        ("ghost.io", ("The thing you were looking for is no longer here",), "Ghost"),
+        ("shopify.com", ("Sorry, this shop is currently unavailable",), "Shopify"),
+        ("fastly.net", ("Fastly error: unknown domain",), "Fastly"),
+        ("unbouncepages.com", ("The requested URL was not found on this server",), "Unbounce"),
+        ("surge.sh", ("project not found",), "Surge.sh"),
+        ("bitbucket.io", ("Repository not found",), "Bitbucket"),
+        ("tumblr.com", ("There's nothing here",), "Tumblr"),
+        ("teamwork.com", ("Oops - We didn't find your site",), "Teamwork"),
+        ("helpjuice.com", ("We could not find what you're looking for",), "Helpjuice"),
+        ("helpscoutdocs.com", ("No settings were found for this company",), "HelpScout"),
+        ("uservoice.com", ("This UserVoice subdomain is currently available",), "UserVoice"),
+        ("feedpress.me", ("The feed has not been found",), "FeedPress"),
+    )
+
+    TAKEOVER_PREFIXES = (
+        "www", "mail", "blog", "shop", "api", "docs", "status", "help",
+        "cdn", "assets", "static", "dev", "test", "staging", "portal",
+        "support", "forum", "community", "careers", "app", "admin",
+        "img", "media", "download", "kb", "store", "beta", "demo",
+        "m", "mobile", "secure", "git", "ci", "wiki",
+    )
+
+    # 常见二级后缀（用于基域提取）
+    MULTI_LEVEL_SUFFIXES = {
+        "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn", "com.hk",
+        "co.uk", "org.uk", "com.tw", "co.jp", "com.au", "co.kr", "com.br",
+    }
+
+    async def check(
+        self,
+        url: str,
+        param: str,
+        normal_resp: Tuple[int, str, Dict],
+        parsed_query: str,
+        session,
+        **kwargs
+    ) -> Optional[Dict]:
+        """参数级入口：DNS/邮件配置与 URL 参数无关，统一走 scan() 全局扫描。"""
+        return None
+
+    async def scan(self, target: str, session, **kwargs) -> List[Dict]:
+        """扫描域名资产的 DNS 与邮件安全配置。"""
+        findings: List[Dict] = []
+        domain = self._base_domain(target)
+        if not domain:
+            return findings
+        if not DNS_AVAILABLE:
+            logger.info("DNS/邮件安全检测跳过：未安装 dnspython")
+            return findings
+
+        findings.extend(await self._check_email_security(domain))
+        findings.extend(await self._check_zone_transfer(domain))
+        findings.extend(await self._check_dnssec(domain))
+        findings.extend(await self._check_subdomain_takeover(domain, session))
+
+        logger.info(f"DNS/邮件安全检测完成：{domain}，发现 {len(findings)} 个问题")
+        return findings
+
+    # ---------- 邮件安全 ----------
+
+    async def _check_email_security(self, domain: str) -> List[Dict]:
+        findings: List[Dict] = []
+        txts = await self._txt_records(domain)
+        if txts is None:  # DNS 查询整体失败（无可用解析器）时不做缺失判定
+            return findings
+
+        spf = [t for t in txts if t.strip().lower().startswith("v=spf1")]
+        if not spf:
+            findings.append(self._finding(
+                domain, "email_spf_missing", "邮件安全：缺少 SPF 记录", "Medium", 5.3,
+                "域名未配置 SPF，攻击者可伪造该域发件人发起钓鱼/欺诈邮件。",
+                f"{domain} 的 TXT 记录中未找到 v=spf1 记录",
+                "添加 SPF 记录，例如 v=spf1 include:_spf.example.com -all。",
+            ))
+        else:
+            record = spf[0].lower()
+            if re.search(r"\+all|(\?\s*all)", record) or record.rstrip().endswith("+all"):
+                findings.append(self._finding(
+                    domain, "email_spf_permissive", "邮件安全：SPF 策略过宽", "Medium", 5.3,
+                    "SPF 记录使用 +all/?all，等同于允许任意主机以该域名义发信，失去防伪造作用。",
+                    f"SPF 记录: {spf[0][:200]}",
+                    "将 SPF 结尾改为 -all（硬失败）或 ~all（软失败）。",
+                ))
+
+        dmarc_txts = await self._txt_records(f"_dmarc.{domain}")
+        dmarc = [t for t in (dmarc_txts or []) if t.strip().lower().startswith("v=dmarc1")]
+        if dmarc_txts is not None and not dmarc:
+            findings.append(self._finding(
+                domain, "email_dmarc_missing", "邮件安全：缺少 DMARC 记录", "Medium", 5.3,
+                "未配置 DMARC，收件方无法按域策略处置伪造邮件，品牌易被用于钓鱼。",
+                f"_dmarc.{domain} 未返回 v=DMARC1 记录",
+                "添加 DMARC 记录，例如 v=DMARC1; p=quarantine; rua=mailto:dmarc@example.com。",
+            ))
+        elif dmarc:
+            policy = re.search(r"\bp\s*=\s*(\w+)", dmarc[0].lower())
+            if policy and policy.group(1) == "none":
+                findings.append(self._finding(
+                    domain, "email_dmarc_none", "邮件安全：DMARC 策略为 p=none", "Low", 3.1,
+                    "DMARC 仅处于监控模式（p=none），不会拦截或隔离伪造邮件。",
+                    f"DMARC 记录: {dmarc[0][:200]}",
+                    "在监控稳定后将策略提升为 p=quarantine 或 p=reject。",
+                ))
+
+        dkim_found = False
+        dkim_results = await asyncio.gather(
+            *[self._txt_records(f"{sel}._domainkey.{domain}") for sel in self.DKIM_SELECTORS]
+        )
+        for records in dkim_results:
+            if records and any("v=dkim1" in r.lower() or "k=rsa" in r.lower() for r in records):
+                dkim_found = True
+                break
+        if not dkim_found and any(r is not None for r in dkim_results):
+            findings.append(self._finding(
+                domain, "email_dkim_missing", "邮件安全：未发现 DKIM 记录", "Low", 3.1,
+                f"常见 DKIM 选择器（{', '.join(self.DKIM_SELECTORS)}）均未返回密钥记录，"
+                f"邮件缺少签名校验（如使用第三方邮件服务请以其实际选择器为准）。",
+                f"{domain} 的常见 _domainkey 选择器无 DKIM 记录",
+                "为外发邮件启用 DKIM 签名并发布公钥 TXT 记录。",
+            ))
+        return findings
+
+    # ---------- 区域传送 ----------
+
+    async def _check_zone_transfer(self, domain: str) -> List[Dict]:
+        try:
+            ns_answer = await self._dns_query(
+                dns.resolver.resolve, domain, "NS", lifetime=self.DNS_TIMEOUT
+            )
+            nameservers = [str(rdata.target).rstrip(".") for rdata in ns_answer]
+        except Exception:
+            return []
+
+        for ns in nameservers[: self.MAX_NS]:
+            try:
+                zone = await self._dns_query(
+                    dns.zone.from_xfr,
+                    dns.query.xfr(ns, domain, lifetime=self.DNS_TIMEOUT, timeout=self.DNS_TIMEOUT),
+                )
+                if zone is not None:
+                    count = len(zone.nodes.keys())
+                    return [self._finding(
+                        domain, "dns_zone_transfer", "DNS 区域传送（AXFR）未受限", "High", 7.5,
+                        "任意主机可从 authoritative DNS 服务器同步完整区域数据，"
+                        "直接泄露内网主机名、子域与主机用途。",
+                        f"名称服务器 {ns} 允许 AXFR 查询，返回 {count} 条记录",
+                        "在 DNS 服务器上限制 AXFR 仅允许从服务器 IP（allow-transfer）。",
+                    )]
+            except Exception:
+                continue
+        return []
+
+    # ---------- DNSSEC ----------
+
+    async def _check_dnssec(self, domain: str) -> List[Dict]:
+        try:
+            await self._dns_query(
+                dns.resolver.resolve, domain, "DS", lifetime=self.DNS_TIMEOUT
+            )
+            return []
+        except dns.resolver.NoAnswer:
+            return [self._finding(
+                domain, "dns_dnssec_missing", "域名未启用 DNSSEC", "Low", 3.1,
+                "域名缺少 DS 记录，DNS 应答可被缓存投毒/劫持且无法校验来源。",
+                f"{domain} 无 DS 记录（DNSSEC 未启用）",
+                "在域名注册商与 DNS 服务商处启用 DNSSEC 并发布 DS 记录。",
+            )]
+        except Exception:
+            return []
+
+    # ---------- 子域名接管 ----------
+
+    async def _check_subdomain_takeover(self, domain: str, session) -> List[Dict]:
+        semaphore = asyncio.Semaphore(self.DNS_CONCURRENCY)
+
+        async def resolve(prefix: str):
+            async with semaphore:
+                return prefix, await self._cname(f"{prefix}.{domain}")
+
+        pairs = await asyncio.gather(*[resolve(p) for p in self.TAKEOVER_PREFIXES])
+        findings: List[Dict] = []
+        for prefix, cname in pairs:
+            if not cname:
+                continue
+            service = self._match_service(cname)
+            if not service:
+                continue
+            host = f"{prefix}.{domain}"
+            body = await self._http_text(f"http://{host}", session)
+            if not body:
+                continue
+            for fingerprint in self._fingerprints_for(cname):
+                if fingerprint.lower() in body.lower():
+                    findings.append(self._finding(
+                        f"http://{host}", "subdomain_takeover",
+                        f"子域名接管风险：{host}（{service}）", "High", 8.1,
+                        f"{host} 的 CNAME 指向 {cname}，但对应 {service} 资源已释放，"
+                        f"攻击者可注册同名资源接管该子域并发布恶意内容。",
+                        f"CNAME: {host} -> {cname}；页面命中接管指纹: {fingerprint}",
+                        "删除悬空 CNAME 记录，或重新claim对应云服务资源。",
+                    ))
+                    break
+        return findings
+
+    # ---------- 内部实现 ----------
+
+    @staticmethod
+    def _base_domain(target: str) -> str:
+        """提取基域（去 www、支持常见多级后缀）；IP 或非域名返回空。"""
+        raw = (target or "").strip()
+        if not raw:
+            return ""
+        if "://" not in raw:
+            raw = "https://" + raw
+        host = (urlparse(raw).hostname or "").lower().rstrip(".")
+        if not host:
+            return ""
+        if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", host):  # 纯 IP 无域名类检测
+            return ""
+        if host.startswith("www."):
+            host = host[4:]
+        parts = host.split(".")
+        if len(parts) <= 2:
+            return host
+        if ".".join(parts[-2:]) in DnsSecurityEngine.MULTI_LEVEL_SUFFIXES and len(parts) >= 3:
+            return ".".join(parts[-3:])
+        return ".".join(parts[-2:])
+
+    async def _dns_query(self, func, *args, **kwargs):
+        """把阻塞的 dnspython 调用放入线程池，避免阻塞 asyncio 事件循环。"""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
+
+    async def _txt_records(self, name: str) -> Optional[List[str]]:
+        """查询 TXT 记录；返回 None 表示查询失败（区别于“记录不存在”）。"""
+        try:
+            answer = await self._dns_query(
+                dns.resolver.resolve, name, "TXT", lifetime=self.DNS_TIMEOUT
+            )
+            records = []
+            for rdata in answer:
+                records.append("".join(
+                    part.decode("utf-8", "ignore") if isinstance(part, bytes) else str(part)
+                    for part in rdata.strings
+                ))
+            return records
+        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+            return []
+        except Exception:
+            return None
+
+    async def _cname(self, host: str) -> Optional[str]:
+        try:
+            answer = await self._dns_query(
+                dns.resolver.resolve, host, "CNAME", lifetime=self.DNS_TIMEOUT
+            )
+            for rdata in answer:
+                return str(rdata.target).rstrip(".")
+        except Exception:
+            return None
+        return None
+
+    async def _http_text(self, url: str, session) -> str:
+        try:
+            resp = await async_get(url, session=session, timeout=self.HTTP_TIMEOUT, no_retry=True)
+            if isinstance(resp, tuple):
+                return resp[1] or ""
+            return (await resp.text()) or ""
+        except Exception:
+            return ""
+
+    def _match_service(self, cname: str) -> str:
+        lowered = (cname or "").lower()
+        for key, _fingerprints, service in self.TAKEOVER_FINGERPRINTS:
+            if key in lowered:
+                return service
+        return ""
+
+    def _fingerprints_for(self, cname: str):
+        lowered = (cname or "").lower()
+        for key, fingerprints, _service in self.TAKEOVER_FINGERPRINTS:
+            if key in lowered:
+                return fingerprints
+        return ()
+
+    @staticmethod
+    def _finding(
+        url: str,
+        ftype: str,
+        title: str,
+        severity: str,
+        cvss: float,
+        description: str,
+        evidence: str,
+        remediation: str,
+    ) -> Dict:
+        return {
+            "url": url,
+            "type": ftype,
+            "severity": severity,
+            "title": title,
+            "description": description,
+            "remediation": remediation,
+            "recommendation": remediation,
+            "parameter": "",
+            "method": "GET",
+            "evidence": evidence,
+            "confidence": "high",
+            "cvss": cvss,
+        }
+
+    @classmethod
+    def _version_rank(cls, version: str) -> int:
+        return cls._VERSION_RANK.get(str(version).strip(), -1)
+
+    @staticmethod
+    def _finding(
+        url: str,
+        ftype: str,
+        title: str,
+        severity: str,
+        cvss: float,
+        description: str,
+        evidence: str,
+        remediation: str,
+    ) -> Dict:
+        return {
+            "url": url,
+            "type": ftype,
+            "severity": severity,
+            "title": title,
+            "description": description,
+            "remediation": remediation,
+            "recommendation": remediation,
+            "parameter": "",
+            "method": "GET",
+            "evidence": evidence,
+            "confidence": "high",
+            "cvss": cvss,
+        }

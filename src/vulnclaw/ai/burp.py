@@ -62,9 +62,10 @@ class BurpClient:
         connect_timeout: int = 10,
         read_timeout: int = 30
     ):
-        env_url = os.getenv("BURP_API_URL", "")
+        from vulnclaw.config.settings import settings as _st
+        env_url = _st.burp_api_url or ""
         self.base_url = (env_url or base_url or "http://127.0.0.1:1337").rstrip('/')
-        self.api_key = api_key or os.getenv("BURP_API_KEY", "")
+        self.api_key = api_key or _st.burp_api_key or ""
         self.max_retries = max_retries
         self.connect_timeout = connect_timeout
         self.read_timeout = read_timeout
@@ -115,7 +116,7 @@ class BurpClient:
                         else:
                             return None
         except BaseException:
-            pass
+            logger.debug("suppressed exception (core audit)")
         return None
 
     def _save_to_cache(self, prefix: str):
@@ -145,7 +146,7 @@ class BurpClient:
                                     logger.info(f"✅ 发现可用前缀: '{prefix}'")
                                     return prefix
                             except BaseException:
-                                pass
+                                logger.debug("suppressed exception (core audit)")
                 except BaseException:
                     continue
         return None
@@ -274,7 +275,7 @@ class BurpClient:
                 os.remove(self.CACHE_FILE)
                 logger.info("🔄 缓存失效，已清除，重新探测...")
             except BaseException:
-                pass
+                logger.debug("suppressed exception (core audit)")
         self._api_prefix = None
         self._connection_status = False
 
@@ -408,7 +409,7 @@ class BurpClient:
                         if epoch < since_epoch - 5:
                             continue
                     except Exception:
-                        pass
+                        logger.debug("suppressed exception (core audit)")
                 name = ev.get("name") or "Unknown Issue"
                 key = (name, ev.get("base_url") or "")
                 if key in seen:
@@ -563,7 +564,7 @@ class BurpClient:
                                          "running", "processing") and s in succeeded:
                             return s
                 except Exception:
-                    pass
+                    logger.debug("suppressed exception (core audit)")
             elif isinstance(status, str) and status.lower() in terminal:
                 return status.lower()
             await asyncio.sleep(interval)
@@ -1203,8 +1204,9 @@ def get_burp_client() -> Optional[BurpClient]:
     global _burp_client
     if _burp_client is None:
         try:
-            base_url = os.getenv("BURP_API_URL", "http://127.0.0.1:1337")
-            api_key = os.getenv("BURP_API_KEY", "")
+            from vulnclaw.config.settings import settings as _st
+            base_url = _st.burp_api_url or "http://127.0.0.1:1337"
+            api_key = _st.burp_api_key or ""
             _burp_client = BurpClient(
                 base_url=base_url,
                 api_key=api_key,

@@ -16,6 +16,7 @@ from vulnclaw.core.utils import async_get
 from vulnclaw.engines.base import BaseEngine
 
 
+__all__ = ['ContainerSecurityEngine']
 class ContainerSecurityEngine(BaseEngine):
     """容器/Kubernetes 配置风险检测引擎"""
 

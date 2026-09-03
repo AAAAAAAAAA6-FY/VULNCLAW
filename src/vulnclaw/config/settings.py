@@ -13,8 +13,8 @@ import atexit
 import shutil
 import tempfile
 from typing import Any, Optional, List, Dict
-from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings
+from pydantic import Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 import json
 import os
 import re
@@ -44,6 +44,11 @@ class Settings(BaseSettings):
     proxy: Optional[str] = Field(None, alias="PROXY")
     proxy_list: List[str] = Field(default_factory=list, alias="PROXY_LIST")
     max_scan_time: int = Field(3600, alias="MAX_SCAN_TIME")
+
+    # ========== B 堆新增引擎开关（可选，默认启用） ==========
+    password_reset: bool = Field(True, alias="PASSWORD_RESET")
+    cloud_container_exposure: bool = Field(True, alias="CLOUD_CONTAINER_EXPOSURE")
+    backend_component_cve: bool = Field(True, alias="BACKEND_COMPONENT_CVE")
 
     # ========== 请求头 ==========
     user_agent: str = Field(
@@ -156,17 +161,76 @@ class Settings(BaseSettings):
     msf_auto_confirm: bool = Field(True, alias="MSF_AUTO_CONFIRM")  # 成功后自动执行 whoami/id
     # P4-3 Nuclei
     nuclei_auto_update: bool = Field(True, alias="NUCLEI_AUTO_UPDATE")
-    nuclei_tags_from_stack: bool = Field(True, alias="NUCLEI_TAGS_FROM_STACK")
+    # P4-3 原默认 True（按技术栈只跑≤6个tags，省时但实战极易扫不出漏洞）。
+    # 拉满覆盖改为 False：不限制 tags，扫描 ~/nuclei-templates 全量模板库。
+    # 需要提速时设 NUCLEI_TAGS_FROM_STACK=true 恢复按指纹裁剪。
+    nuclei_tags_from_stack: bool = Field(False, alias="NUCLEI_TAGS_FROM_STACK")
     # P4-4 SQLMap API 守护进程
     sqlmap_api_url: str = Field("http://127.0.0.1:8775", alias="SQLMAP_API_URL")
     sqlmap_api_autostart: bool = Field(True, alias="SQLMAP_API_AUTOSTART")
+    # P4-4 补充：SQLi 检出后用 sqlmap 轻量确认（POC 级，不提取数据），把引擎检出升级为实锤
+    sqli_sqlmap_confirm: bool = Field(True, alias="SQLI_SQLMAP_CONFIRM")
+    # 实锤后是否做最小化数据提取（仅 DBMS banner/当前库名/当前用户，不导出业务数据表）
+    sqli_sqlmap_extract: bool = Field(True, alias="SQLI_SQLMAP_EXTRACT")
     # P4-5 告警卡片
     alert_card_enabled: bool = Field(True, alias="ALERT_CARD_ENABLED")
     alert_at_all_on_critical: bool = Field(True, alias="ALERT_AT_ALL_ON_CRITICAL")
 
+    # P4-6 XSS 浏览器执行验证（headless 加载 PoC 确认真正可执行，而非仅反射判定）
+    xss_browser_verify: bool = Field(True, alias="XSS_BROWSER_VERIFY")
+    xss_browser_timeout: int = Field(15, alias="XSS_BROWSER_TIMEOUT")
+
     # ========== 性能优化 ==========
     verify_batch_ai: bool = Field(True, alias="VERIFY_BATCH_AI")  # 优化7: 同(url,param)合并 AI 判定
     sqli_fast_fail: bool = Field(True, alias="SQLI_FAST_FAIL")    # 优化3: SQLi 快失败
+
+    # ========== E组 性能优化（增量/分档/早停/复用/分片） ==========
+    # E2: Nuclei 模板分档（full=全量 / balanced=中危以上 / fast=仅高危），与 nuclei_tags_from_stack 配合提速
+    nuclei_template_tier: str = Field("balanced", alias="NUCLEI_TEMPLATE_TIER")
+    # E3: 单参数一旦确认高危/严重，跳过剩余低优先级引擎（早停），减少无效调用
+    engine_early_stop_on_confirmed: bool = Field(True, alias="ENGINE_EARLY_STOP_ON_CONFIRMED")
+    # E1: 增量扫描——基于上次状态文件跳过已扫端点/参数
+    incremental_scan: bool = Field(False, alias="INCREMENTAL_SCAN")
+    incremental_state_file: str = Field("", alias="INCREMENTAL_STATE_FILE")
+    # E4: 请求复用（core/utils.get_shared_session）开关
+    reuse_shared_session: bool = Field(True, alias="REUSE_SHARED_SESSION")
+    # E6: 分布式分片（无 Redis 走 fakeredis 模拟）
+    distributed_scan: bool = Field(False, alias="DISTRIBUTED_SCAN")
+
+    # ========== C组 AI 架构 ==========
+    # C3: 成本预算熔断（美元），超预算后自动降级为纯引擎模式（ai_mode=0）
+    ai_cost_budget_usd: float = Field(0.5, alias="AI_COST_BUDGET_USD")
+    ai_cost_circuit_breaker: bool = Field(True, alias="AI_COST_CIRCUIT_BREAKER")
+    # C9: LLM-as-Judge 去重（对疑似重复 finding 用模型二次判定）
+    llm_as_judge_dedup: bool = Field(True, alias="LLM_AS_JUDGE_DEDUP")
+    # C10: 幻觉抑制（强制 evidence 非空且可复现，否则降级为低置信）
+    hallucination_suppression: bool = Field(True, alias="HALLUCINATION_SUPPRESSION")
+
+    # ========== G5 危险操作三级分级 ==========
+    # 级别：read(只读) / write(写) / destructive(破坏性)
+    # dangerous_mode=deny 时，write/destructive 默认拦截；下列开关可分别放行（需 --dangerous 配合）
+    danger_level_write_allow: bool = Field(False, alias="DANGER_LEVEL_WRITE_ALLOW")
+    danger_level_destructive_allow: bool = Field(False, alias="DANGER_LEVEL_DESTRUCTIVE_ALLOW")
+
+    # ========== H组 交付 ==========
+    report_sarif: bool = Field(True, alias="REPORT_SARIF")               # 输出 SARIF 文件
+    report_include_poc: bool = Field(True, alias="REPORT_INCLUDE_POC")   # 高危必带可运行 PoC
+    scan_diff: bool = Field(True, alias="SCAN_DIFF")                     # 两次扫描 diff/趋势
+    scan_diff_baseline: str = Field("", alias="SCAN_DIFF_BASELINE")      # 基线报告 JSON 路径
+
+    # ========== F组 覆盖增强 ==========
+    graphql_max_depth: int = Field(8, alias="GRAPHQL_MAX_DEPTH")         # GraphQL 查询深度上限
+    api_bola_test: bool = Field(True, alias="API_BOLA_TEST")             # BOLA/BOPLA 越权测试
+    component_cve_check: bool = Field(True, alias="COMPONENT_CVE_CHECK") # 组件指纹→CVE 匹配
+
+    # ========== D组 爬取增强 ==========
+    crawl_render_spa: bool = Field(True, alias="CRAWL_RENDER_SPA")       # SPA/渲染爬取（D1 已落地）
+    crawl_js_sourcemap: bool = Field(True, alias="CRAWL_JS_SOURCEMAP")   # JS sourceMap 分析
+    crawl_authed: bool = Field(False, alias="CRAWL_AUTHED")              # 认证后爬取
+    crawl_hash_routing: bool = Field(True, alias="CRAWL_HASH_ROUTING")   # SPA hash 路由爬取（D2）
+    crawl_websocket: bool = Field(True, alias="CRAWL_WEBSOCKET")         # WebSocket 端点爬取（D2）
+    tci_adaptive_planning: bool = Field(True, alias="TCI_ADAPTIVE_PLANNING")  # TCI 自适应规划总开关（E3）
+    business_flow_modeling: bool = Field(True, alias="BUSINESS_FLOW_MODELING")  # 业务流建模/竞争条件总开关（B）
 
     # ========== 轨道2: 报告可交付化 ==========
     # 2.1: curl 复现命令是否附带会话 Cookie（默认开启以保证可复现；报告外发时可关闭）
@@ -186,6 +250,62 @@ class Settings(BaseSettings):
         alias="PORT_SCAN_PORTS"
     )
     port_scan_rate: int = Field(1000, alias="PORT_SCAN_RATE")
+
+    # ========== 扫描覆盖 / 深度（默认最强：不截断） ==========
+    # scan_profile: strong（默认，最大覆盖，不截断）/ safe（保守）/ aggressive（同 strong，危险操作需另行开启）
+    scan_profile: str = Field("strong", alias="SCAN_PROFILE")
+    # 以下上限 0 = 不限制（最强模式）；如需保守可设具体数字（safe 档）。
+    max_url_params: int = Field(0, alias="MAX_URL_PARAMS")                 # 参数级引擎测试的总参数数
+    max_idor_params: int = Field(0, alias="MAX_IDOR_PARAMS")               # IDOR 测试参数数
+    max_forms: int = Field(0, alias="MAX_FORMS")                           # 表单数
+    max_js_endpoints: int = Field(0, alias="MAX_JS_ENDPOINTS")             # JS/API 端点数（含静态收割、迭代）
+    max_api_endpoints: int = Field(0, alias="MAX_API_ENDPOINTS")           # API 端点任务数
+    max_found_dirs: int = Field(0, alias="MAX_FOUND_DIRS")                 # 目录爆破结果
+    max_nuclei_results: int = Field(0, alias="MAX_NUCLEI_RESULTS")         # 报告/简报保留的 nuclei 条数（0=全部）
+    max_crawl_endpoints: int = Field(0, alias="MAX_CRAWL_ENDPOINTS")       # 爬虫端点喂给引擎的数量（替代原 CRAWL_ENDPOINT_CAP）
+    max_crawl_seed_urls: int = Field(0, alias="MAX_CRAWL_SEED_URLS")       # 迭代爬虫种子 URL
+    max_crawl_batch: int = Field(0, alias="MAX_CRAWL_BATCH")               # 每轮爬虫批处理 URL
+    max_crawl_rounds: int = Field(8, alias="MAX_CRAWL_ROUNDS")             # 迭代爬虫轮数（原固定 3）
+    max_iterative_urls: int = Field(0, alias="MAX_ITERATIVE_URLS")         # 迭代发现 URL 上限
+    max_js_files: int = Field(0, alias="MAX_JS_FILES")                     # 深度分析的 JS 文件数
+    max_intranet_addrs: int = Field(0, alias="MAX_INTRANET_ADDRS")         # SSRF 内网探测地址数
+    max_upload_urls: int = Field(0, alias="MAX_UPLOAD_URLS")               # 上传产物验证 URL 数
+    max_url_pool: int = Field(0, alias="MAX_URL_POOL")                     # 深挖线索 URL 池
+    max_engines_per_param: int = Field(0, alias="MAX_ENGINES_PER_PARAM")   # 单参数选用的引擎数
+    max_test_params_per_endpoint: int = Field(0, alias="MAX_TEST_PARAMS_PER_ENDPOINT")  # 单端点测试参数数
+    max_burp_history: int = Field(0, alias="MAX_BURP_HISTORY")             # Burp 历史解析条数
+    max_subdomains: int = Field(0, alias="MAX_SUBDOMAINS")                  # 子域收集上限（0=不限制）
+    # Nuclei 扫描参数（原硬编码）改为可调
+    nuclei_rate_limit: int = Field(5, alias="NUCLEI_RATE_LIMIT")                       # -rl
+    nuclei_retries: int = Field(1, alias="NUCLEI_RETRIES")                             # -retries
+    nuclei_per_host_timeout: int = Field(120, alias="NUCLEI_PER_HOST_TIMEOUT")         # -timeout
+
+    @model_validator(mode="after")
+    def _apply_profile(self):
+        # scan_profile=safe 时套用保守上限；strong/aggressive 保持默认（0=不限制=最强）
+        if self.scan_profile == "safe":
+            self.max_url_params = 30
+            self.max_idor_params = 10
+            self.max_forms = 30
+            self.max_js_endpoints = 100
+            self.max_api_endpoints = 100
+            self.max_found_dirs = 50
+            self.max_nuclei_results = 50
+            self.max_crawl_endpoints = 60
+            self.max_crawl_seed_urls = 15
+            self.max_crawl_batch = 30
+            self.max_crawl_rounds = 3
+            self.max_iterative_urls = 100
+            self.max_js_files = 5
+            self.max_intranet_addrs = 3
+            self.max_upload_urls = 3
+            self.max_url_pool = 3
+            self.max_engines_per_param = 3
+            self.max_test_params_per_endpoint = 5
+            self.max_burp_history = 50
+            self.max_subdomains = 50
+        return self
+
     # 目录爆破字典（200+ 条，按 OWASP 常见路径分类）
     # 也支持通过环境变量 COMMON_DIRS="/path/to/dict.txt" 指定外部文件
     common_dirs: List[str] = Field(
@@ -469,13 +589,8 @@ class Settings(BaseSettings):
     adaptive_concurrency_max: int = Field(20, alias="ADAPTIVE_CONCURRENCY_MAX")
 
     # ========== Sprint 1: Slack 通知插件 ==========
-    slack_webhook_url: str = Field("", alias="SLACK_WEBHOOK_URL")
 
     # ========== Sprint 1: Jira 集成插件 ==========
-    jira_url: str = Field("", alias="JIRA_URL")
-    jira_user: str = Field("", alias="JIRA_USER")
-    jira_token: str = Field("", alias="JIRA_TOKEN")
-    jira_project: str = Field("VULN", alias="JIRA_PROJECT")
 
     # ========== Sprint 1: 插件目录 ==========
     PLUGIN_DIR: str = Field(str(_PKG_ROOT_DIR / "thirdparty" / "plugins"))
@@ -545,10 +660,11 @@ class Settings(BaseSettings):
             return [item.strip() for item in v.split(",") if item.strip()]
         return v
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        extra = "ignore"
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
 
 settings = Settings()

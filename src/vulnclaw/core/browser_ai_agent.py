@@ -153,7 +153,7 @@ class BrowserAIAgent:
                 if len(self.captured_requests) > 500:
                     self.captured_requests = self.captured_requests[-500:]
         except BaseException:
-            pass
+            logger.debug("suppressed exception (core audit)")
         await route.continue_()
 
     def _capture_console(self, msg):

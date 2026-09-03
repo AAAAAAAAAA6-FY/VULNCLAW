@@ -12,6 +12,8 @@ from urllib.parse import urlparse
 from vulnclaw.core.logger import logger
 from .graph import DAGNode, NodeType
 from .context import DAGContext
+from vulnclaw.core.settings import settings
+from vulnclaw.core.utils import cap
 
 
 def _ctx_key(target_prefix: str, key: str) -> str:
@@ -120,7 +122,7 @@ async def execute_recon_js_node(node: DAGNode, context: DAGContext) -> Dict:
                     result = await analyze_js_deep(js_resp[1], node.target, js_url)
                     js_endpoints.append(result)
             except Exception:
-                pass
+                logger.debug("suppressed exception (core audit)")
 
         prefix = node.params.get('prefix', '')
         await context.update(_ctx_key(prefix, 'recon_js'), js_endpoints)
@@ -305,7 +307,7 @@ async def execute_attack_node(node: DAGNode, context: DAGContext) -> Dict:
                 if mt > 0:
                     max_tasks_default = mt
             except Exception:
-                pass
+                logger.debug("suppressed exception (core audit)")
             user_max = getattr(orchestrator, "_user_max_tasks", None)
             orchestrator.initial_qps = qps
             orchestrator.max_tasks = int(user_max) if user_max and int(user_max) > 0 else max_tasks_default
@@ -357,10 +359,10 @@ async def execute_attack_node(node: DAGNode, context: DAGContext) -> Dict:
             "subdomains": list(subdomains or []),
             "alive_assets": list(alive or []),
             # Nuclei/FFUF 在外部是 severity list / [{path, status_code}] 两类，直接保留。
-            "nuclei_results": (nuclei[:20] if isinstance(nuclei, list) else []),
-            "js_endpoints": list(js_endpoints or [])[:30],
+            "nuclei_results": (cap(nuclei, settings.max_nuclei_results) if isinstance(nuclei, list) else []),
+            "js_endpoints": cap(js_endpoints or [], settings.max_js_endpoints),
             "open_ports": list(open_ports or []),
-            "found_dirs": (found_dirs[:50] if isinstance(found_dirs, list) else []),
+            "found_dirs": (cap(found_dirs, settings.max_found_dirs) if isinstance(found_dirs, list) else []),
         }
 
         # 3）同步会话鉴权状态（与 _recon 末尾逻辑一致）
@@ -756,7 +758,7 @@ def dead_letter_dir() -> str:
     try:
         os.makedirs(d, exist_ok=True)
     except Exception:
-        pass
+        logger.debug("suppressed exception (core audit)")
     return d
 
 

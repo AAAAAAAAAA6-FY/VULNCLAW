@@ -685,7 +685,7 @@ class HostHeaderEngine(BaseEngine):
                 }
 
         except BaseException:
-            pass
+            logger.debug("suppressed exception (engine audit)")
 
         return None
 
@@ -749,7 +749,7 @@ class HostHeaderEngine(BaseEngine):
                 }
 
         except BaseException:
-            pass
+            logger.debug("suppressed exception (engine audit)")
 
         return None
 
@@ -798,7 +798,7 @@ class HostHeaderEngine(BaseEngine):
                             }
 
             except BaseException:
-                pass
+                logger.debug("suppressed exception (engine audit)")
 
         return None
 
@@ -841,7 +841,7 @@ class HostHeaderEngine(BaseEngine):
                         })
 
             except BaseException:
-                pass
+                logger.debug("suppressed exception (engine audit)")
 
         return findings
 
@@ -1068,7 +1068,7 @@ class OpenRedirectEngine(BaseEngine):
             if domain_match:
                 return domain_match.group(1)
         except BaseException:
-            pass
+            logger.debug("suppressed exception (engine audit)")
 
         domain_match = re.search(r'([a-zA-Z0-9-]+\.[a-zA-Z]{2,})', url_str)
         if domain_match:
@@ -1109,6 +1109,71 @@ class OpenRedirectEngine(BaseEngine):
                     return url
 
         return None
+
+    # 全局扫描时探测的常见重定向参数名（聚焦高频项，控制请求量）
+    GLOBAL_REDIRECT_PARAMS = [
+        "redirect", "return", "next", "url", "to", "goto", "redir",
+        "redirect_uri", "redirect_url", "return_to", "callback",
+        "continue", "forward", "target", "dest", "link", "ref",
+    ]
+    # 全局扫描用的高信噪比 payload（命中即报，不过量探测）
+    GLOBAL_REDIRECT_PROBES = ["//evil.com", "https://evil.com", "http://evil.com"]
+
+    async def _quick_redirect_test(self, url: str, param: str, session) -> Optional[Dict]:
+        """单 (端点,参数) 快速探测：发少量高信噪比 payload，命中即返回。"""
+        for payload in self.GLOBAL_REDIRECT_PROBES:
+            attack_url = self._build_redirect_url(url, param, payload, "")
+            try:
+                resp = await async_get(attack_url, session=session,
+                                       timeout=settings.timeout, allow_redirects=False)
+                if isinstance(resp, tuple):
+                    status, headers = resp[0], (resp[2] if len(resp) > 2 else {})
+                else:
+                    status, headers = resp.status, resp.headers
+                location = headers.get("Location", "")
+                if location and self._is_malicious_redirect(location, payload):
+                    return {
+                        'url': attack_url,
+                        'parameter': param,
+                        'payload': payload,
+                        'type': f'开放重定向(全局-{payload})',
+                        'severity': 'Medium',
+                        'ai_verdict': '高',
+                        'evidence': f'Location 头包含恶意地址: {location}',
+                        'status_code': status,
+                        'location': location,
+                        'recommendation': '校验重定向地址白名单',
+                    }
+            except Exception:
+                continue
+        return None
+
+    async def scan(self, target: str, session, **kwargs) -> List[Dict]:
+        """目标级扫描：对 recon 发现的每个端点，用常见重定向参数名探测开放重定向。
+
+        作为全局（目标级）引擎运行，避免被参数级 top-3 优先级挤出
+        （redirect 类参数常被 xss/sqli 等高优先级引擎挤掉而漏检）。
+        """
+        findings: List[Dict] = []
+        endpoints = kwargs.get("endpoints") or [target]
+        seen = set()
+        for ep in endpoints:
+            if not ep or ep.lower().startswith(("javascript:", "data:", "file:")):
+                continue
+            for param in self.GLOBAL_REDIRECT_PARAMS:
+                try:
+                    r = await asyncio.wait_for(
+                        self._quick_redirect_test(ep, param, session), timeout=30)
+                except Exception:
+                    r = None
+                if r:
+                    key = (r.get("url", "").split("?")[0], r.get("parameter"))
+                    if key not in seen:
+                        seen.add(key)
+                        findings.append(r)
+                    break  # 同一端点找到一个开放重定向即足够
+        self.log_info(f"OpenRedirectEngine(全局): {len(findings)} findings / {len(endpoints)} endpoints")
+        return findings
 
 
 # ============================================================

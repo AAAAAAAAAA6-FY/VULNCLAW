@@ -87,7 +87,7 @@ class DistributedMaster:
                 stream_key, group_name, id="0", mkstream=True
             )
         except Exception:  # noqa: BLE001 - 消费组已存在
-            pass
+            logger.debug("suppressed exception (core audit)")
 
     async def submit_task(self, task: Dict) -> str:
         """P3-3: 提交任务到 Redis Stream 队列。

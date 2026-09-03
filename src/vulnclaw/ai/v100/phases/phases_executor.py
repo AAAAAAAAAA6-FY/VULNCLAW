@@ -14,10 +14,12 @@ from typing import Any, Dict, List, Optional
 from vulnclaw.core.logger import logger
 from vulnclaw.core.scanner import safe_request, get_engine_by_name
 from vulnclaw.core.settings import settings
+from vulnclaw.core.utils import cap, get_tool_path, vuln_category
 from vulnclaw.engines.input_engines import BusinessLogicEngine
 from vulnclaw.engines.auxiliary_engines import APIVersionDiffEngine, RequestSmugglingEngine, HTTP2WebSocketEngine
 from vulnclaw.engines.http_engines import CachePoisonEngine
 from vulnclaw.engines.base import annotate_chain_info
+from vulnclaw.deepsec.sqlmap_wrapper import SQLMapWrapper
 async def _run_business_logic_scan(self):
     try:
         logger.info("🧬 [BusinessLogic] 全局扫描...")
@@ -227,7 +229,7 @@ async def _execute_with_limiting(self):
                 try:
                     await self.task_queue.complete_task(task_id, success=False)
                 except Exception:
-                    pass
+                    logger.debug("suppressed exception (core audit)")
                 continue
             # 并发安全计数 + 每 10 次日志
             async with count_lock:
@@ -389,7 +391,7 @@ async def _execute_task(self, task: Dict) -> Optional[Dict]:
         return await self._execute_engine_check(task)
     elif task_type == "cve_scan":
         # Z1.2：CVE 索引命中的高危 CVE 专项扫描（nuclei -id）
-        return await self._execute_cve_scan(task)
+        return await _execute_cve_scan(self, task)
     elif task_type in {"stateful_flow", "multi_identity_compare", "openapi_spec_check"}:
         logger.warning(
             "Skipping phase-2 placeholder task type %s (framework stub, not yet implemented)",
@@ -474,7 +476,7 @@ def _safe_parse_bundle_json(raw_response: str) -> List[Dict[str, Any]]:
             if isinstance(parsed, dict):
                 return [parsed]
         except (json.JSONDecodeError, TypeError):
-            pass
+            logger.debug("suppressed exception (core audit)")
         try:
             parsed = ast.literal_eval(candidate)
             if isinstance(parsed, list):
@@ -482,7 +484,7 @@ def _safe_parse_bundle_json(raw_response: str) -> List[Dict[str, Any]]:
             if isinstance(parsed, dict):
                 return [parsed]
         except (ValueError, SyntaxError, TypeError):
-            pass
+            logger.debug("suppressed exception (core audit)")
     results = []
     pattern = re.compile(
         r"(?:index|idx|\"index\"|'index')\s*[:=]\s*(\d+).*?"
@@ -562,7 +564,7 @@ async def _execute_engine_bundle(self, task: Dict) -> Optional[Dict]:
         f"检测结果\n{json.dumps(evidence, ensure_ascii=False, default=str)}"
     )
     try:
-        parsed = self._safe_parse_bundle_json(await self._ask_ai(prompt, compress=True, task_type="verify"))
+        parsed = _safe_parse_bundle_json(await self._ask_ai(prompt, compress=True, task_type="verify"))
     except Exception as exc:
         logger.warning(f"   ⚠️ Bundle AI 判定失败，保留规则结果: {exc}")
         parsed = []
@@ -586,7 +588,7 @@ async def _execute_engine_bundle(self, task: Dict) -> Optional[Dict]:
                     result, task.get("url") or self.target, str(task.get("param") or "")
                 ).get("chain_info")
             except Exception:  # noqa: BLE001
-                pass
+                logger.debug("suppressed exception (core audit)")
     bundle_results = [item["result"] for item in local_results]
     # S1.2: 记录 bundle 首次执行结果（供 ReAct 深挖判断"本地判定模糊"）
     try:
@@ -770,7 +772,7 @@ async def _chain_ssrf(self, finding: Dict) -> int:
         return 0
     chained = 0
     seen = set()
-    for addr in intranet_addrs[:3]:
+    for addr in cap(intranet_addrs, settings.max_intranet_addrs):
         if addr in seen:
             continue
         seen.add(addr)
@@ -813,7 +815,7 @@ async def _chain_upload(self, finding: Dict) -> int:
     if not upload_urls:
         return 0
     chained = 0
-    for u in upload_urls[:3]:
+    for u in cap(upload_urls, settings.max_upload_urls):
         try:
             resp = await async_get(u, session=self.session, timeout=10, no_retry=True)
             if resp is None or resp[0] == 0:
@@ -852,12 +854,12 @@ async def _generate_clues_for_dive(self, engine=None):
         for u in brief.get(key, []) or []:
             if isinstance(u, str) and u.startswith("http"):
                 url_pool.append(u)
-    url_pool = list(dict.fromkeys(url_pool))[:3]
+    url_pool = cap(list(dict.fromkeys(url_pool)), settings.max_url_pool)
     if not url_pool:
         return
     for u in url_pool:
         try:
-            normal = await self._fetch_normal_response(u)
+            normal = await _fetch_normal_response(self, u)
             status, text = normal[0], str(normal[1] or "")
             headers = normal[2] if len(normal) > 2 else {}
             if engine is not None:
@@ -1066,6 +1068,27 @@ async def _execute_cve_scan(self, task: Dict) -> Optional[Dict]:
     return None
 
 
+def _global_scan_endpoints(orch) -> List[str]:
+    """收集 recon 阶段发现的所有端点 URL，供全局（目标级）引擎精准探测。
+
+    框架升级：此前全局引擎只拿到根 target，导致路径级漏洞（/redirect、/cors、
+    /.env 等）对全局引擎不可见。现在把已发现端点（js_endpoints/apis/found_dirs）
+    归一化后一并传入，新增/改造的全局引擎可据此逐端点探测。
+    """
+    base = str(getattr(orch, "target", "")).rstrip("/")
+    brief = getattr(orch, "_recon_brief", None) or {}
+    out: List[str] = []
+    for key in ("js_endpoints", "apis", "found_dirs", "crawled_endpoints", "ws_endpoints"):
+        for u in brief.get(key, []) or []:
+            if not isinstance(u, str):
+                continue
+            if u.startswith("http") or u.startswith("ws"):
+                out.append(u.split("?")[0].rstrip("/"))
+            elif u.startswith("/"):
+                out.append((base + u).split("?")[0].rstrip("/"))
+    return list(dict.fromkeys(out)) or [base]
+
+
 async def _execute_global_scan(self, task: Dict) -> Optional[Dict]:
     engine_name = task.get("engine")
     target = task.get("target", self.target)
@@ -1073,12 +1096,20 @@ async def _execute_global_scan(self, task: Dict) -> Optional[Dict]:
     if not engine or not hasattr(engine, 'scan'):
         logger.debug(f"   ⚠️ 引擎 {engine_name} 无 scan 方法")
         return None
+    start = time.monotonic()
+    # E1: 增量扫描——跳过上次已扫全局引擎
+    if getattr(settings, "incremental_scan", False):
+        _gkey = (engine_name, target, "")
+        if _gkey in self._incremental_scanned:
+            logger.info(f"   ⏭️ [增量] 已扫过全局引擎: {engine_name}")
+            return None
+        self._incremental_scanned.add(_gkey)
     try:
         if engine_name == "info_leak":
             max_paths = task.get("max_paths", 150)  # 修复：使用传入的参数
-            results = await engine.scan(target, self.session, max_paths=max_paths)
+            results = await engine.scan(target, self.session, max_paths=max_paths, endpoints=_global_scan_endpoints(self))
         else:
-            results = await engine.scan(target, self.session)
+            results = await engine.scan(target, self.session, endpoints=_global_scan_endpoints(self))
         if results:
             for r in results:
                 if not any(f.get('url') == r.get('url') and f.get('type') == r.get('type') for f in self.findings):
@@ -1087,7 +1118,7 @@ async def _execute_global_scan(self, task: Dict) -> Optional[Dict]:
                         try:
                             r["chain_info"] = annotate_chain_info(r, target, str(r.get("parameter", "") or "")).get("chain_info")
                         except Exception:  # noqa: BLE001
-                            pass
+                            logger.debug("suppressed exception (core audit)")
                     self._add_finding(r)
                     logger.info(f"   🌐 {engine_name} 发现: {r.get('type')}")
                     if engine_name == "business_logic":
@@ -1100,7 +1131,9 @@ async def _execute_global_scan(self, task: Dict) -> Optional[Dict]:
                         self._http2_ws_findings += 1
                     elif engine_name == "cache_poison":
                         self._cache_poison_findings += 1
+        self._record_engine_metric(engine_name, time.monotonic() - start, hit=bool(results))
     except Exception as e:
+        self._record_engine_metric(engine_name, time.monotonic() - start, hit=False, error=True)
         logger.warning(f"全局扫描 {engine_name} 失败: {e}")
     return None
 async def _fetch_normal_response(self, target: str):
@@ -1125,6 +1158,54 @@ async def _fetch_normal_response(self, target: str):
     return normal_resp
 
 
+async def _maybe_sqlmap_confirm(result: Dict, target: str, param: str) -> None:
+    """对 SQLi 类检出调用 sqlmap 做轻量确认（不提取数据），成功则 enrich finding。
+
+    失败/未实锤均不影响原引擎检测结果（优雅降级）。
+    """
+    rtype = str(result.get("type", ""))
+    if "SQL" not in rtype.upper() and "注入" not in rtype and "sql" not in rtype.lower():
+        return
+    if not getattr(settings, "sqli_sqlmap_confirm", True):
+        return
+    if get_tool_path("sqlmap") is None:
+        return
+    try:
+        wrapper = SQLMapWrapper(target, session=None, timeout=120, level=2, risk=1)
+        conf = await wrapper.confirm(target, param, method="GET")
+        if conf.get("confirmed"):
+            result["sqlmap_confirmed"] = True
+            result["confidence"] = "high"
+            result["evidence"] = (str(result.get("evidence", "")) + " | [sqlmap 已确认注入点]")[:500]
+            try:
+                result["poc"] = wrapper.generate_poc(result)
+            except Exception:  # noqa: BLE001
+                logger.debug("suppressed exception (core audit)")
+            # 实锤后做最小化数据提取（仅数据库指纹，证明可利用性，不导出业务数据）
+            if getattr(settings, "sqli_sqlmap_extract", True):
+                try:
+                    ext = await wrapper.extract(target, param, method="GET")
+                    if ext.get("extracted"):
+                        result["sqlmap_extracted"] = {
+                            key: value
+                            for key, value in ext.items()
+                            if key not in ("raw_tail", "extracted") and value
+                        }
+                        result["exploit_verified"] = True
+                        result["evidence"] = (
+                            f"{str(result.get('evidence', ''))} | "
+                            f"[sqlmap 实锤并提取: {result['sqlmap_extracted']}]"
+                        )[:800]
+                        logger.info(f"   💉 [SQLMap] 数据提取成功: {result['sqlmap_extracted']}")
+                except Exception as _extend_err:  # noqa: BLE001
+                    logger.debug(f"   💉 [SQLMap] 数据提取异常（忽略）: {_extend_err}")
+            logger.info(f"   💉 [SQLMap] 确认 SQLi: {target} param={param}")
+        else:
+            logger.debug(f"   💉 [SQLMap] 轻量确认未实锤（保留原引擎判定）: {param}")
+    except Exception as _e:  # noqa: BLE001
+        logger.debug(f"   💉 [SQLMap] 确认异常（忽略）: {_e}")
+
+
 async def _execute_engine_check(self, task: Dict) -> Optional[Dict]:
     engine_name = task.get("engine")
     target = task.get("target", self.target)
@@ -1133,6 +1214,20 @@ async def _execute_engine_check(self, task: Dict) -> Optional[Dict]:
     if not engine_name or not param:
         return None
     self._processed_params.add(param)
+    # E4: 早停——该参数已确认同类高危/严重漏洞才跳过（按漏洞大类生效），
+    # 避免 XSS 确认后把同参数的 SQLi/SSTI/LFI/CMDi 等正交大类一并误杀（漏报根因）。
+    if getattr(settings, "engine_early_stop_on_confirmed", True) and (target, param) in self._confirmed_params:
+        _confirmed_cats = self._confirmed_categories.get((target, param), set())
+        _eng_cat = vuln_category(engine_name)
+        if _eng_cat in _confirmed_cats:
+            logger.info(f"   ⏭️ [早停] 同参数已确认同类漏洞({_eng_cat})，跳过 {engine_name} on {param}")
+            return None
+    # E1: 增量扫描——跳过上次已扫端点/参数
+    if getattr(settings, "incremental_scan", False):
+        _inc_key = (engine_name, target, param)
+        if _inc_key in self._incremental_scanned:
+            logger.info(f"   ⏭️ [增量] 已扫过: {engine_name} {param}")
+            return None
     engine = get_engine_by_name(engine_name)
     if not engine:
         logger.debug(f"   ⚠️ 未知引擎: {engine_name}")
@@ -1143,7 +1238,7 @@ async def _execute_engine_check(self, task: Dict) -> Optional[Dict]:
         normal_resp = self._normal_responses.get(target)
         inflight = self._normal_resp_inflight.get(target)
         if normal_resp is None and inflight is None:
-            inflight = asyncio.ensure_future(self._fetch_normal_response(target))
+            inflight = asyncio.ensure_future(_fetch_normal_response(self, target))
             self._normal_resp_inflight[target] = inflight
     if normal_resp is None and inflight is not None:
         try:
@@ -1158,12 +1253,15 @@ async def _execute_engine_check(self, task: Dict) -> Optional[Dict]:
     parsed_query = target.split('?')[1] if '?' in target else ''
     current_model = await self._get_next_model()
     provider_key = self._model_to_provider.get(current_model)
+    _t0 = time.monotonic()
     try:
         if hasattr(engine, 'max_payloads'):
             engine.max_payloads = payload_limit
         kwargs = {}
         if engine_name in ("cmdi", "ssrf") and self._collaborator_domain:
             kwargs["interactsh_domain"] = self._collaborator_domain
+        if getattr(settings, "incremental_scan", False):
+            self._incremental_scanned.add((engine_name, target, param))
         result = await asyncio.wait_for(
             engine.check(
                 url=target,
@@ -1173,15 +1271,22 @@ async def _execute_engine_check(self, task: Dict) -> Optional[Dict]:
                 session=self.session,
                 **kwargs
             ),
-            timeout=60
+            timeout=120
         )
         self._total_engine_calls += 1
+        self._record_engine_metric(engine_name, time.monotonic() - _t0, hit=bool(result))
         if result:
+            # S3: SQLi 类检出 → sqlmap 轻量确认（POC 级，不提取数据），升级为实锤
+            # 关键：确认失败/异常绝不影响引擎原始检出，避免丢 finding
+            try:
+                await _maybe_sqlmap_confirm(result, target, param)
+            except Exception as _ce:  # noqa: BLE001
+                logger.debug("   [SQLMap] 确认异常（忽略，保留引擎判定）: %s", _ce)
             # S2.1: 结构化链信息标注（HTTP状态/可控点/回显特征/可链性），供跨引擎攻击链路由消费
             try:
                 result = annotate_chain_info(result, target, param)
             except Exception:  # noqa: BLE001
-                pass
+                logger.debug("suppressed exception (core audit)")
             if 'role' in kwargs and 'response' in kwargs:
                 await self.context.store_role_response(
                     kwargs.get('role', 'default'),
@@ -1232,6 +1337,7 @@ async def _execute_engine_check(self, task: Dict) -> Optional[Dict]:
         if provider_key:
             await self.balancer.record_result(provider_key, success=False, status_code=408)
         logger.warning(f"   ⏭️ 引擎检查超时(60s): {engine_name} {param}")
+        self._record_engine_metric(engine_name, time.monotonic() - _t0, hit=False, timeout=True)
         return None
     except Exception as e:
         error_str = str(e)
@@ -1240,5 +1346,6 @@ async def _execute_engine_check(self, task: Dict) -> Optional[Dict]:
         if provider_key:
             await self.balancer.record_result(provider_key, success=False, status_code=500)
         logger.debug(f"   ❌ 执行失败: {e}")
+        self._record_engine_metric(engine_name, time.monotonic() - _t0, hit=False, error=True)
         return None
 __all__ = ['_run_business_logic_scan', '_run_api_version_scan', '_run_smuggling_scan', '_run_http2_ws_scan', '_run_cache_poison_scan', '_run_burp_scan', '_execute_with_limiting', '_run_one_task', '_execute_task', '_safe_parse_bundle_json', '_execute_engine_bundle', '_execute_global_scan', '_execute_engine_check', '_run_react_deep_dive', '_collect_react_candidates', '_merge_react_findings', '_run_chain_router', '_chain_ssrf', '_chain_upload', '_generate_clues_for_dive', '_persist_scan_memory', '_run_multi_agent_dive', '_resolve_agent_conflicts']

@@ -206,7 +206,7 @@ class AlertSender:
                             logger.warning(f"⚠️ 钉钉告警返回异常: {str(data)[:200]}")
                             return False
                     except Exception:
-                        pass
+                        logger.debug("suppressed exception (core audit)")
                     return True
         except Exception as e:
             logger.error(f"❌ 钉钉告警发送失败: {e}")
@@ -257,7 +257,7 @@ class AlertSender:
                             logger.warning(f"⚠️ 飞书告警返回异常: {str(data)[:200]}")
                             return False
                     except Exception:
-                        pass
+                        logger.debug("suppressed exception (core audit)")
                     return True
         except Exception as e:
             logger.error(f"❌ 飞书告警发送失败: {e}")

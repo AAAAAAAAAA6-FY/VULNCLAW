@@ -371,7 +371,7 @@ class ELInjectionEngine(BaseEngine):
                         'diff_ratio': 0.5
                     }
             except BaseException:
-                pass
+                logger.debug("suppressed exception (engine audit)")
 
         return None
 
@@ -540,7 +540,7 @@ class FileUploadEngine(BaseEngine):
                         endpoints.append(test_url)
                         logger.info(f"📎 发现文件上传端点: {test_url}")
             except BaseException:
-                pass
+                logger.debug("suppressed exception (engine audit)")
 
         return endpoints
 
@@ -595,7 +595,7 @@ class FileUploadEngine(BaseEngine):
                 if self._is_upload_success(text):
                     # 提取可能返回的文件路径
                     filepath = self._extract_filepath(text)
-                    return {
+                    finding = {
                         'url': upload_url,
                         'parameter': pname,
                         'filename': filename,
@@ -608,6 +608,25 @@ class FileUploadEngine(BaseEngine):
                         'status': status,
                         'recommendation': '限制文件类型，执行内容验证'
                     }
+                    # B2: 上传后回连访问验证（确认是否可被公开访问甚至被解析执行）
+                    access = await self._verify_uploaded_access(
+                        upload_url, filepath, filename, session
+                    )
+                    if access:
+                        finding['upload_verified'] = True
+                        finding['severity'] = 'Critical'
+                        finding['type'] = f'文件上传-可访问/可执行({description})'
+                        finding['evidence'] = (
+                            f'{finding["evidence"]}；上传后访问 {access["url"]} '
+                            f'返回 HTTP {access["status"]}'
+                            + ('，且文件内容被原样返回（可直接访问/被解析执行）'
+                               if access.get('echoed') else '（文件可公开访问）')
+                        )
+                        finding['recommendation'] = (
+                            '将上传目录与 Web 目录隔离并禁用其脚本执行权限，'
+                            '校验文件内容类型、随机重命名存储，禁止直接返回可访问路径'
+                        )
+                    return finding
 
                 # ===== 检测路径泄露 =====
                 path = self._extract_filepath(text)
@@ -652,6 +671,48 @@ class FileUploadEngine(BaseEngine):
     # 响应分析
     # ============================================================
 
+    async def _verify_uploaded_access(
+        self,
+        upload_url: str,
+        filepath: Optional[str],
+        filename: str,
+        session,
+    ) -> Optional[Dict]:
+        """B2: 上传成功后回连访问该文件，确认是否可被公开访问甚至被解析执行。
+
+        仅做只读 GET 请求（不执行任何命令），依据 HTTP 200 与内容回显判定；
+        访问不到时返回 None，不改变原有检出结论。
+        """
+        from urllib.parse import urlparse as _urlparse
+
+        parsed = _urlparse(upload_url)
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        candidates: List[str] = []
+
+        if filepath:
+            if filepath.startswith(("http://", "https://")):
+                candidates.append(filepath)
+            else:
+                candidates.append(base + (filepath if filepath.startswith("/") else "/" + filepath))
+        # 兜底：尝试常见上传目录
+        for folder in ("/uploads/", "/upload/", "/files/", "/static/uploads/", "/media/"):
+            candidates.append(base + folder + filename)
+
+        for url in candidates[:5]:
+            try:
+                resp = await async_get(url, session=session, timeout=6, no_retry=True)
+                status = resp[0]
+                body = resp[1] or ""
+            except Exception:
+                continue
+            if status == 200 and body:
+                return {
+                    "url": url,
+                    "status": status,
+                    "echoed": filename.lower() in str(body).lower(),
+                }
+        return None
+
     def _is_upload_success(self, text: str) -> bool:
         """检测上传是否成功"""
         text_lower = text.lower()
@@ -694,6 +755,12 @@ class FileUploadEngine(BaseEngine):
             ("shell.php", "<?php echo 'test'; ?>", "PHP (MIME绕过)", "image/gif"),
             ("shell.php", "<?php echo 'test'; ?>", "PHP (MIME绕过)", "application/octet-stream"),
             ("shell.asp", "<% Response.Write(\"test\") %>", "ASP (MIME绕过)", "image/jpeg"),
+            # 内容型绕过：魔数头 + 代码（验证是否可通过白名单内容校验但被当脚本保存/执行）
+            ("shell.php", "GIF89a\x01\x00\x01\x00\x00\x00\x00;<?php echo 'test'; ?>", "PHP (内容型绕过-GIF魔数)", "image/gif"),
+            ("shell.php", "\xff\xd8\xff\xe0<?php echo 'test'; ?>", "PHP (内容型绕过-JPEG魔数)", "image/jpeg"),
+            ("shell.png", "\x89PNG\r\n\x1a\n<?php echo 'test'; ?>", "PHP (内容型绕过-PNG魔数)", "image/png"),
+            ("shell.php", "<?php /*000000000*/ __halt_compiler(); ?><?php echo 'test'; ?>", "PHP (内容型绕过-halt_compiler)", "application/octet-stream"),
+            ("shell.svg", "<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert('xss')</script></svg>", "SVG (内容型绕过-隐式XSS)", "image/svg+xml"),
         ]
 
         for filename, content, description, content_type in mime_bypass_files:
@@ -868,7 +935,7 @@ class FileUploadEngine(BaseEngine):
                     'recommendation': '使用文件锁或唯一文件名'
                 }
         except BaseException:
-            pass
+            logger.debug("suppressed exception (engine audit)")
 
         return None
 
@@ -1031,7 +1098,7 @@ class CORSEngine(BaseEngine):
                 if header in headers:
                     return True
         except BaseException:
-            pass
+            logger.debug("suppressed exception (engine audit)")
         return False
 
     async def test_cors_config(
@@ -1087,7 +1154,7 @@ class CORSEngine(BaseEngine):
                 })
 
         except BaseException:
-            pass
+            logger.debug("suppressed exception (engine audit)")
 
         return result
 
@@ -1199,7 +1266,7 @@ class CORSEngine(BaseEngine):
                     result["allow_all_headers"] = True
 
         except BaseException:
-            pass
+            logger.debug("suppressed exception (engine audit)")
 
         return result
 
@@ -1214,63 +1281,71 @@ class CORSEngine(BaseEngine):
         session,
         **kwargs
     ) -> List[Dict]:
-        if not target:
-            return []
+        # 升级：全局引擎现接收 recon 发现的 endpoints（含 /cors 等路径级端点），
+        # 逐端点检测 CORS 配置错误，而非仅检测根 target（此前漏报路径级 CORS）。
+        endpoints = kwargs.get("endpoints") or [target]
+        findings: List[Dict] = []
+        seen = set()
+        for ep in endpoints:
+            if not ep or ep.lower().startswith(("javascript:", "data:", "file:")):
+                continue
+            logger.info(f"🔐 开始 CORS 配置检测: {ep}")
 
-        findings = []
-        logger.info(f"🔐 开始 CORS 配置检测: {target}")
+            config = await self.test_cors_config(ep, session)
 
-        config = await self.test_cors_config(target, session)
+            if config.get("vulnerabilities"):
+                for vuln in config["vulnerabilities"]:
+                    key = (ep, vuln["type"])
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    findings.append({
+                        'url': ep,
+                        'type': vuln["type"],
+                        'severity': vuln["severity"],
+                        'evidence': vuln["detail"],
+                        'recommendation': vuln["fix"],
+                        'aca_origin': config["aca_origin"],
+                        'acac': config["acac"],
+                    })
 
-        if config.get("vulnerabilities"):
-            for vuln in config["vulnerabilities"]:
-                findings.append({
-                    'url': target,
-                    'type': vuln["type"],
-                    'severity': vuln["severity"],
-                    'evidence': vuln["detail"],
-                    'recommendation': vuln["fix"],
-                    'aca_origin': config["aca_origin"],
-                    'acac': config["acac"],
-                })
+            reflection_results = await self.test_origin_reflection(ep, session)
+            findings.extend(reflection_results)
 
-        reflection_results = await self.test_origin_reflection(target, session)
-        findings.extend(reflection_results)
+            preflight = await self.test_preflight(ep, session)
 
-        preflight = await self.test_preflight(target, session)
+            if preflight.get("supports_preflight"):
+                if preflight.get("allow_all_methods"):
+                    findings.append({
+                        'url': ep,
+                        'type': 'CORS 允许所有方法',
+                        'severity': 'Medium',
+                        'evidence': 'Access-Control-Allow-Methods: * 允许任意 HTTP 方法',
+                        'recommendation': '只允许必要的 HTTP 方法'
+                    })
 
-        if preflight.get("supports_preflight"):
-            if preflight.get("allow_all_methods"):
-                findings.append({
-                    'url': target,
-                    'type': 'CORS 允许所有方法',
-                    'severity': 'Medium',
-                    'evidence': 'Access-Control-Allow-Methods: * 允许任意 HTTP 方法',
-                    'recommendation': '只允许必要的 HTTP 方法'
-                })
+                if preflight.get("allow_all_headers"):
+                    findings.append({
+                        'url': ep,
+                        'type': 'CORS 允许所有头',
+                        'severity': 'Low',
+                        'evidence': 'Access-Control-Allow-Headers: * 允许任意请求头',
+                        'recommendation': '只允许必要的请求头'
+                    })
 
-            if preflight.get("allow_all_headers"):
-                findings.append({
-                    'url': target,
-                    'type': 'CORS 允许所有头',
-                    'severity': 'Low',
-                    'evidence': 'Access-Control-Allow-Headers: * 允许任意请求头',
-                    'recommendation': '只允许必要的请求头'
-                })
-
-            if preflight.get("max_age"):
-                try:
-                    max_age = int(preflight["max_age"])
-                    if max_age > 86400:
-                        findings.append({
-                            'url': target,
-                            'type': 'CORS Max-Age 过长',
-                            'severity': 'Low',
-                            'evidence': f'Access-Control-Max-Age: {max_age} 秒（超过24小时）',
-                            'recommendation': '设置合理的 Max-Age（如 3600 秒）'
-                        })
-                except BaseException:
-                    pass
+                if preflight.get("max_age"):
+                    try:
+                        max_age = int(preflight["max_age"])
+                        if max_age > 86400:
+                            findings.append({
+                                'url': ep,
+                                'type': 'CORS Max-Age 过长',
+                                'severity': 'Low',
+                                'evidence': f'Access-Control-Max-Age: {max_age} 秒（超过24小时）',
+                                'recommendation': '设置合理的 Max-Age（如 3600 秒）'
+                            })
+                    except BaseException:
+                        logger.debug("suppressed exception (engine audit)")
 
         logger.info(f"✅ CORS 扫描完成，发现 {len(findings)} 个问题")
         return findings
@@ -1734,7 +1809,7 @@ class CRLFEngine(BaseEngine):
                         'recommendation': '对输入进行深度解码后过滤'
                     }
             except BaseException:
-                pass
+                logger.debug("suppressed exception (engine audit)")
 
         return None
 
@@ -2075,7 +2150,7 @@ class LDAPEngine(BaseEngine):
                     logger.info(f"🔍 发现 LDAP 端口: {host}:{port}")
 
             except (asyncio.TimeoutError, ConnectionRefusedError, ConnectionResetError):
-                pass
+                logger.debug("suppressed exception (engine audit)")
             except Exception as e:
                 self.log_debug(f"LDAP 端口探测失败 {port}: {e}")
 
@@ -2123,7 +2198,7 @@ class LDAPEngine(BaseEngine):
                     }
 
         except BaseException:
-            pass
+            logger.debug("suppressed exception (engine audit)")
 
         return None
 
@@ -2389,7 +2464,7 @@ class BusinessLogicEngine(BaseEngine):
                                     'method': 'amount_tamper'
                                 }
             except BaseException:
-                pass
+                logger.debug("suppressed exception (engine audit)")
         return None
 
     async def _check_role_bypass(self, url, param, normal_resp, parsed_query, session) -> Optional[Dict]:
@@ -2431,7 +2506,7 @@ class BusinessLogicEngine(BaseEngine):
                             'method': 'role_bypass_json'
                         }
             except BaseException:
-                pass
+                logger.debug("suppressed exception (engine audit)")
         return None
 
     async def _check_status_manipulation(self, url, param, normal_resp, parsed_query, session) -> Optional[Dict]:
@@ -2460,7 +2535,7 @@ class BusinessLogicEngine(BaseEngine):
                                 'method': 'status_manipulation'
                             }
             except BaseException:
-                pass
+                logger.debug("suppressed exception (engine audit)")
         return None
 
     async def _check_order_enumeration(self, url, param, normal_resp, parsed_query, session) -> Optional[Dict]:
@@ -2506,7 +2581,7 @@ class BusinessLogicEngine(BaseEngine):
                                 'method': 'order_enumeration'
                             }
             except BaseException:
-                pass
+                logger.debug("suppressed exception (engine audit)")
         return None
 
     async def _check_coupon_abuse(self, url, param, normal_resp, parsed_query, session) -> Optional[Dict]:
@@ -2535,7 +2610,7 @@ class BusinessLogicEngine(BaseEngine):
                                 'method': 'coupon_abuse'
                             }
             except BaseException:
-                pass
+                logger.debug("suppressed exception (engine audit)")
         return None
 
     async def _check_batch_operation(self, url, param, normal_resp, parsed_query, session) -> Optional[Dict]:
@@ -2563,7 +2638,7 @@ class BusinessLogicEngine(BaseEngine):
                                 'method': 'batch_bypass'
                             }
             except BaseException:
-                pass
+                logger.debug("suppressed exception (engine audit)")
         return None
 
     async def _check_qty_overflow(self, url, param, normal_resp, parsed_query, session) -> Optional[Dict]:
@@ -2587,7 +2662,7 @@ class BusinessLogicEngine(BaseEngine):
                             'method': 'qty_overflow'
                         }
             except BaseException:
-                pass
+                logger.debug("suppressed exception (engine audit)")
         return None
 
     async def _check_param_pollution(self, url, param, normal_resp, parsed_query, session) -> Optional[Dict]:
@@ -2612,7 +2687,7 @@ class BusinessLogicEngine(BaseEngine):
                     'method': 'param_pollution'
                 }
         except BaseException:
-            pass
+            logger.debug("suppressed exception (engine audit)")
         return None
 
     async def _scan_flow_bypass(self, base_url: str, session) -> List[Dict]:
@@ -2638,7 +2713,7 @@ class BusinessLogicEngine(BaseEngine):
                                 'method': 'flow_bypass'
                             })
             except BaseException:
-                pass
+                logger.debug("suppressed exception (engine audit)")
 
         # 2FA绕过检测 - 三前置条件
         # 条件1：站点存在2FA迹象（检测常见2FA相关页面/资源）
@@ -2689,7 +2764,7 @@ class BusinessLogicEngine(BaseEngine):
                 logger.debug(f"2FA检测异常: {e}")
                 continue
             except BaseException:
-                pass
+                logger.debug("suppressed exception (engine audit)")
 
         return findings
 
@@ -2759,7 +2834,7 @@ class BusinessLogicEngine(BaseEngine):
                                     })
                                     break
                         except BaseException:
-                            pass
+                            logger.debug("suppressed exception (engine audit)")
 
         try:
             resp = await async_get(target, session=session, timeout=10)
@@ -2782,9 +2857,9 @@ class BusinessLogicEngine(BaseEngine):
                             'method': 's3_public'
                         })
                 except BaseException:
-                    pass
+                    logger.debug("suppressed exception (engine audit)")
         except BaseException:
-            pass
+            logger.debug("suppressed exception (engine audit)")
 
         return findings
 
@@ -2815,7 +2890,7 @@ class BusinessLogicEngine(BaseEngine):
                                 'method': 'state_bypass'
                             })
                     except BaseException:
-                        pass
+                        logger.debug("suppressed exception (engine audit)")
         return findings
 
     async def _param_explorer(self, target: str, session) -> List[Dict]:
@@ -2837,7 +2912,7 @@ class BusinessLogicEngine(BaseEngine):
                     js_params = re.findall(r'["\']([a-zA-Z_][a-zA-Z0-9_]*)["\']\s*:', js_text)
                     all_params.update(js_params)
                 except BaseException:
-                    pass
+                    logger.debug("suppressed exception (engine audit)")
 
             discovered = [p for p in all_params if len(p) > 1 and not p.startswith('_')]
             if discovered:
@@ -2851,7 +2926,7 @@ class BusinessLogicEngine(BaseEngine):
                     'method': 'param_explorer'
                 })
         except BaseException:
-            pass
+            logger.debug("suppressed exception (engine audit)")
         return findings
 
     # ============================================================
@@ -3010,7 +3085,7 @@ class BusinessLogicEngine(BaseEngine):
                 if seg.lower() in STATUS_PARAMS or seg.lower() in ("paid", "completed", "success", "pending", "verified"):
                     fields.append(seg)
         except BaseException:
-            pass
+            logger.debug("suppressed exception (engine audit)")
         return list(dict.fromkeys(fields))[:10]
 
     def _build_flow_graph(self, api_seq: List[Dict]) -> Dict:

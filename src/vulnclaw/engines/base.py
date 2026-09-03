@@ -14,6 +14,7 @@ import time
 import random
 import os
 import re
+import difflib
 from abc import ABC, abstractmethod
 from urllib.parse import urlparse, parse_qs
 from collections import UserDict
@@ -21,7 +22,7 @@ from typing import Dict, List, Optional, Tuple
 
 from vulnclaw.core.logger import logger
 from vulnclaw.core.settings import settings
-from vulnclaw.core.utils import build_attack_url, async_get, obfuscate_payload
+from vulnclaw.core.utils import build_attack_url, async_get, obfuscate_payload, ensure_scheme
 from vulnclaw.core.detectors.spa_detector import SpaFingerprintDetector
 from vulnclaw.core.reflective_validator import ReflectiveValidator
 
@@ -29,6 +30,7 @@ from vulnclaw.core.reflective_validator import ReflectiveValidator
 def build_curl_command(url: str, method: str = "GET", data=None, headers: Optional[Dict] = None) -> str:
     """P2-5: 生成可执行的 curl 复现命令（供各引擎 findings 使用）。"""
     from urllib.parse import urlencode
+    url = ensure_scheme(url, "https")  # 补全 scheme，避免 curl 把无协议 URL 当文件名
     parts = ["curl", "-s", "-i", "-X", method]
     for k, v in (headers or {}).items():
         parts.append(f"-H '{k}: {v}'")
@@ -179,7 +181,7 @@ class BaseEngine(ABC):
                 cleaned = cleaned.replace(quote(p, safe=""), "")
                 cleaned = cleaned.replace(unquote(p), "")
             except Exception:
-                pass
+                logger.debug("suppressed exception (engine audit)")
         return cleaned
 
     def has_response_diff(
@@ -232,6 +234,12 @@ class BaseEngine(ABC):
         elif normal_len > 0 or attack_len > 0:
             if (normal_len == 0) != (attack_len == 0):
                 content_diff = 0.8
+            else:
+                # 短响应/长度悬殊：词集合 Jaccard 不可靠（短文本词少、易误判无差异），
+                # 改用字符级 difflib 相似度，否则 "1 row: id=1" vs "2 rows returned"
+                # 这类短差异会被漏判为无变化 → 布尔/报错型注入漏检。
+                ratio = difflib.SequenceMatcher(None, normal_clean, attack_clean).ratio()
+                content_diff = 1.0 - ratio
 
         status_bonus = 0.05 if normal_status != attack_status else 0.0
         total_diff = min(1.0, length_diff * 0.35 + content_diff * 0.6 + status_bonus)
@@ -322,10 +330,11 @@ class BaseEngine(ABC):
             half = max(3, len(payloads) // 2)
             result = payloads[:min(half, max_count)]
             if param and self.priority_params:
-                for p, desc in payloads:
-                    if any(kw in desc.lower() for kw in self.priority_params):
-                        if (p, desc) not in result:
-                            result.append((p, desc))
+                for item in payloads:
+                    desc = item[-1]
+                    if any(kw in str(desc).lower() for kw in self.priority_params):
+                        if item not in result:
+                            result.append(item)
 
         if len(self._payload_cache) >= self._cache_max_size:
             oldest_key = next(iter(self._payload_cache))
@@ -341,11 +350,13 @@ class BaseEngine(ABC):
         param_lower = param.lower()
         matched = []
         unmatched = []
-        for p, desc in payloads:
-            if param_lower in p.lower() or param_lower in desc.lower():
-                matched.append((p, desc))
+        for item in payloads:
+            p = item[0]
+            desc = item[-1]
+            if param_lower in str(p).lower() or param_lower in str(desc).lower():
+                matched.append(item)
             else:
-                unmatched.append((p, desc))
+                unmatched.append(item)
         return matched + unmatched
 
     def is_param_relevant(self, param: str) -> bool:
@@ -676,7 +687,7 @@ class BaseEngine(ABC):
             if elapsed_1 > 3.0 and elapsed_2 > 3.0:
                 return True
         except Exception:
-            pass
+            logger.debug("suppressed exception (engine audit)")
 
         return False
 
@@ -788,7 +799,7 @@ class BaseEngine(ABC):
                 if isinstance(resp_no_sleep, tuple) and resp_no_sleep[0] != 0:
                     return True, float(sleep_seconds + 2)
             except BaseException:
-                pass
+                logger.debug("suppressed exception (engine audit)")
             return False, 0.0
         except Exception as e:
             logger.debug(f"时间盲注检测异常: {e}")
@@ -814,7 +825,7 @@ class BaseEngine(ABC):
                 if len(text) > 100:
                     return True
             except BaseException:
-                pass
+                logger.debug("suppressed exception (engine audit)")
         return True
 
     def obfuscate_payloads(
@@ -867,7 +878,7 @@ class BaseEngine(ABC):
                     if mutated != payload:
                         result.append((mutated, f"{desc}(混淆)"))
                 except BaseException:
-                    pass
+                    logger.debug("suppressed exception (engine audit)")
         return result
 
     def extract_params_from_url(self, url: str) -> Dict[str, str]:

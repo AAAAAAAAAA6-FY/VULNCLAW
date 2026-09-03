@@ -120,7 +120,7 @@ def _validate_agent(raw: Dict[str, Any]) -> Optional[RemoteAgent]:
             )
             return None
 
-        timeout = int(raw.get("timeout", 60) or 60)
+        timeout = int(raw.get("timeout") or getattr(settings, "remote_agent_timeout", 60) or 60)
         extra = raw.get("headers") or {}
         if isinstance(extra, str):
             try:
@@ -232,7 +232,7 @@ def _normalize_remote_result(result: Any) -> Dict[str, Any]:
             try:
                 return json.loads(result)
             except json.JSONDecodeError:
-                pass
+                logger.debug("suppressed exception (core audit)")
         return {"stdout": result, "success": True}
     return {"output": result, "success": True}
 
@@ -477,7 +477,7 @@ class MCPStdioBackend(AgentBackend):
                 self._proc.kill()
                 await asyncio.wait_for(self._proc.wait(), timeout=5)
             except Exception:
-                pass
+                logger.debug("suppressed exception (core audit)")
             self._proc = None
 
 
@@ -673,7 +673,7 @@ class MCPSSEBackend(AgentBackend):
             try:
                 await asyncio.wait_for(self._reader_task, timeout=2)
             except (asyncio.CancelledError, asyncio.TimeoutError):
-                pass
+                logger.debug("suppressed exception (core audit)")
             self._reader_task = None
         if self._sse_response is not None:
             self._sse_response.close()
@@ -761,12 +761,48 @@ class HTTPBackend(AgentBackend):
 # CLI 子进程后端
 # ============================================================
 
+def _split_windows_command(command: str) -> List[str]:
+    """Windows 命令行分词：按空白切分、单/双引号分组并剥掉引号、反斜杠保持字面量。
+
+    shlex 的 POSIX 模式会把反斜杠当转义符吃掉（C:\\Users\\... → C:Users...），
+    而 Windows 路径依赖反斜杠；这里自写分词器在保留反斜杠的同时仍支持用引号
+    把含空格的 JSON payload 包成单个 argv。
+    """
+    tokens: List[str] = []
+    cur: List[str] = []
+    quote: Optional[str] = None
+    for ch in command:
+        if quote:
+            if ch == quote:
+                quote = None
+            else:
+                cur.append(ch)
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch.isspace():
+            if cur:
+                tokens.append("".join(cur))
+                cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        tokens.append("".join(cur))
+    return tokens
+
+
 class CLIBackend(AgentBackend):
     async def _run(self, command: str, stdin: Optional[bytes] = None) -> bytes:
         if not command:
             raise RuntimeError("CLI 后端未配置 command")
-        # Windows 路径含反斜杠，POSIX 模式会错误转义；非 Windows 仍用 POSIX
-        tokens = shlex.split(command, posix=(sys.platform != "win32"))
+        # Windows 路径含反斜杠，而 shlex 的 POSIX 模式会把 \ 当转义符吃掉
+        # （C:\Users\... → C:Users...，找不到可执行文件）；但任务模板又常用
+        # 单/双引号把含空格的 JSON payload 包成单个 argv。因此 Windows 走自写
+        # 分词器：仅按空白切分、引号分组并剥掉引号字符、反斜杠保持字面量。
+        # 非 Windows 仍用标准 POSIX split（路径无反斜杠，引号语义正确）。
+        if sys.platform == "win32":
+            tokens = _split_windows_command(command)
+        else:
+            tokens = shlex.split(command, posix=True)
         proc = await asyncio.create_subprocess_exec(
             *tokens,
             stdin=asyncio.subprocess.PIPE if stdin is not None else None,
@@ -779,7 +815,7 @@ class CLIBackend(AgentBackend):
             try:
                 proc.kill()
             except Exception:
-                pass
+                logger.debug("suppressed exception (core audit)")
             raise RuntimeError(f"CLI Agent 超时（{self.agent.timeout}s）")
         if proc.returncode != 0:
             raise RuntimeError(

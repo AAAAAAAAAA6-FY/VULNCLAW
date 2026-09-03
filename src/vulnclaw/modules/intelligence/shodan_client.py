@@ -273,7 +273,7 @@ async def resolve_ip(host: str) -> Optional[str]:
         socket.inet_aton(host)
         return host
     except OSError:
-        pass
+        logger.debug("suppressed exception (core audit)")
     try:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, socket.gethostbyname, host)

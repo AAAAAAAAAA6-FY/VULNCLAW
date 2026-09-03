@@ -263,7 +263,7 @@ async def safe_request(
                         _hdrs.update(_inject)
                         kwargs["headers"] = _hdrs
             except Exception:
-                pass
+                logger.debug("suppressed exception (core audit)")
             if method.upper() == "GET":
                 if _http2_available():
                     _http2_get, _ = _http2_request_api()
@@ -294,7 +294,7 @@ async def safe_request(
                 get_metrics().inc_request(method.upper(), int(status) if status is not None else 0)
                 get_metrics().observe_response_time(time.monotonic() - start_ts)
             except Exception:
-                pass
+                logger.debug("suppressed exception (core audit)")
 
             # ===== 反制检测（警告模式） =====
             anti_result = AntiScanDetector.analyze_response(text, status, headers)
@@ -316,7 +316,7 @@ async def safe_request(
                             _level_name = await _adapter.record_block(url)
                             await _adapter.probe(url, session)
                     except Exception:
-                        pass
+                        logger.debug("suppressed exception (core audit)")
                     wait = min(2 ** retry_count * 3, 30)
                     logger.info(f"⏳ 反制等待 {wait}s 后重试（策略: {_level_name}，{retry_count + 1}/{max_retries}）")
                     await asyncio.sleep(wait)
@@ -341,11 +341,11 @@ async def safe_request(
                     if _adapter is not None:
                         await _adapter.record_success(url)
                 except Exception:
-                    pass
+                    logger.debug("suppressed exception (core audit)")
                 try:
                     cache.set(cache_key, (status, text, headers), ttl=300)
                 except Exception:
-                    pass
+                    logger.debug("suppressed exception (core audit)")
 
             # 成功返回
             return status, text, headers
@@ -360,7 +360,7 @@ async def safe_request(
             try:
                 get_metrics().inc_engine_failure("http")
             except Exception:
-                pass
+                logger.debug("suppressed exception (core audit)")
             return None
         except aiohttp.ClientError as e:
             logger.debug(f"安全请求客户端错误 {url}: {e} (尝试 {retry_count + 1}/{max_retries + 1})")
@@ -371,7 +371,7 @@ async def safe_request(
             try:
                 get_metrics().inc_engine_failure("http")
             except Exception:
-                pass
+                logger.debug("suppressed exception (core audit)")
             return None
         except Exception as e:
             logger.debug(f"安全请求失败 {url}: {e}")
@@ -382,7 +382,7 @@ async def safe_request(
             try:
                 get_metrics().inc_engine_failure("http")
             except Exception:
-                pass
+                logger.debug("suppressed exception (core audit)")
             return None
 
     return None

@@ -180,7 +180,7 @@ def alive_scan(subdomains: list, compliant: bool = False) -> list:
                 try:
                     os.remove(temp_subs)
                 except BaseException:
-                    pass
+                    logger.debug("suppressed exception (core audit)")
 
     # 2. httprobe
     if shutil.which("httprobe"):
@@ -229,7 +229,7 @@ def alive_scan(subdomains: list, compliant: bool = False) -> list:
                 try:
                     os.remove(temp_subs)
                 except BaseException:
-                    pass
+                    logger.debug("suppressed exception (core audit)")
 
     # 3. 内置探测（慢速）
     logger.info("  [~] 使用内置探测（慢速）...")
@@ -276,7 +276,7 @@ def alive_scan(subdomains: list, compliant: bool = False) -> list:
                     "content_length": len(r.text)
                 }
             except BaseException:
-                pass
+                logger.debug("suppressed exception (core audit)")
         return None
 
     with tqdm(total=len(subs_to_probe), desc="探测存活") as pbar:
@@ -376,7 +376,7 @@ def _is_internal_domain(domain: str) -> bool:
         ip = _ip.ip_address(d.rstrip('.'))
         return ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_multicast or ip.is_unspecified
     except (ValueError, TypeError):
-        pass
+        logger.debug("suppressed exception (core audit)")
     return False
 
 
@@ -547,9 +547,9 @@ def brute_force_subdomains(domain: str, wordlist: str = "subdomains_top5000.txt"
             if answers:
                 return full
         except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.resolver.Timeout):
-            pass
+            logger.debug("suppressed exception (core audit)")
         except Exception:
-            pass
+            logger.debug("suppressed exception (core audit)")
         return None
 
     max_workers = min(MAX_THREADS // 2, 10)
@@ -788,7 +788,7 @@ async def _run_subfinder_batch_async(domains: List[str]) -> Dict[str, list]:
             try:
                 os.remove(output_file)
             except Exception:
-                pass
+                logger.debug("suppressed exception (core audit)")
         for sub in raw:
             for d in public:
                 if sub == d or sub.endswith("." + d):
@@ -804,7 +804,7 @@ async def _run_subfinder_batch_async(domains: List[str]) -> Dict[str, list]:
             try:
                 os.unlink(tmp_file)
             except Exception:
-                pass
+                logger.debug("suppressed exception (core audit)")
     return result
 
 
@@ -815,7 +815,7 @@ def get_subdomains(domain: str, compliant: bool = True) -> list:
             import uvloop  # type: ignore
             asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
         except ImportError:
-            pass
+            logger.debug("suppressed exception (core audit)")
         return asyncio.run(get_subdomains_async(domain, compliant))
 
     # 如果当前线程已在运行 loop（比如被 to_thread/run_in_executor 丢进来的 worker 线程）：
@@ -911,7 +911,7 @@ class PortScanner:
                 try:
                     os.unlink(tmpfile)
                 except BaseException:
-                    pass
+                    logger.debug("suppressed exception (core audit)")
 
     async def _scan_socket(self, host: str, port: int, timeout: float = 1.0) -> bool:
         """异步 socket 连接测试"""
@@ -1355,7 +1355,7 @@ class EndpointCollector:
                                     endpoints.add(ep)
                                     count += 1
                             except BaseException:
-                                pass
+                                logger.debug("suppressed exception (core audit)")
                     count_total += count
             except FileNotFoundError:
                 self._tool_stats["katana"]["available"] = False
@@ -1413,7 +1413,7 @@ class EndpointCollector:
                     except BaseException:
                         continue
         except BaseException:
-            pass
+            logger.debug("suppressed exception (core audit)")
         return urls
 
     async def import_to_burp(self, endpoints: Set[str], limit: int = 300):
@@ -1573,6 +1573,123 @@ class EndpointCollector:
         except Exception as e:
             logger.debug(f"         anew 失败: {e}")
         return urls
+
+
+async def crawl_same_origin(target: str, session=None, max_depth: int = 2, max_urls: int = 80, render: bool = False, crawl_hash_routing: bool = False, crawl_websocket: bool = False, ws_endpoints=None) -> Dict[str, List[str]]:
+    from vulnclaw.config.settings import settings as _st
+    if render and not _st.crawl_render_spa:
+        render = False
+
+    """同源链接爬虫：从 target 出发 BFS 跟踪同源 <a href> 链接（深度 max_depth），
+    返回 端点URL -> 候选注入参数 列表（参数来自该页 query / 表单 <input name> / 相对 ?x=1 链接）。
+    目的：补 endpoint 覆盖率（如 DVWA /sqli /xss），让真实漏洞端点进入引擎扫描队列。
+    安全措施：同源限制、静态后缀过滤、总数上限、单请求超时、去重、异常吞掉不影响主流程。
+    render=True 时优先用 playwright 渲染 JS 后爬取（D1：发现 SPA 隐藏端点/参数），
+    渲染不可用则回退纯 HTTP 爬取（安全降级，行为不变）。
+    """
+    from urllib.parse import urlparse, urljoin, parse_qs
+    from vulnclaw.core.utils import async_get
+    import re as _re
+    base = urlparse(target)
+    origin = f"{base.scheme}://{base.netloc}"
+    results: Dict[str, set] = {}
+    visited = set()
+    queue: List[tuple] = [(target, 0)]
+    _STATIC = ('.css', '.js', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico',
+               '.woff', '.woff2', '.ttf', '.pdf', '.zip', '.mp3', '.mp4')
+
+    async def _fetch_html(url: str):
+        """D1 渲染爬取：render=True 时优先 playwright 渲染 JS 取 DOM；失败回退 HTTP。"""
+        if render:
+            try:
+                from playwright.async_api import async_playwright
+                async with async_playwright() as p:
+                    b = await p.chromium.launch(headless=True)
+                    pg = await b.new_page()
+                    resp = await pg.goto(url, timeout=15000, wait_until="networkidle")
+                    status = resp.status if resp is not None else 200
+                    html = await pg.content()
+                    await b.close()
+                    return status, html
+            except BaseException:
+                logger.debug("suppressed exception (core audit)")
+        try:
+            resp = await async_get(url, session=session, timeout=10, no_retry=True)
+        except BaseException:
+            return None
+        if not isinstance(resp, tuple) or len(resp) < 2:
+            return None
+        return resp[0], (resp[1] or "")
+
+    async def _visit(url: str, depth: int):
+        if url in visited or len(results) >= max_urls:
+            return
+        visited.add(url)
+        fetched = await _fetch_html(url)
+        if fetched is None:
+            return
+        status, text = fetched
+        # D2: SPA hash 路由 + WebSocket 端点发现（按需启用，仅正则提取，零额外请求）
+        if isinstance(text, str):
+            if crawl_hash_routing:
+                for hr in _re.findall(r'#/[A-Za-z0-9_./-]{1,120}', text):
+                    hurl = target.split('#')[0] + hr
+                    if hurl not in results:
+                        results[hurl] = {k for k in parse_qs(urlparse(hr).query)}
+            if crawl_websocket and ws_endpoints is not None:
+                for w in _re.findall("wss?://[^\\s\"'<>()]+", text):
+                    ws_endpoints.add(w)
+        if status is None or status >= 400 or not isinstance(text, str):
+            return
+        params: set = set()
+        for k in parse_qs(urlparse(url).query):
+            params.add(k)
+        for name in _re.findall(r'<input[^>]+name=["\']([^"\']+)["\']', text, _re.I):
+            if name:
+                params.add(name)
+        # 相对 ?x=1 链接 → 参数记到本页
+        for h in _re.findall(r'href=["\']([^"\']+)["\']', text, _re.I):
+            if h.startswith('?'):
+                for k in parse_qs(urlparse(h).query):
+                    params.add(k)
+        if params:
+            results[url] = params
+        if depth >= max_depth:
+            return
+        for h in _re.findall(r'href=["\']([^"\']+)["\']', text, _re.I):
+            if not h or h.startswith(('#', 'mailto:', 'javascript:', 'tel:')):
+                continue
+            if h.startswith('/'):
+                full = urljoin(origin + '/', h)
+            elif h.startswith('http'):
+                if urlparse(h).netloc != base.netloc:
+                    continue
+                full = h
+            else:
+                continue
+            if full in visited:
+                continue
+            if '?' in full:
+                # 带 query 的链接：记录其参数但不再深入（避免爆炸）
+                for k in parse_qs(urlparse(full).query):
+                    results.setdefault(full, set()).add(k)
+                continue
+            if full.lower().endswith(_STATIC):
+                continue
+            queue.append((full, depth + 1))
+            if len(queue) > max_urls * 3:
+                return
+
+    head = 0
+    sem = asyncio.Semaphore(8)
+    while head < len(queue):
+        if len(results) >= max_urls:
+            break
+        url, depth = queue[head]
+        head += 1
+        async with sem:
+            await _visit(url, depth)
+    return {u: sorted(p) for u, p in results.items()}
 
 
 __all__ = ['EndpointCollector']

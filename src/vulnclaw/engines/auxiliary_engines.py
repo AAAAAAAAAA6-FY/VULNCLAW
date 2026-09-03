@@ -195,7 +195,7 @@ class APIVersionDiffEngine(BaseEngine):
                 if version_matches:
                     current_version = version_matches[0]
             except BaseException:
-                pass
+                logger.debug("suppressed exception (engine audit)")
 
         if current_version:
             versions_to_test = ["1", "2", "3", "4", "5"] if current_version == "1" else ["1"]
@@ -218,7 +218,7 @@ class APIVersionDiffEngine(BaseEngine):
                             'method': 'api_version_diff'
                         })
                 except BaseException:
-                    pass
+                    logger.debug("suppressed exception (engine audit)")
 
         logger.info(f"   ✅ APIVersion 完成，发现 {len(findings)} 个问题")
         return findings
@@ -266,7 +266,7 @@ class HTTP2WebSocketEngine(BaseEngine):
                             'method': 'http2_support'
                         })
         except BaseException:
-            pass
+            logger.debug("suppressed exception (engine audit)")
 
         # 2. WebSocket 端点发现与安全检测（CSWSH / Accept 校验 / 消息注入）
         ws_paths = ["/ws", "/websocket", "/socket", "/ws/", "/live", "/stream", "/events", "/push", "/realtime"]
@@ -282,7 +282,7 @@ class HTTP2WebSocketEngine(BaseEngine):
                     except BaseException:
                         continue
         except BaseException:
-            pass
+            logger.debug("suppressed exception (engine audit)")
 
         logger.info(f"   ✅ HTTP2/WS 完成，发现 {len(findings)} 个问题")
         return findings
@@ -341,7 +341,7 @@ class HTTP2WebSocketEngine(BaseEngine):
                             'method': 'websocket_unauth',
                         })
         except BaseException:
-            pass
+            logger.debug("suppressed exception (engine audit)")
 
         # 2) CSWSH：使用恶意 Origin 发起真实 WebSocket 连接
         try:
@@ -375,9 +375,9 @@ class HTTP2WebSocketEngine(BaseEngine):
                             'method': 'websocket_message_injection',
                         })
                 except BaseException:
-                    pass
+                    logger.debug("suppressed exception (engine audit)")
         except BaseException:
-            pass
+            logger.debug("suppressed exception (engine audit)")
 
         return findings
 
@@ -457,9 +457,9 @@ class RequestSmugglingEngine(BaseEngine):
                             'method': 'request_smuggling_suspected'
                         })
                 except BaseException:
-                    pass
+                    logger.debug("suppressed exception (engine audit)")
         except BaseException:
-            pass
+            logger.debug("suppressed exception (engine audit)")
 
         logger.info(f"   ✅ Smuggling 完成，发现 {len(findings)} 个问题")
         return findings

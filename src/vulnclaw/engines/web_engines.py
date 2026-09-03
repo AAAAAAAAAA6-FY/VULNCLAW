@@ -167,7 +167,7 @@ class XSSEngine(BaseEngine):
                         if result:
                             return result
                 except BaseException:
-                    pass
+                    logger.debug("suppressed exception (engine audit)")
 
             result = await self._test_xss_payload(
                 url, param, payload, desc,
@@ -226,7 +226,7 @@ class XSSEngine(BaseEngine):
 
             if self._is_xss_reflected(attack_text, payload):
                 evidence = self._extract_reflected_evidence(attack_text, payload)
-                return {
+                result = {
                     'url': url,
                     'parameter': param,
                     'payload': payload,
@@ -237,6 +237,12 @@ class XSSEngine(BaseEngine):
                     'evidence': evidence,
                     'diff_ratio': 0.5,
                 }
+                if await self._verify_xss_browser(attack_url):
+                    result['browser_verified'] = True
+                    result['severity'] = 'Critical'
+                    result['evidence'] += "；浏览器执行验证命中（弹窗/事件触发），已确认可执行"
+                    result['ai_verdict'] = '极高'
+                return result
 
             if self._has_js_execution(attack_text):
                 return {
@@ -272,6 +278,46 @@ class XSSEngine(BaseEngine):
             self.log_debug(f"XSS 检测异常 {param}: {e}")
 
         return None
+
+    async def _verify_xss_browser(self, attack_url: str) -> bool:
+        """A1 XSS 浏览器执行验证：用 headless 加载 PoC，监听 alert/confirm/prompt 弹窗，
+        命中即确认该注入点真正可执行（而非仅字符串反射）。playwright 不可用时返回 False，
+        不改变原"反射型"结论（安全降级）。
+        """
+        if not getattr(settings, 'xss_browser_verify', True):
+            return False
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            return False  # 浏览器不可用，不降级原结论
+
+        timeout = getattr(settings, 'xss_browser_timeout', 15)
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                page = await browser.new_page()
+                dialog_fired = asyncio.Event()
+                async def _on_dialog(dialog):
+                    dialog_fired.set()
+                    try:
+                        await dialog.dismiss()
+                    except BaseException:
+                        logger.debug("suppressed exception (engine audit)")
+                page.on("dialog", _on_dialog)
+                try:
+                    await page.goto(attack_url, timeout=timeout * 1000, wait_until="domcontentloaded")
+                except BaseException:
+                    logger.debug("suppressed exception (engine audit)")
+                try:
+                    await page.wait_for_event("dialog", timeout=2000)
+                except BaseException:
+                    logger.debug("suppressed exception (engine audit)")
+                verified = dialog_fired.is_set()
+                await browser.close()
+                return verified
+        except Exception as e:
+            self.log_debug(f"XSS 浏览器验证异常: {e}")
+            return False
 
     async def _is_param_reflected(
         self,
@@ -492,6 +538,37 @@ class SQLiEngine(BaseEngine):
     FINGERPRINT_CACHE_TTL = 300
     NORMAL_RESP_REFRESH_INTERVAL = 60
     SQL_PARAM_BLACKLIST = ("nreum", "newrelic")
+    # 高辨识度 SQL 报错短语；仅这些才判为报错，避免把页面里 "SQL Injection" 链接、
+    # 数据库名提及等静态内容误判（曾导致 DVWA 首页刷 11 条报错注入误报）。
+    SQL_ERROR_PHRASES = (
+        "you have an error in your sql syntax",
+        "sql syntax error",
+        "unclosed quotation mark",
+        "microsoft ole db provider",
+        "ole db provider for odbc",
+        "sqlstate",
+        "ora-",
+        "sqlcode",
+        "mysql_fetch",
+        "mysqli_query",
+        "mysqli_fetch",
+        "pg_query",
+        "psql: error",
+        "warning: mysql",
+        "native error",
+        "invalid query",
+        "mysql server has gone away",
+        "odbc driver",
+        "db2 sql error",
+        # SQLite / 通用报错特征（Python/PHP/Node 应用大量使用 SQLite，原短语表漏覆盖）
+        "sqlite error",
+        "sqlite3.operationalerror",
+        "sqlite_exception",
+        "near \"",
+        "unterminated string literal",
+        "syntax error near",
+        "ambiguous column",
+    )
 
     def __init__(self):
         super().__init__()
@@ -692,23 +769,20 @@ class SQLiEngine(BaseEngine):
                             logger.info(f"[{self.name}] 识别数据库: {db_type}")
                             return db_type, True
             except BaseException:
-                pass
+                logger.debug("suppressed exception (engine audit)")
 
         logger.debug(f"[{self.name}] 数据库指纹识别失败，返回 Unknown")
         return "Unknown", False
 
-    def _has_sql_error(self, text: str) -> bool:
+    def _matched_sql_error_phrases(self, text: str):
+        """返回响应中命中的报错短语列表（空即无）。仅匹配高辨识度短语。"""
         if not text:
-            return False
-        sql_errors = ['sql', 'mysql', 'syntax', 'odbc', 'drivers', 'db2', 'postgresql', 'sqlite',
-                      'microsoft ole db', 'oracle', 'jdbc', 'jdbcdriver', 'com.microsoft',
-                      'unclosed', 'quoted string', 'you have an error in your sql',
-                      'warning: mysql', 'sqlstate', 'sql server', 'native error',
-                      'driver error', 'database error', 'db error', 'ORA-', 'SQLSTATE',
-                      'SQLCODE', 'MSSQL', 'invalid query', 'mysql_fetch', 'pg_query',
-                      'SQLite', 'SQL syntax', 'MySQL server', 'PostgreSQL', 'Oracle Database']
-        text_lower = text.lower()
-        return any(err in text_lower for err in sql_errors)
+            return []
+        tl = text.lower()
+        return [p for p in self.SQL_ERROR_PHRASES if p in tl]
+
+    def _has_sql_error(self, text: str) -> bool:
+        return bool(self._matched_sql_error_phrases(text))
 
     def _extract_sql_error(self, text: str) -> str:
         if not text:
@@ -754,7 +828,7 @@ class SQLiEngine(BaseEngine):
                     new_val = str(int(last) + 1 if last.isdigit() else 1)
                     return payload.replace(last, new_val, -1)
                 except BaseException:
-                    pass
+                    logger.debug("suppressed exception (engine audit)")
         # 准确率修复：无法构造"真逆"时返回 None，而不是返回 "'"。
         # 旧版对单引号/双引号探测 payload 返回 "'" 作 B 样本，A/B 变成
         # '"' vs "'" 两种不同语法探测——回显/报错型目标（httpbin）天然不同，
@@ -805,7 +879,7 @@ class SQLiEngine(BaseEngine):
                 if isinstance(resp_no_sleep, tuple) and resp_no_sleep[0] != 0:
                     return True, float(sleep_seconds + 2)
             except BaseException:
-                pass
+                logger.debug("suppressed exception (engine audit)")
             return False, 0.0
         except Exception as e:
             logger.debug(f"时间盲注验证异常: {e}")
@@ -890,6 +964,11 @@ class SQLiEngine(BaseEngine):
                     _p_status, _p_text = _probe_resp[0], _probe_resp[1] or ""
                     # 不稳定响应不作为信号，也不作为否定依据
                     if _p_status in (0, 429) or _p_status >= 500:
+                        # 例外：含 SQL 报错特征（error-based 注入常以 500 返回 DB 错误）
+                        # 应视为命中信号；否则报错注入在探针阶段就被快失败，永远漏检。
+                        if self._has_sql_error(_p_text):
+                            _any_signal = True
+                            break
                         continue
                     if self._has_sql_error(_p_text):
                         _any_signal = True
@@ -897,10 +976,14 @@ class SQLiEngine(BaseEngine):
                     if _is_time_probe and _probe_elapsed >= 4.0:
                         _any_signal = True  # 疑似时间盲注，继续全量检测
                         break
+                    # 短响应差异天然被压缩（如 "1 row: id=1" vs "2 rows returned"
+                    # diff≈0.13），用更低阈值避免漏判布尔/报错注入的快失败信号
+                    # （否则快失败误判“无差异”直接 return None，全量检测永不执行 → SQLi 漏检）。
+                    _fast_thr = 0.1 if (len(_normal_text) < 50 or len(_p_text) < 50) else 0.15
                     _has_diff, _diff = self.has_response_diff(
                         normal_resp,
                         (_p_status, self.strip_payload_reflection(_p_text, _probe_payload), {}),
-                        threshold=0.15,
+                        threshold=_fast_thr,
                     )
                     if _has_diff:
                         _any_signal = True
@@ -938,10 +1021,15 @@ class SQLiEngine(BaseEngine):
                     attack_text = ""
 
                 # 准确率修复：服务器错误/限流/连接失败（5xx/429/0）与 payload 无关，
-                # 差异来自错误页 → 跳过该 payload（不稳定目标会随机返回 502）
+                # 差异来自错误页 → 跳过该 payload（不稳定目标会随机返回 502）。
+                # 例外：响应已含 SQL 报错特征（error-based 注入常以 500 返回 DB 错误），
+                # 不能当作不稳定跳过，必须落到下方报错注入判定（否则报错注入永远漏检）。
                 if attack_status in (0, 429) or attack_status >= 500:
-                    self.log_debug(f"攻击响应不稳定 (状态码 {attack_status})，跳过 payload: {payload[:30]}")
-                    continue
+                    if self._has_sql_error(attack_text):
+                        pass  # 含 SQL 报错特征 → 继续走下方报错注入判定
+                    else:
+                        self.log_debug(f"攻击响应不稳定 (状态码 {attack_status})，跳过 payload: {payload[:30]}")
+                        continue
 
                 if attack_status in (403, 406) and len(attack_text) < 100:
                     self.log_debug(f"检测到 WAF 阻断 (状态码 {attack_status})，尝试绕过...")
@@ -964,22 +1052,39 @@ class SQLiEngine(BaseEngine):
                         return bypass_result
                     continue
 
-                if self._has_sql_error(attack_text):
-                    evidence = self._extract_sql_error(attack_text)
-                    return {
-                        'url': url,
-                        'parameter': param,
-                        'payload': payload,
-                        'type': f'SQL注入-报错注入({desc})',
-                        'severity': 'High',
-                        'ai_verdict': '高',
-                        'confidence': 'high',
-                        'evidence': f'SQL错误特征: {evidence}',
-                        'diff_ratio': 0.5,
-                        'elapsed': elapsed,
-                        'db_type': db_type,
-                        'method': 'error_based'
-                    }
+                matched_phrases = self._matched_sql_error_phrases(attack_text)
+                if matched_phrases:
+                    # 基线对比（与 UNION 路径对齐）：报错短语若已存在于正常响应
+                    # （静态页面提及 SQL/数据库等）或来自被回显的 payload 本身，
+                    # 不算注入触发 → 跳过，避免把靶场首页等静态内容误判成报错注入。
+                    _norm_lower = (_normal_text or '').lower()
+                    _payload_lower = payload.lower()
+                    new_phrases = [
+                        p for p in matched_phrases
+                        if p not in _norm_lower and p not in _payload_lower
+                    ]
+                    if new_phrases:
+                        evidence = self._extract_sql_error(attack_text)
+                        return {
+                            'url': url,
+                            'parameter': param,
+                            'payload': payload,
+                            'type': f'SQL注入-报错注入({desc})',
+                            'severity': 'High',
+                            'ai_verdict': '高',
+                            'confidence': 'high',
+                            'evidence': f'SQL错误特征(新出现): {evidence}',
+                            'diff_ratio': 0.5,
+                            'elapsed': elapsed,
+                            'db_type': db_type,
+                            'method': 'error_based',
+                            'sql_error_phrases': new_phrases
+                        }
+                    self.log_debug(
+                        f"参数 {param} 响应含 SQL 报错关键词但基线已存在，"
+                        f"判定为静态噪声，跳过报错注入"
+                    )
+                    continue
 
                 if is_time_based and elapsed > 4.0:
                     reverse_payload = self._generate_reverse_payload(payload)
@@ -1431,17 +1536,32 @@ class LFIEngine(BaseEngine):
 
                 if self._is_file_included(attack_text):
                     evidence = self._extract_file_evidence(attack_text, payload)
+                    verified = self._is_strong_system_evidence(attack_text)
                     return {
                         'url': url,
                         'parameter': param,
                         'payload': payload,
                         'type': f'文件包含-LFI({desc})',
-                        'severity': 'High',
-                        'ai_verdict': '高',
+                        'severity': 'Critical' if verified else 'High',
+                        'ai_verdict': '极高' if verified else '高',
                         'confidence': 'high',
                         'evidence': evidence,
                         'diff_ratio': 0.5,
-                        'file_read': True
+                        'file_read': True,
+                        'lfi_verified': verified,
+                    }
+
+                if self._is_error_disclosure(attack_text):
+                    return {
+                        'url': url,
+                        'parameter': param,
+                        'payload': payload,
+                        'type': f'路径遍历-报错泄露({desc})',
+                        'severity': 'Medium',
+                        'ai_verdict': '中',
+                        'confidence': 'medium',
+                        'evidence': f"检测到错误信息泄露（非文件内容回显）: {attack_text[:120]}",
+                        'diff_ratio': 0.5,
                     }
 
                 if self._is_base64_content(attack_text):
@@ -1525,7 +1645,7 @@ class LFIEngine(BaseEngine):
             if status in (404, 403) or "not found" in text.lower():
                 return True
         except BaseException:
-            pass
+            logger.debug("suppressed exception (engine audit)")
 
         return True
 
@@ -1534,6 +1654,30 @@ class LFIEngine(BaseEngine):
             if indicator in text:
                 return True
         return False
+
+    def _is_strong_system_evidence(self, text: str) -> bool:
+        """A6 读取证明：响应含强系统文件特征（只有真实读到系统文件才会出现），
+        才认定实锤（lfi_verified），避免把普通字符串回显误判为高危。
+        """
+        STRONG = [
+            'root:x:0:0:', 'daemon:x:1:1:', 'bin:x:2:2:', 'nobody:x:65534:',
+            'mysql:x:', 'postgres:x:', '[boot loader]', '[operating systems]',
+            '[extensions]', 'HKEY_LOCAL_MACHINE', '[Unit]', '[Service]', '[Install]',
+        ]
+        return any(s in text for s in STRONG)
+
+    def _is_error_disclosure(self, text: str) -> bool:
+        """A6 报错泄露降级：响应是框架/语言错误信息（而非文件内容）时，
+        只能证明路径遍历存在，不能证明读到文件内容，降级 Medium。
+        """
+        ERROR_PATTERNS = [
+            'failed to open stream', 'no such file or directory',
+            'open_basedir', 'warning:', 'fatal error:', 'traceback',
+            'filenotfounderror', 'permission denied', 'include(',
+            'java.io.filenotfoundexception', 'system.io.filenotfoundexception',
+        ]
+        low = text.lower()
+        return any(p in low for p in ERROR_PATTERNS)
 
     def _is_base64_content(self, text: str) -> bool:
         base64_pattern = r'^[A-Za-z0-9+/=]+$'
@@ -1786,15 +1930,38 @@ class CMDIEngine(BaseEngine):
                     }
 
                 if is_time_based and elapsed > 4.0:
+                    verified, slow_times, fast = await self._verify_time_based_cmdi(
+                        payload, url, param, parsed_query, session, compliant
+                    )
+                    if verified:
+                        return {
+                            'url': url,
+                            'parameter': param,
+                            'payload': payload,
+                            'type': f'命令注入-时间盲注({desc})',
+                            'severity': 'High',
+                            'ai_verdict': '高',
+                            'confidence': 'high',
+                            'evidence': (
+                                f"延时 payload 两次平均 {sum(slow_times)/2:.1f}s，"
+                                f"sleep 0 对照 {fast:.1f}s，差异显著（A/B 复核通过）"
+                            ),
+                            'elapsed': elapsed,
+                            'time_based': True,
+                            'time_verified': True
+                        }
                     return {
                         'url': url,
                         'parameter': param,
                         'payload': payload,
-                        'type': f'命令注入-时间盲注({desc})',
-                        'severity': 'High',
-                        'ai_verdict': '高',
-                        'confidence': 'high',
-                        'evidence': f"响应延迟 {elapsed:.1f}s",
+                        'type': f'命令注入-时间盲注疑似({desc})',
+                        'severity': 'Medium',
+                        'ai_verdict': '中',
+                        'confidence': 'medium',
+                        'evidence': (
+                            f"单次延迟 {elapsed:.1f}s 但 A/B 复核未通过"
+                            f"（延时 {slow_times} / 对照 {fast:.1f}s），可能为网络抖动"
+                        ),
                         'elapsed': elapsed,
                         'time_based': True
                     }
@@ -1826,11 +1993,11 @@ class CMDIEngine(BaseEngine):
                         'url': url,
                         'parameter': param,
                         'payload': payload,
-                        'type': f'命令注入-时间盲注({desc})',
-                        'severity': 'High',
-                        'ai_verdict': '高',
-                        'confidence': 'high',
-                        'evidence': f"请求超时 ({req_timeout}s)，可能触发sleep",
+                        'type': f'命令注入-时间盲注疑似({desc})',
+                        'severity': 'Medium',
+                        'ai_verdict': '中',
+                        'confidence': 'medium',
+                        'evidence': f"请求超时 ({req_timeout}s)，可能触发 sleep 也可能为网络慢，未通过 A/B 复核",
                         'time_based': True,
                         'timeout': True
                     }
@@ -1838,6 +2005,57 @@ class CMDIEngine(BaseEngine):
                 self.log_debug(f"CMDI 检测异常 {param}: {e}")
 
         return None
+
+    async def _verify_time_based_cmdi(
+        self,
+        payload: str,
+        url: str,
+        param: str,
+        parsed_query: str,
+        session,
+        compliant: bool,
+    ):
+        """A5 时间盲注 A/B 复核：延时 payload 连续两次都慢、且 sleep 0 对照明显更快，
+        才认定是真实命令延时（time_verified），排除网络抖动导致的单次超时误报。
+        返回 (是否实锤, 两次延时秒数列表, 对照秒数)。
+        """
+        import time as _time
+
+        slow_times = []
+        for _ in range(2):
+            if compliant:
+                await asyncio.sleep(0.3)
+            t0 = _time.time()
+            try:
+                await async_get(
+                    build_attack_url(url, param, payload, parsed_query),
+                    session=session, timeout=20, no_retry=True
+                )
+            except Exception:
+                pass  # 超时也计入"慢"
+            slow_times.append(_time.time() - t0)
+
+        zero_payload = re.sub(r'(?i)sleep\s+\d+', 'sleep 0', payload)
+        if zero_payload == payload:
+            zero_payload = re.sub(r'(?i)timeout\s*/t\s+\d+', 'timeout /t 0', payload)
+        if compliant:
+            await asyncio.sleep(0.3)
+        t0 = _time.time()
+        try:
+            await async_get(
+                build_attack_url(url, param, zero_payload, parsed_query),
+                session=session, timeout=10, no_retry=True
+            )
+        except Exception:
+            logger.debug("suppressed exception (engine audit)")
+        fast = _time.time() - t0
+
+        verified = (
+            all(s > 4 for s in slow_times)
+            and fast < 3
+            and (sum(slow_times) / 2 - fast) > 3
+        )
+        return verified, slow_times, fast
 
     async def _is_cmd_param(
         self,
@@ -1863,7 +2081,7 @@ class CMDIEngine(BaseEngine):
             if "test" in text:
                 return True
         except BaseException:
-            pass
+            logger.debug("suppressed exception (engine audit)")
 
         return True
 
@@ -1958,6 +2176,17 @@ class SSTIEngine(BaseEngine):
         ("{7*7}", "49", "Smarty算术"),
         ("@(7*7)", "49", "Velocity算术"),
         ('${"7"*7}', "7777777", "Mako字符串乘法"),
+    ]
+
+    # A4 二次复核对：用不同算式（1337*2→2674）排除“页面本就含该数字”的巧合误报。
+    # 按 payload 前缀匹配对应语法形式；顺序敏感（"{{" 必须在 "{" 之前）。
+    L1_VERIFY_PAIRS = [
+        ("{{", "{{1337*2}}", "2674"),
+        ("${", "${1337*2}", "2674"),
+        ("<%=", "<%= 1337*2 %>", "2674"),
+        ("#{", "#{1337*2}", "2674"),
+        ("@(", "@(1337*2)", "2674"),
+        ("{", "{1337*2}", "2674"),
     ]
 
     L2_PAYLOADS = [
@@ -2099,17 +2328,29 @@ class SSTIEngine(BaseEngine):
                     is_in_html_attr = self._is_in_html_attribute(text, expected)
 
                     if is_in_template_context and not is_in_html_attr:
+                        calc_verified = await self._verify_calc(
+                            payload, url, param, parsed_query, session, compliant
+                        )
+                        evidence = (
+                            f"响应中出现 '{expected}'（{payload} 的计算结果），且出现在模板上下文中"
+                        )
+                        if calc_verified:
+                            evidence += "；二次复核 {{1337*2}}→2674 同样命中，排除巧合"
+                        else:
+                            evidence += "；二次复核未命中（可能被过滤或单次巧合），建议人工确认"
                         return {
                             'url': url,
                             'parameter': param,
                             'payload': payload,
                             'type': f'SSTI-L1算术检测({engine})',
-                            'ai_verdict': '高',
-                            'confidence': 'high',
-                            'evidence': f"响应中出现 '{expected}'（{payload} 的计算结果），且出现在模板上下文中",
+                            'ai_verdict': '高' if calc_verified else '中',
+                            'confidence': 'high' if calc_verified else 'medium',
+                            'evidence': evidence,
                             'diff_ratio': 0.5,
                             'engine': engine,
-                            'context_verified': True
+                            'context_verified': True,
+                            'calc_verified': calc_verified,
+                            'template_engine': engine,
                         }
                     elif not is_in_normal_response and len(text) < 500:
                         return {
@@ -2132,6 +2373,39 @@ class SSTIEngine(BaseEngine):
                 self.log_debug(f"SSTI L1 检测异常: {e}")
 
         return None
+
+    async def _verify_calc(
+        self,
+        payload: str,
+        url: str,
+        param: str,
+        parsed_query: str,
+        session,
+        compliant: bool,
+    ) -> bool:
+        """A4 二次复核：用同一语法的不同算式（1337*2→2674）再次请求，
+        只有结果同样命中才认定是真实模板计算，排除“页面本就含 49”的巧合。
+        """
+        verify_payload, verify_expected = self._verify_pair(payload)
+        if not verify_payload:
+            return False
+        if compliant:
+            await asyncio.sleep(0.3)
+        attack_url = build_attack_url(url, param, verify_payload, parsed_query)
+        try:
+            resp = await async_get(attack_url, session=session, timeout=settings.timeout, no_retry=True)
+            _status, text, _ = await _parse_response(resp)
+            return bool(verify_expected in text and len(text) < 10000)
+        except Exception as e:
+            self.log_debug(f"SSTI 二次复核异常: {e}")
+            return False
+
+    def _verify_pair(self, payload: str):
+        """根据 payload 前缀返回同语法的复核算式与期望结果。"""
+        for prefix, vp, ve in self.L1_VERIFY_PAIRS:
+            if payload.startswith(prefix):
+                return vp, ve
+        return None, None
 
     def _is_in_template_context(self, text: str, payload: str) -> bool:
         context_patterns = [
@@ -2447,7 +2721,7 @@ class NoSQLEngine(BaseEngine):
             if 'json' in content_type.lower() or 'graphql' in content_type.lower():
                 return True
         except BaseException:
-            pass
+            logger.debug("suppressed exception (engine audit)")
 
         return True
 

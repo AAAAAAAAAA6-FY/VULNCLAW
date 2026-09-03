@@ -32,7 +32,7 @@ os.environ["PYTHONUTF8"] = "1"
 try:
     sys.stdout.reconfigure(encoding='utf-8')
 except AttributeError:
-    pass
+    logger.debug("suppressed exception (core audit)")
 
 
 class TokenBudget:
@@ -218,7 +218,7 @@ def get_configured_ai_models() -> List[str]:
                     return []
                 raw = raw[:n]
             except (TypeError, ValueError):
-                pass  # 非法档位值 → 回退全量，保持向后兼容
+                logger.debug("suppressed exception (core audit)")
         models = resolve_model_aliases(raw)
         seen: set = set()
         result: List[str] = []
@@ -289,7 +289,7 @@ class LLMClient:
                 try:
                     self.model_configs = json.loads(configs_raw)
                 except BaseException:
-                    pass
+                    logger.debug("suppressed exception (core audit)")
 
         if not self.api_key and self.model_configs:
             first_key = list(self.model_configs.keys())[0]
@@ -474,7 +474,7 @@ class LLMClient:
                     try:
                         get_metrics().inc_ai_call(model, True)
                     except Exception:
-                        pass
+                        logger.debug("suppressed exception (core audit)")
                     # P1-2: 写入语义缓存（1h TTL，有界 LRU）
                     if use_cache and cache_key:
                         try:
@@ -493,7 +493,7 @@ class LLMClient:
                                             list(LLMClient._semantic_cache.items())[-LLMClient._semantic_cache_max // 2:]
                                         )
                         except Exception:
-                            pass
+                            logger.debug("suppressed exception (core audit)")
                     return result
                 else:
                     logger.warning(f"⚠️ 模型 {model} 返回空内容，切换到下一个模型...")
@@ -517,7 +517,7 @@ class LLMClient:
                 try:
                     get_metrics().inc_ai_call(model, False)
                 except Exception:
-                    pass
+                    logger.debug("suppressed exception (core audit)")
                 last_error = e
                 continue
 
@@ -706,7 +706,7 @@ async def close_llm_client():
         from vulnclaw.ai.remote_agents import close_remote_agents
         await close_remote_agents()
     except Exception:
-        pass
+        logger.debug("suppressed exception (core audit)")
 
 
 def compress_http_response(response_text: str, max_len: int = 1500) -> str:
@@ -1517,7 +1517,7 @@ class AgentRuleEngine:
                 elif isinstance(data, list):
                     return f"JSON数组，{len(data)} 条记录，首条: {json.dumps(data[0] if data else {}, ensure_ascii=False)[:200]}"
             except BaseException:
-                pass
+                logger.debug("suppressed exception (core audit)")
 
         head = text[:min(max_len // 2, 2500)]
         tail = text[-min(max_len // 2, 2500):]
@@ -1861,7 +1861,7 @@ class VectorMemory:
                             if payload_val:
                                 fail_payloads.add(payload_val)
                         except:
-                            pass
+                            logger.debug("suppressed exception (core audit)")
                 filtered = []
                 for doc_str in documents:
                     try:

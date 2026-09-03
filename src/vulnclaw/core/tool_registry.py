@@ -46,6 +46,34 @@ _TOOL_FALLBACKS: Dict[str, str] = {
 # 工具调用统计（成功/失败/降级），供 Agent 成功率排序与审计
 _TOOL_CALL_STATS: Dict[str, Dict[str, int]] = {}
 
+# G5: 危险操作三级分级（read 只读 / write 写 / destructive 破坏性）
+# 默认所有工具为 read（不阻断正常扫描）；仅显式标记的高危工具升级级别。
+# deny 模式下 write/destructive 默认拦截，需对应开关（DANGER_LEVEL_WRITE_ALLOW /
+# DANGER_LEVEL_DESTRUCTIVE_ALLOW）或 DANGEROUS_MODE=allow 才放行。
+_DANGER_LEVELS: Dict[str, str] = {
+    "msf": "destructive",
+    "msfconsole": "destructive",
+    "metasploit": "destructive",
+    "exploit": "destructive",
+}
+_LEVEL_RANK = {"read": 0, "write": 1, "destructive": 2}
+
+
+def grade_danger_op(op_name: str) -> str:
+    """G5: 返回操作危险级别（read/write/destructive）。未知工具默认 read（不阻断扫描）。"""
+    return _DANGER_LEVELS.get((op_name or "").lower(), "read")
+
+
+def is_danger_allowed(level: str) -> bool:
+    """G5: 依据 settings 判断该危险级别当前是否允许执行。"""
+    if level == "read":
+        return True
+    if level == "write":
+        return bool(settings.danger_level_write_allow or settings.dangerous_mode == "allow")
+    if level == "destructive":
+        return bool(settings.danger_level_destructive_allow or settings.dangerous_mode == "allow")
+    return True
+
 
 def record_tool_result(name: str, success: bool, degraded: bool = False) -> None:
     """A5.5: 记录工具调用结果（成功/失败/降级）。"""
@@ -278,6 +306,20 @@ async def run_tool(
         }
     """
     config = load_tool_config(name)
+
+    # ===== G5: 危险操作三级分级（read/write/destructive）=====
+    # write/destructive 在 deny 模式下默认拦截，需对应开关或 DANGEROUS_MODE=allow 放行。
+    _op_level = grade_danger_op(name)
+    if not is_danger_allowed(_op_level):
+        return {
+            "success": False,
+            "error": (
+                f"DangerGuard(G5) 拦截 {_op_level} 级操作: {name} "
+                f"（需开启 DANGER_LEVEL_WRITE_ALLOW / DANGER_LEVEL_DESTRUCTIVE_ALLOW 或 DANGEROUS_MODE=allow）"
+            ),
+            "cmd": name,
+            "returncode": -1,
+        }
 
     # ===== 远程任务委派路由 =====
     # 若 .env 里 REMOTE_TASK_ROUTING 配置了该工具，优先尝试交给远程 AI Agent 执行。

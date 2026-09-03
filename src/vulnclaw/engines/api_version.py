@@ -18,6 +18,7 @@ from vulnclaw.core.utils import async_get
 from vulnclaw.engines.base import BaseEngine
 
 
+__all__ = ['APIVersionEngine']
 class APIVersionEngine(BaseEngine):
     """API 版本差异检测引擎"""
 

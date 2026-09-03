@@ -68,7 +68,7 @@ def _run_io_save_sync(
                     try:
                         tmp_file.unlink()
                     except BaseException:
-                        pass
+                        logger.debug("suppressed exception (core audit)")
             return  # 成功
         except Exception as e:
             last_exc = e
@@ -81,7 +81,7 @@ def _run_io_save_sync(
         try:
             tmp_file.unlink()
         except BaseException:
-            pass
+            logger.debug("suppressed exception (core audit)")
     if last_exc is not None:
         raise last_exc  # type: ignore[misc]
 
@@ -140,7 +140,7 @@ class ScanState:
                 self.state_file.rename(backup)
                 logger.info(f"📂 已备份损坏的状态文件到: {backup}")
             except BaseException:
-                pass
+                logger.debug("suppressed exception (core audit)")
             return False
         except Exception as e:
             logger.warning(f"⚠️ 加载状态失败: {e}，将从头开始")
@@ -265,7 +265,7 @@ class ScanState:
             try:
                 self.state_file.unlink()
             except BaseException:
-                pass
+                logger.debug("suppressed exception (core audit)")
         logger.info("🧹 已清除扫描状态")
         await self._schedule_flush(force=True)
 
@@ -329,7 +329,7 @@ class ScanState:
                         try:
                             tmp.unlink()
                         except BaseException:
-                            pass
+                            logger.debug("suppressed exception (core audit)")
 
     def load_latest_checkpoint(self) -> Dict:
         checkpoint_dir = self.state_dir.parent / "checkpoints"
@@ -373,7 +373,7 @@ class ScanState:
                 try:
                     f.unlink()
                 except BaseException:
-                    pass
+                    logger.debug("suppressed exception (core audit)")
         remaining = sorted(
             checkpoint_dir.glob("checkpoint_*.json"),
             key=lambda f: f.stat().st_mtime,
@@ -384,7 +384,7 @@ class ScanState:
                 try:
                     f.unlink()
                 except BaseException:
-                    pass
+                    logger.debug("suppressed exception (core audit)")
 
     def has_pending_tasks(self) -> bool:
         data = self.load_latest_checkpoint()
@@ -558,7 +558,7 @@ class IncrementalSaver:
                 try:
                     self.index_file.unlink()
                 except BaseException:
-                    pass
+                    logger.debug("suppressed exception (core audit)")
 
 
 class CorrelationEngine:
@@ -591,7 +591,7 @@ class CorrelationEngine:
                     data = json.load(f)
                     scans.append(data)
             except BaseException:
-                pass
+                logger.debug("suppressed exception (core audit)")
         return scans
 
     def find_common_vulns(self, current_vulns: List[Dict]) -> List[Dict]:
@@ -608,7 +608,7 @@ class CorrelationEngine:
                     try:
                         historical_patterns.add(vuln_url.split('/')[2] if '://' in vuln_url else '')
                     except BaseException:
-                        pass
+                        logger.debug("suppressed exception (core audit)")
         for vuln in current_vulns:
             vuln_type = vuln.get('type', '')
             vuln_url = vuln.get('url', '')

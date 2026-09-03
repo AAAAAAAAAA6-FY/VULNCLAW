@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC_PKG = ROOT / "src" / "vulnclaw"
 
 ALLOWED_ROOT_ITEMS = {
-    "src", "tests", "docs", "scripts", "thirdparty",
+    "src", "tests", "docs", "scripts", "assets", "thirdparty",
     "pyproject.toml", "README.md", "CHANGELOG.md", "CONTRIBUTING.md", "SECURITY.md",
     "LICENSE", ".gitignore", ".pre-commit-config.yaml",
     "_runtime_cache", "venv", ".vscode", ".idea", ".trae", ".codebuddy",

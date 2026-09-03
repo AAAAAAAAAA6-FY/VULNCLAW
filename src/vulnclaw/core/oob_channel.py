@@ -197,7 +197,7 @@ class OOBChannel:
                     with open(path, encoding="utf-8", errors="replace") as f:
                         candidates.append(f.read()[:2000])
                 except OSError:
-                    pass
+                    logger.debug("suppressed exception (core audit)")
         for text in candidates:
             m = _OAST_DOMAIN_RE.search(text or "")
             if m:

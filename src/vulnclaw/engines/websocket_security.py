@@ -23,6 +23,7 @@ from vulnclaw.core.utils import async_get
 from vulnclaw.engines.base import BaseEngine
 
 
+__all__ = ['WebSocketSecurityEngine']
 class WebSocketSecurityEngine(BaseEngine):
     """WebSocket 安全检测引擎"""
 
@@ -65,6 +66,10 @@ class WebSocketSecurityEngine(BaseEngine):
                 finding = await self._probe_ws_endpoint(ws_url, session)
                 if finding:
                     findings.append(finding)
+                    # B9: CSWSH 命中后附加消息层注入验证（回显确认）
+                    msg = await self._test_message_layer_injection(ws_url, session)
+                    if msg:
+                        findings.append(msg)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -85,6 +90,22 @@ class WebSocketSecurityEngine(BaseEngine):
                     raise
                 except Exception as exc:
                     logger.debug(f"[websocket_security] 明文探测 {clear_url} 异常: {exc}")
+
+        # D2: 对爬取发现的 WebSocket 端点做真实握手探测（而非仅猜测常见路径）
+        for ep in (kwargs.get("endpoints") or []):
+            if not isinstance(ep, str) or not ep.startswith("ws"):
+                continue
+            try:
+                finding = await self._probe_ws_endpoint(ep, session)
+                if finding:
+                    findings.append(finding)
+                    msg = await self._test_message_layer_injection(ep, session)
+                    if msg:
+                        findings.append(msg)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug(f"[websocket_security] 发现端点探测 {ep} 异常: {exc}")
 
         logger.info(f"WebSocketSecurityEngine: {len(findings)} findings")
         return findings
@@ -147,6 +168,46 @@ class WebSocketSecurityEngine(BaseEngine):
             finding["evidence"] += f"；响应回显 Access-Control-Allow-Origin={acao}（Origin 反射），CSWSH 实锤性更高"
             finding["origin_reflected"] = True
         return finding
+
+    async def _test_message_layer_injection(self, ws_url: str, session) -> Optional[Dict[str, Any]]:
+        """B9: 消息层注入验证 —— 在 CSWSH/端点可用时，通过 aiohttp 建立真实 WS 连接，
+        发送含唯一标记的探测消息，观察是否被原样回显（判定消息层注入/回显攻击面）。
+
+        仅做只读回显验证，不注入恶意内容；回显端点存在本身即为信息泄露/逻辑风险点。
+        """
+        marker = "vulnclaw_ws_echo_7f3c"
+        try:
+            import aiohttp
+            # aiohttp ws_connect 需要绝对 ws:// wss:// 地址
+            if not ws_url.startswith(("ws://", "wss://")):
+                return None
+            async with session.ws_connect(ws_url, timeout=5) as ws:
+                try:
+                    await ws.send_str(marker)
+                except Exception:
+                    return None
+                try:
+                    reply = await ws.receive(timeout=4)
+                except Exception:
+                    return None
+                if reply.type in (aiohttp.WSMsgType.TEXT, aiohttp.WSMsgType.BINARY):
+                    data = reply.data
+                    if isinstance(data, (bytes, bytearray)):
+                        data = data.decode("utf-8", errors="replace")
+                    if marker in str(data):
+                        return {
+                            "url": ws_url,
+                            "type": "websocket_message_echo",
+                            "title": "WebSocket 消息层回显泄漏",
+                            "severity": "Medium",
+                            "ai_verdict": "高",
+                            "confidence": "medium",
+                            "evidence": f"向 {ws_url} 发送含标记 {marker} 的消息被原样回显",
+                            "remediation": "对 WebSocket 消息做服务端过滤/校验，禁止反射回显用户输入",
+                        }
+        except Exception as exc:
+            logger.debug(f"[websocket_security] 消息层探测 {ws_url} 异常: {exc}")
+        return None
 
     async def _probe_cleartext(self, ws_url: str, session, own_origin: str) -> Optional[Dict[str, Any]]:
         """A7 增强：检测 HTTPS 站点是否同时接受明文 ws:// 升级（未强制 TLS）。"""

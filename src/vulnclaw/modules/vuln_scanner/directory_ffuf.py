@@ -206,7 +206,7 @@ async def run_ffuf_async(target: str, concurrency: int = 20, timeout: int = 120)
                 try:
                     os.unlink(f)
                 except BaseException:
-                    pass
+                    logger.debug("suppressed exception (core audit)")
 
 
 __all__ = ['run_ffuf_async']

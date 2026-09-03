@@ -58,6 +58,8 @@ cache-dir = "_runtime_cache/ruff"
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["E501"]
+# 根 scan.py 是有意保持的薄壳（布局守卫要求 <=15 行），import 无法按 ruff 分组留空行
+"scan.py" = ["I001"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

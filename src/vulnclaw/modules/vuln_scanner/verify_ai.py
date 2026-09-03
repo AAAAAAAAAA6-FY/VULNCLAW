@@ -97,7 +97,7 @@ def safe_extract_json(text: str) -> Optional[Dict]:
     try:
         return json.loads(text)
     except BaseException:
-        pass
+        logger.debug("suppressed exception (core audit)")
     cleaned = re.sub(r'```json\s*|\s*```', '', text)
     cleaned = re.sub(r'```\s*|\s*```', '', cleaned)
     match = re.search(r'(\{.*\})', cleaned, re.DOTALL)
@@ -105,13 +105,13 @@ def safe_extract_json(text: str) -> Optional[Dict]:
         try:
             return json.loads(match.group(1))
         except BaseException:
-            pass
+            logger.debug("suppressed exception (core audit)")
     match = re.search(r'(\[.*\])', cleaned, re.DOTALL)
     if match:
         try:
             return json.loads(match.group(1))
         except BaseException:
-            pass
+            logger.debug("suppressed exception (core audit)")
     return None
 
 

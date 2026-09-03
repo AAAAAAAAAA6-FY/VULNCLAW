@@ -10,9 +10,9 @@ Import engine classes directly from the package root, e.g.:
     from vulnclaw.engines import SQLiEngine, XSSEngine
 """
 
-from .auth_engines import IDOREngine, JWTEngine, OAuthEngine, SessionEngine
+from .auth_engines import IDOREngine, JWTEngine, OAuthEngine, SessionEngine, WeakCredentialEngine, PasswordResetEngine
 from .auxiliary_engines import APIVersionDiffEngine, HTTP2WebSocketEngine, RequestSmugglingEngine
-from .api_security_engines import APISecurityEngine
+from .api_security_engines import APISecurityEngine, MassAssignmentEngine
 from .api_version import APIVersionEngine
 from .base import BaseEngine, CaseInsensitiveDict
 from .container_engines import ContainerSecurityEngine
@@ -20,6 +20,7 @@ from .deserialization import DeserializationEngine
 from .dotnet_deserialization import DotNetDeserializationEngine
 from .framework_zero_day_engines_2 import (
     AdminConsoleExposureEngine,
+    CloudAndContainerExposureEngine,
     ContainerPlatformExposureEngine,
     ShiroRememberMeEngine,
     SpringCloudGatewayEngine,
@@ -42,15 +43,17 @@ from .input_engines import (
     LDAPEngine,
 )
 from .logic_leak_engines_2 import (
+    BackendComponentFingerprintEngine,
     BackupFileLeakEngine,
     GraphQLIntrospectionEngine,
+    JsLibraryCveEngine,
     PrometheusMetricsExposureEngine,
     RateLimitEngine,
     SwaggerApiDocEngine,
     VerbTamperingEngine,
 )
 from .mobile_engines import MobileAPIEngine
-from .net_engines import GraphQLEngine, SSRFEngine, XXEEngine
+from .net_engines import DnsSecurityEngine, GraphQLEngine, SSRFEngine, TlsSecurityEngine, XXEEngine
 from .web_engines import CMDIEngine, LFIEngine, NoSQLEngine, RFIEngine, SQLiEngine, SSTIEngine, XSSEngine
 from .http_advanced_engines import CSRFEngine, WebCacheDeceptionEngine
 from .framework_zero_day_engines import FastjsonDeserializationEngine, Log4ShellEngine, Spring4ShellEngine, Struts2OGNLEngine, ViewStateEngine
@@ -122,4 +125,12 @@ __all__ = [
     "RateLimitEngine",
     "VerbTamperingEngine",
     "PrometheusMetricsExposureEngine",
+    "TlsSecurityEngine",
+    "DnsSecurityEngine",
+    "MassAssignmentEngine",
+    "WeakCredentialEngine",
+    "JsLibraryCveEngine",
+    "PasswordResetEngine",
+    "CloudAndContainerExposureEngine",
+    "BackendComponentFingerprintEngine",
 ]

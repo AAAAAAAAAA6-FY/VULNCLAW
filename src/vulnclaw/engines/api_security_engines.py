@@ -18,6 +18,7 @@ from vulnclaw.core.utils import async_get, async_post
 from vulnclaw.engines.base import BaseEngine
 
 
+__all__ = ['APISecurityEngine', 'MassAssignmentEngine']
 class APISecurityEngine(BaseEngine):
     """API 安全深度检测引擎"""
 
@@ -307,3 +308,205 @@ class APISecurityEngine(BaseEngine):
             logger.debug(f"JWT 重放检测异常: {e}")
 
         return None
+
+
+
+async def _api_verb_engine(method: str, url: str, payload: Dict, session, timeout: int):
+    """模块级辅助：以指定 HTTP 方法（PUT/PATCH）发送 JSON body。"""
+    import aiohttp
+    try:
+        async with session.request(
+            method, url, json=payload, timeout=aiohttp.ClientTimeout(total=timeout)
+        ) as resp:
+            text = await resp.text()
+            return resp.status, text
+    except Exception:
+        return None, ""
+
+
+class MassAssignmentEngine(BaseEngine):
+    """批量赋值（Mass Assignment / 自动绑定）检测引擎
+
+    原理：向 API 端点提交特权字段（is_admin / role / balance 等），
+    若服务端将该字段绑定进业务对象并在响应中回显（甚至持久化），
+    即存在批量赋值漏洞（CWE-915）。
+
+    误报控制：
+    1. 字段值使用唯一标记串，只有服务端真正接受并回显才算命中（避免“任意 200 即报”）；
+    2. 要求基线请求（无害字段）的响应中不含该字段，排除 API 本就返回该字段的情况；
+    3. 命中后再发一次 GET 确认标记是否被持久化，区分“回显”与“已写入”。
+    """
+
+    name = "mass_assignment"
+    description = "批量赋值/自动绑定漏洞检测（特权字段注入，CWE-915）"
+
+    MARKER = "vulnclaw_ma_7f3c"
+
+    # 特权字段：字段名 -> 是否属高危（权限/角色类）
+    PRIVILEGE_FIELDS = (
+        ("is_admin", True), ("isAdmin", True), ("admin", True),
+        ("role", True), ("roles", True), ("group", True),
+        ("user_type", True), ("permission", True), ("permissions", True),
+        ("is_active", False), ("isActive", False), ("verified", False),
+        ("email_verified", False), ("approved", False), ("status", False),
+        ("balance", False), ("credit", False), ("level", False), ("vip", False),
+    )
+
+    # 候选 API 端点（避免注册类路径，防止创建账号等副作用）
+    API_PATHS = (
+        "/api/profile", "/api/account", "/api/me", "/api/settings",
+        "/api/user", "/api/users", "/api/v1/profile", "/api/v1/me",
+        "/api/v1/account", "/profile", "/account", "/settings", "/api/user/update",
+    )
+
+    MAX_ENDPOINTS = 6
+    TIMEOUT = 6
+
+    async def check(
+        self,
+        url: str,
+        param: str,
+        normal_resp: Tuple[int, str, Dict],
+        parsed_query: str,
+        session,
+        **kwargs
+    ) -> Optional[Dict]:
+        """参数级入口：批量赋值需提交 JSON 请求体，统一走 scan() 全局扫描。"""
+        return None
+
+    async def scan(self, target: str, session, **kwargs) -> List[Dict]:
+        from vulnclaw.config.settings import settings as _st
+        if not _st.api_bola_test:
+            return []
+
+        """扫描 API 端点的批量赋值风险。"""
+        findings: List[Dict] = []
+        parsed = urlparse(target)
+        base_url = f"{parsed.scheme}://{parsed.netloc}"
+        logger.info(f"🔍 [MassAssignment] 扫描批量赋值: {target}")
+
+        endpoints = await self._discover_endpoints(base_url, session)
+        if not endpoints:
+            logger.info("   ℹ️ 未发现可用 API 端点，跳过批量赋值检测")
+            return findings
+
+        for url in endpoints[: self.MAX_ENDPOINTS]:
+            base_status, base_text = await self._send(session, url, {"vulnclaw_probe": "1"})
+            if base_status is None:
+                continue
+
+            # 组合探测：一次性提交全部特权字段，先判断是否值得展开
+            combined = {field: self.MARKER for field, _ in self.PRIVILEGE_FIELDS}
+            status, text = await self._send(session, url, combined)
+            used_method = "POST"
+            # B6 扩展：POST 未绑定特权字段时，尝试 PATCH 与表单（内容型/方法型绕过）
+            if status is not None and (not (200 <= status < 300) or self.MARKER not in (text or "")):
+                for alt_method, alt_form in (("PATCH", False), ("PUT", False), ("POST", True)):
+                    m_status, m_text = await self._send(session, url, combined, method=alt_method, as_form=alt_form)
+                    if m_status is not None and (200 <= m_status < 300) and self.MARKER in (m_text or ""):
+                        status, text, used_method = m_status, m_text, alt_method
+                        break
+            if status is None or not (200 <= status < 300) or self.MARKER not in (text or ""):
+                continue
+
+            # 命中后逐字段定位（沿用命中的方法通道），确认到底是哪个字段被绑定
+            for field, high_risk in self.PRIVILEGE_FIELDS:
+                f_status, f_text = await self._send(
+                    session, url, {field: self.MARKER}, method=used_method
+                )
+                if f_status is None or not (200 <= f_status < 300):
+                    continue
+                if self.MARKER not in (f_text or ""):
+                    continue
+                if self._contains_field(base_text, field):
+                    continue  # 基线本就返回该字段，非本次注入所致
+
+                persisted = await self._persisted(session, url)
+                findings.append({
+                    "url": url,
+                    "type": "mass_assignment_privilege_field",
+                    "severity": "High" if high_risk else "Medium",
+                    "title": f"批量赋值：特权字段 {field} 可被客户端写入",
+                    "description": (
+                        f"向 {url} 提交特权字段 `{field}` 后，服务端接受并在响应中回显该值"
+                        + ("，且再次读取该资源时标记仍存在（已被持久化）。" if persisted else "。")
+                        + " 攻击者可借此直接提升自身权限或篡改账户属性（CWE-915）。"
+                    ),
+                    "remediation": (
+                        "使用白名单显式声明允许客户端写入的字段，"
+                        "敏感字段（角色/权限/余额/审核状态）只在服务端赋值。"
+                    ),
+                    "recommendation": "服务端采用字段白名单绑定，禁止客户端提交特权字段。",
+                    "parameter": field,
+                    "method": used_method,
+                    "evidence": (
+                        f"POST {url} {{\"{field}\": \"{self.MARKER}\"}} -> HTTP {f_status}，"
+                        f"响应回显标记值"
+                        + ("；再次 GET 仍返回该标记（持久化）" if persisted else "")
+                    ),
+                    "confidence": "high" if persisted else "medium",
+                    "cvss": 8.8 if high_risk else 6.5,
+                })
+
+        logger.info(f"   ✅ MassAssignment 完成，发现 {len(findings)} 个问题")
+        return findings
+
+    async def _discover_endpoints(self, base_url: str, session) -> List[str]:
+        """探测存活的 API 端点（仅 GET，无副作用）。"""
+        endpoints: List[str] = []
+        for path in self.API_PATHS:
+            url = base_url.rstrip("/") + path
+            try:
+                resp = await async_get(url, session=session, timeout=self.TIMEOUT, no_retry=True)
+                if isinstance(resp, tuple):
+                    status = resp[0]
+                else:
+                    status = resp.status
+                if status in (200, 401, 403, 405, 422):
+                    endpoints.append(url)
+            except Exception:
+                continue
+        return endpoints
+
+    async def _send(self, session, url: str, payload: Dict, method: str = "POST",
+                    as_form: bool = False):
+        """发送请求，返回 (status, text)。
+
+        method 支持 POST/PUT/PATCH；as_form=True 时以 application/x-www-form-urlencoded
+        发送（内容型绕过：部分框架仅表单绑定，对 JSON body 宽松/严格不同，测试双通道）。
+        """
+        try:
+            if as_form:
+                from urllib.parse import urlencode as _ue
+                import aiohttp
+                form = aiohttp.FormData(payload)
+                resp = await async_post(
+                    url, data=form, session=session, timeout=self.TIMEOUT, no_retry=True,
+                )
+            elif method in ("PUT", "PATCH"):
+                resp = await _api_verb_engine(method, url, payload, session, self.TIMEOUT)
+            else:
+                resp = await async_post(
+                    url, json=payload, session=session, timeout=self.TIMEOUT, no_retry=True
+                )
+            if isinstance(resp, tuple):
+                return resp[0], resp[1] or ""
+            return resp.status, (await resp.text()) or ""
+        except Exception:
+            return None, ""
+
+    async def _persisted(self, session, url: str) -> bool:
+        """再次读取资源，确认标记是否被持久化存储。"""
+        try:
+            resp = await async_get(url, session=session, timeout=self.TIMEOUT, no_retry=True)
+            if isinstance(resp, tuple):
+                text = resp[1] or ""
+            else:
+                text = (await resp.text()) or ""
+            return self.MARKER in text
+        except Exception:
+            return False
+
+    @staticmethod
+    def _contains_field(text: str, field: str) -> bool:
+        return bool(text) and f'"{field}"' in text

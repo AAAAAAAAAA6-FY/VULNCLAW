@@ -458,17 +458,36 @@ class JSONPHijackingEngine(BaseEngine):
                 evidence = f'端点以 Callback `{callback}` 回显 JSONP：`{stripped[:120]}`'
 
                 if sensitive:
-                    findings.append({
-                        'url': probe_url,
-                        'parameter': cb_key,
-                        'payload': callback,
-                        'type': 'JSONP数据劫持风险(敏感数据)',
-                        'severity': 'High',
-                        'ai_verdict': '高',
-                        'confidence': 'high',
-                        'evidence': evidence + '，且返回数据命中敏感字段特征（可被第三方页面跨域读取）',
-                        'recommendation': 'JSONP 接口校验 Referer/Origin，或改用 CORS + 凭证策略并移除敏感字段',
-                    })
+                    # B11 深化：跨域 Referer/Origin 校验检测 —— 带恶意出处请求，
+                    # 若仍返回含敏感字段的真实数据（未拦截），则数据劫持确证（弱校验 -> High）。
+                    referer_checked = await self._probe_cross_origin_guard(
+                        probe_url, callback, session
+                    )
+                    if referer_checked is True:
+                        findings.append({
+                            'url': probe_url,
+                            'parameter': cb_key,
+                            'payload': callback,
+                            'type': 'JSONP数据劫持(无跨域校验/已确证)',
+                            'severity': 'High',
+                            'ai_verdict': '高',
+                            'confidence': 'high',
+                            'evidence': (evidence + '；且带恶意跨域 Referer/Origin 请求仍返回含敏感字段的真实 JSONP，'
+                                        '说明服务端未做跨域出处校验，可被任意第三方页面跨域读取'),
+                            'recommendation': 'JSONP 接口必须校验 Referer/Origin 白名单，或改用 CORS + 凭证（SameSite）策略并移除敏感字段',
+                        })
+                    else:
+                        findings.append({
+                            'url': probe_url,
+                            'parameter': cb_key,
+                            'payload': callback,
+                            'type': 'JSONP数据劫持风险(敏感数据,有出处校验)',
+                            'severity': 'Medium',
+                            'ai_verdict': '中',
+                            'confidence': 'medium',
+                            'evidence': evidence + '，且返回敏感字段；但带跨域出处请求已校验，请人工复核不受限面',
+                            'recommendation': '确认 Referer/Origin 校验规则强度，如可被伪造则升级处置',
+                        })
                 else:
                     findings.append({
                         'url': probe_url,
@@ -484,6 +503,44 @@ class JSONPHijackingEngine(BaseEngine):
         except Exception as e:
             logger.debug(f"[{self.name}] JSONP 检测异常: {e}")
         return findings
+
+    async def _probe_cross_origin_guard(
+        self, probe_url: str, callback: str, session
+    ):
+        """B11 深化：以恶意跨域 Referer + Origin 重新请求 JSONP 端点，判断是否做了出处校验。
+
+        返回三种分类：
+        - True  跨域请求仍返回真实 JSONP（未校验）-> 数据劫持确证
+        - False 跨域请求被校验拦截/改写（403/错误/不含 callback）-> 有出处校验
+        - None  探测异常或无法判定
+        """
+        evil_ref = "https://evil-vlccsp.example.com/"
+        evil_origin = "https://evil-vlccsp.example.com"
+        try:
+            resp = await async_get(
+                probe_url, headers={"Referer": evil_ref, "Origin": evil_origin},
+                session=session, timeout=settings.timeout, no_retry=True,
+            )
+            if resp is None:
+                return None
+            status, text = resp[0], resp[1] or ""
+            if not isinstance(text, str):
+                return None
+            if status in (403, 401, 451):
+                return False
+            stripped = text.lstrip()
+            if f"{callback}(" in stripped:
+                return True
+            if self.SENSITIVE_KEY_RE.search(text[: self.MAX_BODY_PARSE]):
+                return True
+            low = text.lower()
+            if any(k in low for k in ("forbidden", "invalid referer", "invalid origin",
+                                      "not allowed", "access denied", "csrf")):
+                return False
+            return None
+        except Exception as e:
+            logger.debug(f"[{self.name}] 跨域校验探测异常: {e}")
+            return None
 
     async def check(
         self,

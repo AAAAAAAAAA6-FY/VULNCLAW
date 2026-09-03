@@ -63,9 +63,9 @@ async def _is_llm_endpoint(url: str, session) -> bool:
                                 if 'choices' in data or 'response' in data or 'content' in data:
                                     return True
                         except BaseException:
-                            pass
+                            logger.debug("suppressed exception (core audit)")
             except BaseException:
-                pass
+                logger.debug("suppressed exception (core audit)")
         return False
     except Exception:
         return False
@@ -163,9 +163,9 @@ async def scan_spring_actuator(base_url: str, session) -> List[Dict]:
                                 "confidence": "中"
                             })
                     except BaseException:
-                        pass
+                        logger.debug("suppressed exception (core audit)")
         except BaseException:
-            pass
+            logger.debug("suppressed exception (core audit)")
     return findings
 
 
@@ -231,7 +231,7 @@ async def scan_oauth_hijack(base_url: str, session) -> List[Dict]:
                             "confidence": "高"
                         })
         except BaseException:
-            pass
+            logger.debug("suppressed exception (core audit)")
     return findings
 
 
@@ -258,7 +258,7 @@ async def scan_rtsp_default_creds(ip: str) -> List[Dict]:
                     "exploit": "可使用 VLC 或 ffmpeg 直接拉流"
                 })
     except BaseException:
-        pass
+        logger.debug("suppressed exception (core audit)")
     return findings
 
 
@@ -285,7 +285,7 @@ async def scan_graphql_introspection(base_url: str, session) -> List[Dict]:
                         "confidence": "高"
                     })
         except BaseException:
-            pass
+            logger.debug("suppressed exception (core audit)")
     return findings
 
 
@@ -307,7 +307,7 @@ async def scan_dns_rebinding(domain: str) -> List[Dict]:
                 "confidence": "中"
             })
     except BaseException:
-        pass
+        logger.debug("suppressed exception (core audit)")
     return findings
 
 

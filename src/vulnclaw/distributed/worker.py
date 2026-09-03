@@ -123,7 +123,7 @@ class DistributedWorker:
                 stream_key, group_name, id="0", mkstream=True
             )
         except Exception:  # noqa: BLE001 - 组已存在
-            pass
+            logger.debug("suppressed exception (core audit)")
 
     async def pull_task(self, timeout: int = 5) -> Optional[Dict]:
         """P3-3: 从 Redis Stream 消费组拉取任务。
@@ -307,7 +307,7 @@ class DistributedWorker:
                 try:
                     await context.set(_k, _v)
                 except Exception:  # noqa: BLE001
-                    pass
+                    logger.debug("suppressed exception (core audit)")
         result = await executor(node, context)
 
         if not isinstance(result, dict):
@@ -333,7 +333,7 @@ class DistributedWorker:
             try:
                 await self._redis.xack(stream_key, group_name, msg_id)
             except Exception:  # noqa: BLE001
-                pass
+                logger.debug("suppressed exception (core audit)")
             self._current_msg_id = None
 
         # 推入结果队列
@@ -392,7 +392,7 @@ class DistributedWorker:
         try:
             await asyncio.gather(heartbeat_task, task_task)
         except asyncio.CancelledError:
-            pass
+            logger.debug("suppressed exception (core audit)")
 
     async def stop(self) -> None:
         """停止 Worker。"""
