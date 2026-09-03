@@ -1,0 +1,8 @@
+# 本地轻量靶场剧本（scripts/local_lab.py）：模拟 XSS / SQL 注入 / 文件上传三类漏洞
+# 由 benchmark.py --mode eval 消费，与扫描报告比对计算 recall
+- name: local_lab
+  target: http://127.0.0.1:8090
+  expected_vulns:
+    - XSS
+    - SQL Injection
+    - File Upload

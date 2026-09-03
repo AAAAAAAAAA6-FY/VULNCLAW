@@ -1,0 +1,15 @@
+# G1b WAVSEP 基准剧本：Web Application Security Scanner Evaluation Project 主类别期望检出项
+# 由 benchmark.py --mode eval 消费，与扫描报告比对计算 recall/precision
+- name: wavsep
+  target: http://localhost:8082
+  expected_vulns:
+    - SQL Injection
+    - XSS
+    - Reflected XSS
+    - Stored XSS
+    - LFI
+    - Local File Inclusion
+    - RFI
+    - Command Injection
+    - Unvalidated Redirect
+    - XML External Entity

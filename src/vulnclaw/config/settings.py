@@ -44,6 +44,8 @@ class Settings(BaseSettings):
     proxy: Optional[str] = Field(None, alias="PROXY")
     proxy_list: List[str] = Field(default_factory=list, alias="PROXY_LIST")
     max_scan_time: int = Field(3600, alias="MAX_SCAN_TIME")
+    # E5.1 scope 硬约束白名单（逗号分隔：example.com 匹配自身及子域；*.*.example.com 通配；10.0.0.0/8 CIDR；精确 IP）
+    allowed_scope: str = Field("", alias="ALLOWED_SCOPE")
 
     # ========== B 堆新增引擎开关（可选，默认启用） ==========
     password_reset: bool = Field(True, alias="PASSWORD_RESET")

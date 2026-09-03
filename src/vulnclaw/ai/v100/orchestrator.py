@@ -819,7 +819,52 @@ class V100Orchestrator:
                         merged.append(v)
                 self._pending_verify = merged
 
+
+    @staticmethod
+    def _classify_finding_verdict(finding: Dict) -> str:
+        """C4-C10 三档分级：confirm / likely / suspicious。
+
+        严格低误报优先，规则保持可解释：
+        1) 硬实锤（exploited / burp_verified / cross_confirmed / OOB 回调）或
+           高置信(高/high/>=90)且 ai_verdict=真实漏洞  -> confirm；
+        2) ai_verdict=真实漏洞 且置信中等（中/medium）  -> likely（需人工复核，概率较高）；
+        3) 其余（待人工复核 / 已跳过 / 预算已满 / 低优先级 / 非漏洞 / low）-> suspicious。
+        """
+        if finding.get("verdict"):
+            return finding["verdict"]
+        if (
+            finding.get("exploited")
+            or finding.get("burp_verified")
+            or finding.get("cross_confirmed")
+            or finding.get("oob_confirmed")
+            or finding.get("collaborator_callback")
+        ):
+            return "confirm"
+        verdict = str(finding.get("ai_verdict", ""))
+        if (
+            "待人工复核" in verdict
+            or "已跳过" in verdict
+            or "预算已满" in verdict
+            or "低优先级" in verdict
+        ):
+            return "suspicious"
+        is_real = "真实漏洞" in verdict
+        conf = finding.get("confidence")
+        if isinstance(conf, int) and conf >= 90:
+            return "confirm"
+        if isinstance(conf, str):
+            base_conf = conf.split("（")[0].split(" (")[0].strip().lower()
+            if base_conf in ("高", "high"):
+                return "confirm" if is_real else "suspicious"
+            if base_conf.startswith("中") or base_conf == "medium":
+                return "likely" if is_real else "suspicious"
+            return "suspicious"
+        return "likely" if is_real else "suspicious"
     def _add_finding(self, finding: Dict):
+        try:
+            finding["verdict"] = self._classify_finding_verdict(finding)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"verdict 分级失败，跳过: {exc}")
         key = (
             finding.get('url', ''),
             finding.get('parameter', ''),

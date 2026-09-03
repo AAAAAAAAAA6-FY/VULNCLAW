@@ -33,6 +33,69 @@ except ImportError:  # pragma: no cover
     logger.info("ℹ️  httpx[http2] 未安装，HTTP/2 不可用（pip install httpx[http2] 可启用）")
 
 
+class ScopeGuardError(Exception):
+    """E5.1: 请求超出 allowed_scope 白名单，被 HTTP 客户端层硬拦截。"""
+
+
+def parse_scope() -> list:
+    """解析 allowed_scope（逗号分隔条目：域名 / *.通配域 / CIDR / 精确 IP）。"""
+    raw = str(getattr(settings, "allowed_scope", "") or "")
+    return [s.strip() for s in raw.split(",") if s.strip()]
+
+
+def url_in_scope(url: str, scope_entries=None) -> bool:
+    """越界判断：scope 未配置时放行（兼容旧行为）；配置后仅白名单命中才放行。
+
+    域名规则：entry 命中自身与其所有子域（evil-example.com 不会被 example.com 命中；
+    *.example.com 与 example.com 行为一致，.*为显式通配写法）。
+    """
+    if scope_entries is None:
+        scope_entries = parse_scope()
+    if not scope_entries:
+        return True
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).hostname or ""
+    except Exception:  # noqa: BLE001
+        return True
+    if not host:
+        return True
+    import ipaddress as _ia
+    for entry in scope_entries:
+        if not entry:
+            continue
+        if "/" in entry and _looks_like_cidr(entry, host):
+            try:
+                return _ia.ip_address(host) in _ia.ip_network(entry, strict=False)
+            except ValueError:
+                continue
+        base = entry[2:] if entry.startswith("*.") else entry
+        if host == base or host.endswith("." + base):
+            return True
+    return False
+
+
+def _looks_like_cidr(entry: str, host: str) -> bool:
+    """entry 形如 10.0.0.0/8 时按 CIDR 处理；若是域+斜杠路径则按域匹配。"""
+    try:
+        import ipaddress as _ia
+        _ia.ip_address(host)
+    except ValueError:
+        return False
+    return True
+
+
+async def _scope_guard(request) -> None:
+    """httpx event_hooks.request 守卫：白名单外的请求直接 raise 拦截（不可被 LLM 绕过）。"""
+    if not getattr(settings, "allowed_scope", ""):
+        return
+    url = str(request.url)
+    if not url.startswith(("http://", "https://")):
+        return
+    if not url_in_scope(url):
+        raise ScopeGuardError(f"E5 越界请求被 HTTP 客户端层拦截（超出 allowed_scope）: {url}")
+
+
 class _SessionManager:
     """httpx.AsyncClient 单例：锁内双检，避免并发重建连接。"""
 
@@ -64,6 +127,7 @@ class _SessionManager:
                     headers=headers,
                     limits=limits,
                     timeout=timeout,
+                    event_hooks=({"request": [_scope_guard]},),
                 )
                 self._last_target = target
                 logger.info("🚀 HTTP/2 客户端已初始化（httpx + 连接池）")
