@@ -388,6 +388,14 @@ async def _http_request(
     no_retry: bool = False,
     **kwargs
 ) -> Tuple[int, str, Dict]:
+    # E5.1 越界硬拦截：默认（allowed_scope 为空）放行，兼容旧行为；
+    # 配置后仅白名单内主机可出网，越界请求直接抛 ScopeGuardError（不可被 LLM 绕过）。
+    if getattr(settings, "allowed_scope", ""):
+        from vulnclaw.core.http_client import url_in_scope, ScopeGuardError
+        if not url_in_scope(url):
+            raise ScopeGuardError(
+                f"E5 越界请求被 HTTP 客户端层拦截（超出 allowed_scope）: {url}"
+            )
     # 优化2：按 URL 类型分档超时（调用方显式传值时尊重调用方）
     if timeout is None:
         timeout = _timeout_for_url(url, settings.timeout)

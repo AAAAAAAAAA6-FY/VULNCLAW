@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from vulnclaw.core import http_client
+from vulnclaw.core import utils as core_utils
 from vulnclaw.core.http_client import (
     ScopeGuardError,
     url_in_scope,
@@ -65,3 +66,12 @@ class TestScopeGuardHook:
     def test_guard_disabled_when_empty(self, monkeypatch):
         monkeypatch.setattr(http_client.settings, "allowed_scope", "")
         asyncio.run(_scope_guard(self._req("https://anything.example/x")))
+
+
+class TestDefaultPathWiring:
+    """E5.1 必须覆盖默认 aiohttp 出口（core.utils.async_get），而非仅 HTTP/2 路径。"""
+
+    def test_default_path_blocks_out_of_scope(self, monkeypatch):
+        monkeypatch.setattr(core_utils.settings, "allowed_scope", "example.com")
+        with pytest.raises(ScopeGuardError):
+            asyncio.run(core_utils.async_get("https://evil.net/x"))

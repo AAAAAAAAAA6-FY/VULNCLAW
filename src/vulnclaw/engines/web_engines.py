@@ -1011,7 +1011,13 @@ class SQLiEngine(BaseEngine):
 
             try:
                 start_time = time.time()
-                resp = await async_get(attack_url, session=session, timeout=timeout, no_retry=is_time_based)
+                # N2 修复：注入 payload 触发的 5xx 是报错注入的**判定信号**（error-based
+                # 注入本就以 500 + DB 错误页呈现），不是服务端瞬时故障。此前 no_retry
+                # 仅对时间型 payload 生效，非时间型走默认重试 → 每个报错 payload 被重试
+                # 3 轮（实测单请求 2.8s，放大约 1000 倍），SQLi 全量检测累计耗时 113s，
+                # 逼近编排层 asyncio.wait_for(timeout=120) 预算，真实目标上必然超时被杀
+                # → 静默 return None（SQLi 生产链路漏报根因）。注入请求一律不重试。
+                resp = await async_get(attack_url, session=session, timeout=timeout, no_retry=True)
                 elapsed = time.time() - start_time
 
                 if isinstance(resp, tuple) and len(resp) >= 2:

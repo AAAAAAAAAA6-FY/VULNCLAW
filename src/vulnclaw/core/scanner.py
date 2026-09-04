@@ -159,6 +159,62 @@ def get_all_engines():
     return engines
 
 
+def engine_capability(engine) -> tuple:
+    """P0-1: 判定引擎暴露的能力入口。
+
+    返回 (has_scan, has_check)：
+      - has_scan  : 重写了目标级 `scan(target, session, **kwargs)`
+      - has_check : 重写了参数级 `check(url, param, normal_resp, parsed_query, session, **kwargs)`
+    """
+    from vulnclaw.engines.base import BaseEngine
+    return (
+        type(engine).scan is not BaseEngine.scan,
+        type(engine).check is not BaseEngine.check,
+    )
+
+
+async def run_engine(engine_name, target=None, url=None, param=None, session=None, **kwargs):
+    """P0-1: 统一引擎调用适配层（供 MCP / 多智能体调度复用）。
+
+    自动按引擎能力选择 scan（目标级）或 check（参数级）入口：
+      - 有 scan 覆盖 → engine.scan(target, session, **kwargs)
+      - 仅 check   → 拉取基线后 engine.check(url, param, normal_resp, parsed_query, session, **kwargs)
+    返回 findings 列表（可能为空）。session 由调用方传入时复用，否则内部创建并关闭。
+    """
+    engine = get_engine_by_name(engine_name)
+    if engine is None:
+        raise ValueError(f"引擎不存在: {engine_name}")
+
+    if not target and url:
+        target = url
+    if not target:
+        raise ValueError("run_engine 需要 target 或 url")
+    if not str(target).startswith(("http://", "https://")):
+        target = "https://" + str(target)
+
+    has_scan, has_check = engine_capability(engine)
+    own_session = session is None
+    if own_session:
+        from vulnclaw.core.utils import get_shared_session, close_shared_session
+        session = await get_shared_session(target=target)
+    try:
+        if has_scan:
+            return (await engine.scan(target, session, **kwargs)) or []
+        if has_check and param:
+            from urllib.parse import urlparse
+            normal_resp = await engine._get_normal_response(url or target, session)
+            parsed_query = urlparse(url or target).query
+            result = await engine.check(url or target, param, normal_resp, parsed_query, session, **kwargs)
+            return [result] if result else []
+        raise ValueError(
+            f"引擎 {engine_name} 无可用入口（scan={has_scan}, check={has_check}, param={bool(param)}）"
+        )
+    finally:
+        if own_session:
+            from vulnclaw.core.utils import close_shared_session
+            await close_shared_session()
+
+
 # ============================================================
 # 错误收集器
 # ============================================================
@@ -326,13 +382,17 @@ async def safe_request(
                     logger.warning(f"⚠️ 限流/封禁重试 {max_retries} 次失败，放弃请求")
                     return None
 
-            # ===== 修复：状态码 500+ 重试 =====
-            if status >= 500 and retry_count < max_retries:
-                wait = min(2 ** retry_count * 2, 16)
-                logger.info(f"⏳ 服务端错误 {status}，等待 {wait}s 后重试 ({retry_count + 1}/{max_retries})")
-                await asyncio.sleep(wait)
-                retry_count += 1
-                continue
+            # ===== N2 修复：5xx 直接返回，不再退避重试 =====
+            # 对安全扫描器而言 5xx 是**判定信号**而非瞬时故障：报错型注入（error-based）
+            # 本就以 500 + 数据库错误页呈现，调用方（如 web_engines SQLi 攻击响应处理）
+            # 恰恰需要这个 500 响应体去匹配 SQL 报错短语。
+            # 旧逻辑对每个 500 退避重试 3 轮（2s/4s/8s ≈ 14s 每请求），而
+            # probe_param / ab_verify 等引擎链路全部走 safe_request，导致 SQLi 全量
+            # 检测累计耗时 74~114s，撞上编排层 asyncio.wait_for(timeout=120) 预算被杀
+            # → 静默 return None（N2：SQLi 生产链路漏报根因）。
+            # 附带收益：不再把同一攻击载荷重复发送给目标最多 4 次。
+            if status >= 500:
+                logger.debug(f"5xx 响应直接返回（不重试）: HTTP {status} {url}")
 
             if status < 500 and status not in (429, 408):
                 # P0-3：成功响应 → 记录并锁定当前策略

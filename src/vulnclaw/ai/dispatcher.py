@@ -13,7 +13,7 @@ import asyncio
 import json
 import re
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import Any, Dict, List, Optional
 
 from vulnclaw.core.logger import logger
@@ -1399,6 +1399,378 @@ WAF拦截了以下Payload，请生成3个绕过变体。
         return list(set(variants))[:3]
 
 
+# ============================================================
+# P2-1: AgentCoordinator —— strix 式可寻址 agent 树 + mailbox + 快照
+# 构建于现有 Blackboard / AGENT_ROLES / run_engine 之上：
+#   * 根 agent 按角色分解任务，派生 recon/analysis/exploit/verify 子 agent（并发）
+#   * agent 间用 mailbox 投递结构化消息（发现/提问/委派），共享 snapshot 保持一致视图
+#   * 子 agent 以确定性引擎套件为主（Tier-1 广覆盖），LLM 仅做根编排与可选推理
+# ============================================================
+
+def _parse_target(target: str):
+    """拆分目标为 base(url 无 query) / full(原样) / params(query 参数名列表)。"""
+    if "?" not in target:
+        return target, target, []
+    base, q = target.split("?", 1)
+    params = []
+    for pair in q.split("&"):
+        if "=" in pair:
+            params.append(pair.split("=", 1)[0])
+    return base, target, params
+
+
+class Mailbox:
+    """可寻址信箱：agent 之间用结构化消息通信（发现/提问/委派/状态）。
+
+    每个地址一条入队队列；post 精确投递，broadcast 投给子树全部子代理。
+    非阻塞投递，接收方 drain 消费。这是 strix 多 agent 消息传递的轻量实现。
+    """
+
+    def __init__(self) -> None:
+        self._boxes: Dict[str, deque] = {}
+        self._lock = asyncio.Lock()
+
+    def _ensure(self, addr: str) -> deque:
+        return self._boxes.setdefault(addr, deque())
+
+    async def post(self, to_addr: str, message: Dict) -> None:
+        async with self._lock:
+            self._ensure(to_addr).append(message)
+
+    async def broadcast(self, tree_prefix: str, message: Dict) -> None:
+        async with self._lock:
+            for a in list(self._boxes.keys()):
+                if a == tree_prefix or a.startswith(tree_prefix + "."):
+                    self._boxes[a].append(message)
+
+    async def drain(self, addr: str) -> List[Dict]:
+        """取出某地址所有积压消息（非阻塞）。"""
+        out: List[Dict] = []
+        async with self._lock:
+            dq = self._boxes.get(addr)
+            while dq:
+                out.append(dq.popleft())
+        return out
+
+    def pending(self, addr: str) -> int:
+        return len(self._boxes.get(addr, ()))
+
+
+class Snapshot:
+    """共享快照：整棵树看到的"世界状态"一致视图（strix context 快照的等价物）。
+
+    含共享黑板 state、全局 findings、各 agent 状态。任一 agent 启动即从最新
+    快照 bootstrap，避免重复侦察与冲突调度；版本号随每次更新自增。
+    """
+
+    def __init__(self) -> None:
+        self.version = 0
+        self.blackboard = Blackboard()
+        self.findings: List[Dict] = []
+        self.agent_status: Dict[str, Dict] = {}
+        self._lock = asyncio.Lock()
+
+    async def update(self, *, findings=None, status=None, publish=None) -> int:
+        async with self._lock:
+            if findings:
+                self.findings.extend(findings)
+            if status:
+                self.agent_status.update(status)
+            if publish:
+                for k, v in (publish or {}).items():
+                    self.blackboard.publish(k, v)
+            self.version += 1
+            return self.version
+
+    def digest(self, limit: int = 400) -> str:
+        eps = [str(e)[:40] for e in self.blackboard._state["endpoints"][:5]]
+        vulns = [
+            f"{v.get('type', '')}/{v.get('severity', '')}"
+            for v in self.findings[:5] if isinstance(v, dict)
+        ]
+        ags = [f"{a}:{s.get('state', '?')}" for a, s in list(self.agent_status.items())[:6]]
+        return f"v{self.version} endpoints={eps} vulns={vulns} agents={ags}"[:limit]
+
+
+_TOOL_CAP_CACHE: Dict[str, tuple] = {}
+
+
+def _findings_key(f: Dict) -> tuple:
+    return (
+        str(f.get("url", "")), str(f.get("parameter", "")), str(f.get("type", "")),
+        str(f.get("method", "")), str(f.get("source", "")), str(f.get("evidence", ""))[:80],
+    )
+
+
+def _dedup_findings(findings: List[Dict]) -> List[Dict]:
+    """跨 agent 去重（strix 在产出端合并同因发现）：按 url/param/type/method/source/evidence 指纹。"""
+    seen = set()
+    out: List[Dict] = []
+    for f in findings:
+        if not isinstance(f, dict):
+            continue
+        k = _findings_key(f)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(f)
+    return out
+
+
+def _tool_capability(tool_name: str) -> tuple:
+    """复用 P0-1 的能力探测：该工具引擎是否支持 scan / check。"""
+    if tool_name in _TOOL_CAP_CACHE:
+        return _TOOL_CAP_CACHE[tool_name]
+    has_scan = has_check = False
+    try:
+        from vulnclaw.core.scanner import get_engine_by_name, engine_capability
+        eng = get_engine_by_name(tool_name)
+        if eng is not None:
+            has_scan, has_check = engine_capability(eng)
+    except Exception:
+        logger.debug("suppressed exception (core audit)")
+    _TOOL_CAP_CACHE[tool_name] = (has_scan, has_check)
+    return has_scan, has_check
+
+
+class AgentNode:
+    """可寻址 agent 树节点：一个角色化执行单元（确定性引擎套件 + 可选 LLM 推理）。"""
+
+    def __init__(self, coordinator: "AgentCoordinator", addr: str, role: str,
+                 parent: Optional["AgentNode"], focus: str = None):
+        self.coordinator = coordinator
+        self.addr = addr
+        self.role = role
+        self.parent = parent
+        self.focus = focus
+        self.children: List["AgentNode"] = []
+        self.status = {"state": "init", "iterations": 0, "findings": 0}
+        self.blackboard = coordinator.snapshot.blackboard
+        self.mailbox = coordinator.mailbox
+        role_cfg = (AGENT_ROLES.get(role) or {})
+        self.tools = list(role_cfg.get("tools", []))
+        self.system = role_cfg.get("system", "")
+        self.llm = None
+        try:
+            from vulnclaw.ai.core import get_llm_client
+            if getattr(settings, "ai_mode", 1):
+                self.llm = get_llm_client()
+        except Exception:
+            self.llm = None
+
+    async def run(self, target: str, session) -> List[Dict]:
+        self.status["state"] = "running"
+        await self.coordinator.snapshot.update(status={self.addr: dict(self.status)})
+
+        # 目标集：原始目标 + 共享黑板中已发现端点（多 agent 知识融合：recon 产出、其余消费）
+        _, full0, params0 = _parse_target(target)
+        targets = [(target, full0, params0)]
+        try:
+            for ep in (self.blackboard.consume("endpoints") or []):
+                if isinstance(ep, str) and ep != target:
+                    _, ep_full, ep_params = _parse_target(ep)
+                    targets.append((ep, ep_full, ep_params))
+        except Exception:
+            pass
+
+        findings: List[Dict] = []
+        for tool_name in self.tools:
+            if tool_name not in TOOL_REGISTRY:
+                continue
+            has_scan, has_check = _tool_capability(tool_name)
+            try:
+                for (orig, full, params) in targets:
+                    base = orig.split("?")[0]
+                    if has_scan:
+                        f = await self._call(tool_name, target=base, param="", session=session)
+                        findings = self._merge(findings, f)
+                    if has_check and params:
+                        for p in params:
+                            # focus 参数优先；否则遍历 query 参数
+                            if self.focus and p != self.focus:
+                                continue
+                            f = await self._call(tool_name, target=full, param=p, session=session)
+                            findings = self._merge(findings, f)
+            except Exception as e:
+                logger.warning(f"[AgentNode {self.addr}] 工具 {tool_name} 失败: {e}")
+
+        if findings:
+            # 写入共享快照/黑板（兄弟 agent 可见），并通知父/根
+            await self.coordinator.snapshot.update(
+                findings=findings,
+                publish={"vulns": findings, "endpoints": [base]},
+            )
+            await self.mailbox.post(self.coordinator.root_addr, {
+                "type": "finding", "from": self.addr, "findings": findings,
+            })
+        self.status["findings"] = len(findings)
+        self.status["state"] = "done"
+        await self.coordinator.snapshot.update(status={self.addr: dict(self.status)})
+        return findings
+
+    async def _call(self, tool_name: str, *, target: str, param: str, session) -> List[Dict]:
+        """复用 P0-1 统一适配层 run_engine 执行单个引擎工具。"""
+        from vulnclaw.core.scanner import run_engine
+        try:
+            res = await run_engine(tool_name, target=target or None, param=param or None, session=session)
+        except Exception as e:
+            logger.debug(f"[AgentNode {self.addr}] run_engine({tool_name}) 跳过: {e}")
+            return []
+        return self._extract(res)
+
+    @staticmethod
+    def _extract(res) -> List[Dict]:
+        if not isinstance(res, dict):
+            return list(res) if isinstance(res, list) else []
+        out: List[Dict] = []
+        if res.get("type") == "漏洞":
+            data = res.get("data")
+            if isinstance(data, list):
+                out.extend(data)
+            elif isinstance(data, dict):
+                out.append(data)
+        for k in ("sqli", "xss", "lfi", "cmdi", "ssti", "ssrf", "xxe", "idor", "jwt",
+                 "vulnerabilities", "findings", "data"):
+            if k in res and res[k]:
+                v = res[k]
+                out.extend(v if isinstance(v, list) else [v])
+        return [x for x in out if isinstance(x, dict)]
+
+    @staticmethod
+    def _merge(a: List[Dict], b: List[Dict]) -> List[Dict]:
+        for x in b:
+            if x not in a:
+                a.append(x)
+        return a
+
+
+class AgentCoordinator:
+    """可寻址 agent 树协调器（strix AgentCoordinator 融合版）。
+
+    根 agent 按角色分解任务并派生子 agent（recon/analysis/exploit/verify 等），
+    并发执行；agent 间通过 mailbox 通信、共享 snapshot 保持一致视图。
+    最终聚合所有 findings 返回。LLM 仅用于"根编排决策"与可选 agent 推理，
+    主执行以确定性引擎为主（Tier-1 快/廉），可叠加 LLM 推理。
+    """
+
+    def __init__(self, target: str, session):
+        self.target = target
+        self.session = session
+        self.snapshot = Snapshot()
+        self.mailbox = Mailbox()
+        self.nodes: Dict[str, AgentNode] = {}
+        self.root_addr = "root"
+        self.root = AgentNode(self, self.root_addr, role="", parent=None)
+        self.nodes[self.root_addr] = self.root
+        self._tree_lock = asyncio.Lock()
+
+    async def spawn(self, role: str, parent_addr: str = "root", focus: str = None) -> AgentNode:
+        async with self._tree_lock:
+            parent = self.nodes.get(parent_addr) or self.root
+            child_addr = role if parent_addr == "root" else f"{parent_addr}.{role}"
+            if child_addr in self.nodes:
+                return self.nodes[child_addr]
+            node = AgentNode(self, child_addr, role, parent, focus=focus)
+            parent.children.append(node)
+            self.nodes[child_addr] = node
+            logger.info(f"🌲 [Coordinator] 派生 agent: {child_addr} (role={role}, focus={focus})")
+            return node
+
+    async def coordinate(self, roles: List[str] = None) -> Dict:
+        roles = roles or ["recon", "analysis", "exploit", "verify"]
+        # LLM 根编排（可选）：可用则让 LLM 决定角色顺序/裁剪；否则默认全跑
+        if getattr(settings, "ai_mode", 1):
+            try:
+                plan = await self._llm_plan_roles(roles)
+                if plan:
+                    roles = plan
+            except Exception as e:
+                logger.debug(f"[Coordinator] LLM 编排失败，使用默认角色集: {e}")
+
+        # 两波并发：先跑 recon（知识生产者，写入共享黑板端点/漏洞），
+        # 再并发其余角色并消费 recon 的共享知识（strix 式共享上下文）。
+        recon_findings: List[Dict] = []
+        rest = list(roles)
+        if "recon" in rest:
+            rest.remove("recon")
+            recon_node = await self.spawn("recon", "root")
+            recon_findings = await recon_node.run(self.target, self.session)
+
+        tasks = []
+        for role in rest:
+            node = await self.spawn(role, "root")
+            tasks.append(asyncio.create_task(node.run(self.target, self.session)))
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        all_findings: List[Dict] = []
+        all_findings.extend(recon_findings)
+        for r in results:
+            if isinstance(r, Exception):
+                logger.warning(f"[Coordinator] agent 执行异常: {r}")
+                continue
+            all_findings.extend(r)
+
+        # 回收 mailbox 中 agent 主动 post 的发现（兜底，避免漏收）
+        root_msgs = await self.mailbox.drain(self.root_addr)
+        for m in root_msgs:
+            if m.get("type") == "finding" and m.get("findings"):
+                all_findings.extend([f for f in m["findings"] if isinstance(f, dict)])
+
+        # 跨 agent 去重（角色天然重叠，如 analysis/exploit/verify 都跑 sqli）
+        all_findings = _dedup_findings(all_findings)
+
+        self.root.status["state"] = "done"
+        await self.snapshot.update(status={self.root_addr: dict(self.root.status)})
+        return {
+            "target": self.target,
+            "snapshot_version": self.snapshot.version,
+            "agents": {a: n.status for a, n in self.nodes.items()},
+            "findings": all_findings,
+            "blackboard": self.snapshot.blackboard.digest(),
+        }
+
+    def bridge_into(self, orchestrator) -> None:
+        """把协调器的共享知识（黑板 + findings）并入主编排器状态，供最终报告使用。
+
+        去重后逐一 _add_finding（编排器侧再次按 key 去重），并把共享黑板摘要
+        写入编排器 blackboard（若其具备 publish），使多 agent 深扫成果透传进报告。
+        """
+        try:
+            merged = _dedup_findings(self.snapshot.findings)
+            for f in merged:
+                if isinstance(f, dict):
+                    f.setdefault("source", "agent_coordinator")
+                    orchestrator._add_finding(f)
+            ob = getattr(orchestrator, "blackboard", None)
+            if ob is not None and hasattr(ob, "publish"):
+                ob.publish("agent_coordinator_knowledge", self.snapshot.blackboard.digest())
+        except Exception as e:
+            logger.warning(f"⚠️ [AgentCoordinator] bridge_into 失败（不影响主链路）: {e}")
+
+    async def _llm_plan_roles(self, roles: List[str]) -> Optional[List[str]]:
+        try:
+            from vulnclaw.ai.core import get_llm_client
+            client = get_llm_client()
+        except Exception:
+            return None
+        prompt = (
+            f"你是渗透测试编排器。目标 {self.target}，可用角色: {roles}。"
+            "请返回要并发执行的角色顺序列表（JSON 数组，可为其子集），"
+            "例如 [\"recon\",\"analysis\",\"exploit\",\"verify\"]。只输出 JSON 数组。"
+        )
+        try:
+            resp = await client.ask(
+                prompt, system="你是渗透测试编排器，只输出JSON数组。",
+                temperature=0.2, max_tokens=200, task_type="plan",
+            )
+            data = json.loads(resp)
+            if isinstance(data, list) and data:
+                return [str(x) for x in data if str(x) in roles]
+        except Exception:
+            return None
+        return None
+
+
 _agent = None
 
 
@@ -1408,4 +1780,5 @@ def get_agent(target: str, session):
     return _agent
 
 
-__all__ = ['ReActAgent', 'get_agent', 'PayloadGenerator']
+__all__ = ['ReActAgent', 'get_agent', 'PayloadGenerator',
+           'AgentCoordinator', 'AgentNode', 'Mailbox', 'Snapshot']

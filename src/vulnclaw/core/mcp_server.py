@@ -416,6 +416,57 @@ class MCPJsonRpcHandler:
                     "openWorldHint": True,
                 },
             },
+            "engine.list": {
+                "name": "engine.list",
+                "description": "列出所有已注册的确定性检测引擎（vulnclaw 的规则/签名引擎），含名称、描述与能力入口（scan=目标级 / check=参数级）。供 agent 选定要调用的引擎。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                },
+                "annotations": {
+                    "readOnlyHint": True,
+                    "destructiveHint": False,
+                    "idempotentHint": True,
+                    "openWorldHint": False,
+                },
+            },
+            "engine.run": {
+                "name": "engine.run",
+                "description": "运行指定确定性检测引擎（融合 strix 的 agent 可调工具思路）。engine 为引擎名（见 engine.list）；"
+                               "scan 型引擎传 target，check 型引擎传 url+param。返回 findings 列表。受危险操作门卫约束。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "engine": {
+                            "type": "string",
+                            "description": "引擎名称（如 sqli / xss / ssrf / tls_security / api_security），见 engine.list",
+                        },
+                        "target": {
+                            "type": "string",
+                            "description": "目标 URL（scan 型引擎使用）",
+                        },
+                        "url": {
+                            "type": "string",
+                            "description": "带参数的完整 URL（check 型引擎使用，如 https://x/id=1）",
+                        },
+                        "param": {
+                            "type": "string",
+                            "description": "待检测参数名（check 型引擎使用）",
+                        },
+                        "jwt_token": {
+                            "type": "string",
+                            "description": "可选，传给支持 JWT 审计的引擎（如 api_security）",
+                        },
+                    },
+                    "required": ["engine"],
+                },
+                "annotations": {
+                    "readOnlyHint": False,
+                    "destructiveHint": True,
+                    "idempotentHint": False,
+                    "openWorldHint": False,
+                },
+            },
         }
 
     async def handle_request(self, request: dict) -> dict:
@@ -493,6 +544,10 @@ class MCPJsonRpcHandler:
             return await self._tool_scan_deep_remote(arguments)
         elif tool_name == "intel.lookup":
             return await self._tool_intel_lookup(arguments)
+        elif tool_name == "engine.list":
+            return await self._tool_engine_list(arguments)
+        elif tool_name == "engine.run":
+            return await self._tool_engine_run(arguments)
         else:
             raise ValueError(f"Tool not implemented: {tool_name}")
 
@@ -925,6 +980,80 @@ class MCPJsonRpcHandler:
                         "censys": censys.enabled,
                     },
                     "intel": info or "未查到情报（目标可能未被收录）",
+                }, ensure_ascii=False, indent=2, default=str),
+            }],
+        }
+
+    async def _tool_engine_list(self, args: dict) -> dict:
+        """列出所有已注册确定性检测引擎及其能力入口。"""
+        from vulnclaw.core.scanner import get_all_engines, engine_capability
+
+        items = []
+        for eng in get_all_engines():
+            has_scan, has_check = engine_capability(eng)
+            caps = []
+            if has_scan:
+                caps.append("scan")
+            if has_check:
+                caps.append("check")
+            items.append({
+                "name": eng.name,
+                "description": getattr(eng, "description", "") or "",
+                "capabilities": caps,
+            })
+
+        logger.info(f"MCP engine.list → {len(items)} 个引擎")
+        return {
+            "content": [{
+                "type": "text",
+                "text": json.dumps({
+                    "count": len(items),
+                    "engines": items,
+                }, ensure_ascii=False, indent=2, default=str),
+            }],
+        }
+
+    async def _tool_engine_run(self, args: dict) -> dict:
+        """运行指定确定性检测引擎（scan / check 由引擎能力自动选择）。"""
+        from vulnclaw.core.scanner import run_engine
+
+        engine_name = (args.get("engine") or "").strip()
+        if not engine_name:
+            raise ValueError("engine 参数不能为空（可用引擎见 engine.list）")
+
+        target = (args.get("target") or "").strip()
+        url = (args.get("url") or "").strip()
+        param = (args.get("param") or "").strip()
+        jwt_token = args.get("jwt_token")
+
+        kwargs = {}
+        if jwt_token:
+            kwargs["jwt_token"] = jwt_token
+
+        logger.info(f"MCP engine.run: {engine_name} (target={target or url}, param={param or '-'})")
+        try:
+            findings = await run_engine(
+                engine_name,
+                target=target or None,
+                url=url or None,
+                param=param or None,
+                **kwargs,
+            )
+        except ValueError as exc:
+            raise ValueError(str(exc))
+        except Exception as exc:
+            logger.error(f"MCP engine.run 失败: {exc}\n{traceback.format_exc()}")
+            raise ValueError(f"引擎执行失败: {exc}")
+
+        findings = findings or []
+        return {
+            "content": [{
+                "type": "text",
+                "text": json.dumps({
+                    "engine": engine_name,
+                    "target": target or url,
+                    "findings_count": len(findings),
+                    "findings": findings,
                 }, ensure_ascii=False, indent=2, default=str),
             }],
         }

@@ -1125,6 +1125,28 @@ class V100Orchestrator:
         except Exception as _e:  # noqa: BLE001
             logger.debug(f"   [增量] 状态保存失败（忽略）: {_e}")
 
+    async def _run_agent_coordinator(self) -> None:
+        """P2-1: 多智能体协调器（strix 式可寻址 agent 树）——可选增强通道。
+
+        默认关闭（settings.agent_coordinator_enabled=False），开启后作为主链路之外的
+        补充深扫：把目标交给 AgentCoordinator 派生 recon/analysis/exploit/verify 子 agent
+        并发执行，复用确定性引擎（Tier-1）并把发现合并进 findings。任何异常都被吞掉，
+        绝不影响主链路出报告。
+        """
+        if not getattr(settings, "agent_coordinator_enabled", False):
+            return
+        try:
+            from vulnclaw.ai.dispatcher import AgentCoordinator
+            coord = AgentCoordinator(self.target, self.session)
+            await coord.coordinate()
+            coord.bridge_into(self)  # 把多 agent 共享知识（含 recon 产出）并入 findings/黑板
+            logger.info(
+                f"🌲 [AgentCoordinator] 完成: agents={len(coord.nodes)}, "
+                f"snapshot={coord.snapshot.version}, 黑板={coord.snapshot.blackboard.digest()}"
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ [AgentCoordinator] 执行失败（不影响主链路）: {e}")
+
     async def run(self) -> Dict:
         # P4-3: 后台更新 Nuclei 模板（不阻塞扫描启动，收尾时回收）
         self._nuclei_update_task = None
@@ -1196,6 +1218,10 @@ class V100Orchestrator:
             # 对 engine_bundle 首次执行结果全部 low/info 或判定模糊的参数，
             # 用 ReActAgent 做多轮深度渗透（V100=广度覆盖，ReAct=单点深度）。
             await self._run_react_deep_dive()
+
+            # P2-1: 多智能体协调器（strix 式可寻址 agent 树）——可选增强通道。
+            # 默认关闭，开启后作为主链路之外的补充深扫，复用确定性引擎并把发现合并进 findings。
+            await self._run_agent_coordinator()
 
             # 步骤3：并行提交 Burp 扫描（与下面各全局扫描同时进行，收尾前合并结果）
             self._burp_scan_task = asyncio.create_task(self._run_burp_scan())
