@@ -31,6 +31,14 @@ from vulnclaw.ai.remote_agents import (
     get_remote_agents,
 )
 
+# Py3.14 + Windows：Proactor 事件循环与 asyncio 子进程不兼容，创建子进程报
+# WinError 6/50（本机环境缺陷，CI 的 Py3.11/3.12 无此问题）。
+# 只豁免真正起子进程的用例，其余用例在本机照常执行。
+_SKIP_WIN_PY314_SUBPROCESS = pytest.mark.skipif(
+    sys.platform.startswith("win") and sys.version_info >= (3, 14),
+    reason="Py3.14+Windows: Proactor 与 asyncio 子进程不兼容（WinError 6/50），CI Py3.11/3.12 正常",
+)
+
 
 # ============================================================
 # 辅助函数
@@ -361,6 +369,7 @@ def _write_cli_execute_mock(tmp_path: Path) -> Path:
     return script
 
 
+@_SKIP_WIN_PY314_SUBPROCESS  # 本类用例全部经子进程调用 CLI，命中本机 Py3.14 缺陷
 class TestCLIBackend:
     @pytest.mark.asyncio
     async def test_analyze_with_placeholder(self, tmp_path):

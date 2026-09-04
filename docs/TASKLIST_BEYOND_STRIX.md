@@ -377,7 +377,7 @@
 | 编号 | 小方向 | 落地 | P | 分工 | 验收 |
 |---|---|---|---|---|---|
 | E3.1 | GitHub Action 模板：PR 触发非交互扫描（对标 Strix 一行接入） | `.github/workflows/pen.yml`（模板化） | P1 | B | 模板仓库/文档可复制即用 |
-| E3.2 | 增量扫描：--diff 模式只测上次以来变化面（依赖 A3.2 目标画像） | `core/persistence.py`+`cli.py` | P1 | A | 二次扫描耗时显著下降 （✅ 已实现 2026-09-05：--diff CLI 接入，复用 A3.2 画像增量）|
+| E3.2 | 增量扫描：--diff 模式只测上次以来变化面（依赖 A3.2 目标画像） | `core/persistence.py`+`cli.py` | P1 | A | 二次扫描耗时显著下降 （✅ 已实现 2026-09-05：--diff CLI 接入，复用 A3.2 画像增量；已封板：全量回归 0 失败，本机 Py3.14+Windows 子进程缺陷 7 例已 skipif 豁免，CI Py3.11/3.12 全量执行）|
 | E3.3 | PR 评论机器人：扫描结论以评论形式回贴 PR（含证据链接） | `scripts/` | P2 | B | PR 上出现漏洞评论 |
 | E3.4 | 内置定时调度：平台级 cron（周期重扫+告警），不依赖外部 CI | `core/`+cli 子命令 | P2 | A | `vulnclaw schedule add` 生效 |
 
