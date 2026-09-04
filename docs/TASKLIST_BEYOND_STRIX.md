@@ -532,6 +532,23 @@
 - **SP9 融合终验**：benchmark --mode eval 对比融合基线（373 单测基线 + 检出率）；local_lab + wavsep 剧本真扫；质量红线：正/负样例行在、误报零新增、任务清单纯增量、worktree 干净（thirdparty 除外）。
 
 
+### P2+ 扩展：DeepSec 融合增量（SP10-SP11，对面 14 项交付后执行）
+
+> 来源：DeepSec（Vercel Labs，Apache-2.0）对比结论——融合路线图已覆盖其五段流水线约 90%，仅"finding 生命周期"与"静态代码审计通道"为净增量。合规已核：Apache-2.0 无 copyleft，子进程聚合调用即可，无需改造其源码。
+> 并行性：本组与对面产物**无强制依赖**，理论上对面执行期间即可开工；按用户要求统一延后至对面交付后开工。
+
+- **SP10 finding 生命周期台账**（P2，纯我方文件，不依赖对面）
+  - SP10.1 状态机四态：new / reconfirmed / fixed / deprecated；状态字段写入 finding 与报告
+  - SP10.2 跨扫描状态迁移：复用 `report_generator` 已有两次扫描差异计算——上次报过本次消失→fixed（证据留存）、持续命中→reconfirmed、新出现→new；寿命账本落 `_runtime_cache/metrics/`（标准库 JSON，不引 Redis 死依赖）
+  - SP10.3 治理台账报告视角：报告按"新增/持续/已修复"分组展示 + 联动 SP3 覆盖账本
+  - 验收：同一目标两次扫描（中间修复一处）后，报告出现"已修复"分组且消失项带历史证据
+- **SP11 静态代码审计通道（DeepSec 融合，P2 高价值）**——内部串行 C1→C2→C3
+  - C1 通道壳 `core/static_audit.py`：`--scan-repo <path>` 显式开启（默认关闭，动态渗透零成本增量）；Node 22 检测、缺环境自动降级记 gaps；子进程调 DeepSec CLI（Apache-2.0 合规聚合：附 THIRD_PARTY_NOTICES、产品不冠 "DeepSec" 名）；findings 统一格式落库；**降本默认值内置**：diff-only 优先 / `--max-cost-usd 20` 硬顶 / BYOK 绕过 Vercel AI Gateway / 白名单目录正则预筛（auth/支付/上传）
+  - C2 覆盖账本接入：repo 扫描走 SP3 machine_observed（asset=repo×file×rule），模型/Node 缺失自动记 gaps
+  - C3 静态→动态证据闭环：静态 finding（url/param/type）→ 映射我方 69 动态引擎构造请求 → SP1 沙箱实弹验证 → 产出"代码级根因 + 运行时证据"完整证据链
+  - 可选降本配套（不影响检出率）：文件级指纹缓存（git blob-hash，未变文件不送审，二次扫描省≈90%）；符号裁剪（tree-sitter 只送 diff 相关函数切片，单文件省≈60%）；规则收敛（LLM 确认模式→沉淀确定性静态规则，复用 cve_index 沉淀机制，长期成本单调递减）
+  - 验收：对 local_lab 源仓库 `--scan-repo` 一次，静态 finding 经 C3 闭环产出带沙箱证据的确认项；无 Node 环境时降级不报错且 gaps 有记录
+
 ### 执行状态（主 Agent 侧，2026-09-04）
 
 - [x] **SP1** 无 Docker 自动降级沙箱链 —— 已实现 `core/sandbox_runner.py`（level-0 Docker 优先 / level-1 进程隔离；无 shell、净化 env、绝对路径隔离工作目录 `_runtime_cache/sandbox/`、超时 kill、输出截断；execution 前置门复用 E5.1 `allowed_scope` 越界拒绝；verdict 三档策略 confirm->docker/process、likely->process、suspicious->不执行）。测试 `tests/test_sandbox_runner.py`（11 例）。
@@ -540,3 +557,4 @@
 - [x] **SP4** SARIF 内嵌 E1 攻击图 —— `report_generator.generate_sarif` 已注入 run.graphs + run.graphTraversals（TOP 攻击路径 edgeTraversals）。测试 `tests/test_sarif_attack_graph.py`（4 例）。
 - [ ] SP5-SP8 —— 待对面（LLM 去重 / Docker 沙箱 / 上下文预算 / skills）交付后接线
 - [ ] SP9 —— 融合终验（最后统一验收）
+- [ ] SP10 / SP11 —— 已入清单待对面交付后执行（与对面无强制依赖，可并行开发）

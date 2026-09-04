@@ -490,6 +490,8 @@ def render_html(enhanced_report):
     if len(vulns) > 50:
         vuln_section += f'<p style="color:#666; font-style:italic;">... 共 {len(vulns)} 个漏洞，仅显示前 50 个。请查看 JSON 报告获取完整列表。</p>'
 
+    lifecycle_block = _render_lifecycle_block(enhanced_report)
+
     html_content = f"""
 <!DOCTYPE html>
 <html>
@@ -541,6 +543,8 @@ def render_html(enhanced_report):
             <div class="summary-card"><div class="number">{info}</div>信息</div>
             <div class="summary-card"><div class="number" style="color:#fd7e14">{pending_review}</div>待人工复核</div>
         </div>
+
+        {lifecycle_block}
 
         <h2>📊 可视化统计</h2>
         <div class="charts">
@@ -1065,6 +1069,38 @@ _FIX_SNIPPETS = {
 
 
 
+def _render_lifecycle_block(report: Dict) -> str:
+    """SP10.3: 治理台账视角——按生命周期（新增/持续/已修复）分组渲染。无数据返回空串。"""
+    import html as html_escape
+
+    summary = (report or {}).get("lifecycle_summary") or {}
+    if not summary:
+        return ""
+    groups = (report or {}).get("lifecycle_groups") or {}
+    chips = ""
+    for key, label, color in (("reconfirmed", "持续", "#fd7e14"),
+                              ("new", "新增", "#dc3545"),
+                              ("fixed", "已修复", "#2E7D32")):
+        n = int(summary.get(key, 0) or 0)
+        if n:
+            chips += ('<span style="display:inline-block;margin:4px 8px 4px 0;padding:6px 14px;'
+                      'background:%s;color:#fff;border-radius:20px;font-size:13px;">%s %d</span>') % (color, label, n)
+    fixed_items = groups.get("fixed") or []
+    fixed_html = ""
+    if fixed_items:
+        rows = []
+        for v in fixed_items[:20]:
+            rows.append("<li><code>%s</code> %s <span style='color:#666;'>%s</span></li>" % (
+                html_escape.escape(str(v.get("type", ""))),
+                html_escape.escape(str(v.get("url", ""))),
+                html_escape.escape(str(v.get("severity", "")))))
+        fixed_html = ('<div style="background:#f0f9f0;border:1px solid #c6e6c6;border-radius:8px;padding:12px;'
+                      'margin-top:8px;"><h4 style="margin:0 0 8px;">已修复项（基线证据留存）</h4>'
+                      '<ul style="margin:0;padding-left:18px;line-height:1.9;">%s</ul></div>') % "".join(rows)
+    return ('<div style="background:#fff8f0;border:1px solid #f0d9c0;border-radius:8px;padding:12px;margin:16px 0;">'
+            '<h3 style="margin:0 0 8px;">漏洞治理台账（SP10）</h3>%s%s</div>') % (chips, fixed_html)
+
+
 # ============================================================
 # B5/H4: 两次扫描结果 diff（新增/已修复/持续存在）
 # ============================================================
@@ -1103,6 +1139,7 @@ __all__ = [
     "render_html",
     "generate_sarif",
     "diff_reports",
+    "_render_lifecycle_block",
     "build_fix_snippet",
     "_build_poc_python",
     "_build_curl_command",

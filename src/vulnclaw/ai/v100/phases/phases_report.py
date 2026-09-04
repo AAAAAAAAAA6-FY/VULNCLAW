@@ -374,6 +374,10 @@ async def _generate_report(self) -> Dict:
         logger.info(f"   E1 攻击图: {len(report['attack_paths'])} 条 TOP 攻击路径")
     except Exception as exc:  # noqa: BLE001
         logger.debug(f"E1 攻击图构建失败，报告降级跳过: {exc}")
+    # SP10: finding 生命周期台账 + 对比分组（失败不阻塞主报告）
+    from vulnclaw.core.finding_lifecycle import apply_lifecycle
+
+    report = apply_lifecycle(report)
     return report
 __all__ = ['_generate_report']
 from typing import Dict
