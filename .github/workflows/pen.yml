@@ -1,0 +1,94 @@
+# E3.1: GitHub Action 模板——PR 触发验证网关（对标 Strix 一行接入）
+#
+# 用法：把本文件复制到你自己的仓库 .github/workflows/pen.yml。
+# 两种模式：
+#   1) verify（PR 自动触发）：把任意扫描器输出（SARIF/JSON）交给 vulnclaw verify
+#      去伪存真 → 回贴 PR 评论（upsert 不刷屏）→ 上传 verified.sarif + 审计凭证链。
+#      扫描器输出路径可在仓库 Settings → Variables 配 VULNCLAW_SCANNER_OUTPUT，
+#      缺省 scanner-output.sarif（由你现有的 SAST/DAST 步骤产出）。
+#   2) active-scan（仅手动 workflow_dispatch）：对 inputs.target 主动扫描。
+#      ⚠️ 只允许对获得书面授权的目标使用。
+name: vulnclaw-verify
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "要主动扫描的目标 URL（仅手动触发；必须为已授权目标）"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  verify:
+    name: Verification Gateway (deterministic)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install VULNCLAW
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Verify scanner output
+        if: github.event_name == 'pull_request'
+        env:
+          SCANNER_OUTPUT: ${{ vars.VULNCLAW_SCANNER_OUTPUT }}
+        run: |
+          IN="${SCANNER_OUTPUT:-scanner-output.sarif}"
+          echo "使用扫描器输出: $IN"
+          vulnclaw verify --input "$IN" --output verified.sarif --receipt verified.receipt.json
+
+      - name: Comment findings on PR (upsert)
+        if: github.event_name == 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python scripts/pr_comment.py --input verified.sarif
+
+      - name: Upload verified artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulnclaw-verified
+          path: |
+            verified.sarif
+            verified.receipt.json
+          if-no-files-found: ignore
+
+  active-scan:
+    name: Active Scan (authorized targets only)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.target != ''
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install VULNCLAW
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Active scan (incremental; authorized targets only!)
+        run: vulnclaw scan -t "${{ inputs.target }}" --diff
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulnclaw-report
+          path: _runtime_cache/reports/
+          if-no-files-found: ignore

@@ -188,7 +188,7 @@ def main(argv: list[str] | None = None) -> None:
         # P1-3: python scan.py resume --scan-id xxx -> 转发为 --resume --scan-id xxx
         _run_scan_main(["--resume", *argv[1:]])
         return
-    elif argv[0] not in ("scan", "code", "health", "mcp", "setup"):
+    elif argv[0] not in ("scan", "code", "health", "mcp", "setup", "verify"):
         # 兼容模式：非子命令 -> 旧 scan.py 风格直接转发（保留全量旧参数行为）
         _run_scan_main(argv)
         return
@@ -407,6 +407,52 @@ def main(argv: list[str] | None = None) -> None:
     install_parser.add_argument("--token", help="http 模式下的鉴权 token")
     install_parser.add_argument("--write", action="store_true", help="直接写入客户端配置文件（先备份 .bak 再合并）")
 
+    verify_parser = subparsers.add_parser(
+        "verify",
+        help="验证网关：对任意扫描器输出（SARIF/JSON）做去伪存真",
+        description="Verification Gateway：消费 Strix / Burp / nuclei / xray 等任意扫描器的输出，\n"
+                    "执行 去重合并 → 证据分诊 → 本地规则 → [可选]LLM 粗筛 → [可选]HTTP 重放探测 的验证链，\n"
+                    "输出 verified SARIF + 防篡改审计凭证链（hash chain + 可选 HMAC）。",
+        epilog="示例:\n"
+               "  vulnclaw verify --input strix-output.sarif\n"
+               "  vulnclaw verify --input burp.json --probe          # 附加 HTTP 重放探测\n"
+               "  vulnclaw verify --input n.sarif --use-llm --receipt-key $RC_KEY\n"
+               "  vulnclaw verify --input x.sarif --verify-only      # 只做收据审计校验",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    verify_parser.add_argument(
+        "--input", required=True,
+        help="输入文件：SARIF 2.1（含 runs/results）或 findings JSON（数组或 {\"findings\": [...]}）",
+    )
+    verify_parser.add_argument(
+        "--output", default="",
+        help="verified SARIF 输出路径（默认 <input>.verified.sarif）",
+    )
+    verify_parser.add_argument(
+        "--receipt", default="",
+        help="审计凭证链输出路径（默认 <output>.receipt.json）",
+    )
+    verify_parser.add_argument(
+        "--receipt-key", default="",
+        help="可选 HMAC 密钥：给凭证链加防伪造签名（同密钥 --verify-only 可验真）",
+    )
+    verify_parser.add_argument(
+        "--probe", action="store_true",
+        help="启用 HTTP 重放探测（基线 vs 载荷；默认关：零外呼，CI 安全）",
+    )
+    verify_parser.add_argument(
+        "--use-llm", action="store_true",
+        help="启用 LLM 粗筛（filter 档；默认关；失败自动跳过不阻断）",
+    )
+    verify_parser.add_argument(
+        "--source", default="",
+        help="标注输入来源（strix/burp/nuclei/...）；SARIF 自动读取 tool 名",
+    )
+    verify_parser.add_argument(
+        "--verify-only", action="store_true",
+        help="跳过验证，只对 --input（verified SARIF）+ 凭证链做审计校验",
+    )
+
     args = parser.parse_args(argv)
 
     if args.command == "scan":
@@ -459,3 +505,28 @@ def main(argv: list[str] | None = None) -> None:
         _run_scan_main(["--health"])
     elif args.command == "mcp":
         sys.exit(_run_mcp(args))
+    elif args.command == "verify":
+        import asyncio
+        import json
+
+        from vulnclaw.core.verification_gateway import run_gateway, verify_gateway_output
+
+        if args.verify_only:
+            result = verify_gateway_output(
+                output_path=args.input,
+                receipt_path=args.receipt or "",
+                secret=args.receipt_key or "",
+            )
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            sys.exit(0 if result.get("ok") else 2)
+        result = asyncio.run(run_gateway(
+            input_path=args.input,
+            output_path=args.output or "",
+            receipt_path=args.receipt or "",
+            probe=bool(args.probe),
+            use_llm=bool(args.use_llm),
+            source=args.source or "",
+            receipt_key=args.receipt_key or "",
+        ))
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        sys.exit(0 if result.get("ok") else 2)
