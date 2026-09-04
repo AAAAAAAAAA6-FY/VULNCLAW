@@ -160,6 +160,25 @@ class CoverageLedger:
         return path
 
 
+# ---------- P4-2: 进程级账本单例（扫描全程共用；记录仅 append，协程安全） ----------
+_LEDGER: Optional[CoverageLedger] = None
+
+
+def get_coverage_ledger(target: str = "") -> CoverageLedger:
+    """进程级账本单例：引擎调用路径自动记账，收尾由报告层 write 落盘。"""
+    global _LEDGER
+    if _LEDGER is None:
+        _LEDGER = CoverageLedger(target=target)
+    return _LEDGER
+
+
+def reset_coverage_ledger(target: str = "") -> CoverageLedger:
+    """显式重置（新扫描开始时调用，避免跨扫描串账）。"""
+    global _LEDGER
+    _LEDGER = CoverageLedger(target=target)
+    return _LEDGER
+
+
 class _TrackGuard:
     """with ledger.track(asset, engine) as row: ... —— 异常自动记为 failed。"""
 
