@@ -952,6 +952,12 @@ def generate_sarif(report_data: Dict, out_path: str = "") -> Dict:
             "results": results,
         }],
     }
+    # SP4: E1 攻击图 -> SARIF 2.1.0 run.graphs + run.graphTraversals
+    _ag_sarif = _sarif_graphs(report_data)
+    if _ag_sarif and _ag_sarif.get("graphs"):
+        sarif["runs"][0]["graphs"] = _ag_sarif["graphs"]
+        if _ag_sarif.get("traversals"):
+            sarif["runs"][0]["graphTraversals"] = _ag_sarif["traversals"]
     if out_path:
         with open(out_path, "w", encoding="utf-8") as f:
             _json.dump(sarif, f, ensure_ascii=False, indent=2)
@@ -966,6 +972,60 @@ def _sarif_level(severity: str) -> str:
     if sev == "medium":
         return "warning"
     return "note"
+
+
+def _sarif_graphs(report_data: dict) -> dict:
+    """SP4: E1 攻击图 -> SARIF 2.1.0 run.graphs + graphTraversals。
+
+    - run.graphs[]：攻击图（nodes:id/label；edges:id/sourceNodeId/targetNodeId/label）
+    - run.graphTraversals[]：TOP 攻击路径的 edgeTraversals（graphIndex 引用 graphs[0]）
+    离线可用（JSON 数据，不依赖 D3 CDN）；无攻击图数据时返回空结构。
+    """
+    ag = report_data.get("attack_graph") or {}
+    nodes = ag.get("nodes") or []
+    edges = ag.get("edges") or []
+    if not nodes or not edges:
+        return {"graphs": [], "traversals": []}
+    sarif_nodes = [
+        {"id": str(n.get("id")),
+         "label": str(n.get("label") or n.get("type") or n.get("id"))}
+        for n in nodes
+    ]
+    edge_id_by_pair = {}
+    sarif_edges = []
+    for e in edges or []:
+        src, tgt = str(e.get("source")), str(e.get("target"))
+        if not src or not tgt:
+            continue
+        eid = "e{}".format(len(sarif_edges))
+        edge_id_by_pair[(src, tgt)] = eid
+        sarif_edges.append({
+            "id": eid, "sourceNodeId": src, "targetNodeId": tgt,
+            "label": str(e.get("label") or ""),
+        })
+    graphs = [{"description": {"text": "E1 资产-漏洞-利用链攻击图"},
+               "nodes": sarif_nodes, "edges": sarif_edges}]
+
+    traversals = []
+    for p in (report_data.get("attack_paths") or [])[:10]:
+        ids = [str(x.get("id")) for x in (p.get("nodes") or [])]
+        seq = []
+        for i in range(len(ids) - 1):
+            eid = edge_id_by_pair.get((ids[i], ids[i + 1]))
+            if eid is None:
+                seq = []
+                break
+            seq.append({"edgeId": eid})
+        if not seq:
+            continue
+        traversals.append({
+            "id": "t{}".format(len(traversals)),
+            "graphIndex": 0,
+            "description": {"text": "TOP path prob={} end={}".format(
+                p.get("probability", 0), p.get("end_type", ""))},
+            "edgeTraversals": seq,
+        })
+    return {"graphs": graphs, "traversals": traversals}
 
 
 # ============================================================

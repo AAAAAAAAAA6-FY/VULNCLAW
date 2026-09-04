@@ -505,3 +505,38 @@
 3. **【v3】0day 专项并行波次（另一 Agent，与 D 组并行安全，文件不相交）**：Z1.1（CVE 索引，纯 `core/data/` 新建）→ Z2.1（OOB 客户端，新 `core/oob_channel.py`）→ Z1.2（= D2.4，合入 `phases_taskgen`）→ Z2.2（框架引擎接 OOB）。**Z1.1/Z2.1 可立即启动**，不依赖 D7 基线。
 4. **汇合点检查**：D7 基线数据就绪后，双方再各自向 F1/F7 冲突文件推进；每次合入 `opt/<编号>-<slug>` 分支前先 git pull 最新 main。
 5. **禁止事项**：P0 未闭环不得铺开 P1；E7（已移除）相关分支不要创建；`ai/dispatcher.py` 另一 Agent 只读不写；Z1.2 与 D2.4 只做一次（F12）；Z3.4 依赖本人 S1 完成后启动。
+
+
+***
+
+## 8. STRIX 融合补充清单（对面 14 项全交付后执行，编号 SP1-SP9）
+
+> 前提：对面已完成 阶段0-7（引擎 MCP 化 / 协调器 / Docker 沙箱+Caido / exploit_verify 升级 / SARIF / LLM 去重 / 覆盖率 / SQLite 续跑 / 上下文预算 / skills / 验收）。以下为其之外的增量，不与对面清单重叠。
+
+### P0 独立高价值（不依赖对面产物，可随时并行）
+
+- **SP1 无 Docker 自动降级沙箱链**：本机/用户环境无 Docker 时自动降级为 Windows 进程级隔离（subprocess + 受限 env + `_runtime_cache` 隔离 cwd + 超时/内存配额 + 出网白名单复用 `allowed_scope`）；执行策略 confirm→真沙箱（Docker 可用时）→进程隔离、likely→进程隔离、suspicious→启发式+人工复核。验收：无 Docker 环境 exploit_verify 正常运行、越界请求被拒、超时 payload 被 kill。
+- **SP2 确定性去重前置**：在 LLM dedupe 之前加 `_dedup_findings` 确定性指纹层，确定性命中直接合并（省 LLM 调用）；仅语义疑似重复进 LLM。验收：构造重复 finding 场景，LLM 调用量下降 >=80%，去重结果不回退。
+- **SP3 机器事实覆盖账本**：orchestrator 执行路径自动落 asset×engine×status(ran/skipped/failed/blocked) 账本，engine 全集=引擎注册表；产出 coverage.json + gaps + complete 标记（若对面照抄 strix agent_reported 版，则以本项替代其账本为报告主源）。验收：clean 扫描也能回答"检查了什么"；failed/skipped 引擎有明确原因。
+- **SP4 SARIF 内嵌 E1 攻击图**：generate_sarif 补 graphs 编码（AttackGraph.to_json → SARIF 2.1.0 graph；attack_paths → edgeTraversals）。验收：SARIF 过官方 schema 校验、GitHub 安全视图可渲染、攻击图不因 D3 离线降级丢失。
+
+### P1 接线层（依赖对面产物做 VULNCLAW 化改造）
+
+- **SP5 ProviderBalancer × 上下文预算接线**：上下文预算/压缩接我们的 ProviderBalancer 与 11 免费模型池：预算触发→交错切备用模型→仍超→压缩历史；耗尽→本地确定性判定兜底。验收：预算超限自动降级不中断；连续限流被交错策略规避。
+- **SP6 skills × 三腿沉淀闭环**：把技能包 payload 定义与 exploit_chain 统一（skill 产出可被链式利用直接消费）；"AI 新漏洞→自动沉淀 nuclei/PoC"生成腿技能化；cve_index 反哺 skill 版本匹配。验收：新增一个 skill 包，其 payload 可被 exploit_chain 直接引用并跑通一次验证。
+- **SP7 MCP 引擎参数 schema 审计**：为 engine.list 生成逐引擎参数 schema（OpenAPI 式输入定义，含必填/类型/默认值），提升 LLM agent 调工具准确性。验收：agent 对带参数引擎误调率下降；schema 与引擎签名自动同步。
+- **SP8 成本/用量追踪**：ProviderBalancer 调用点记录 provider/model/token/耗时/结果到 `_runtime_cache/metrics`（机器事实版 strix pricing/usage）。验收：一次真实扫描后能按 provider×engine 出成本表。
+
+### P2 终验
+
+- **SP9 融合终验**：benchmark --mode eval 对比融合基线（373 单测基线 + 检出率）；local_lab + wavsep 剧本真扫；质量红线：正/负样例行在、误报零新增、任务清单纯增量、worktree 干净（thirdparty 除外）。
+
+
+### 执行状态（主 Agent 侧，2026-09-04）
+
+- [x] **SP1** 无 Docker 自动降级沙箱链 —— 已实现 `core/sandbox_runner.py`（level-0 Docker 优先 / level-1 进程隔离；无 shell、净化 env、绝对路径隔离工作目录 `_runtime_cache/sandbox/`、超时 kill、输出截断；execution 前置门复用 E5.1 `allowed_scope` 越界拒绝；verdict 三档策略 confirm->docker/process、likely->process、suspicious->不执行）。测试 `tests/test_sandbox_runner.py`（11 例）。
+- [x] **SP2** 确定性去重前置 —— 已实现 `core/dedupe.py`（指纹去重 host|path|type|method|param 零 LLM；语义疑似组供 LLM 二次裁决；`merge_llm_verdict` 仅显式判重才丢弃，未裁决全保留）。测试 `tests/test_dedupe_core.py`（9 例）。
+- [x] **SP3** 机器事实覆盖账本 —— 已实现 `core/coverage.py`（asset x engine x status 账本 + rollup + gaps + complete 标记 + `run_engine_tracked` 接线包装）。测试 `tests/test_coverage_ledger.py`（9 例）。
+- [x] **SP4** SARIF 内嵌 E1 攻击图 —— `report_generator.generate_sarif` 已注入 run.graphs + run.graphTraversals（TOP 攻击路径 edgeTraversals）。测试 `tests/test_sarif_attack_graph.py`（4 例）。
+- [ ] SP5-SP8 —— 待对面（LLM 去重 / Docker 沙箱 / 上下文预算 / skills）交付后接线
+- [ ] SP9 —— 融合终验（最后统一验收）
