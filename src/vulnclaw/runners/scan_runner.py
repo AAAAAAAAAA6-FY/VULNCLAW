@@ -1110,6 +1110,13 @@ async def extract_target_cookies(target_url: str):
 
 async def main_async(args):
 
+    # 自动成长-方向1：CVE 情报增量摄入 -> 规则草稿（默认关，enable_growth_ingest=False 不摄入）
+    try:
+        from vulnclaw.growth.bridges import maybe_ingest_cves
+        maybe_ingest_cves()
+    except Exception as exc:
+        logger.debug(f"growth ingest 跳过: {exc}")
+
     # P0-5: --metrics-port 启动 Prometheus 指标服务器
     metrics_port = getattr(args, 'metrics_port', 0) or getattr(settings, 'metrics_port', 0)
     if metrics_port:
@@ -2467,6 +2474,13 @@ async def main_async(args):
         print(f"📄 覆盖账本: {_cov_path}")
     except Exception as e:
         print(f"⚠️ 覆盖账本落盘异常（忽略）: {e}")
+
+    # 自动成长-方向2：实战回灌——吸收本次扫描经验（默认关，enable_growth_feedback=False 不落数据）
+    try:
+        from vulnclaw.growth.bridges import maybe_absorb_scan
+        maybe_absorb_scan(report)
+    except Exception as exc:
+        logger.debug(f"growth absorb 跳过: {exc}")
 
 
 

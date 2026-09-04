@@ -562,6 +562,14 @@
 - [x] **SP9** 融合终验 —— 全量回归 469 passed / 0 failed / 9 skipped（较基线 406 无回退）；engine.list 69 引擎齐；SP1-SP8 全部打勾；scripts/fusion_acceptance.py compare 红线全绿。
 - [x] **SP10** finding 生命周期台账 —— 已实现 `core/finding_lifecycle.py`（new/reconfirmed/fixed/deprecated 四态 + 寿命账本 `_runtime_cache/metrics/`）。测试 `tests/test_finding_lifecycle.py`。
 - [x] **SP11** 静态代码审计通道（DeepSec 融合）—— 已实现 `core/static_audit.py`（C1 审计 + C2 覆盖账本接入 + 指纹缓存/diff-only/符号裁剪/预算硬顶降本），与 SP3 覆盖账本兼容。测试 `tests/test_static_audit.py`。
+- [x] **SP12** 平台自动成长（growth 包，五个方向，2026-09-05 落地）——
+    - 方向1 威胁情报自喂养 growth/cve_ingest.py（CveIngest：cve_index 增量摄入 -> 确定性 YAML 规则草稿 -> 校验 -> 晋升台账；LLM 增强按开关默认关）
+    - 方向2 实战回灌闭环 growth/feedback_ledger.py（FeedbackLedger：findings 吸收为经验事实 -> 按 漏洞类型 x 技术栈 推荐历史有效 payload -> fp 累计达阈值自动产抑制签名；bridges.maybe_absorb_scan / adaptive_payloads 供给）
+    - 方向3 自举靶机覆盖自测 growth/target_lab.py（TargetLab 本地最小漏洞靶机 reflect_sqli / reflect_xss / open_redirect / ssrf_fetch + run_coverage 调真实引擎求命中 -> 覆盖缺口优先级清单；LFI 靶机 Windows 无法确定性复现，暂挂二期补模板）
+    - 方向4 专精模型蒸馏（软件侧）growth/distill_data.py（export_training_data 把 confirm/fixed + high 置信 finding 沉淀为 Qwen 系可微调 JSONL；train_lor_a 仅在有 GPU 时执行，无卡场景静默降级只产数据，杜绝虚耗）
+    - 方向5 本地规则集市 growth/rule_bazaar.py（RuleBazaar：外部/社区 nuclei YAML 导入 -> 必需段/severity 校验 -> 指纹去重 -> 来源信誉 x 成长命中率评分 -> export_pool 落可加载复用池；社区网络侧 community_publish 占位注明依赖用户生态，暂不实现）
+    - 接线 growth/bridges.py：扫描主流程两处钩子（开始前 maybe_ingest_cves / 结束后 maybe_absorb_scan），开关全部走 settings 动态 getattr 默认关，失败静默，对现有扫描行为零影响；方向3/4/5 显式函数调用（不挂扫描钩子，与对面封装零共享文件交集）
+    - 测试：tests/test_feedback_ledger.py + tests/test_cve_ingest.py + tests/test_target_lab.py + tests/test_distill_data.py + tests/test_rule_bazaar.py（growth 组 55 例全绿）
 
 
 ***
