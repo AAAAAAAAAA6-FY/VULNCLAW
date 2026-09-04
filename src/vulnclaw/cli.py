@@ -178,6 +178,27 @@ def _run_mcp(args) -> int:
     return 1
 
 
+def _run_tools(args) -> int:
+    """tools 子命令分发：status / verify / audit"""
+    import json
+
+    from vulnclaw.core.tool_governance import get_governance
+
+    gov = get_governance()
+    action = getattr(args, "tools_command", "status")
+    if action == "verify":
+        results = gov.verify_all()
+        print(json.dumps(results, ensure_ascii=False, indent=2))
+        bad = [r for r in results
+               if r.get("status") not in ("ok", "absent", "unpinned", "unavailable")]
+        return 2 if bad else 0
+    if action == "audit":
+        print(json.dumps(gov.audit_snapshot(), ensure_ascii=False, indent=2))
+        return 0
+    print(json.dumps(gov.status_snapshot(), ensure_ascii=False, indent=2))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> None:
     argv = list(sys.argv[1:] if argv is None else argv)
 
@@ -188,7 +209,7 @@ def main(argv: list[str] | None = None) -> None:
         # P1-3: python scan.py resume --scan-id xxx -> 转发为 --resume --scan-id xxx
         _run_scan_main(["--resume", *argv[1:]])
         return
-    elif argv[0] not in ("scan", "code", "health", "mcp", "setup", "verify"):
+    elif argv[0] not in ("scan", "code", "health", "mcp", "setup", "verify", "tools"):
         # 兼容模式：非子命令 -> 旧 scan.py 风格直接转发（保留全量旧参数行为）
         _run_scan_main(argv)
         return
@@ -453,6 +474,28 @@ def main(argv: list[str] | None = None) -> None:
         help="跳过验证，只对 --input（verified SARIF）+ 凭证链做审计校验",
     )
 
+    tools_parser = subparsers.add_parser(
+        "tools",
+        help="工具治理：目录/健康/完整性/调用审计",
+        description="平台第六层能力：受管工具目录（版本钉定）+ 供应链完整性（SHA256 抽检/隔离）"
+                    "+ 健康降级（坏工具自动绕过）+ 全量调用审计（tool_usage.jsonl + 治理事件哈希链）。",
+        epilog="示例:\n  vulnclaw tools status\n  vulnclaw tools verify\n  vulnclaw tools audit",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    tools_sub = tools_parser.add_subparsers(dest="tools_command", required=True)
+    tools_sub.add_parser(
+        "status",
+        help="目录总览：每个工具的可用性/健康/完整性状态",
+    )
+    tools_sub.add_parser(
+        "verify",
+        help="强制全量 SHA256 完整性校验（不符即隔离并入审计链）",
+    )
+    tools_sub.add_parser(
+        "audit",
+        help="查看调用审计尾部 + 健康状态 + 治理事件链根",
+    )
+
     args = parser.parse_args(argv)
 
     if args.command == "scan":
@@ -530,3 +573,5 @@ def main(argv: list[str] | None = None) -> None:
         ))
         print(json.dumps(result, ensure_ascii=False, indent=2))
         sys.exit(0 if result.get("ok") else 2)
+    elif args.command == "tools":
+        sys.exit(_run_tools(args))

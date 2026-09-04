@@ -1,0 +1,130 @@
+# 工具治理目录（Tool Directory）——平台受管工具的唯一权威声明
+#
+# 面向多用户平台的承诺：
+#   版本钉定（不自动升版，升级 = 管理员改这里 + 显式重装）
+#   + SHA256 供应链校验（运行前抽检，不符即隔离）
+#   + 能力级降级链（外部工具全灭也有内置兜底）
+#   + 健康隔离（坏工具 TTL 内自动绕过）+ 全量调用审计 + 治理事件哈希链
+#
+# 版本哲学：本文件的 ver 是"期望版本"。升级流程 = 改 ver → 显式重装 → 复核
+#   tool_manifest.json 的 SHA256。运行期永不自动升版（保证结果可复现）。
+# sha256 字段可选：填了则运行期强制校验；不填则以 tool_manifest.json 的
+#   安装时记录为准（同样会被抽检）。
+version: 1
+
+defaults:
+  verify_on_use: true                       # 运行前完整性抽检（按 path/mtime/size 记忆）
+  health:
+    max_consecutive_failures: 3             # 连续失败 N 次 → 降级
+    degraded_ttl_seconds: 600               # 降级 TTL，到期自动恢复观察
+
+tools:
+  nuclei:
+    capability: template_scan
+    ver: "3.3.8"
+    danger: guarded
+  subfinder:
+    capability: subdomain_enum
+    ver: "2.6.6"
+    danger: safe
+  httpx:
+    capability: liveness
+    ver: "1.6.9"
+    danger: safe
+  interactsh-client:
+    capability: oob
+    ver: "1.1.10"
+    danger: safe
+  ffuf:
+    capability: dir_brute
+    ver: "2.1.0"
+    danger: guarded
+  trivy:
+    capability: sast
+    danger: safe
+  gitleaks:
+    capability: secret_scan
+    danger: safe
+  waybackurls:
+    capability: endpoint_discovery
+    danger: safe
+  gau:
+    capability: endpoint_discovery
+    danger: safe
+  gospider:
+    capability: endpoint_discovery
+    danger: safe
+  katana:
+    capability: endpoint_discovery
+    danger: safe
+  sqlmap:
+    capability: sqli_deep
+    danger: guarded
+  nmap:
+    capability: port_scan
+    danger: guarded
+  # ---- 描述性条目（允许缺失；缺失只影响对应增强，能力解析自动跳过）----
+  assetfinder:
+    capability: subdomain_enum
+    danger: safe
+  arjun:
+    capability: param_discovery
+    danger: safe
+  masscan:
+    capability: port_scan
+    danger: guarded
+  naabu:
+    capability: port_scan
+    danger: guarded
+  nikto:
+    capability: web_probe
+    danger: safe
+  gobuster:
+    capability: dir_brute
+    danger: safe
+  dirbuster:
+    capability: dir_brute
+    danger: safe
+  curl:
+    capability: web_probe
+    danger: safe
+
+# 能力级降级链：candidates 按序尝试（缺失/不健康自动跳过）；
+# 全部不可用时落 builtin_fallback（纯内置实现，永远在线）。
+capabilities:
+  endpoint_discovery:
+    candidates: [waybackurls, gau, gospider, katana]
+    builtin_fallback: crawler_bfs            # modules/recon 同源 BFS 爬虫
+  subdomain_enum:
+    candidates: [subfinder, assetfinder]
+    builtin_fallback: none
+  liveness:
+    candidates: [httpx]
+    builtin_fallback: builtin_probe
+  template_scan:
+    candidates: [nuclei]
+    builtin_fallback: none
+  dir_brute:
+    candidates: [ffuf, gobuster, dirbuster]
+    builtin_fallback: none
+  port_scan:
+    candidates: [naabu, masscan, nmap]
+    builtin_fallback: builtin_socket_scan    # recon 内置 python-socket 扫描
+  sqli_deep:
+    candidates: [sqlmap]
+    builtin_fallback: none
+  oob:
+    candidates: [interactsh-client]
+    builtin_fallback: builtin_dnslog         # dnslog.cn 通道（已实证可用）
+  secret_scan:
+    candidates: [gitleaks, trivy]
+    builtin_fallback: none
+  param_discovery:
+    candidates: [arjun]
+    builtin_fallback: none
+  web_probe:
+    candidates: [curl, nikto]
+    builtin_fallback: none
+  sast:
+    candidates: [trivy]
+    builtin_fallback: none

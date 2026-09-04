@@ -373,6 +373,54 @@ async def run_tool(
     stdin_text: Optional[str] = None,
     **kwargs
 ) -> Dict[str, Any]:
+    """统一工具调用入口（含工具治理层钩子）。
+
+    治理三件事：运行前完整性抽检（供应链） / 运行后健康记录（降级依据）
+    / 每次调用审计（tool_usage.jsonl）。所有治理钩子吞异常——
+    治理层故障绝不影响工具执行本身。
+    """
+    import time
+
+    started = time.time()
+    gov = None
+    try:
+        from vulnclaw.core.tool_governance import get_governance
+
+        gov = get_governance()
+        gov.pre_run(name)
+    except Exception:  # noqa: BLE001
+        gov = None
+
+    ok = False
+    error = ""
+    try:
+        result = await _run_tool_impl(
+            name, args=args, timeout=timeout, extra_args=extra_args,
+            stdin_text=stdin_text, **kwargs
+        )
+        ok = bool(result.get("success"))
+        error = str(result.get("error") or "")
+        return result
+    finally:
+        if gov is not None:
+            try:
+                gov.post_run(
+                    name, success=ok,
+                    duration_ms=int((time.time() - started) * 1000),
+                    error=error,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+
+async def _run_tool_impl(
+    name: str,
+    args: Optional[List[str]] = None,
+    timeout: Optional[int] = None,
+    extra_args: Optional[List[str]] = None,
+    stdin_text: Optional[str] = None,
+    **kwargs
+) -> Dict[str, Any]:
     """
     统一工具调用入口
 

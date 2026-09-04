@@ -382,6 +382,7 @@
 | E3.4 | 内置定时调度：平台级 cron（周期重扫+告警），不依赖外部 CI | `core/`+cli 子命令 | P2 | A | `vulnclaw schedule add` 生效 |
 | E3.5 | 纯 HTTP 兜底爬虫：零外部工具依赖，主站 BFS 同域提取（href/src/action/data-src/srcset） | `modules/recon.py` | P1 | A | 外部工具全缺时端点收集不归零（✅ 已实现 2026-09-05：_fallback_crawl BFS 增强 + 同域过滤 + max_urls 总量限制；13 用例全绿 + recon 单测回归全绿）|
 | E3.6 | 工具体检自动安装：启动时缺失第三方工具尽力而为下载（GitHub 预检 + SHA256 manifest 防替换），失败静默降级 | `core/utils.py`+`config/settings.py`+`runners/scan_runner.py` | P1 | A | TOOL_AUTO_INSTALL 开关 + [工具体检] 日志（✅ 已实现 2026-09-05：waybackurls/gau/gospider/katana 入清单 + plan/ensure + manifest 校验；15 用例全绿）|
+| E3.7 | 工具治理层（平台第六层能力）：目录中心化（tool_directory.yaml 版本钉定，运行期不自动升版）+ 供应链完整性（run_tool 运行前 SHA256 抽检，不符即隔离+治理事件哈希链）+ 健康降级（连续失败 TTL 自动绕过）+ 全量调用审计（tool_usage.jsonl）+ 能力级降级链（外部全灭落内置兜底）+ `vulnclaw tools` CLI | `core/tool_governance.py`+`core/data/tool_directory.yaml`+`core/tool_registry.py`+`cli.py` | P1 | A | 治理钩子零影响执行；篡改二进制即隔离入链；14 用例全绿（✅ 已实现 2026-09-05）|
 
 #### E4 报告与自动修复建议
 
