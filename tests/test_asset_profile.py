@@ -99,3 +99,73 @@ async def test_profile_roundtrip(tmp_path):
     assert loaded["surface_fp"] == profile["surface_fp"]
     assert loaded["assets"] == profile["assets"]
     assert load_prev_profile("http://other/", saver=saver) is None
+
+
+# ============================================================
+# A3.2 回归防护：_generate_tasks 在默认配置（增量关）下必须正常生成任务。
+# 回归背景：09a31ff 曾把 asset_profile 的 import 藏在 if 分支内，而调用点
+# 无条件执行 → 默认路径 UnboundLocalError → 任务生成整体崩溃 → 0 引擎调用。
+# 全量回归因无 taskgen 端到端用例而漏检，本用例补上这道防线。
+# ============================================================
+import vulnclaw.ai.v100.phases.phases_taskgen as phases_taskgen  # noqa: E402
+
+
+class _StubQueue:
+    def __init__(self):
+        self.tasks = []
+
+    async def add_task(self, task, priority=5):
+        self.tasks.append(task)
+
+
+class _StubLocalFilter:
+    def should_skip(self, *a, **k):
+        return False, ""
+
+
+class _StubOrch:
+    def __init__(self):
+        self.target = "http://t/"
+        self._recon_brief = {
+            "tech_stack": [],
+            "url_params": ["id"],
+            "forms": [],
+            "burp_params": [],
+            "apis": ["/api/user"],
+            "js_endpoints": ["/ajax/endpoint"],
+            "crawled_endpoints": [{"url": "http://t/list?x=1", "params": ["q"]}],
+            "open_ports": [],
+            "subdomains": [],
+        }
+        self.task_queue = _StubQueue()
+        self.local_filter = _StubLocalFilter()
+        self.batch_processor = None
+        self._rotation_offset = 0
+        self._a32_skipped = 0
+
+    async def _gen_cve_task(self):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_taskgen_default_settings_generates_tasks(monkeypatch):
+    """默认（增量关）下 _generate_tasks 不得崩溃，且必须产出任务（含全局引擎）。"""
+    from vulnclaw.config.settings import settings
+
+    monkeypatch.setattr(settings, "incremental_scan", False)
+    orch = _StubOrch()
+    await phases_taskgen._generate_tasks(orch)
+    # 参数级 bundle + api + js + crawl + 25 个全局引擎 → 远大于 10
+    assert len(orch.task_queue.tasks) > 10
+    assert orch._a32_skipped == 0  # 增量关 → 不允许跳过任何资产
+
+
+@pytest.mark.asyncio
+async def test_taskgen_incremental_on_no_baseline(monkeypatch):
+    """增量开但无历史画像 → 走真实现导入路径，同样不得崩溃。"""
+    from vulnclaw.config.settings import settings
+
+    monkeypatch.setattr(settings, "incremental_scan", True)
+    orch = _StubOrch()
+    await phases_taskgen._generate_tasks(orch)
+    assert len(orch.task_queue.tasks) > 10

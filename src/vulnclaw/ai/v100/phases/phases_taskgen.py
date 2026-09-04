@@ -117,6 +117,12 @@ async def _generate_tasks(self):
         all_params = ["id", "page", "user", "file", "q", "s", "cat", "product", "order", "view"]
     all_params = cap(all_params, settings.max_url_params)
     # A3.2: 目标画像增量——加载上次画像，未变资产相关任务不入队（只测变化面）
+    # 兜底默认实现：增量关闭/画像不可用时，任何资产一律视为“已变化”→ 全量不跳过。
+    def _a32_never_unchanged(*_args, **_kwargs):
+        return False
+
+    generic_asset_unchanged = _a32_never_unchanged
+    crawl_asset_unchanged = _a32_never_unchanged
     _a32_prev = None
     _a32_assets = {}
     _a32_target_unchanged = False
@@ -124,8 +130,8 @@ async def _generate_tasks(self):
     if getattr(settings, "incremental_scan", False):
         try:
             from vulnclaw.core_modules.asset_profile import (
-                crawl_asset_unchanged,
-                generic_asset_unchanged,
+                crawl_asset_unchanged as crawl_asset_unchanged,
+                generic_asset_unchanged as generic_asset_unchanged,
                 load_prev_profile,
                 profile_expired,
                 surface_fp,
