@@ -364,6 +364,16 @@ async def _generate_report(self) -> Dict:
         await alert_findings(self.findings, min_severity="high")
     except Exception as e:
         logger.debug(f"告警发送跳过: {e}")
+    # E1.3: 攻击图 + TOP 攻击路径（构建失败不阻塞主报告，降级为跳过）
+    try:
+        from vulnclaw.core.attack_graph import AttackGraph
+
+        _ag = AttackGraph().build_from_report(report)
+        report["attack_graph"] = _ag.to_json()
+        report["attack_paths"] = _ag.top_attack_paths(top_k=5)
+        logger.info(f"   E1 攻击图: {len(report['attack_paths'])} 条 TOP 攻击路径")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"E1 攻击图构建失败，报告降级跳过: {exc}")
     return report
 __all__ = ['_generate_report']
 from typing import Dict

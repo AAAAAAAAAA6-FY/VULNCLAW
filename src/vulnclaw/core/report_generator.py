@@ -211,6 +211,92 @@ def _regression_block(report_data: Dict) -> str:
     )
 
 
+
+_AG_D3_CDN = "https://cdn.jsdelivr.net/npm/d3@7"
+_AG_D3_BODY = r"""
+<script>
+var __data = window.__AG_DATA__;
+if (__data && __data.nodes && __data.nodes.length) {
+    var box = document.getElementById('attackGraphBox');
+    var width = Math.max(box ? box.clientWidth : 600, 600);
+    var height = 520;
+    var nodes = __data.nodes.slice();
+    var nodeById = {};
+    nodes.forEach(function(n, i){ n.index = i; nodeById[n.id] = i; });
+    var links = (__data.edges || []).map(function(l){
+        return {source: nodeById[l.source], target: nodeById[l.target], label: l.label || '', prob: l.prob || ''};
+    }).filter(function(l){ return l.source !== undefined && l.target !== undefined; });
+    var svg = d3.select('#attackGraphSvg').attr('viewBox', [0, 0, width, height]);
+    svg.selectAll('*').remove();
+    var color = {asset: '#28a745', vuln: '#dc3545', gate: '#fd7e14'};
+    var simulation = d3.forceSimulation(nodes)
+        .force('link', d3.forceLink(links).distance(75))
+        .force('charge', d3.forceManyBody().strength(-280))
+        .force('center', d3.forceCenter(width / 2, height / 2))
+        .force('collide', d3.forceCollide(35));
+    var link = svg.append('g').selectAll('line').data(links).join('line')
+        .attr('stroke', '#adb5bd').attr('stroke-width', 1.2);
+    var node = svg.append('g').attr('stroke', '#fff').attr('stroke-width', 1.5)
+        .selectAll('circle').data(nodes).join('circle')
+        .attr('r', 24)
+        .attr('fill', function(d){ return color[d.kind] || '#888'; })
+        .call(d3.drag().on('start', function(e, d){ if (!e.active) simulation.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
+                       .on('drag', function(e, d){ d.fx = e.x; d.fy = e.y; })
+                       .on('end', function(e, d){ if (!e.active) simulation.alphaTarget(0); d.fx = null; d.fy = null; }));
+    node.append('title').text(function(d){ return d.kind === 'vuln' ? d.type + ' [' + d.severity + '] p=' + d.prob : d.id; });
+    var label = svg.append('g').selectAll('text').data(nodes).join('text')
+        .attr('text-anchor', 'middle').attr('dy', '.35em').attr('font-size', 10).attr('fill', '#fff')
+        .text(function(d){ var s = d.kind === 'asset' ? d.id : (d.type || d.id || ''); return s && s.length > 14 ? s.slice(0, 14) + '...' : s; });
+    simulation.on('tick', function(){
+        link.attr('x1', function(d){ return d.source.x; }).attr('y1', function(d){ return d.source.y; })
+            .attr('x2', function(d){ return d.target.x; }).attr('y2', function(d){ return d.target.y; });
+        node.attr('cx', function(d){ return d.x; }).attr('cy', function(d){ return d.y; });
+        label.attr('x', function(d){ return d.x; }).attr('y', function(d){ return d.y; });
+    });
+} else {
+    var fb = document.getElementById('attackGraphFallback');
+    if (fb) { fb.style.display = 'block'; fb.textContent = '当前已无攻击图数据（无资产/漏洞节点）'; }
+}
+</script>
+"""
+
+def _build_attack_graph_block(report_data):
+    """E1.3: 由报告攻击图生成 HTML 段（交互 D3 图 + 离线可见的 TOP 路径列表）。"""
+    import html as html_escape
+    import json as _json
+    ag = report_data.get("attack_graph") or {}
+    paths = report_data.get("attack_paths") or []
+    paths_html = ""
+    if paths:
+        items = []
+        for i, p in enumerate(paths, 1):
+            chain = html_escape.escape(" -> ".join(p.get("path") or []))
+            end = html_escape.escape(str(p.get("end_type", "")))
+            prob = float(p.get("probability") or 0)
+            items.append(
+                '<li><strong>Path %d:</strong> <code>%s</code><br>'
+                '<span style="color:#666;">终点: %s, 综合权重: %d, 成功率: %.1f%%</span></li>'
+                % (i, chain, end, int(p.get("total_weight") or 0), prob * 100)
+            )
+        paths_html = (
+            '<h3 style="margin-top:16px;">TOP 攻击路径</h3><ol style="line-height:1.8;">%s</ol>'
+            % "".join(items)
+        )
+    nodes = ag.get("nodes") or []
+    if not nodes:
+        return paths_html, ""
+    ag_json = _json.dumps({"nodes": nodes, "edges": ag.get("edges") or []}, ensure_ascii=False)
+    script_html = (
+        '<script src="%s" '
+        "onerror=\"var _fb=document.getElementById('attackGraphFallback'); if(_fb){_fb.style.display='block';"
+        " _fb.textContent='D3 CDN 不可用，交互攻击图渲染失败（TOP 路径列表可见）。';}\"></script>"
+        % _AG_D3_CDN
+    )
+    script_html += '<script>window.__AG_DATA__ = %s;</script>' % ag_json
+    script_html += _AG_D3_BODY
+    return paths_html, script_html
+
+
 def generate_html_report(report_data, html_file="report.html"):
     """生成 HTML 报告 - 同步版本"""
     try:
@@ -399,6 +485,8 @@ def render_html(enhanced_report):
         ''')
 
     vuln_section = ''.join(vuln_items_html)
+
+    attack_paths_html, attack_graph_script = _build_attack_graph_block(enhanced_report)
     if len(vulns) > 50:
         vuln_section += f'<p style="color:#666; font-style:italic;">... 共 {len(vulns)} 个漏洞，仅显示前 50 个。请查看 JSON 报告获取完整列表。</p>'
 
@@ -466,6 +554,15 @@ def render_html(enhanced_report):
             </div>
         </div>
 
+        <h2>🕸️ 攻击图（E1）</h2>
+        <div id="attackGraphBox" style="background:#fff; border:1px solid #e9ecef; border-radius:8px; padding:12px;">
+            <svg id="attackGraphSvg" width="100%" height="520"></svg>
+            <p id="attackGraphFallback" style="display:none; color:#fd7e14; font-style:italic;">
+                交互图不可用（CDN 离线或数据为空），请参考下方 TOP 攻击路径列表。
+            </p>
+        </div>
+        {attack_paths_html}
+        {attack_graph_script}
         <h2>📋 漏洞明细</h2>
         <div class="filter-bar">
             <label>严重性筛选:

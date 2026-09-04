@@ -34,6 +34,8 @@ dependencies = [
     "numpy>=1.24.0,<2.0",
     "scikit-learn>=1.3.0",
     "fastapi>=0.110.0",
+    # E1 攻击图统一图模型（networkx 起步，可换 neo4j）
+    "networkx>=3.4.0",
 ]
 
 [project.optional-dependencies]
