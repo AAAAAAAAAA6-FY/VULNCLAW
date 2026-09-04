@@ -750,9 +750,86 @@ async def _poll_collaborator_callback(self, expected_scan_id: Optional[str] = No
         logger.debug(f"Collaborator 鍥炶繛杞失败: {e}")
         return False
 async def _verify_with_burp_repeater(self, vuln: Dict) -> Dict:
-    # Burp Repeater 功能暂不可用，直接返回未确认
-    logger.debug("Burp Repeater 未实现，跳过验证")
-    return {"confirmed": False}
+    """Burp 重放对比验证（Repeater 思路自动化）：基线 vs 载荷的响应差异判定。
+
+    只作为 Critical/High finding 的**附加**确认（调用方把 burp_verified 当加分项，
+    本函数返回 False 不会降低原有判定）。流程：
+      1. 基线：优先取 Burp 历史里该 URL 的真实响应；历史没有 → 直连请求一次。
+      2. 重放：用 build_attack_url 注入 finding 自带的 payload 发起攻击请求。
+      3. 判定（任一命中即确认）：
+         - 载荷回显：attack body 含 payload 而 baseline body 不含（payload>=4 字符）；
+         - 状态突变：attack >=500 而 baseline <500（报错型注入特征）。
+    任何异常都不上抛（绝不影响验证主流程）。
+    """
+    try:
+        if not getattr(self, "burp_available", False):
+            return {"confirmed": False, "reason": "burp_unavailable"}
+        url = str(vuln.get("url", "") or "").strip()
+        param = str(vuln.get("parameter") or vuln.get("param") or "").strip()
+        payload = str(vuln.get("payload", "") or "").strip()
+        if not url:
+            return {"confirmed": False, "reason": "no_url"}
+        if not param or not payload:
+            return {"confirmed": False, "reason": "insufficient_param_payload"}
+
+        from vulnclaw.core.utils import async_get, build_attack_url
+
+        # 1) 基线：优先 Burp 历史（真实用户视角的响应）
+        base_status = None
+        base_body = ""
+        client = getattr(self, "burp_client", None)
+        if client is not None:
+            try:
+                history = await client.get_history_since(0, limit=50)
+                url_root = url.split("?")[0]
+                for ev in history or []:
+                    if str(ev.get("url", "") or "").split("?")[0] == url_root:
+                        base_status = ev.get("status")
+                        base_body = str(ev.get("body", "") or "")[:20000]
+                        break
+            except Exception as _he:  # noqa: BLE001
+                logger.debug(f"[BurpReplay] 历史基线获取失败，改用直连基线: {_he}")
+        if base_status is None:
+            try:
+                s, text, _h = await async_get(url, session=self.session, timeout=15, no_retry=True)
+                base_status, base_body = s, str(text or "")[:20000]
+            except Exception as _be:  # noqa: BLE001
+                logger.debug(f"[BurpReplay] 直连基线失败（基线未知）: {_be}")
+
+        # 2) 重放攻击请求（no_retry：攻击请求不吃退避，复用 SQLi 快失败经验）
+        attack_url = build_attack_url(url, param, payload)
+        a_status, a_text, _ah = await async_get(
+            attack_url, session=self.session, timeout=15, no_retry=True
+        )
+        a_body = str(a_text or "")[:20000]
+
+        # 3) 差异判定
+        confirmed = False
+        signals = []
+        low = payload.lower()
+        if len(payload) >= 4 and (low in a_body.lower()) and (low not in base_body.lower()):
+            confirmed = True
+            signals.append("payload_reflected")
+        if base_status is not None and a_status and a_status >= 500 and base_status < 500:
+            confirmed = True
+            signals.append("status_shift_5xx")
+
+        result = {
+            "confirmed": confirmed,
+            "verification_method": "burp_replay_diff",
+            "baseline_status": base_status,
+            "attack_status": a_status,
+            "signals": signals,
+        }
+        if confirmed:
+            logger.info(
+                f"   🔁 [BurpReplay] 重放确认: {vuln.get('type', '?')} "
+                f"(signals={signals}, base={base_status}, attack={a_status})"
+            )
+        return result
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[BurpReplay] 重放验证异常（按未确认处理）: {exc}")
+        return {"confirmed": False, "reason": f"error: {exc}"}
 # ============================================================
 # C9 / C10: AI 后处理 —— LLM-as-Judge 去重 + 幻觉抑制
 # 这两个能力此前只有 settings 开关（llm_as_judge_dedup /

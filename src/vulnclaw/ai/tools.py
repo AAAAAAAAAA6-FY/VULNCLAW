@@ -298,6 +298,74 @@ def _register_cli_tools() -> int:
 
 
 _cli_registered = _register_cli_tools()
+
+
+# ==================================================================
+# Burp 集成工具——把 agent metadata 里的幽灵名 fetch_burp_issues 变成
+# 可执行工具（Burp Pro Scanner 提交 + 三级收割）。Burp 未运行时返回
+# 明确的可用性说明而非崩溃；注册无条件（Burp 可能稍后才启动）。
+# ==================================================================
+class BurpIssuesTool(BaseTool):
+    """把 URL 提交给 Burp Pro Scanner 深度扫描并收割 issues。
+
+    复用 BurpClient.scan_and_collect（提交 → 轮询终态 → 扩展桥/REST 三级收割），
+    与 phases_executor._run_burp_scan 同源。danger_level=guarded：触发的是
+    Burp 主动扫描，属主动行为。
+    """
+
+    def __init__(self):
+        self.name = "fetch_burp_issues"
+        self.description = (
+            "把 URL 提交给本机 Burp Pro Scanner 深度扫描并收割 issues"
+            "（需要 Burp 运行且 REST API 已开启；未运行时返回可用性说明）"
+        )
+        self.parameters = [
+            {"name": "url", "type": "string", "required": True, "description": "目标URL"},
+            {"name": "wait_timeout", "type": "number", "required": False,
+             "description": "等待扫描终态的秒数（默认 120）"},
+        ]
+        self.category = "burp"
+        self.danger_level = "guarded"
+
+    async def execute(self, url: str = "", wait_timeout: int = 120, **kwargs) -> Dict:
+        from vulnclaw.ai.burp import get_burp_client
+
+        url = str(url or "").strip()
+        if not url:
+            return {"tool": self.name, "success": False, "error": "url 参数不能为空"}
+        client = get_burp_client()
+        if client is None:
+            return {"tool": self.name, "success": False, "burp_available": False,
+                    "error": "Burp 客户端未配置（检查 BURP_API_URL / BURP_API_KEY）"}
+        try:
+            if not await client.get_status():
+                return {"tool": self.name, "success": False, "burp_available": False,
+                        "error": "Burp 未运行或 REST API 未开启（Burp → Settings → Suite → REST API）"}
+            issues = await client.scan_and_collect(urls=[url], wait_timeout=int(wait_timeout))
+            return {
+                "tool": self.name,
+                "type": "burp_issues",
+                "success": bool(issues),
+                "count": len(issues),
+                "issues": issues[:50],
+                "summary": (f"Burp Scanner 返回 {len(issues)} 个 issue"
+                            if issues else "Burp 扫描完成：无 issue"),
+            }
+        except Exception as e:  # noqa: BLE001
+            return {"tool": self.name, "success": False, "error": f"Burp 扫描失败: {e}"}
+
+
+def _register_burp_tools() -> int:
+    registered = 0
+    try:
+        TOOL_REGISTRY["fetch_burp_issues"] = BurpIssuesTool()
+        registered += 1
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"⚠️ Burp 工具注册失败: {e}")
+    return registered
+
+
+_register_burp_tools()
 logger.info(
     f"✅ 已注册 {len(TOOL_REGISTRY) - _cli_registered} 个检测工具"
     f" + {_cli_registered} 个 CLI 工具（A5.2 安全工具全集入册）"

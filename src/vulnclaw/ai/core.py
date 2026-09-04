@@ -1472,8 +1472,8 @@ class AgentRuleEngine:
     # 结果降级规则
     # ============================================================
     FALLBACK_MAP = {
-        "burp_intruder": "send_payload",
-        "burp_repeater": "send_payload",
+        "burp_intruder": "ffuf",   # 原指向 send_payload（不存在的工具名）→ 改指真实可执行的模糊测试工具
+        "burp_repeater": "curl",   # 原指向 send_payload → 改指真实可执行的原始请求重放（Repeater 等价物）
         "burp_collaborator": None,
         "burp_sequencer": None,
         "burp_turbo_intruder": "burp_intruder",

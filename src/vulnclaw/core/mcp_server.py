@@ -467,6 +467,31 @@ class MCPJsonRpcHandler:
                     "openWorldHint": False,
                 },
             },
+            "burp.scan": {
+                "name": "burp.scan",
+                "description": "把 URL 提交给本机 Burp Pro Scanner 深度扫描并收割 issues"
+                               "（需要 Burp 运行且 REST API 已开启；未运行时返回可用性说明，不报错崩溃）。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "目标 URL",
+                        },
+                        "wait_timeout": {
+                            "type": "number",
+                            "description": "等待扫描终态的秒数（默认 120）",
+                        },
+                    },
+                    "required": ["url"],
+                },
+                "annotations": {
+                    "readOnlyHint": False,
+                    "destructiveHint": True,
+                    "idempotentHint": False,
+                    "openWorldHint": True,
+                },
+            },
         }
 
     async def handle_request(self, request: dict) -> dict:
@@ -548,6 +573,8 @@ class MCPJsonRpcHandler:
             return await self._tool_engine_list(arguments)
         elif tool_name == "engine.run":
             return await self._tool_engine_run(arguments)
+        elif tool_name == "burp.scan":
+            return await self._tool_burp_scan(arguments)
         else:
             raise ValueError(f"Tool not implemented: {tool_name}")
 
@@ -1013,6 +1040,36 @@ class MCPJsonRpcHandler:
                     "count": len(items),
                     "engines": items,
                 }, ensure_ascii=False, indent=2, default=str),
+            }],
+        }
+
+    async def _tool_burp_scan(self, args: dict) -> dict:
+        """burp.scan：URL 提交本机 Burp Pro Scanner 并收割 issues。
+
+        复用 ai.tools 的 fetch_burp_issues 可执行工具（同一实现，双入口：
+        MCP 外部 agent 与内部 agent 都能点）。Burp 未运行时返回可用性说明。
+        """
+        url = str(args.get("url", "")).strip()
+        if not url:
+            raise ValueError("url 参数不能为空")
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        try:
+            wait_timeout = int(args.get("wait_timeout") or 120)
+        except (TypeError, ValueError):
+            wait_timeout = 120
+
+        from vulnclaw.ai.tools import execute_tool
+
+        result = await execute_tool("fetch_burp_issues", url=url, wait_timeout=wait_timeout)
+        if result.get("success"):
+            logger.info(f"MCP burp.scan: {url} → {result.get('count', 0)} issues")
+        else:
+            logger.info(f"MCP burp.scan: {url} → {result.get('error', '未获取 issue')}")
+        return {
+            "content": [{
+                "type": "text",
+                "text": json.dumps(result, ensure_ascii=False),
             }],
         }
 

@@ -162,6 +162,7 @@ class TestMCPJsonRpcHandler:
             "scan.deep",
             "engine.list",
             "engine.run",
+            "burp.scan",
         }
         # scan.start 为主动攻击工具，须携带 MCP annotations 危险标注
         start_tool = next(t for t in tools if t["name"] == "scan.start")
