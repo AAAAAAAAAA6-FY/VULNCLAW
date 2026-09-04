@@ -276,6 +276,95 @@ def _raw_command(name: str, args: List[str], timeout: int) -> Dict[str, Any]:
         return {"success": False, "error": str(exc), "returncode": -1, "cmd": cmd_str}
 
 
+# ============================================================
+# P3-1: 沙箱执行层（strix 式 run_in_sandbox）—— 高危动作隔离执行
+# 默认 local 后端（等同原 run_tool 行为，零隔离但集中审计）；配置
+# sandbox_backend=docker 且 Docker 可用时，write/destructive 工具改走容器隔离执行。
+# 默认关闭，开启即生效；docker 后端不可用时明确告警并降级 local。
+# ============================================================
+
+class SandboxUnavailableError(RuntimeError):
+    """docker 后端不可用（未装 SDK / 守护进程未起 / 执行失败）。"""
+
+
+async def _sandbox_local(cmd: List[str], timeout: int, stdin_text: Optional[str]):
+    """local 后端：直接子进程执行（等价于原 run_tool 行为）。"""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdin=asyncio.subprocess.PIPE if stdin_text is not None else None,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    if stdin_text is not None:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(stdin_text.encode("utf-8", errors="ignore")), timeout=timeout
+        )
+    else:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    return proc.returncode, stdout.decode("utf-8", errors="ignore"), stderr.decode("utf-8", errors="ignore")
+
+
+async def _sandbox_docker(cmd: List[str], timeout: int, stdin_text: Optional[str],
+                          image: Optional[str] = None):
+    """docker 后端：一次性容器内执行（network_mode=none、无持久化），命令退出即销毁。"""
+    try:
+        import docker
+    except ImportError:
+        raise SandboxUnavailableError("未安装 docker SDK（pip install docker）")
+    try:
+        client = docker.from_env()
+        client.ping()
+    except Exception as exc:
+        raise SandboxUnavailableError(f"Docker 守护进程不可用: {exc}")
+    image = image or getattr(settings, "sandbox_image", "alpine:latest")
+    try:
+        container = client.containers.run(
+            image,
+            ["sh", "-c", " ".join(cmd)],
+            network_mode="none",
+            remove=True,
+            detach=True,
+            mem_limit=getattr(settings, "sandbox_mem_limit", "512m"),
+        )
+        exit_status = await asyncio.wait_for(
+            asyncio.to_thread(container.wait, timeout=timeout), timeout=timeout
+        )
+        stdout = container.logs(stdout=True, stderr=False).decode("utf-8", errors="ignore")
+        stderr = container.logs(stdout=False, stderr=True).decode("utf-8", errors="ignore")
+        return exit_status, stdout, stderr
+    except SandboxUnavailableError:
+        raise
+    except Exception as exc:
+        raise SandboxUnavailableError(f"Docker 执行失败: {exc}")
+    finally:
+        try:
+            client.containers.get(container.id).remove(force=True)
+        except Exception:
+            pass
+
+
+async def sandbox_run(cmd: List[str], timeout: int, stdin_text: Optional[str] = None,
+                     level: str = "read", backend: Optional[str] = None) -> tuple:
+    """统一沙箱执行入口。
+
+    - level=read：直接 local（无需隔离，省开销）。
+    - level in (write,destructive)：若 settings.sandbox_enabled 且后端可用则隔离执行，
+      否则退回 local。docker 后端不可用时明确告警并降级。
+    backend 可显式指定（测试/未来协调器复用），None 时按 settings 推导。
+    返回 (returncode, stdout, stderr)。
+    """
+    if backend is None:
+        backend = "local"
+        if level in ("write", "destructive") and getattr(settings, "sandbox_enabled", False):
+            backend = getattr(settings, "sandbox_backend", "local")
+    if backend == "docker":
+        try:
+            return await _sandbox_docker(cmd, timeout, stdin_text)
+        except SandboxUnavailableError as exc:
+            logger.warning(f"⚠️ [Sandbox] Docker 隔离不可用，降级 local: {exc}")
+    return await _sandbox_local(cmd, timeout, stdin_text)
+
+
 async def run_tool(
     name: str,
     args: Optional[List[str]] = None,
@@ -403,44 +492,15 @@ async def run_tool(
     logger.debug(f"🔧 [Tool] {name}: {cmd_str}")
 
     try:
-        if stdin_text is not None:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(stdin_text.encode("utf-8", errors="ignore")),
-                    timeout=timeout,
-                )
-                stdout_text = stdout.decode("utf-8", errors="ignore")
-                stderr_text = stderr.decode("utf-8", errors="ignore")
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                logger.warning(f"⏰ [Tool] {name} 超时 ({timeout}s)")
-                return _finalize_failure(name, f"Timeout after {timeout}s", -1, cmd_str)
-        else:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-                stdout_text = stdout.decode("utf-8", errors="ignore")
-                stderr_text = stderr.decode("utf-8", errors="ignore")
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                logger.warning(f"⏰ [Tool] {name} 超时 ({timeout}s)")
-                return _finalize_failure(name, f"Timeout after {timeout}s", -1, cmd_str)
+        try:
+            returncode, stdout_text, stderr_text = await sandbox_run(cmd, timeout, stdin_text, level=_op_level)
+        except asyncio.TimeoutError:
+            logger.warning(f"⏰ [Tool] {name} 超时 ({timeout}s)")
+            return _finalize_failure(name, f"Timeout after {timeout}s", -1, cmd_str)
 
         result = {
-            "success": proc.returncode == 0,
-            "returncode": proc.returncode,
+            "success": returncode == 0,
+            "returncode": returncode,
             "stdout": stdout_text[:5000] if len(stdout_text) > 5000 else stdout_text,
             "stderr": stderr_text[:500] if len(stderr_text) > 500 else stderr_text,
             "cmd": cmd_str,

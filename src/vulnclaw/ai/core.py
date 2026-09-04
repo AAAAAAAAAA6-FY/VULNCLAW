@@ -15,11 +15,12 @@ AI 核心模块 - 修复版
 """
 from vulnclaw.core.settings import settings
 from vulnclaw.core.logger import logger
-from vulnclaw.core_modules.metrics import get_metrics
+from vulnclaw.core_modules.metrics import get_metrics, UsageLedger
 import os
 import sys
 import json
 import re
+import random
 import asyncio
 import hashlib
 import threading
@@ -35,6 +36,10 @@ except AttributeError:
     logger.debug("suppressed exception (core audit)")
 
 
+class BudgetExhaustedError(RuntimeError):
+    """Token 预算持续超限（降级收缩未能缓解）——调用方应压缩历史或转本地确定性判定兜底。"""
+
+
 class TokenBudget:
     """Token 预算管理 - 单例模式，全局共享"""
 
@@ -48,6 +53,7 @@ class TokenBudget:
         self._degraded_mode = False
         self._degraded_until = 0
         self._degraded_cooldown = 60
+        self._degraded_streaks = 0
 
     async def consume(self, prompt_tokens: int, completion_tokens: int) -> bool:
         """记录token消耗，返回True=正常，False=降级模式"""
@@ -62,6 +68,9 @@ class TokenBudget:
                     self._degraded_mode = True
                     self._degraded_until = time.time() + self._degraded_cooldown
                     logger.warning(f"⚠️ Token 预算超限！进入降级模式 {self._degraded_cooldown}s")
+                # SP5: 连续处于降级态的每次超限调用都累计 streak（恢复后归零），
+                # 供 ask() 在 streak>=3 时抛 BudgetExhaustedError 驱动上游压缩/兜底。
+                self._degraded_streaks += 1
                 return False
 
             if self.round_count >= self.max_rounds:
@@ -69,12 +78,14 @@ class TokenBudget:
                     self._degraded_mode = True
                     self._degraded_until = time.time() + self._degraded_cooldown
                     logger.warning(f"⚠️ 思考轮次超限！进入降级模式 {self._degraded_cooldown}s")
+                self._degraded_streaks += 1
                 return False
 
             # 修复：恢复时重置 _degraded_until
             if self._degraded_mode and time.time() > self._degraded_until:
                 self._degraded_mode = False
                 self._degraded_until = 0
+                self._degraded_streaks = 0
                 logger.info("♻️ Token 预算降级已自动恢复")
 
             return True
@@ -84,8 +95,15 @@ class TokenBudget:
         if self._degraded_mode and time.time() > self._degraded_until:
             self._degraded_mode = False
             self._degraded_until = 0
+            self._degraded_streaks = 0
             logger.info("♻️ Token 预算降级已自动恢复")
         return self._degraded_mode
+
+    def degraded_streaks(self) -> int:
+        """连续处于降级态的调用次数（驱动'压缩历史'决策；恢复后归零）。"""
+        if self.is_degraded():
+            return int(getattr(self, "_degraded_streaks", 0))
+        return 0
 
     def get_status(self) -> Dict:
         return {
@@ -379,6 +397,7 @@ class LLMClient:
         force_json: bool = False,
         wrap_data: bool = False,
         use_cache: bool = False,  # P1-2: 语义缓存（1h TTL，命中直接返回）
+        usage_site: Optional[str] = None,  # SP8: 成本台账调用点标签（provider×site 成本表维度）
     ) -> Union[str, Dict[str, Any]]:
         if not self.api_key:
             raise ValueError("❌ API Key 未配置")
@@ -391,6 +410,12 @@ class LLMClient:
             if temperature > 0.1:
                 temperature = 0.1
             logger.debug(f"🔄 降级模式: max_tokens={max_tokens}")
+            # SP5: 预算持续超限（连续>=3次收缩无效）→ 显式抛 BudgetExhaustedError，
+            # 供调用方（ReActAgent）压缩历史或转本地确定性判定，不再无限收缩硬扛。
+            if self.budget.degraded_streaks() >= 3:
+                raise BudgetExhaustedError(
+                    "Token 预算持续超限，降级收缩无效——请压缩历史或转本地确定性判定"
+                )
 
         prompt = self._clean_string(prompt)
         if system:
@@ -445,81 +470,109 @@ class LLMClient:
         if not models_to_use:
             raise RuntimeError("没有可用的模型（所有模型均被屏蔽）")
 
-        # 修复：统一重试策略，外层只做一次全模型轮询
-        # Sprint 1: 集成 ProviderFailover 熔断器
+        # P5-2: 模型错误退避——全模型轮询外层加指数退避重试轮（strix 韧性）。
+        # 瞬时错误（5xx/超时/连接/限流/空返回）→ 整轮退避后重试；永久错误不重试：
+        # 内容审核 → 模型黑名单（跨调用），401/403 认证失败 → 本轮 dead_models 剔除。
+        try:
+            extra_rounds = max(0, int(getattr(settings, "llm_retry_rounds", 2)))
+        except Exception:
+            extra_rounds = 2
+        try:
+            backoff_base = max(0.0, float(getattr(settings, "llm_backoff_base", 2.0)))
+        except Exception:
+            backoff_base = 2.0
         last_error = None
-        for model in models_to_use:
-            # Sprint 1: 检查该模型所属 Provider 的熔断状态
-            if self._failover:
-                provider = self._get_model_provider(model)
-                breaker = self._failover._breakers.get(provider)
-                if breaker and breaker.state == "OPEN":
-                    logger.info(f"🔌 [Failover] {provider} 熔断中，跳过模型 {model}")
+        dead_models: set = set()
+        for round_idx in range(1 + extra_rounds):
+            transient_seen = False
+            for model in models_to_use:
+                if model in dead_models:
                     continue
-            try:
-                result = await self._call_model_once(
-                    model=model,
-                    prompt=processed_prompt,
-                    system=final_system,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
-                if result and result.strip():
-                    # Sprint 1: 调用成功 → 恢复熔断器
+                # Sprint 1: 检查该模型所属 Provider 的熔断状态
+                if self._failover:
+                    provider = self._get_model_provider(model)
+                    breaker = self._failover._breakers.get(provider)
+                    if breaker and breaker.state == "OPEN":
+                        logger.info(f"🔌 [Failover] {provider} 熔断中，跳过模型 {model}")
+                        continue
+                try:
+                    result = await self._call_model_once(
+                        model=model,
+                        prompt=processed_prompt,
+                        system=final_system,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        usage_site=usage_site,  # SP8
+                    )
+                    if result and result.strip():
+                        # Sprint 1: 调用成功 → 恢复熔断器
+                        if self._failover:
+                            provider = self._get_model_provider(model)
+                            breaker = self._failover._breakers.get(provider)
+                            if breaker:
+                                await breaker.on_success()
+                        try:
+                            get_metrics().inc_ai_call(model, True)
+                        except Exception:
+                            logger.debug("suppressed exception (core audit)")
+                        # P1-2: 写入语义缓存（1h TTL，有界 LRU）
+                        if use_cache and cache_key:
+                            try:
+                                with LLMClient._semantic_lock:
+                                    LLMClient._semantic_cache[cache_key] = (time.time(), result)
+                                    if len(LLMClient._semantic_cache) > LLMClient._semantic_cache_max:
+                                        now = time.time()
+                                        expired = [
+                                            k for k, (t, _) in LLMClient._semantic_cache.items()
+                                            if now - t > LLMClient._semantic_cache_ttl
+                                        ]
+                                        for k in expired:
+                                            LLMClient._semantic_cache.pop(k, None)
+                                        if len(LLMClient._semantic_cache) > LLMClient._semantic_cache_max:
+                                            LLMClient._semantic_cache = dict(
+                                                list(LLMClient._semantic_cache.items())[-LLMClient._semantic_cache_max // 2:]
+                                            )
+                            except Exception:
+                                logger.debug("suppressed exception (core audit)")
+                        return result
+                    else:
+                        logger.warning(f"⚠️ 模型 {model} 返回空内容，切换到下一个模型...")
+                        transient_seen = True  # P5-2: 空返回视为瞬时异常，值得退避重试
+                        continue
+                except Exception as e:
+                    error_str = str(e)
+                    # Sprint 1: 记录 Provider 失败到熔断器
                     if self._failover:
                         provider = self._get_model_provider(model)
                         breaker = self._failover._breakers.get(provider)
                         if breaker:
-                            await breaker.on_success()
+                            await breaker.on_failure()
+                    if "内容审核" in error_str or "contentFilter" in error_str:
+                        logger.warning(f"🚫 模型 {model} 因内容审核被屏蔽，加入黑名单")
+                        LLMClient._blocked_models.add(model)
+                    elif ("401" in error_str or "403" in error_str
+                          or "unauthorized" in error_str.lower() or "invalid api key" in error_str.lower()):
+                        logger.warning(f"🔑 模型 {model} 认证失败（401/403），本轮剔除不重试")
+                        dead_models.add(model)
+                    elif "RateLimit" in error_str or "429" in error_str:
+                        # P5-2: 限流交给轮间指数退避统一等待（不再逐模型固定 sleep(5)）
+                        logger.warning(f"⚠️ 模型 {model} 触发限流，记入瞬时错误待退避重试")
+                        transient_seen = True
+                    else:
+                        # P5-2: 5xx/超时/连接类瞬时错误 → 退避重试（旧版单轮直接放弃）
+                        logger.warning(f"⚠️ 模型 {model} 调用失败: {e}，切换到下一个模型...")
+                        transient_seen = True
                     try:
-                        get_metrics().inc_ai_call(model, True)
+                        get_metrics().inc_ai_call(model, False)
                     except Exception:
                         logger.debug("suppressed exception (core audit)")
-                    # P1-2: 写入语义缓存（1h TTL，有界 LRU）
-                    if use_cache and cache_key:
-                        try:
-                            with LLMClient._semantic_lock:
-                                LLMClient._semantic_cache[cache_key] = (time.time(), result)
-                                if len(LLMClient._semantic_cache) > LLMClient._semantic_cache_max:
-                                    now = time.time()
-                                    expired = [
-                                        k for k, (t, _) in LLMClient._semantic_cache.items()
-                                        if now - t > LLMClient._semantic_cache_ttl
-                                    ]
-                                    for k in expired:
-                                        LLMClient._semantic_cache.pop(k, None)
-                                    if len(LLMClient._semantic_cache) > LLMClient._semantic_cache_max:
-                                        LLMClient._semantic_cache = dict(
-                                            list(LLMClient._semantic_cache.items())[-LLMClient._semantic_cache_max // 2:]
-                                        )
-                        except Exception:
-                            logger.debug("suppressed exception (core audit)")
-                    return result
-                else:
-                    logger.warning(f"⚠️ 模型 {model} 返回空内容，切换到下一个模型...")
+                    last_error = e
                     continue
-            except Exception as e:
-                error_str = str(e)
-                # Sprint 1: 记录 Provider 失败到熔断器
-                if self._failover:
-                    provider = self._get_model_provider(model)
-                    breaker = self._failover._breakers.get(provider)
-                    if breaker:
-                        await breaker.on_failure()
-                if "内容审核" in error_str or "contentFilter" in error_str:
-                    logger.warning(f"🚫 模型 {model} 因内容审核被屏蔽，加入黑名单")
-                    LLMClient._blocked_models.add(model)
-                elif "RateLimit" in error_str or "429" in error_str:
-                    logger.warning(f"⚠️ 模型 {model} 触发限流，跳过")
-                    await asyncio.sleep(5)  # 限流等待
-                else:
-                    logger.warning(f"⚠️ 模型 {model} 调用失败: {e}，切换到下一个模型...")
-                try:
-                    get_metrics().inc_ai_call(model, False)
-                except Exception:
-                    logger.debug("suppressed exception (core audit)")
-                last_error = e
-                continue
+            # P5-2: 轮间指数退避（2s→4s→8s…封顶 30s，+随机抖动防雪崩）
+            if round_idx < extra_rounds and transient_seen:
+                delay = min(30.0, backoff_base * (2 ** round_idx) + random.uniform(0, 1.0))
+                logger.warning(f"⏳ [Backoff] 第 {round_idx + 1} 轮全模型未成功（存在瞬时错误），退避 {delay:.1f}s 后重试")
+                await asyncio.sleep(delay)
 
         raise RuntimeError(f"所有模型调用均失败: {last_error}")
 
@@ -530,8 +583,10 @@ class LLMClient:
         system: str,
         temperature: float,
         max_tokens: int,
+        usage_site: Optional[str] = None,  # SP8
     ) -> str:
         """单次模型调用，不重试（重试由外层统一管理）"""
+        _started = time.time()
         async with self._semaphore:
             prompt = self._clean_string(prompt)
             system = self._clean_string(system)
@@ -637,6 +692,20 @@ class LLMClient:
                         logger.warning(f"⚠️ 模型 {model} 触发降级模式")
 
                     logger.debug(f"✅ AI 响应成功，长度 {len(content)}，本轮花费 ~{prompt_tokens + completion_tokens} tokens")
+
+                    # SP8: 成本/用量台账埋点（成功路径；失败静默不影响调用）
+                    try:
+                        UsageLedger.record(
+                            provider=provider,
+                            model=model,
+                            prompt_tokens=prompt_tokens,
+                            completion_tokens=completion_tokens,
+                            ms=(time.time() - _started) * 1000,
+                            ok=True,
+                            site=usage_site,
+                        )
+                    except Exception:
+                        logger.debug("suppressed exception (core audit)")
 
                     await asyncio.sleep(2)
                     return content

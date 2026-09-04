@@ -24,6 +24,7 @@ from vulnclaw.core.settings import settings
 
 # ===== 修复：所有合并后的 AI 模块统一从 ai.core 导入 =====
 from vulnclaw.ai.core import (
+    BudgetExhaustedError,
     get_llm_client,
     get_memory,          # memory 已合并到 core.py
     get_rule_engine,     # rule_engine 已合并到 core.py
@@ -543,6 +544,9 @@ class ReActAgent:
 oob_confirm(url,param,payload,timeout)：规则引擎全 miss 的无回显假设验证——注入带外地址并轮询回调，回调=Critical 实锤。payload 为载荷模板，用 {{{{OBS_DNS}}}}（DNS 外带）或 {{{{OBS_HTTP}}}}（HTTP 外带）占位，例如 ${{jndi:ldap://{{{{OBS_DNS}}}}/a}}、http://{{{{OBS_DNS}}}}/probe。适合 log4shell/fastjson/struts2-ognl/ssrf/xxe 等盲打场景。
 ask_expert(question,context,system)：困惑时外询——内部知识盲区/判断依据不足时（未知漏洞类型、载荷不确定、技术栈陌生、证据难解释），把问题委派给已配置的外部 Agent 拿第二意见。只传分析所需文本，禁止传密钥/OOB token/本地路径；外部不可用会自动降级回本地，不影响流程。
 
+【技能知识包（P6-1 skills，按上下文命中）】
+{self._skills_context(params=all_param_names, max_chars=700)}
+
 请思考：
 1. 当前最有价值的攻击面是什么？
 2. 给出下一步决策。
@@ -555,11 +559,16 @@ ask_expert(question,context,system)：困惑时外询——内部知识盲区/�
                 system=self.role_system or "你是渗透测试AI Agent，擅长推理决策。",
                 temperature=0.3,
                 wrap_data=True,
-                task_type="plan"
+                task_type="plan",
+                usage_site=f"react:{self.role or 'general'}"  # SP8
             )
             self._scene_cache[cache_key] = result.strip()
             self._cache_miss_count += 1
             return result.strip()
+        except BudgetExhaustedError:
+            self._mark_budget_exhausted()
+            logger.warning("⚠️ 思考预算超限：压缩历史后转本地默认决策")
+            return "继续使用常见漏洞检测工具探索目标。"
         except Exception as e:
             logger.warning(f"思考失败: {e}")
             return "继续使用常见漏洞检测工具探索目标。"
@@ -620,6 +629,9 @@ ask_expert(question,context,system)：困惑时外询——内部知识盲区/�
 【线索（S3.2 ClueEngine）】
 {self._get_review_clues()}
 
+【技能知识包（P6-1 skills，按上下文命中）】
+{self._skills_context()}
+
 【历史经验（S3.1 跨会话记忆）】
 {self._get_memory_experiences()}
 
@@ -669,7 +681,8 @@ ask_expert(question,context,system)：困惑时外询——内部知识盲区/�
                     system="你是渗透测试AI Agent，只输出JSON。",
                     temperature=0.2,
                     wrap_data=True,
-                    task_type="plan"
+                    task_type="plan",
+                    usage_site=f"react:{self.role or 'general'}"  # SP8
                 )
                 match = re.search(r'\{.*\}', result, re.DOTALL)
                 if match:
@@ -700,6 +713,10 @@ ask_expert(question,context,system)：困惑时外询——内部知识盲区/�
                     prompt += "\n请确保输出是有效的JSON格式。"
                     continue
 
+            except BudgetExhaustedError:
+                self._mark_budget_exhausted()
+                logger.warning("⚠️ 决策预算超限：压缩历史后走本地智能降级")
+                break
             except Exception as e:
                 logger.warning(f"决策失败 (尝试 {attempt + 1}/2): {e}")
                 if attempt == 0:
@@ -1163,9 +1180,10 @@ ask_expert(question,context,system)：困惑时外询——内部知识盲区/�
         return report
 
     def _format_history(self) -> str:
-        if not self.history:
-            return "无"
         lines = []
+        # P5-2: 历史被滚动压缩后仍要在渲染中保留纪要（否则摘要只出现一次就丢）
+        if self._compressed_summary:
+            lines.append(f"  - 纪要: {self._compressed_summary}")
         for h in self.history[-3:]:
             if "action" in h:
                 action = h.get("action", {})
@@ -1177,11 +1195,14 @@ ask_expert(question,context,system)：困惑时外询——内部知识盲区/�
 
     # ---------------- S3: 唤醒闲置资产 ----------------
     def _compress_history(self, keep_last: int = 3) -> str:
-        """S3.3: 上下文压缩——超过阈值后把 history 滚动压缩为结构化纪要（对标 Strix MemoryCompressor）。
+        """S3.3/P5-2: 上下文压缩——超过阈值后把 history 滚动压缩为结构化纪要（对标 Strix MemoryCompressor）。
 
         长程多轮场景（ReAct 深挖 max_iterations 较大）下，对话不断累积，
         若不压缩会导致 prompt 膨胀、token 成本上升。压缩只保留动作骨架，
         最近 keep_last 轮保留全量细节。
+        P5-2 强化：压缩后把旧轮从 self.history 内存中滚动剔除（只留一条
+        compressed 标记 + 最近 keep_last 轮），history 恒有界，后续轮次
+        不再 O(n) 重算全量纪要。
         """
         if not self.history:
             return "无"
@@ -1204,7 +1225,40 @@ ask_expert(question,context,system)：困惑时外询——内部知识盲区/�
                     parts.append(f"结果:{str(r)[:30]}/valid={h.get('valid')}")
         body = "; ".join(parts) if parts else "[无可压缩内容]"
         self._compressed_summary = f"[已压缩{len(compact_entries)}轮] {body[:300]}"
+        # P5-2: 内存级滚动压缩——旧轮剔除，history 长度恒 ≤ 1+keep_last+后续增量
+        self.history = [{"phase": "compressed", "summary": self._compressed_summary}] + self.history[-keep_last:]
         return f"{self._compressed_summary} ... 【最近】{self._format_history()}"
+
+    def _mark_budget_exhausted(self) -> None:
+        """SP5: 预算耗尽信号——压缩历史释放预算（后续仍超则转本地判定兜底）。"""
+        try:
+            self._compress_history(keep_last=2)
+        except Exception:  # noqa: BLE001
+            logger.debug("suppressed exception (core audit)")
+
+    def _skills_context(self, params: List[str] = None, max_chars: int = 900) -> str:
+        """P6-1: 按上下文（技术栈/参数/已发现漏洞类型/角色）选取 skills 知识包注入 prompt。
+
+        skills 是可执行测试套路（"这类目标该怎么打"），与 A3.3 模式库（"这个框架有什么
+        已知弱点"）互补；渲染有字符上限，避免 prompt 膨胀。
+        """
+        try:
+            from vulnclaw.core.knowledge import format_skills_for_prompt
+            obs = self._recon_observation or {}
+            tech_stack = list(obs.get("tech_stack", []) or [])
+            if params is None:
+                params = [p.get("param", "") for p in (obs.get("params", []) or [])]
+            vuln_types = [str(f.get("type", "")) for f in (self.findings or [])[-10:]]
+            return format_skills_for_prompt(
+                tech_stack=tech_stack,
+                params=params,
+                vuln_types=vuln_types,
+                role=self.role or "",
+                max_chars=max_chars,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("skills 上下文渲染失败（忽略）")
+            return ""
 
     def _get_review_clues(self) -> str:
         """S3.2: 从扫描上下文读取 ClueEngine 线索，作为 ReAct 决策候选。"""
@@ -1566,15 +1620,42 @@ class AgentNode:
         _, full0, params0 = _parse_target(target)
         targets = [(target, full0, params0)]
         try:
-            for ep in (self.blackboard.consume("endpoints") or []):
+            for ep in (self.blackboard.read("endpoints") or []):
                 if isinstance(ep, str) and ep != target:
                     _, ep_full, ep_params = _parse_target(ep)
                     targets.append((ep, ep_full, ep_params))
         except Exception:
             pass
 
+        # P6-1: skills 知识包靶向补工具——按上下文（参数名/焦点/已发现漏洞类型/角色）
+        # 推荐的确定性引擎（Tier-1）补充到本节点工具集；上限 3 个已注册引擎，
+        # 保持 A2.1"窄工具集"原则不被无限放宽。
+        tool_names = list(self.tools)
+        try:
+            from vulnclaw.core.knowledge import skill_tools_for
+            _ctx_params = [str(p) for p in (params0 or [])]
+            if self.focus:
+                _ctx_params.append(str(self.focus))
+            _vuln_types = [
+                str(x.get("type", "")) for x in (self.coordinator.snapshot.findings or [])[-10:]
+                if isinstance(x, dict)
+            ]
+            # P6-2: 加上跨会话召回的历史高发类型，让首轮就有历史靶向性
+            _vuln_types += [
+                str(t) for t in (
+                    (getattr(self.coordinator, "_memory_recall", {}) or {}).get("vuln_types", []) or []
+                )
+            ]
+            for _t in skill_tools_for(params=_ctx_params, vuln_types=_vuln_types,
+                                      role=self.role or "", top_n=5):
+                if (_t in TOOL_REGISTRY and _t not in tool_names
+                        and len(tool_names) < len(self.tools) + 3):
+                    tool_names.append(_t)
+        except Exception:
+            pass
+
         findings: List[Dict] = []
-        for tool_name in self.tools:
+        for tool_name in tool_names:
             if tool_name not in TOOL_REGISTRY:
                 continue
             has_scan, has_check = _tool_capability(tool_name)
@@ -1663,6 +1744,8 @@ class AgentCoordinator:
         self.root = AgentNode(self, self.root_addr, role="", parent=None)
         self.nodes[self.root_addr] = self.root
         self._tree_lock = asyncio.Lock()
+        # P6-2: 跨会话记忆召回结果（coordinate() 开跑前填充，供子 agent 消费）
+        self._memory_recall: Dict = {}
 
     async def spawn(self, role: str, parent_addr: str = "root", focus: str = None) -> AgentNode:
         async with self._tree_lock:
@@ -1676,8 +1759,113 @@ class AgentCoordinator:
             logger.info(f"🌲 [Coordinator] 派生 agent: {child_addr} (role={role}, focus={focus})")
             return node
 
+    # ---------------- P6-2: 跨会话学习（VectorMemory）----------------
+    @staticmethod
+    def _get_memory():
+        try:
+            from vulnclaw.ai.core import get_memory
+            return get_memory()
+        except Exception:
+            return None
+
+    async def recall_memory(self, n_results: int = 5) -> Dict:
+        """P6-2: 开跑前召回本目标的历史经验（同指纹跨会话学习）。
+
+        产出：高发漏洞类型（按频次）、失败教训条数、证据样例摘要；写入共享黑板
+        notes.memory_recall 供全部子 agent 消费，并缓存到 self._memory_recall
+        （AgentNode 用它给 skills 选择器补 vuln_types，让首轮就有历史靶向性）。
+        任何异常都被吞掉——记忆是增强项，不是必需项。
+        """
+        out: Dict = {"recalled": 0, "vuln_types": [], "failures": 0, "samples": []}
+        try:
+            memory = self._get_memory()
+            if memory is None:
+                return out
+            recalled = await memory.recall(self.target, n_results=n_results)
+            if not recalled:
+                return out
+            type_count: Dict[str, int] = {}
+            fails = 0
+            samples: List[str] = []
+            for raw in recalled:
+                try:
+                    entry = json.loads(raw) if isinstance(raw, str) else (raw or {})
+                except Exception:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                vt = str(entry.get("vuln_type", "") or "")
+                if vt:
+                    type_count[vt] = type_count.get(vt, 0) + 1
+                if entry.get("success") is False:
+                    fails += 1
+                ev = str(entry.get("evidence", "") or "")[:80]
+                if ev:
+                    samples.append(f"{vt}: {ev}" if vt else ev)
+            out["recalled"] = len(recalled)
+            out["vuln_types"] = [k for k, _ in sorted(type_count.items(), key=lambda x: -x[1])][:5]
+            out["failures"] = fails
+            out["samples"] = samples[:3]
+            try:
+                self.snapshot.blackboard.publish("notes", {
+                    "memory_recall": {
+                        "target": self.target,
+                        "vuln_types": out["vuln_types"],
+                        "samples": out["samples"],
+                    }
+                })
+            except Exception:
+                pass
+            self._memory_recall = out
+            logger.info(
+                f"🧠 [CoordinatorMemory] 召回 {out['recalled']} 条历史经验，"
+                f"高发类型={out['vuln_types'][:3]}"
+            )
+        except Exception as e:
+            logger.debug(f"[CoordinatorMemory] 召回失败（忽略）: {e}")
+        return out
+
+    async def persist_memory(self, max_items: int = 20) -> int:
+        """P6-2: 收尾把本次多 agent 成果（去重后）沉淀进 VectorMemory。
+
+        写成功经验（confirmed findings，按 url/param/type 去重，上限 max_items）；
+        下次同指纹目标的扫描会由 recall_memory() 自动召回，形成闭环学习。
+        """
+        written = 0
+        try:
+            memory = self._get_memory()
+            if memory is None:
+                return 0
+            seen = set()
+            for f in _dedup_findings(self.snapshot.findings):
+                if not isinstance(f, dict) or written >= max_items:
+                    continue
+                vuln_type = str(f.get("type", "") or "")
+                if not vuln_type:
+                    continue
+                key = (str(f.get("url", "")), str(f.get("parameter", "")), vuln_type)
+                if key in seen:
+                    continue
+                seen.add(key)
+                await memory.add_experience(
+                    target=self.target,
+                    vuln_type=vuln_type,
+                    payload=str(f.get("payload", "") or ""),
+                    success=True,
+                    evidence=str(f.get("evidence", "") or "")[:500],
+                )
+                written += 1
+            if written:
+                logger.info(f"🧠 [CoordinatorMemory] 沉淀 {written} 条多 agent 经验")
+        except Exception as e:
+            logger.debug(f"[CoordinatorMemory] 沉淀失败（忽略）: {e}")
+        return written
+
     async def coordinate(self, roles: List[str] = None) -> Dict:
         roles = roles or ["recon", "analysis", "exploit", "verify"]
+        # P6-2: 未显式召回过（外部直调 coordinate）时自动召回一次，保证子 agent 有历史上下文
+        if not self._memory_recall:
+            await self.recall_memory()
         # LLM 根编排（可选）：可用则让 LLM 决定角色顺序/裁剪；否则默认全跑
         if getattr(settings, "ai_mode", 1):
             try:

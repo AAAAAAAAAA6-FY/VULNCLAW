@@ -1098,12 +1098,18 @@ async def _execute_global_scan(self, task: Dict) -> Optional[Dict]:
         return None
     start = time.monotonic()
     # E1: 增量扫描——跳过上次已扫全局引擎
-    if getattr(settings, "incremental_scan", False):
+    # P5-1: 续扫模式下（_resume_skip_done）复用同一跳过逻辑，避免重扫已扫引擎
+    if getattr(settings, "incremental_scan", False) or getattr(self, "_resume_skip_done", False):
         _gkey = (engine_name, target, "")
         if _gkey in self._incremental_scanned:
             logger.info(f"   ⏭️ [增量] 已扫过全局引擎: {engine_name}")
             return None
         self._incremental_scanned.add(_gkey)
+        if getattr(self, "_checkpoint", None) is not None:
+            try:
+                self._checkpoint.mark_task_done(engine_name, target, "")
+            except Exception:  # noqa: BLE001
+                logger.debug("suppressed exception (core audit)")
     try:
         if engine_name == "info_leak":
             max_paths = task.get("max_paths", 150)  # 修复：使用传入的参数
@@ -1223,7 +1229,8 @@ async def _execute_engine_check(self, task: Dict) -> Optional[Dict]:
             logger.info(f"   ⏭️ [早停] 同参数已确认同类漏洞({_eng_cat})，跳过 {engine_name} on {param}")
             return None
     # E1: 增量扫描——跳过上次已扫端点/参数
-    if getattr(settings, "incremental_scan", False):
+    # P5-1: 续扫模式下（_resume_skip_done）复用同一跳过逻辑，避免重扫已扫 (engine,target,param)
+    if getattr(settings, "incremental_scan", False) or getattr(self, "_resume_skip_done", False):
         _inc_key = (engine_name, target, param)
         if _inc_key in self._incremental_scanned:
             logger.info(f"   ⏭️ [增量] 已扫过: {engine_name} {param}")
@@ -1260,8 +1267,13 @@ async def _execute_engine_check(self, task: Dict) -> Optional[Dict]:
         kwargs = {}
         if engine_name in ("cmdi", "ssrf") and self._collaborator_domain:
             kwargs["interactsh_domain"] = self._collaborator_domain
-        if getattr(settings, "incremental_scan", False):
+        if getattr(settings, "incremental_scan", False) or getattr(self, "_resume_skip_done", False):
             self._incremental_scanned.add((engine_name, target, param))
+            if getattr(self, "_checkpoint", None) is not None:
+                try:
+                    self._checkpoint.mark_task_done(engine_name, target, param)
+                except Exception:  # noqa: BLE001
+                    logger.debug("suppressed exception (core audit)")
         result = await asyncio.wait_for(
             engine.check(
                 url=target,

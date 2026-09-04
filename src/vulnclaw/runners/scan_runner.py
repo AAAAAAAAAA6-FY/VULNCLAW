@@ -2168,7 +2168,9 @@ async def main_async(args):
 
 
 
-                initial_qps=args.initial_qps
+                initial_qps=args.initial_qps,
+
+                resume=getattr(args, "resume_scan", False),
 
 
 
@@ -2444,6 +2446,27 @@ async def main_async(args):
 
 
         print(f"⚠️ HTML报告生成异常: {e}")
+
+    # P4-1: SARIF 2.1.0 输出（CI/DevSecOps 消费；异常绝不影响主报告）
+    try:
+        from vulnclaw.core.report_generator import generate_sarif
+        sarif_path = json_path.with_suffix('.sarif')
+        generate_sarif(report, str(sarif_path))
+        print(f"📄 SARIF报告: {sarif_path}")
+    except Exception as e:
+        print(f"⚠️ SARIF报告生成异常（忽略）: {e}")
+
+    # P4-2: 机器事实覆盖账本 coverage.json（审计口径：检查了什么/谁被跳过失败）
+    try:
+        from vulnclaw.core.coverage import get_coverage_ledger
+        from vulnclaw.core.scanner import get_all_engines
+        _fullset = [getattr(e, "name", type(e).__name__) for e in get_all_engines()]
+        _ledger = get_coverage_ledger(target=str(report.get("target", "")))
+        _cov_path = json_path.parent / "coverage.json"
+        _ledger.write(out_path=str(_cov_path), engine_fullset=_fullset, complete=True)
+        print(f"📄 覆盖账本: {_cov_path}")
+    except Exception as e:
+        print(f"⚠️ 覆盖账本落盘异常（忽略）: {e}")
 
 
 

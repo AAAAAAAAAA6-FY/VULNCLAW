@@ -68,7 +68,7 @@ async def test_llm_semantic_cache_hit():
     client = LLMClient(api_key="test-key", models=["glm-4-flash"])
     calls = {"n": 0}
 
-    async def fake_call_model_once(model, prompt, system, temperature, max_tokens):
+    async def fake_call_model_once(model, prompt, system, temperature, max_tokens, usage_site=None):
         calls["n"] += 1
         return "cached response"
 
@@ -90,7 +90,7 @@ async def test_llm_semantic_cache_miss_on_diff_prompt():
     client = LLMClient(api_key="test-key", models=["glm-4-flash"])
     calls = {"n": 0}
 
-    async def fake_call_model_once(model, prompt, system, temperature, max_tokens):
+    async def fake_call_model_once(model, prompt, system, temperature, max_tokens, usage_site=None):
         calls["n"] += 1
         return f"response-{calls['n']}"
 
@@ -110,7 +110,7 @@ async def test_llm_semantic_cache_disabled_by_default():
     client = LLMClient(api_key="test-key", models=["glm-4-flash"])
     calls = {"n": 0}
 
-    async def fake_call_model_once(model, prompt, system, temperature, max_tokens):
+    async def fake_call_model_once(model, prompt, system, temperature, max_tokens, usage_site=None):
         calls["n"] += 1
         return "response"
 

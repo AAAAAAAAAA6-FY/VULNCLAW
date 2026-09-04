@@ -238,9 +238,20 @@ def main(argv: list[str] | None = None) -> None:
         help="启用深度侦察：子域名/存活/JS/端口/目录全量收集，耗时较长但覆盖更全面。",
     )
     scan_parser.add_argument(
+        "--agent-coordinator",
+        action="store_true",
+        help="启用多智能体协调器：recon/analysis/exploit/verify 并发深扫 + 共享黑板知识融合（Tier-1 确定性引擎）。",
+    )
+    scan_parser.add_argument(
         "--dangerous",
         action="store_true",
         help="危险模式：实际执行漏洞利用（默认仅生成 POC 报告，不实际攻击）。",
+    )
+    scan_parser.add_argument(
+        "--resume-scan",
+        dest="resume_scan",
+        action="store_true",
+        help="P5-1: 从 SQLite 断点恢复扫描（kill -9 后续跑，跳过已完成阶段）。",
     )
     scan_parser.add_argument(
         "--proxy",
@@ -401,8 +412,12 @@ def main(argv: list[str] | None = None) -> None:
             fwd += ["--dag", "--agents", str(args.agents)]
         if args.deep:
             fwd += ["--deep"]
+        if getattr(args, "agent_coordinator", False):
+            fwd += ["--agent-coordinator"]
         if args.dangerous:
             fwd += ["--dangerous"]
+        if getattr(args, "resume_scan", False):
+            fwd += ["--resume-scan"]
         if args.proxy:
             fwd += ["--proxy", args.proxy]
         if args.metrics_port:

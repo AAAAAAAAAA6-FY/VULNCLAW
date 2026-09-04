@@ -989,6 +989,7 @@ class MCPJsonRpcHandler:
         from vulnclaw.core.scanner import get_all_engines, engine_capability
 
         items = []
+        from vulnclaw.core.scanner import engine_param_schema as _engine_schema
         for eng in get_all_engines():
             has_scan, has_check = engine_capability(eng)
             caps = []
@@ -1000,6 +1001,8 @@ class MCPJsonRpcHandler:
                 "name": eng.name,
                 "description": getattr(eng, "description", "") or "",
                 "capabilities": caps,
+                # SP7: 逐引擎 OpenAPI 式入参 schema（常驻主链路）
+                "schema": _engine_schema(eng),
             })
 
         logger.info(f"MCP engine.list → {len(items)} 个引擎")

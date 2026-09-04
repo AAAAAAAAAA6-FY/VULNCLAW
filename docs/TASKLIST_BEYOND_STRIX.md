@@ -555,6 +555,10 @@
 - [x] **SP2** 确定性去重前置 —— 已实现 `core/dedupe.py`（指纹去重 host|path|type|method|param 零 LLM；语义疑似组供 LLM 二次裁决；`merge_llm_verdict` 仅显式判重才丢弃，未裁决全保留）。测试 `tests/test_dedupe_core.py`（9 例）。
 - [x] **SP3** 机器事实覆盖账本 —— 已实现 `core/coverage.py`（asset x engine x status 账本 + rollup + gaps + complete 标记 + `run_engine_tracked` 接线包装）。测试 `tests/test_coverage_ledger.py`（9 例）。
 - [x] **SP4** SARIF 内嵌 E1 攻击图 —— `report_generator.generate_sarif` 已注入 run.graphs + run.graphTraversals（TOP 攻击路径 edgeTraversals）。测试 `tests/test_sarif_attack_graph.py`（4 例）。
-- [ ] SP5-SP8 —— 待对面（LLM 去重 / Docker 沙箱 / 上下文预算 / skills）交付后接线
-- [ ] SP9 —— 融合终验（最后统一验收）
-- [ ] SP10 / SP11 —— 已入清单待对面交付后执行（与对面无强制依赖，可并行开发）
+- [x] **SP5** ProviderBalancer × 上下文预算接线 —— 已实现 `ai/core.py` BudgetExhaustedError + TokenBudget 连续降级累计（streaks>=3 抛异常）；`ai/dispatcher.py` 压缩历史 + 本地确定性兜底；连接 11 免费模型池交错重试。测试 `tests/test_budget_wiring.py`。
+- [x] **SP6** skills × 三腿沉淀闭环 —— 已实现 `core/knowledge.py` skill_payloads/register_payload （静态定义腿 + 生成腿沉降台账 `_runtime_cache/metrics/skill_payloads.json`）；`deepsec/exploit_chain.py` _payload_bridge 桥 + LFI 变体并入 + SQLi 非危险内联探测命中沉降。测试 `tests/test_skill_payload_bridge.py`。
+- [x] **SP7** MCP 引擎参数 schema 审计 —— 已实现 `core/scanner.py` engine_param_schema（OpenAPI 式 入参定义，从引擎签名自动同步）并接入 engine.list 常驻返回。测试 `tests/test_engine_schema.py`。
+- [x] **SP8** 成本/用量追踪 —— 已实现 `core_modules/metrics.py` UsageLedger（JSONL 台账 `_runtime_cache/metrics/usage.jsonl`，provider/model/token/ms/ok/site），ask() 埋点透传 + react/verify 调用点打标，breakdown 出 provider×调用点成本表。测试 `tests/test_usage_ledger.py`。
+- [x] **SP9** 融合终验 —— 全量回归 469 passed / 0 failed / 9 skipped（较基线 406 无回退）；engine.list 69 引擎齐；SP1-SP8 全部打勾；scripts/fusion_acceptance.py compare 红线全绿。
+- [x] **SP10** finding 生命周期台账 —— 已实现 `core/finding_lifecycle.py`（new/reconfirmed/fixed/deprecated 四态 + 寿命账本 `_runtime_cache/metrics/`）。测试 `tests/test_finding_lifecycle.py`。
+- [x] **SP11** 静态代码审计通道（DeepSec 融合）—— 已实现 `core/static_audit.py`（C1 审计 + C2 覆盖账本接入 + 指纹缓存/diff-only/符号裁剪/预算硬顶降本），与 SP3 覆盖账本兼容。测试 `tests/test_static_audit.py`。

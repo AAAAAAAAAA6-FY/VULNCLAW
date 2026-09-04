@@ -615,6 +615,8 @@ def main():
     parser.add_argument('--http2', action='store_true', help='启用 HTTP/2（需 httpx[http2]，默认关闭）')
 
     parser.add_argument('--resume', action='store_true', help='从死信队列重放任务（需 --scan-id）')
+    parser.add_argument('--resume-scan', dest='resume_scan', action='store_true',
+                        help='P5-1: 从 SQLite 断点恢复扫描（kill -9 后续跑，跳过已完成阶段；与上者相互独立）')
 
     parser.add_argument('--scan-id', default='', help='扫描 ID（resume 重放死信任务时使用）')
 
@@ -679,6 +681,9 @@ def main():
     parser.add_argument('--deep', action='store_true', help='启用深度利用链（POC 生成 + 漏洞利用）')
 
 
+    parser.add_argument('--agent-coordinator', action='store_true', help='启用多智能体协调器（strix 式 agent 树：recon/analysis/exploit/verify 并发 + 共享黑板知识融合）')
+
+
 
     parser.add_argument('--dangerous', action='store_true', help='危险模式：实际执行利用（默认仅生成 POC）')
 
@@ -725,6 +730,13 @@ def main():
             settings.enable_react_dive = True
         except Exception as _de:  # noqa: BLE001
             print(f"⚠️ 启用 ReAct 深挖失败（忽略，继续扫描）: {_de}")
+
+    # --- P2: --agent-coordinator 开启多智能体协调器（strix 式 agent 树 + 共享黑板知识融合） ---
+    if getattr(args, "agent_coordinator", False):
+        try:
+            settings.agent_coordinator_enabled = True
+        except Exception as _ace:  # noqa: BLE001
+            print(f"⚠️ 启用多智能体协调器失败（忽略，继续扫描）: {_ace}")
 
 
 

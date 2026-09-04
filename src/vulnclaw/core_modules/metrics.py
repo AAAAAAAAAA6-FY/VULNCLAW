@@ -199,3 +199,108 @@ def start_metrics_server(port: int = 9090):
 
 
 __all__ = ['get_metrics', 'start_metrics_server', 'Metrics']
+
+
+# ============================================================
+# SP8: AI 成本/用量台账（机器事实，JSONL 追加写）
+# ============================================================
+import json  # noqa: E402
+import os  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+# src/vulnclaw/core_modules/metrics.py → 项目根（parents[3]）
+ROOT = Path(__file__).resolve().parents[3]
+_USAGE_LOCK = threading.Lock()
+
+
+class UsageLedger:
+    """SP8: AI 调用成本/用量台账。
+
+    每行一条 {ts, provider, model, prompt_tokens, completion_tokens, ms, ok, site}，
+    落盘 `_runtime_cache/metrics/usage.jsonl`（追加写、线程安全、写失败不影响业务）。
+    breakdown() 默认按 provider×model 聚合，site 维度可出 provider×调用点成本表。
+    """
+
+    @staticmethod
+    def path():
+        p = ROOT / "_runtime_cache" / "metrics" / "usage.jsonl"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return p
+
+    @classmethod
+    def record(cls, provider, model, prompt_tokens=0, completion_tokens=0,
+               ms=0.0, ok=True, site=None):
+        """记一行；任何异常都不上抛（台账失败必须静默）。"""
+        try:
+            row = {
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "provider": str(provider or ""),
+                "model": str(model or ""),
+                "prompt_tokens": int(prompt_tokens or 0),
+                "completion_tokens": int(completion_tokens or 0),
+                "ms": round(float(ms or 0), 1),
+                "ok": bool(ok),
+                "site": str(site or ""),
+            }
+            with _USAGE_LOCK:
+                with cls.path().open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except Exception:
+            pass  # noqa: BLE001 —— 台账失败静默
+
+    @classmethod
+    def rows(cls):
+        p = cls.path()
+        if not p.exists():
+            return []
+        out = []
+        with _USAGE_LOCK:
+            for line in p.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    continue
+        return out
+
+    @classmethod
+    def breakdown(cls, by=("provider", "model")):
+        agg = {}
+        for r in cls.rows():
+            key = tuple(r.get(k, "") for k in by)
+            a = agg.setdefault(key, {
+                "calls": 0, "ok": 0, "prompt_tokens": 0,
+                "completion_tokens": 0, "ms": 0.0,
+            })
+            a["calls"] += 1
+            if r.get("ok"):
+                a["ok"] += 1
+            a["prompt_tokens"] += int(r.get("prompt_tokens", 0))
+            a["completion_tokens"] += int(r.get("completion_tokens", 0))
+            a["ms"] += float(r.get("ms", 0))
+        return agg
+
+    @classmethod
+    def table(cls, by=("provider", "model")):
+        """Markdown 成本表：| 维度 | calls | ok | tokens | ms | ~usd |"""
+        lines = ["| " + " | ".join(by) + " | calls | ok | tokens | ms | ~usd |",
+                 "|---|---|---|---|---|---|"]
+        for key in sorted(cls.breakdown(by)):
+            a = cls.breakdown(by)[key]
+            toks = a["prompt_tokens"] + a["completion_tokens"]
+            usd = toks / 1000.0 * 0.01
+            lines.append("| " + " | ".join(str(k) for k in key)
+                         + " | %d | %d | %d | %.1f | %.4f |"
+                         % (a["calls"], a["ok"], toks, a["ms"], usd))
+        return "\n".join(lines)
+
+    @classmethod
+    def reset(cls):
+        with _USAGE_LOCK:
+            p = cls.path()
+            if p.exists():
+                os.remove(p)

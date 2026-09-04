@@ -173,6 +173,75 @@ def engine_capability(engine) -> tuple:
     )
 
 
+# ============================================================
+# SP7: 逐引擎参数 schema（OpenAPI 式输入定义，签名自动同步）
+# ============================================================
+_ENGINE_PARAM_PINNED = {
+    "self", "url", "param", "normal_resp", "parsed_query", "session", "target",
+}
+
+
+def engine_param_schema(engine) -> Dict:
+    """SP7: 从引擎能力与签名自动推导 OpenAPI 式入参 schema。
+
+    - scan 能力 → 必填 target；check 能力 → 必填 url+param；
+    - 引擎在具体 scan()/check() 上显式声明的额外具名参数自动爬入
+      （带默认值 → optional；无默认 → required，MCP 调用方缺它会报错）；
+    - 每次调用实时取自签名 —— 引擎签名变更即自动同步，无需人工维护。
+    """
+    has_scan, has_check = engine_capability(engine)
+    params: Dict[str, Dict] = {}
+    if has_scan:
+        params["target"] = {
+            "type": "string", "description": "目标地址（域名/IP/URL）。", "required": True,
+            "default": None,
+        }
+    if has_check:
+        params["url"] = {
+            "type": "string", "description": "完整测试 URL（含 query 串）。", "required": True,
+            "default": None,
+        }
+        params["param"] = {
+            "type": "string", "description": "被测查询参数名。", "required": True,
+            "default": None,
+        }
+    if not has_scan:
+        params.setdefault("target", {
+            "type": "string", "description": "目标域名（check 链路 OOB/上下文用）。",
+            "required": False, "default": None,
+        })
+    for attr, enabled in (("scan", has_scan), ("check", has_check)):
+        if not enabled:
+            continue
+        try:
+            sig = inspect.signature(getattr(type(engine), attr))
+        except (TypeError, ValueError):
+            continue
+        for pname, pp in sig.parameters.items():
+            if pname in _ENGINE_PARAM_PINNED:
+                continue
+            if pp.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+                continue
+            if pname in params:
+                continue
+            params[pname] = {
+                "type": "string",
+                "description": f"{attr}() 具名参数（签名自动同步）。",
+                "required": pp.default is inspect.Parameter.empty,
+                "default": None if pp.default is inspect.Parameter.empty else pp.default,
+            }
+    required = [n for n, v in params.items() if v.get("required")]
+    return {
+        "type": "object",
+        "properties": params,
+        "required": required,
+    }
+
+
+# ============================================================
+
+
+
 async def run_engine(engine_name, target=None, url=None, param=None, session=None, **kwargs):
     """P0-1: 统一引擎调用适配层（供 MCP / 多智能体调度复用）。
 
@@ -197,18 +266,46 @@ async def run_engine(engine_name, target=None, url=None, param=None, session=Non
     if own_session:
         from vulnclaw.core.utils import get_shared_session, close_shared_session
         session = await get_shared_session(target=target)
+    # P4-2: 机器事实覆盖账本（旁路记账，异常零传播——绝不影响引擎执行语义）
+    try:
+        from vulnclaw.core.coverage import get_coverage_ledger
+        _ledger = get_coverage_ledger(target=str(target))
+    except Exception:
+        _ledger = None
+    _asset = str(url or target)
     try:
         if has_scan:
-            return (await engine.scan(target, session, **kwargs)) or []
-        if has_check and param:
+            _out = (await engine.scan(target, session, **kwargs)) or []
+        elif has_check and param:
             from urllib.parse import urlparse
             normal_resp = await engine._get_normal_response(url or target, session)
             parsed_query = urlparse(url or target).query
-            result = await engine.check(url or target, param, normal_resp, parsed_query, session, **kwargs)
-            return [result] if result else []
-        raise ValueError(
-            f"引擎 {engine_name} 无可用入口（scan={has_scan}, check={has_check}, param={bool(param)}）"
-        )
+            _result = await engine.check(url or target, param, normal_resp, parsed_query, session, **kwargs)
+            _out = [_result] if _result else []
+        else:
+            if _ledger is not None:
+                try:
+                    _ledger.record_skipped(_asset, engine_name,
+                                           f"no_entry(scan={has_scan},check={has_check},param={bool(param)})")
+                except Exception:
+                    pass
+            raise ValueError(
+                f"引擎 {engine_name} 无可用入口（scan={has_scan}, check={has_check}, param={bool(param)}）"
+            )
+        if _ledger is not None:
+            try:
+                _ledger.record_run(_asset, engine_name,
+                                   findings=len(_out) if isinstance(_out, list) else 0)
+            except Exception:
+                pass
+        return _out
+    except Exception as e:
+        if _ledger is not None and not isinstance(e, ValueError):
+            try:
+                _ledger.record_failed(_asset, engine_name, str(e)[:200])
+            except Exception:
+                pass
+        raise
     finally:
         if own_session:
             from vulnclaw.core.utils import close_shared_session

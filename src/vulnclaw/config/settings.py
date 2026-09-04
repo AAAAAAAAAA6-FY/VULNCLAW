@@ -126,6 +126,19 @@ class Settings(BaseSettings):
     react_dive_max_params: int = Field(3, alias="REACT_DIVE_MAX_PARAMS")  # 每轮最多深挖参数数
     react_dive_max_iterations: int = Field(5, alias="REACT_DIVE_MAX_ITERATIONS")  # 每参数 ReAct 轮数
     react_dive_budget: float = Field(150.0, alias="REACT_DIVE_BUDGET")  # 每参数总预算（秒）
+    # ========== P2: AgentCoordinator 多智能体协调器（strix 式 agent 树，Tier-1 确定性引擎） ==========
+    agent_coordinator_enabled: bool = Field(False, alias="AGENT_COORDINATOR_ENABLED")  # 默认关闭；env/配置开启后并入主链路
+    # ========== P5: 韧性（LLM 调用指数退避） ==========
+    llm_retry_rounds: int = Field(2, alias="LLM_RETRY_ROUNDS")  # 全模型轮询外的额外重试轮数（0=单轮兼容旧行为）
+    llm_backoff_base: float = Field(2.0, alias="LLM_BACKOFF_BASE")  # 退避基数秒：2s→4s→8s…（+抖动，封顶 30s）
+    # ========== P3/P7: 沙箱执行层（高危动作隔离；exploit_verify 联动） ==========
+    # 注：这几个字段此前从未定义，而 P3 的 sandbox_run 用 getattr 默认值读取，
+    # 导致沙箱"实现存在但永远关闭"——与 agent_coordinator_enabled 同型陷阱。
+    sandbox_enabled: bool = Field(False, alias="SANDBOX_ENABLED")  # 总开关（默认 False=零行为变更）
+    sandbox_backend: str = Field("local", alias="SANDBOX_BACKEND")  # local / docker
+    sandbox_image: str = Field("alpine:latest", alias="SANDBOX_IMAGE")
+    sandbox_mem_limit: str = Field("512m", alias="SANDBOX_MEM_LIMIT")
+    sandbox_require_for_browser: bool = Field(True, alias="SANDBOX_REQUIRE_FOR_BROWSER")  # 浏览器 JS 确认必须隔离
     # ========== S2: 跨引擎攻击链路由（chain_router） ==========
     enable_chain_router: bool = Field(True, alias="ENABLE_CHAIN_ROUTER")  # SSRF->内网/Redis、上传->RCE
     # ========== S3: 唤醒闲置资产（VectorMemory/ClueEngine/上下文压缩） ==========

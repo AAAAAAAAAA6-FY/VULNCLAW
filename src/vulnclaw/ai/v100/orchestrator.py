@@ -6,6 +6,7 @@
 
 """v100 orchestrator facade and public scan entry point."""
 import asyncio
+import contextlib
 import gc
 import time
 from typing import Dict, List, Optional, Set, Tuple
@@ -58,7 +59,7 @@ class V100Orchestrator:
         'session', 'token', 'csrf', 'authenticity_token', 'utf8'
     }
 
-    def __init__(self, target: str, session, max_tasks: int = None, initial_qps: int = None):
+    def __init__(self, target: str, session, max_tasks: int = None, initial_qps: int = None, resume: bool = False):
         self.target = target
         self.session = session
         self._user_max_tasks = max_tasks
@@ -144,6 +145,35 @@ class V100Orchestrator:
                             self._incremental_scanned.add(tuple(_k))
         except Exception:
             logger.debug("suppressed exception (core audit)")
+        # P5-1: SQLite 断点续扫存储（A4.6 落地）
+        # 每个 target 一个确定性 DB：PROJECT_CACHE_DIR/persistence/<safe_target>.db
+        self._resume = bool(resume)
+        self._resume_stage_index = -1
+        self._resume_skip_done = False   # 续扫时主循环跳过已扫 (engine,target,param)
+        self._checkpoint = None
+        try:
+            from vulnclaw.core_modules.sqlite_persistence import (
+                SqliteCheckpointStore,
+                db_path_for_target,
+            )
+            self._checkpoint = SqliteCheckpointStore(db_path_for_target(self.target))
+            if self._resume:
+                _info = self._checkpoint.resume_info()
+                if _info.get("should_resume"):
+                    self._resume_stage_index = int(_info["stage_index"])
+                    logger.info(
+                        f"♻️ [P5-1 续扫] 检测到断点: 已完成阶段 #{self._resume_stage_index}，"
+                        f"将从下一阶段恢复（kill -9 不重扫已完成阶段）"
+                    )
+                else:
+                    logger.info(f"ℹ️ [P5-1 续扫] 无有效断点（{_info.get('reason','')}），按全新扫描进行")
+            else:
+                # 非续扫模式：清空可能存在的上一次残留检查点，保证全新起点
+                self._checkpoint.reset()
+                self._checkpoint.init_scan(scan_id="", target=self.target)
+        except Exception as _e:  # noqa: BLE001
+            logger.warning(f"⚠️ [P5-1] 检查点存储初始化失败（降级为无持久化）: {_e}")
+            self._checkpoint = None
         # S1: engine_bundle 首次执行结果（param -> [result, ...]），供 ReAct 深挖判断模糊参数
         self._bundle_results: Dict[str, List[Dict]] = {}
         self._start_time = time.time()
@@ -879,6 +909,12 @@ class V100Orchestrator:
             except Exception as exc:  # noqa: BLE001
                 logger.debug(f"finding 后处理跳过: {exc}")
             self.findings.append(finding)
+            # P5-1: 增量持久化 finding 到 SQLite 检查点（kill -9 不丢，续扫自动并入）
+            if getattr(self, "_checkpoint", None) is not None:
+                try:
+                    self._checkpoint.add_finding(finding)
+                except Exception:  # noqa: BLE001
+                    logger.debug("suppressed exception (core audit)")
             # E4: 记录已确认高危/严重漏洞的参数（按大类），供早停跳过“同类”剩余引擎
             try:
                 if str(finding.get('severity', '')).lower() in ('high', 'critical'):
@@ -1138,14 +1174,99 @@ class V100Orchestrator:
         try:
             from vulnclaw.ai.dispatcher import AgentCoordinator
             coord = AgentCoordinator(self.target, self.session)
+            # P6-2: 开跑前召回目标历史经验（同指纹跨会话学习），收尾沉淀本次成果
+            await coord.recall_memory()
             await coord.coordinate()
             coord.bridge_into(self)  # 把多 agent 共享知识（含 recon 产出）并入 findings/黑板
+            await coord.persist_memory()
             logger.info(
                 f"🌲 [AgentCoordinator] 完成: agents={len(coord.nodes)}, "
                 f"snapshot={coord.snapshot.version}, 黑板={coord.snapshot.blackboard.digest()}"
             )
         except Exception as e:
             logger.warning(f"⚠️ [AgentCoordinator] 执行失败（不影响主链路）: {e}")
+
+    # ============================================================
+    # P5-1: 断点续扫阶段定义 + 阶段检查点上下文管理器
+    # 阶段顺序即 run() 执行顺序；每一阶段在开始前写 start、结束后写 done，
+    # 续扫时已完成阶段（index <= _resume_stage_index）整段跳过。
+    # ============================================================
+    _STAGES = [
+        "recon",            # 侦察
+        "taskgen",          # 任务生成
+        "scan",             # 主扫描循环（引擎广覆盖）
+        "chain_router",     # 跨引擎攻击链路由
+        "react_deep_dive",  # ReAct 深挖
+        "agent_coordinator",# 多智能体协调器（可选）
+        "extras",           # Burp/IDOR/默认凭证/业务逻辑/... 补充扫描
+        "verify",           # 验证 + 报告前收尾
+        "report",           # 报告生成
+    ]
+
+    @contextlib.asynccontextmanager
+    async def _stage(self, name: str):
+        """阶段检查点上下文管理器。
+
+        yield 值：True=本段实际执行；False=续扫跳过（已完成）。
+        """
+        idx = self._STAGES.index(name)
+        if self._checkpoint is not None and self._resume and idx <= self._resume_stage_index:
+            logger.info(f"♻️ [P5-1] 跳过已完成阶段: {name} (#{idx})")
+            yield False
+            return
+        if self._checkpoint is not None:
+            try:
+                self._checkpoint.save_stage_start(idx, name)
+            except Exception:  # noqa: BLE001
+                logger.debug("suppressed exception (core audit)")
+        try:
+            yield True
+        finally:
+            if self._checkpoint is not None:
+                try:
+                    self._checkpoint.save_stage_done(idx, name)
+                except Exception:  # noqa: BLE001
+                    logger.debug("suppressed exception (core audit)")
+
+    def _seed_resume_state(self) -> None:
+        """续扫：把断点中已落盘的发现 / 已扫三元组 / agent 记忆回填进本次运行。"""
+        if self._checkpoint is None or not self._resume:
+            return
+        # 1) 已扫 (engine,target,param) → 主循环跳过
+        try:
+            done = self._checkpoint.load_done_tasks()
+            if done:
+                self._incremental_scanned.update(done)
+                self._resume_skip_done = True
+                logger.info(f"♻️ [P5-1] 已恢复 {len(done)} 个已扫 (engine,target,param)，主循环将跳过")
+        except Exception as _e:  # noqa: BLE001
+            logger.debug(f"[P5-1] 恢复已扫三元组失败: {_e}")
+        # 2) 增量 findings → 直接并入本次 findings（避免重复工作丢失）
+        try:
+            loaded = self._checkpoint.load_findings()
+            for f in loaded:
+                key = (
+                    f.get('url', ''), f.get('parameter', ''), f.get('type', ''),
+                    f.get('method', 'unknown'),
+                )
+                if key not in self._finding_keys:
+                    self._finding_keys.add(key)
+                    self.findings.append(f)
+            if loaded:
+                logger.info(f"♻️ [P5-1] 已恢复 {len(loaded)} 条历史发现并入 findings")
+        except Exception as _e:  # noqa: BLE001
+            logger.debug(f"[P5-1] 恢复 findings 失败: {_e}")
+        # 3) agent 记忆 / shared_knowledge 经验（A4.6：含 agent 记忆）
+        try:
+            mem = self._checkpoint.load_agent_memory("shared_knowledge")
+            if isinstance(mem, dict):
+                shared = self._ensure_shared_knowledge()
+                shared.setdefault("experiences", [])
+                for exp in (mem.get("experiences") or []):
+                    shared["experiences"].append(exp)
+                logger.info(f"♻️ [P5-1] 已恢复 agent 记忆（经验 {len(mem.get('experiences') or [])} 条）")
+        except Exception as _e:  # noqa: BLE001
+            logger.debug(f"[P5-1] 恢复 agent 记忆失败: {_e}")
 
     async def run(self) -> Dict:
         # P4-3: 后台更新 Nuclei 模板（不阻塞扫描启动，收尾时回收）
@@ -1174,6 +1295,9 @@ class V100Orchestrator:
             self.local_filter = get_local_filter()
             self.task_queue = SmartTaskQueue(max_size=2000)
 
+            # P5-1: 续扫——回填断点中的 findings / 已扫三元组 / agent 记忆
+            self._seed_resume_state()
+
             self.balancer.init_clients(self.rate_limiter)
 
             self._model_to_provider = {}
@@ -1196,87 +1320,115 @@ class V100Orchestrator:
                 self.memory = None
 
             _pt = time.monotonic()
-            await self._recon()
+            async with self._stage("recon"):
+                await self._recon()
             self._phase_timings['recon'] = time.monotonic() - _pt
             _pt = time.monotonic()
-            await self._generate_tasks()
+            async with self._stage("taskgen"):
+                await self._generate_tasks()
             self._phase_timings['taskgen'] = time.monotonic() - _pt
-            # 在任务执行之前启动流水线验证后台协程，任务边产出 finding 边验证。
-            self._start_stream_verify()
-            _pt = time.monotonic()
-            await self._execute_with_limiting()
-            self._phase_timings['scan'] = time.monotonic() - _pt
+            async with self._stage("scan"):
+                # 在任务执行之前启动流水线验证后台协程，任务边产出 finding 边验证。
+                self._start_stream_verify()
+                _pt = time.monotonic()
+                await self._execute_with_limiting()
+                self._phase_timings['scan'] = time.monotonic() - _pt
 
             # C3: 成本预算熔断——扫描阶段累计 AI 成本超预算则降级纯引擎模式，防失控
             self._maybe_trip_cost_breaker()
 
-            # S2: 跨引擎攻击链路由——基于 S2.1 链信息把已确认发现串成后续动作
-            #（SSRF->内网探测/Redis 未授权，文件上传/LFI->RCE 链）。
-            await self._run_chain_router()
+            async with self._stage("chain_router"):
+                # S2: 跨引擎攻击链路由——基于 S2.1 链信息把已确认发现串成后续动作
+                #（SSRF->内网探测/Redis 未授权，文件上传/LFI->RCE 链）。
+                await self._run_chain_router()
 
-            # S1: ReActAgent 深挖阶段（插桩点：_generate_tasks 之后、全局扫描之前）。
-            # 对 engine_bundle 首次执行结果全部 low/info 或判定模糊的参数，
-            # 用 ReActAgent 做多轮深度渗透（V100=广度覆盖，ReAct=单点深度）。
-            await self._run_react_deep_dive()
+            async with self._stage("react_deep_dive"):
+                # S1: ReActAgent 深挖阶段（插桩点：_generate_tasks 之后、全局扫描之前）。
+                # 对 engine_bundle 首次执行结果全部 low/info 或判定模糊的参数，
+                # 用 ReActAgent 做多轮深度渗透（V100=广度覆盖，ReAct=单点深度）。
+                await self._run_react_deep_dive()
 
-            # P2-1: 多智能体协调器（strix 式可寻址 agent 树）——可选增强通道。
-            # 默认关闭，开启后作为主链路之外的补充深扫，复用确定性引擎并把发现合并进 findings。
-            await self._run_agent_coordinator()
+            async with self._stage("agent_coordinator"):
+                # P2-1: 多智能体协调器（strix 式可寻址 agent 树）——可选增强通道。
+                # 默认关闭，开启后作为主链路之外的补充深扫，复用确定性引擎并把发现合并进 findings。
+                await self._run_agent_coordinator()
 
-            # 步骤3：并行提交 Burp 扫描（与下面各全局扫描同时进行，收尾前合并结果）
-            self._burp_scan_task = asyncio.create_task(self._run_burp_scan())
+            async with self._stage("extras"):
+                # 步骤3：并行提交 Burp 扫描（与下面各全局扫描同时进行，收尾前合并结果）
+                self._burp_scan_task = asyncio.create_task(self._run_burp_scan())
 
-            if self._collaborator_domain:
-                await self._check_collaborator_callback()
+                if self._collaborator_domain:
+                    await self._check_collaborator_callback()
 
-            if self._enable_idor:
-                await self._scan_idor()
+                if self._enable_idor:
+                    await self._scan_idor()
 
-            if self._enable_default_creds:
-                await self._check_default_creds()
+                if self._enable_default_creds:
+                    await self._check_default_creds()
 
-            if self._enable_business_logic:
-                await self._run_business_logic_scan()
-            if self._enable_api_version:
-                await self._run_api_version_scan()
-            if self._enable_smuggling:
-                await self._run_smuggling_scan()
-            if self._enable_http2_ws:
-                await self._run_http2_ws_scan()
-            await self._run_cache_poison_scan()
+                if self._enable_business_logic:
+                    await self._run_business_logic_scan()
+                if self._enable_api_version:
+                    await self._run_api_version_scan()
+                if self._enable_smuggling:
+                    await self._run_smuggling_scan()
+                if self._enable_http2_ws:
+                    await self._run_http2_ws_scan()
+                await self._run_cache_poison_scan()
 
-            # 步骤3：等待并行 Burp 扫描完成并合并其结果
-            if self._burp_scan_task is not None:
+                # 步骤3：等待并行 Burp 扫描完成并合并其结果
+                if self._burp_scan_task is not None:
+                    try:
+                        await self._burp_scan_task
+                    except Exception as e:
+                        logger.warning(f"⚠️ Burp 扫描任务异常: {e}")
+                    finally:
+                        self._burp_scan_task = None
+
+            async with self._stage("verify"):
+                # 等所有流式 verify 把存量 pending 跑完；再收尾剩余未被流式 pick 的。
+                await self._stop_stream_verify(wait_pending=True)
+                _pt = time.monotonic()
+                await self._verify_all_findings()
+                # C9/C10: AI 去重 + 幻觉抑制（配置默认开启；异常则保留原始结果，绝不阻断出报告）
                 try:
-                    await self._burp_scan_task
-                except Exception as e:
-                    logger.warning(f"⚠️ Burp 扫描任务异常: {e}")
-                finally:
-                    self._burp_scan_task = None
-
-            # 等所有流式 verify 把存量 pending 跑完；再收尾剩余未被流式 pick 的。
-            await self._stop_stream_verify(wait_pending=True)
-            _pt = time.monotonic()
-            await self._verify_all_findings()
-            # C9/C10: AI 去重 + 幻觉抑制（配置默认开启；异常则保留原始结果，绝不阻断出报告）
-            try:
-                if getattr(settings, "llm_as_judge_dedup", False) or getattr(settings, "hallucination_suppression", False):
-                    from vulnclaw.ai.v100.phases.phases_verify import llm_judge_dedup, hallucination_suppress
-                    self.findings = await llm_judge_dedup(self, self.findings)
-                    self.findings = hallucination_suppress(self, self.findings)
-            except Exception as _ce:  # noqa: BLE001
-                logger.warning(f"⚠️ C9/C10 后处理异常，保留原始 findings: {_ce}")
-            self._phase_timings['verify'] = time.monotonic() - _pt
+                    if getattr(settings, "llm_as_judge_dedup", False) or getattr(settings, "hallucination_suppression", False):
+                        from vulnclaw.ai.v100.phases.phases_verify import llm_judge_dedup, hallucination_suppress
+                        self.findings = await llm_judge_dedup(self, self.findings)
+                        self.findings = hallucination_suppress(self, self.findings)
+                except Exception as _ce:  # noqa: BLE001
+                    logger.warning(f"⚠️ C9/C10 后处理异常，保留原始 findings: {_ce}")
+                self._phase_timings['verify'] = time.monotonic() - _pt
 
             self._force_gc()
             await self._finalize_nuclei_update()
             # S3.1: 扫描收尾——把本次关键发现写入 VectorMemory（跨会话学习）
             await self._persist_scan_memory()
             self._save_incremental_state()
-            _pt = time.monotonic()
-            report = await self._generate_report()
-            self._phase_timings['report'] = time.monotonic() - _pt
+            # P5-1: 把 shared_knowledge 经验落盘，供续扫恢复 agent 记忆（A4.6）
+            if self._checkpoint is not None:
+                try:
+                    self._checkpoint.save_agent_memory("shared_knowledge", self._ensure_shared_knowledge())
+                except Exception:  # noqa: BLE001
+                    logger.debug("suppressed exception (core audit)")
+            async with self._stage("report"):
+                # P5-1: 收尾前把全部 findings 落盘（双保险，_add_finding 增量已覆盖）
+                if self._checkpoint is not None:
+                    try:
+                        for f in self.findings:
+                            self._checkpoint.add_finding(f)
+                    except Exception:  # noqa: BLE001
+                        logger.debug("suppressed exception (core audit)")
+                _pt = time.monotonic()
+                report = await self._generate_report()
+                self._phase_timings['report'] = time.monotonic() - _pt
             self._emit_metrics(report)
+            # P5-1: 标记正常完成（后续 --resume-scan 不会误判为可恢复断点）
+            if self._checkpoint is not None:
+                try:
+                    self._checkpoint.mark_finished()
+                except Exception:  # noqa: BLE001
+                    logger.debug("suppressed exception (core audit)")
             return report
         except Exception as e:
             logger.error(f"扫描过程中发生错误: {e}")
@@ -1305,8 +1457,8 @@ class V100Orchestrator:
         finally:
             self._nuclei_update_task = None
 
-async def run_v100_scan(target: str, session, max_tasks: int = None, initial_qps: int = None) -> Dict:
-    system = V100Orchestrator(target, session, max_tasks, initial_qps)
+async def run_v100_scan(target: str, session, max_tasks: int = None, initial_qps: int = None, resume: bool = False) -> Dict:
+    system = V100Orchestrator(target, session, max_tasks, initial_qps, resume=resume)
     return await system.run()
 
 __all__ = ['V100Orchestrator', 'run_v100_scan']

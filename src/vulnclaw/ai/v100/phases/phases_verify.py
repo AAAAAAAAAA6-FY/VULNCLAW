@@ -577,7 +577,8 @@ async def _verify_cross(
                         temperature=0.1,
                         max_tokens=200,
                         wrap_data=True,  # 安全加固
-                        use_cache=True   # P1-2: 语义缓存（1h TTL，重复验证命中直接返回）
+                        use_cache=True,  # P1-2: 语义缓存（1h TTL，重复验证命中直接返回）
+                        usage_site="verify:cross"  # SP8
                     ),
                     timeout=_VERIFY_CROSS_TIMEOUT,
                 )
