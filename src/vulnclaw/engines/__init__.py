@@ -56,6 +56,11 @@ from .mobile_engines import MobileAPIEngine
 from .net_engines import DnsSecurityEngine, GraphQLEngine, SSRFEngine, TlsSecurityEngine, XXEEngine
 from .web_engines import CMDIEngine, LFIEngine, NoSQLEngine, RFIEngine, SQLiEngine, SSTIEngine, XSSEngine
 from .http_advanced_engines import CSRFEngine, WebCacheDeceptionEngine
+from .middleware_exposure_engines import (
+    ConfluenceExposureEngine,
+    NacosExposureEngine,
+    SolrExposureEngine,
+)
 from .framework_zero_day_engines import FastjsonDeserializationEngine, Log4ShellEngine, Spring4ShellEngine, Struts2OGNLEngine, ViewStateEngine
 from .leak_logic_engines import AuthEnumerationEngine, SourceCodeLeakEngine, SpringActuatorEngine
 from .web_advanced_engines import JSONPHijackingEngine, PrototypePollutionEngine, SSIInjectionEngine, XPathInjectionEngine
@@ -133,4 +138,7 @@ __all__ = [
     "PasswordResetEngine",
     "CloudAndContainerExposureEngine",
     "BackendComponentFingerprintEngine",
+    "ConfluenceExposureEngine",
+    "NacosExposureEngine",
+    "SolrExposureEngine",
 ]

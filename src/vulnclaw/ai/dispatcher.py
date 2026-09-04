@@ -79,6 +79,22 @@ AGENT_ROLES: Dict[str, Dict[str, object]] = {
     },
 }
 
+# A5.6: 扫描阶段 → AGENT_ROLES 角色映射（阶段化工具裁剪的查表基础）
+STAGE_TO_ROLE: Dict[str, str] = {
+    "recon": "recon",      # 侦察：信息收集类工具
+    "taskgen": "analysis",  # 任务生成：注入分析类工具
+    "execute": "exploit",   # 执行/深挖：利用验证类工具
+    "verify": "verify",     # 验证：判定复核类工具
+}
+
+
+def stage_tool_keys(stage: str) -> Optional[List[str]]:
+    """A5.6: 按扫描阶段返回裁剪后的工具白名单（未映射阶段返回 None=全量）。"""
+    if not stage:
+        return None
+    role_cfg = AGENT_ROLES.get(STAGE_TO_ROLE.get(stage.strip().lower(), ""))
+    return list(role_cfg.get("tools", [])) if role_cfg else None
+
 
 class Blackboard:
     """A2.2: 共享黑板——子 Agent 之间通过结构化 state 通信（端点/漏洞/证据），
@@ -131,7 +147,7 @@ class Blackboard:
 class ReActAgent:
     """推理-行动-观察循环 Agent - 计划执行版"""
 
-    def __init__(self, target: str, session, max_iterations: int = None, focus_param: str = "", role: str = "", blackboard=None):
+    def __init__(self, target: str, session, max_iterations: int = None, focus_param: str = "", role: str = "", blackboard=None, stage: str = ""):
         self.target = target
         self.session = session
         # S1: 聚焦单个参数深挖（V100 主链路回落时传入），空串=全参数模式
@@ -155,6 +171,14 @@ class ReActAgent:
         role_tools = role_cfg.get("tools")
         if role_tools:
             self.tools = {k: v for k, v in TOOL_REGISTRY.items() if k in role_tools}
+        # A5.6: 阶段化工具裁剪——未指定角色但指定了扫描阶段时，按阶段白名单收紧工具集，
+        # 减少 LLM 提示词长度与工具调用错误率（recon 不给 exploit 工具，反之亦然）
+        self.stage = str(stage or "").strip().lower()
+        if not self.role and self.stage:
+            stage_tools = stage_tool_keys(self.stage)
+            if stage_tools:
+                self.tools = {k: v for k, v in TOOL_REGISTRY.items() if k in stage_tools}
+                logger.info("[A5.6] stage=%s 工具裁剪: 全量%d -&gt; %d", self.stage, len(TOOL_REGISTRY), len(self.tools))
         # A2.2: 共享黑板（子 Agent 间结构化通信；未传入则自建独立黑板）
         self.blackboard = blackboard if blackboard is not None else Blackboard()
 

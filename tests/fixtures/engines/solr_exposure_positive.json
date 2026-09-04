@@ -1,0 +1,9 @@
+{
+  "engine": "solr_exposure",
+  "kwargs": {"target": "https://target.example"},
+  "routes": [
+    {"url_contains": "/solr/admin/cores?indexInfo=false&wt=json", "status": 200, "body": "{\"responseHeader\":{\"status\":0},\"status\":{\"core1\":{\"instanceDir\":\"/opt/solr/core1\",\"name\":\"core1\"}}}"},
+    {"url_contains": "/solr/admin/info/system?wt=json", "status": 200, "body": "{\"lucene\":{\"solr-spec-version\":\"8.11.2\"},\"jvm\":{\"name\":\"HotSpot\"}}" }
+  ],
+  "expected": {"not_none": true, "type": "Apache Solr Admin 未授权访问"}
+}

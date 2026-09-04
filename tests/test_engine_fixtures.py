@@ -50,6 +50,37 @@ def _load(name):
         return json.load(fh)
 
 
+_MIDDLEWARE_PREFIXES = ("nacos_", "solr_", "confluence_")
+
+
+async def _run_middleware_fixture(monkeypatch, fname, fx):
+    """Z4.4: 中间件引擎分支——mock async_get 按 URL 子串路由 canned responses。"""
+    from vulnclaw.core.scanner import get_engine_by_name
+
+    engine = get_engine_by_name(fx["engine"])
+    assert engine is not None, f"{fname}: 引擎 {fx['engine']} 未注册"
+    routes = fx.get("routes", [])
+
+    async def _fake_async_get(url, session=None, headers=None, timeout=None, no_retry=False, **kwargs):
+        for r in routes:
+            if r["url_contains"] in url:
+                return (r.get("status", 200), r.get("body", ""), r.get("headers", {}))
+        return (404, "", {})
+
+    monkeypatch.setattr(
+        "vulnclaw.engines.middleware_exposure_engines.async_get", _fake_async_get
+    )
+    res = await engine.scan(fx["kwargs"]["target"], session=None)
+    exp = fx["expected"]
+    if exp.get("not_none"):
+        assert res, f"{fname}: 期望检出却为空"
+        if exp.get("type"):
+            types = [f.get("type", "") for f in res]
+            assert exp["type"] in types, f"{fname}: 类型不符 ({types})"
+    else:
+        assert not res, f"{fname}: 反例不应检出（低误报铁律）got {[f.get('type', '') for f in res]}"
+
+
 _FIXTURE_FILES = sorted(os.path.basename(p) for p in glob.glob(os.path.join(FIXTURE_DIR, "*.json")))
 
 
@@ -57,6 +88,10 @@ _FIXTURE_FILES = sorted(os.path.basename(p) for p in glob.glob(os.path.join(FIXT
 @pytest.mark.parametrize("fname", _FIXTURE_FILES)
 async def test_engine_fixture(monkeypatch, fname):
     fx = _load(fname)
+    # Z4.4: 中间件引擎 fixture 走 mock async_get 分支
+    if fname.startswith(_MIDDLEWARE_PREFIXES):
+        await _run_middleware_fixture(monkeypatch, fname, fx)
+        return
     kwargs = dict(fx["kwargs"])
     kwargs.setdefault("session", None)
     exp = fx["expected"]

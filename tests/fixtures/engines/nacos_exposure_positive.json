@@ -1,0 +1,9 @@
+{
+  "engine": "nacos_exposure",
+  "kwargs": {"target": "https://target.example"},
+  "routes": [
+    {"url_contains": "/nacos/v1/console/health/readiness", "status": 200, "body": "{\"status\":\"UP\",\"nacos\":\"nacos\"}"},
+    {"url_contains": "/nacos/v1/auth/users", "status": 200, "body": "{\"totalCount\":1,\"pageItems\":[{\"username\":\"admin\"}]}"}
+  ],
+  "expected": {"not_none": true, "type": "Nacos 未授权访问-用户列表泄露"}
+}

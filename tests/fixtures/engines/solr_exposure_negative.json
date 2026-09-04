@@ -1,0 +1,8 @@
+{
+  "engine": "solr_exposure",
+  "kwargs": {"target": "https://target.example"},
+  "routes": [
+    {"url_contains": "/solr/admin/cores?indexInfo=false&wt=json", "status": 200, "body": "{\"code\":403,\"message\":\"forbidden\"}"}
+  ],
+  "expected": {"not_none": false}
+}

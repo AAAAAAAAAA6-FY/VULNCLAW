@@ -15,9 +15,11 @@
 - rce.py.j2     → Python RCE POC
 - xss.html.j2   → HTML XSS POC
 """
+import json
 from pathlib import Path
 
 from vulnclaw.core.logger import logger
+from vulnclaw.core.settings import settings
 from typing import Dict, Optional
 
 
@@ -141,6 +143,9 @@ class POCGenerator:
         """
         self.templates_dir = Path(templates_dir) if templates_dir else TEMPLATES_DIR
         self._jinja_env = None
+        # Z3.1: 本次生成来源（template/llm/generic），批量路径据此打 template 字段
+        self._last_origin = "template"
+        self._last_description = ""
         self._init_jinja()
 
     def _init_jinja(self) -> None:
@@ -170,18 +175,27 @@ class POCGenerator:
         vuln_type = finding.get("type", "").lower()
         template_name = self._select_template(vuln_type)
 
-        if template_name is None:
-            # 无匹配模板，生成通用 POC
-            return self._generate_generic(finding)
+        if template_name is not None:
+            # 构建模板上下文
+            context = self._build_context(finding)
 
-        # 构建模板上下文
-        context = self._build_context(finding)
+            # 渲染模板
+            poc = await self._render(template_name, context)
+            self._last_origin = "template"
+            self._last_description = template_name
+            logger.info(f"📝 [POCGenerator] 生成 POC: {vuln_type} → {template_name}")
+            return poc
 
-        # 渲染模板
-        poc = await self._render(template_name, context)
-
-        logger.info(f"📝 [POCGenerator] 生成 POC: {vuln_type} → {template_name}")
-        return poc
+        # Z3.1: 无匹配模板 → 先走 LLM 动态生成（失败/开关关 → 硬回退静态通用骨架，绝不阻断）
+        self._last_origin = "generic"
+        self._last_description = "static generic skeleton"
+        llm_poc = await self._generate_llm(finding)
+        if llm_poc:
+            self._last_origin = "llm"
+            logger.info(f"📝 [POCGenerator] LLM 动态生成 POC: {vuln_type}")
+            return llm_poc
+        logger.info(f"📝 [POCGenerator] 无模板回退通用骨架: {vuln_type}")
+        return self._generate_generic(finding)
 
     def _select_template(self, vuln_type: str) -> Optional[str]:
         """根据漏洞类型选择模板。
@@ -240,6 +254,62 @@ class POCGenerator:
             for key, value in context.items():
                 content = content.replace(f"{{{{ {key} }}}}", str(value))
             return content
+
+    async def _generate_llm(self, finding: Dict) -> Optional[str]:
+        """Z3.1: LLM 按漏洞类型动态生成可运行 PoC。
+
+        仅在未命中静态模板时触发（降低 Token 消耗）；LLM 不可用 / 输出非法 /
+        开关关闭 → 返回 None，调用方硬回退静态通用骨架，绝不阻断报告生成。
+
+        system 固化约束：非破坏性、最小影响、单次验证 <=10s、不外传目标数据。
+        """
+        if not getattr(settings, "enable_llm_poc", True):
+            return None
+        try:
+            from vulnclaw.ai.core import get_llm_client
+
+            client = get_llm_client()
+            if client is None:
+                return None
+            prompt = (
+                "请为以下漏洞生成一个可直接运行的 Python3 PoC 脚本（requests 标准库，"
+                "以 if __name__ == '__main__' 组织）。\n"
+                f"漏洞类型: {finding.get('type', 'unknown')}\n"
+                f"目标 URL: {finding.get('url', '')}\n"
+                f"参数: {finding.get('parameter', '')}\n"
+                f"已观察载荷: {finding.get('payload', '') or finding.get('matched', '')}\n"
+                f"严重度: {finding.get('severity', 'High')}\n"
+                "输出为 JSON 对象，字段：code（脚本全文）、description（一句话说明）、"
+                "validation_steps（验证步骤数组）。硬性约束：1) 非破坏性，不删改数据；"
+                "2) 最小影响，单次验证调用耗时 <=10s，超时终止；3) 不把目标响应外传给任何第三方；"
+                "4) 发送的请求不携带破坏性载荷。"
+            )
+            result = await client.ask(
+                prompt,
+                system=(
+                    "你是安全研究 PoC 编写专家。只输出合法 JSON（code/description/"
+                    "validation_steps 三字段），禁止 markdown 与额外文字。code 必须是"
+                    "可直接运行的 Python3 脚本，且严格遵守非破坏、最小影响、单次 <=10s、"
+                    "不外传目标数据。"
+                ),
+                temperature=0.2,
+                max_tokens=1200,
+                retries=2,
+                force_json=True,
+                usage_site="pocgen",
+            )
+            payload = result
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            code = str((payload or {}).get("code", "") or "").strip()
+            if len(code) < 30:
+                return None
+            desc = str((payload or {}).get("description", "") or "").strip()
+            self._last_description = desc or "llm generated poc"
+            return code
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"⚙️ [POCGenerator] LLM 动态生成失败，回退静态骨架: {exc}")
+            return None
 
     def _generate_generic(self, finding: Dict) -> str:
         """生成通用 POC（无模板时）。
@@ -301,8 +371,12 @@ if __name__ == "__main__":
         results = []
         for finding in findings:
             vuln_type = finding.get("type", "").lower()
-            template = self._select_template(vuln_type) or "generic"
             poc = await self.generate(finding)
+            if self._last_origin == "template":
+                template = self._select_template(vuln_type) or "generic"
+            else:
+                # llm / generic：批量路径直接沿用本次生成来源标记
+                template = self._last_origin
             results.append({
                 "finding_id": finding.get("id", vuln_type),
                 "poc": poc,

@@ -30,6 +30,7 @@ DANGEROUS_OPS: Dict[str, str] = {
     "msf_shell_write": "向已建立的 MSF 会话 shell 写入命令",
     "remote_task_execution": "将本地工具调用委派给远程 AI Agent 执行（远程 Agent 实际发送载荷）",
     "remote_deep_penetrate": "由远程 AI Agent 自主执行单点深度渗透（远程 Agent 实际攻击目标）",
+    "privilege_escalation": "尝试权限提升（对已获低权 shell 的目标执行提权验证命令）",
 }
 
 # A5.4: 工具+危险参数注册表（工具级审批粒度，配合 E5.2 联动）

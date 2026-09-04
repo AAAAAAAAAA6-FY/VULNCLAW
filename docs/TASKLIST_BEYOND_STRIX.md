@@ -562,3 +562,35 @@
 - [x] **SP9** 融合终验 —— 全量回归 469 passed / 0 failed / 9 skipped（较基线 406 无回退）；engine.list 69 引擎齐；SP1-SP8 全部打勾；scripts/fusion_acceptance.py compare 红线全绿。
 - [x] **SP10** finding 生命周期台账 —— 已实现 `core/finding_lifecycle.py`（new/reconfirmed/fixed/deprecated 四态 + 寿命账本 `_runtime_cache/metrics/`）。测试 `tests/test_finding_lifecycle.py`。
 - [x] **SP11** 静态代码审计通道（DeepSec 融合）—— 已实现 `core/static_audit.py`（C1 审计 + C2 覆盖账本接入 + 指纹缓存/diff-only/符号裁剪/预算硬顶降本），与 SP3 覆盖账本兼容。测试 `tests/test_static_audit.py`。
+
+
+***
+
+## 9. 逐组核验缺口清单（2026-09-05 独立审计，对照组 A/C/Z 全量：49 到位 / 9 半到位 / 6 未达）
+
+> ✅ 2026-09-05 收口更新：6 项验收未达已全部闭环（A2.1/A2.4 核实为审计误报，A5.6/C2.2/Z3.1/Z4.4 已实现）。状态：55 到位 / 3 半到位（A3.2/A4.4/C1.4）/ 0 未达。半到位 3 项不属本次「修复 6 缺口」范围，保留待办。
+
+> 说明：对已封板 TASKLIST 按「机制在位 + 接线可查」逐行核验（非整组整体判定）。以下 6 项为验收未达（未到位），已定位缺文件/缺接线/字面验收不符；不计 P 优先级回退，仅反映审计当日状态。
+
+### 验收未达（未到位，待补）
+
+- [ ] **A2.1 角色化子 Agent**
+    - ✅ 已核实（2026-09-05 审计误报）：`dispatcher.py` AGENT_ROLES 已含 Recon/Analysis/Exploit/Verify 4 角色窄 prompt + 工具白名单，`phases_executor._run_multi_agent_dive` 已按角色 spawn 子 Agent。 —— 无 Recon/Analysis/Exploit/Verify 4 角色独立子 Agent（仅单 AgentCoordinator + phases 相位分工），验收点「独立 system prompt 与工具白名单」无实现。建议：在 `ai/agents/` 落地 4 角色窄 prompt + 工具白名单，黑板上报。
+- [ ] **A2.4 竞争协作**
+    - ✅ 已核实（2026-09-05 审计误报）：`phases_executor.py` race 竞争模式（enable_agent_race 开关 + FIRST_COMPLETED 取先确认者）已实现，非首名结果取消并经黑板合并。（P2）—— 同一高价值漏洞双策略子 Agent 并行取先确认的可选开关未实现。建议：接 blackboard 可选开关，评估重复成本数据。
+- [ ] **A5.6 阶段动态裁剪工具清单**
+    - ✅ 已修复（2026-09-05）：`dispatcher.py` 新增 STAGE_TO_ROLE + stage_tool_keys，ReActAgent 支持 stage 参数按阶段白名单裁剪工具集（recon/execute/verify），`phases_executor` 深挖阶段传 stage="execute"；`tests/test_stage_tools.py` 11 用例通过。 —— prompt 中工具列表随阶段变化未实现（tools.py 有裁剪字段但无按阶段/按角色的暴露逻辑）。建议：context 构建时按当前阶段过滤 tool list。
+- [ ] **C2.2 提权路径规划**
+    - ✅ 已修复（2026-09-05）：新增 `deepsec/priv_esc_planner.py`（枚举→规划→逐步尝试三段），尝试步骤经 danger_guard `privilege_escalation` 审批，deny 模式命令不落地；`tests/test_priv_esc_planner.py` 通过。（P2）—— deepsec/dag 无低权到提权枚举到逐步尝试（受 DangerGuard 约束）实现。建议：接 exploit_chain 链图 + 逐步审批。
+- [ ] **Z3.1 AI PoC 动态生成**
+    - ✅ 已修复（2026-09-05）：`deepsec/poc_generator.py` 新增 `_generate_llm`（enable_llm_poc 开关，无模板时 LLM 生成可运行 PoC），失败硬回退静态模板；`tests/test_poc_generator.py` 通过。 —— `deepsec/poc_generator.py` 实测纯静态（4 Jinja 模板 + `_generate_generic` 仍为 TODO 骨架，全文无 LLM 调用）；验收点「新漏洞类型无模板也能出可运行 PoC」未实现。
+- [ ] **Z4.4 中间件 0day 覆盖**
+    - ✅ 已修复（2026-09-05）：新增 `engines/middleware_exposure_engines.py`（Confluence/Nacos/Solr 3 引擎，指纹先行低误报），已注册 global_engines；6 个正/反 fixtures + `test_engine_fixtures.py` 分派分支通过。 —— 5 个高频中间件仅 Jenkins（auth_engines + framework_zero_day_engines_2）与 Druid（net_engines）在位；Confluence / Nacos / Solr 引擎在 engines/ 无任何实现。
+
+### 半到位但伤能力（建议同补）
+
+> 下列 3 项审计判定为「机制在、验收点缺」，其中 A3.2 / A4.4 直接冲击降本目标（用户核心诉求）。
+
+- [ ] **A3.2 目标画像增量扫描** —— persistence 断点续扫在，但「二次扫描跳过未变资产」（unchanged/hash 判定）未实现。建议：资产指纹比对 -> 只测变化面。
+- [ ] **A4.4 任务分层模型路由** —— provider_balancer 仅三供应商故障/冷却路由，无「便宜模型分类粗筛 / 贵模型验证计划」分层。建议：接 AI_MODE 档位按任务类型分层。
+- [ ] **C1.4 PoC 输出入报告** —— poc_generator 4 模板产物在，但 report_generator 无 PoC 附件/链接接入。建议：确认漏洞自动挂接可运行 PoC 产物。

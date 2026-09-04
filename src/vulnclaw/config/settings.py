@@ -148,6 +148,8 @@ class Settings(BaseSettings):
     multi_agent_max_params: int = Field(1, alias="MULTI_AGENT_MAX_PARAMS")
     multi_agent_max_iterations: int = Field(4, alias="MULTI_AGENT_MAX_ITERATIONS")
     enable_agent_race: bool = Field(False, alias="ENABLE_AGENT_RACE")  # 竞争协作：取先确认者
+    # ========== Z3: AI 生成式 0day（动态 PoC 生成开关） ==========
+    enable_llm_poc: bool = Field(True, alias="ENABLE_LLM_POC")  # 无模板漏洞走 LLM 动态生成 PoC
     # ========== A4: 上下文管理（分层/裁剪） ==========
     context_clip_max_chars: int = Field(1500, alias="CONTEXT_CLIP_MAX_CHARS")  # 工具原始输出裁剪阈值
 

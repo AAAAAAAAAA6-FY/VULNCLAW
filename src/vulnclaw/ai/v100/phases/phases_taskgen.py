@@ -418,6 +418,8 @@ async def _generate_tasks(self):
         "mass_assignment", "weak_credential",
         "password_reset", "cloud_container_exposure", "backend_component_cve",
         "open_redirect", "cors", "idor", "jwt", "oauth", "deserialization",
+        "file_upload",
+        "nacos_exposure", "solr_exposure", "confluence_exposure",
     ]
     for engine_name in global_engines:
         # 修复：info_leak 扫描路径数提升至 150

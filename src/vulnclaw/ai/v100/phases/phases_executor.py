@@ -655,7 +655,7 @@ async def _run_react_deep_dive(self):
     total_merged = 0
     for param in candidates[:max_params]:
         try:
-            agent = ReActAgent(self.target, self.session, max_iterations=max_iters, focus_param=param)
+            agent = ReActAgent(self.target, self.session, max_iterations=max_iters, focus_param=param, stage="execute")
             # S3.2: 注入 ClueEngine，使 _decide_action 读取上下文线索
             if clue_engine is not None:
                 agent.clue_engine = clue_engine

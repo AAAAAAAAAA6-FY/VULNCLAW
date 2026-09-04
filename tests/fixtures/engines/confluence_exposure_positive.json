@@ -1,0 +1,9 @@
+{
+  "engine": "confluence_exposure",
+  "kwargs": {"target": "https://target.example"},
+  "routes": [
+    {"url_contains": "/rest/applinks/1.0/manifest", "status": 200, "body": "{\"status\":\"ok\",\"applicationLinks\":[{\"typeId\":\"federation\",\"displayUrl\":\"https://wiki.example\"}]}"},
+    {"url_contains": "/rest/api/content?limit=1", "status": 200, "body": "{\"results\":[{\"type\":\"page\",\"title\":\"Confidential Roadmap\",\"extensions\":{\"position\":\"none\"}}]}"}
+  ],
+  "expected": {"not_none": true, "type": "Confluence 未授权访问-内容读取"}
+}

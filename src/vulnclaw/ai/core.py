@@ -1634,13 +1634,36 @@ import asyncio
 from vulnclaw.core.logger import logger
 from vulnclaw.core.settings import PROJECT_CACHE_DIR
 
-try:
+_CHROMA_PROBE_RESULT = None
+
+
+def _chromadb_probe() -> bool:
+    """子进程探测 chromadb 是否可导入（硬崩溃不可捕获，只能隔离到子进程）。"""
+    global _CHROMA_PROBE_RESULT
+    if _CHROMA_PROBE_RESULT is not None:
+        return _CHROMA_PROBE_RESULT
+    ok = False
+    try:
+        import subprocess
+        import sys as _sys
+        probe = subprocess.run(
+            [_sys.executable, "-c", "import chromadb"],
+            capture_output=True, timeout=30,
+        )
+        ok = probe.returncode == 0
+    except Exception:  # noqa: BLE001
+        ok = False
+    _CHROMA_PROBE_RESULT = ok
+    return ok
+
+
+if _chromadb_probe():
     import chromadb
     from chromadb.utils import embedding_functions
     CHROMADB_AVAILABLE = True
-except ImportError:
+else:
     CHROMADB_AVAILABLE = False
-    logger.warning("⚠️ chromadb 未安装，记忆系统降级为内存版本")
+    logger.warning("chromadb 不可用（导入探测失败），记忆系统降级为内存版本")
 
 _chroma_write_lock = asyncio.Lock()
 
