@@ -160,6 +160,8 @@ class Settings(BaseSettings):
     # ========== 工具路径 ==========
     thirdparty_dir: str = Field(str(_PKG_ROOT_DIR / "thirdparty"), alias="THIRDPARTY_DIR")
     nuclei_template_dir: str = Field(os.path.expanduser("~/nuclei-templates"), alias="NUCLEI_TEMPLATE_DIR")
+    # 方案②：工具体检——缺失第三方工具启动时尽力而为自动安装（默认开，GitHub 不通静默跳过）
+    tool_auto_install: bool = Field(True, alias="TOOL_AUTO_INSTALL")
 
     # ========== P4: 外围工具集成 ==========
     # P4-1 情报补全（Shodan / Censys）

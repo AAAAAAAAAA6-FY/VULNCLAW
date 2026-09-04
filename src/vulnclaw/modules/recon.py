@@ -1099,9 +1099,53 @@ import subprocess
 import json
 import re
 import shutil
+from urllib.parse import urljoin, urlparse, urlunparse
 
 from vulnclaw.core.logger import logger
 from vulnclaw.core.tool_registry import run_tool
+
+# ============================================================
+# E3.3: 纯 HTTP 兜底爬虫——零外部工具依赖（方案③）
+# 外部工具（waybackurls/gau/gospider/katana 等）缺失或失效时，
+# 仍能从主站 HTML 提取站内链接，保证端点收集不归零。
+# ============================================================
+_LINK_ATTR_RE = re.compile(r'(?:href|src|action|data-src)\s*=\s*["\']([^"\']+)["\']', re.I)
+_SRCSET_RE = re.compile(r'srcset\s*=\s*["\']([^"\']+)["\']', re.I)
+
+
+def _extract_links_from_html(html: str) -> list:
+    """从 HTML 提取候选链接：href/src/action/data-src + srcset 逗号列表。
+
+    纯正则、零依赖；供 _fallback_crawl 在外部工具全部不可用时兜底。
+    """
+    links = []
+    for m in _LINK_ATTR_RE.finditer(html or ""):
+        links.append(m.group(1))
+    for m in _SRCSET_RE.finditer(html or ""):
+        for part in m.group(1).split(","):
+            cand = part.strip().split(" ")[0] if part.strip() else ""
+            if cand:
+                links.append(cand)
+    return links
+
+
+def _normalize_url(base: str, link: str) -> str:
+    """相对链接解析为同协议绝对 URL；过滤伪协议与锚点，去 fragment，返回规范化 URL 或空串。"""
+    link = (link or "").strip().strip('"').strip("'")
+    if not link or link.startswith(("#", "mailto:", "tel:", "javascript:", "data:", "about:")):
+        return ""
+    if link.startswith("//"):
+        link = f"{urlparse(base).scheme}:{link}"
+    try:
+        if not link.startswith(("http://", "https://")):
+            link = urljoin(base, link)
+        u = urlparse(link)
+        if u.scheme not in ("http", "https"):
+            return ""
+        return urlunparse((u.scheme, u.netloc, u.path, u.params, u.query, ""))
+    except ValueError:
+        return ""
+
 
 
 class EndpointCollector:
@@ -1302,27 +1346,48 @@ class EndpointCollector:
 
         return urls
 
-    async def _fallback_crawl(self, domain: str) -> Set[str]:
+    async def _fallback_crawl(self, domain: str, max_depth: int = 2, max_urls: int = 30) -> Set[str]:
+        """纯 HTTP 兜底爬虫：零外部工具依赖，从主站出发 BFS 提取站内链接。
+
+        解析 href/src/action/data-src/srcset 四类属性 + 站内同域跟随，
+        总量/深度受限，保证任何环境下端点收集不归零。
+        """
         urls = set()
         try:
             import aiohttp
+        except ImportError:
+            return urls
+        base = domain if domain.startswith(("http://", "https://")) else f"https://{domain}"
+        base_host = urlparse(base).netloc.lower()
+        try:
             async with aiohttp.ClientSession() as sess:
-                for scheme in ['https', 'http']:
-                    try:
-                        async with sess.get(f"{scheme}://{domain}", timeout=10, ssl=False) as resp:
-                            if resp.status == 200:
+                seen = set()
+                frontier = [base]
+                for _depth in range(max_depth):
+                    next_frontier = []
+                    for page in frontier:
+                        if len(urls) >= max_urls or page in seen:
+                            continue
+                        seen.add(page)
+                        try:
+                            async with sess.get(page, timeout=10, ssl=False) as resp:
+                                if resp.status != 200:
+                                    continue
                                 html = await resp.text()
-                                pattern = r'(?:href|src)=["\']([^"\']+)["\']'
-                                for m in re.finditer(pattern, html, re.I):
-                                    link = m.group(1)
-                                    if link.startswith('/'):
-                                        link = f"{scheme}://{domain}{link}"
-                                    if link.startswith(('http://', 'https://')):
-                                        if self._is_valid_endpoint(link, strict=False):
-                                            urls.add(link)
-                                break
-                    except BaseException:
-                        continue
+                                for link in _extract_links_from_html(html):
+                                    norm = _normalize_url(page, link)
+                                    if not norm or urlparse(norm).netloc.lower() != base_host:
+                                        continue
+                                    if self._is_valid_endpoint(norm, strict=False):
+                                        if len(urls) >= max_urls:
+                                            continue
+                                        urls.add(norm)
+                                        next_frontier.append(norm)
+                        except BaseException:
+                            continue
+                    if not next_frontier:
+                        break
+                    frontier = next_frontier[:max_urls]
         except Exception as e:
             logger.debug(f"备用爬虫失败: {e}")
         return urls

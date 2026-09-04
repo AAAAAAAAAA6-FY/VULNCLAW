@@ -376,10 +376,12 @@
 
 | 编号 | 小方向 | 落地 | P | 分工 | 验收 |
 |---|---|---|---|---|---|
-| E3.1 | GitHub Action 模板：PR 触发非交互扫描（对标 Strix 一行接入） | `.github/workflows/pen.yml`（模板化） | P1 | B | 模板仓库/文档可复制即用 |
+| E3.1 | GitHub Action 模板：PR 触发非交互扫描（对标 Strix 一行接入） | `.github/workflows/pen.yml`（模板化） | P1 | B | 模板仓库/文档可复制即用 （✅ 已实现 2026-09-05：pen.yml 双模式——PR 验证网关 + 手动主动扫描）|
 | E3.2 | 增量扫描：--diff 模式只测上次以来变化面（依赖 A3.2 目标画像） | `core/persistence.py`+`cli.py` | P1 | A | 二次扫描耗时显著下降 （✅ 已实现 2026-09-05：--diff CLI 接入，复用 A3.2 画像增量；已封板：全量回归 0 失败，本机 Py3.14+Windows 子进程缺陷 7 例已 skipif 豁免，CI Py3.11/3.12 全量执行）|
-| E3.3 | PR 评论机器人：扫描结论以评论形式回贴 PR（含证据链接） | `scripts/` | P2 | B | PR 上出现漏洞评论 |
+| E3.3 | PR 评论机器人：扫描结论以评论形式回贴 PR（含证据链接） | `scripts/` | P2 | B | PR 上出现漏洞评论 （✅ 已实现 2026-09-05：scripts/pr_comment.py，marker upsert 不刷屏，无 token 自动 dry-run）|
 | E3.4 | 内置定时调度：平台级 cron（周期重扫+告警），不依赖外部 CI | `core/`+cli 子命令 | P2 | A | `vulnclaw schedule add` 生效 |
+| E3.5 | 纯 HTTP 兜底爬虫：零外部工具依赖，主站 BFS 同域提取（href/src/action/data-src/srcset） | `modules/recon.py` | P1 | A | 外部工具全缺时端点收集不归零（✅ 已实现 2026-09-05：_fallback_crawl BFS 增强 + 同域过滤 + max_urls 总量限制；13 用例全绿 + recon 单测回归全绿）|
+| E3.6 | 工具体检自动安装：启动时缺失第三方工具尽力而为下载（GitHub 预检 + SHA256 manifest 防替换），失败静默降级 | `core/utils.py`+`config/settings.py`+`runners/scan_runner.py` | P1 | A | TOOL_AUTO_INSTALL 开关 + [工具体检] 日志（✅ 已实现 2026-09-05：waybackurls/gau/gospider/katana 入清单 + plan/ensure + manifest 校验；15 用例全绿）|
 
 #### E4 报告与自动修复建议
 

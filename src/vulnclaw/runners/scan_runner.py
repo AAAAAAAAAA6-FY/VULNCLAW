@@ -27,7 +27,7 @@ from vulnclaw.ai.core import close_llm_client
 from vulnclaw.ai.v100 import run_v100_scan
 from vulnclaw.config import PROJECT_CACHE_DIR, settings
 from vulnclaw.core.logger import logger
-from vulnclaw.core.utils import close_shared_session, get_shared_session
+from vulnclaw.core.utils import close_shared_session, ensure_thirdparty_tools, get_shared_session
 from vulnclaw.runners.code_audit_runner import run_code_audit
 from vulnclaw.core.detectors.spa_detector import SpaFingerprintDetector
 
@@ -161,6 +161,12 @@ def check_environment():
 
 
     print("")
+
+    # 方案②：工具体检——缺失的第三方工具尽力而为自动安装（失败降级，不阻塞扫描）
+    try:
+        ensure_thirdparty_tools()
+    except Exception:
+        logger.debug("suppressed exception (core audit)")
 
 def _get_cookie_file_path(domain: str) -> Path:
 

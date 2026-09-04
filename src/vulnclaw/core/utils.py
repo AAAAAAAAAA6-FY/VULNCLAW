@@ -692,6 +692,51 @@ THIRDPARTY_TOOLS = [
             "darwin": "trivy",
         },
     },
+    # -------- 爬虫/历史数据工具（方案②：补全真扫缺件；下载失败自动降级，不阻塞） --------
+    {
+        "name": "waybackurls",
+        "ver": "0.1.0",
+        "owner": "tomnomnom",
+        "repo": "waybackurls",
+        "bin": {
+            "win": "waybackurls.exe",
+            "linux": "waybackurls",
+            "darwin": "waybackurls",
+        },
+    },
+    {
+        "name": "gau",
+        "ver": "2.0.9",
+        "owner": "lc",
+        "repo": "gau",
+        "bin": {
+            "win": "gau.exe",
+            "linux": "gau",
+            "darwin": "gau",
+        },
+    },
+    {
+        "name": "gospider",
+        "ver": "1.1.6",
+        "owner": "jaeles-project",
+        "repo": "gospider",
+        "bin": {
+            "win": "gospider.exe",
+            "linux": "gospider",
+            "darwin": "gospider",
+        },
+    },
+    {
+        "name": "katana",
+        "ver": "1.1.3",
+        "owner": "projectdiscovery",
+        "repo": "katana",
+        "bin": {
+            "win": "katana.exe",
+            "linux": "katana",
+            "darwin": "katana",
+        },
+    },
 ]
 
 
@@ -787,6 +832,28 @@ def _tp_release_url(tool: dict) -> tuple[str, str]:
         )
         return url, "tar.gz"
 
+    # -------- lc/gau --------
+    if owner == "lc":
+        # 例: https://github.com/lc/gau/releases/download/v2.0.9/gau_2.0.9_windows_amd64.zip
+        os_name = {"win": "windows", "linux": "linux", "darwin": "macOS"}[os_key]
+        ext = "zip" if os_key == "win" else "tar.gz"
+        url = (
+            f"https://github.com/{owner}/{repo}/releases/download/"
+            f"v{ver}/{repo}_{ver}_{os_name}_{arch}.{ext}"
+        )
+        return url, ext
+
+    # -------- jaeles-project/gospider --------
+    if owner == "jaeles-project":
+        # 例: https://github.com/jaeles-project/gospider/releases/download/v1.1.6/gospider_1.1.6_windows_amd64.zip
+        os_name = {"win": "windows", "linux": "linux", "darwin": "darwin"}[os_key]
+        ext = "zip" if os_key in ("win", "darwin") else "tar.gz"
+        url = (
+            f"https://github.com/{owner}/{repo}/releases/download/"
+            f"v{ver}/{repo}_{ver}_{os_name}_{arch}.{ext}"
+        )
+        return url, ext
+
     raise ValueError(f"未实现 {tool['name']} 的下载 URL 规则")
 
 
@@ -868,6 +935,123 @@ def _tp_extract(archive: Path, dest_dir: Path, bin_src_name: str, bin_dest: Path
         logger.debug("suppressed exception (core audit)")
 
 
+
+
+def _sha256_file(path: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _load_tool_manifest(third_dir: Path) -> dict:
+    mf = third_dir / "tool_manifest.json"
+    if not mf.exists():
+        return {}
+    try:
+        import json as _json
+        return _json.loads(mf.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _record_tool_manifest(third_dir: Path, name: str, ver: str, dest_file: Path) -> None:
+    """记录已装工具 SHA256 到 manifest；同版本 hash 变化时告警（防替换/防损坏）。"""
+    import json as _json
+    try:
+        cur = _sha256_file(dest_file)
+    except OSError:
+        return
+    mf = third_dir / "tool_manifest.json"
+    data = _load_tool_manifest(third_dir)
+    prev = data.get(name)
+    if prev and prev.get("ver") == ver and prev.get("sha256") and prev["sha256"] != cur:
+        logger.warning(
+            f"⚠️ [工具校验] {name} v{ver} 与上次安装的 SHA256 不一致（文件可能被替换/损坏）；"
+            f"上次 {prev['sha256'][:16]}… / 本次 {cur[:16]}…"
+        )
+    data[name] = {"ver": ver, "sha256": cur}
+    try:
+        mf.write_text(_json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        logger.debug("suppressed exception (core audit)")
+
+
+
+
+def plan_tool_install() -> list:
+    """工具体检（只检查不下载）：返回 thirdparty/ 下缺失的工具清单。
+
+    判定缺失：目标二进制不存在，或存在但 < 100KB（残留/损坏文件）。
+    """
+    from vulnclaw.config.settings import settings as _st
+
+    third_dir = Path(_st.thirdparty_dir)
+    os_key = _tp_os_key()
+    missing = []
+    for tool in THIRDPARTY_TOOLS:
+        bin_name = tool["bin"][os_key]
+        dest = third_dir / bin_name
+        if not dest.exists() or dest.stat().st_size < 100 * 1024:
+            missing.append(tool)
+    return missing
+
+
+def _github_reachable(timeout: int = 5) -> bool:
+    """快速连通性预检：GitHub 不通时跳过自动安装（避免每次扫描空等超时）。"""
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            "https://github.com", method="HEAD",
+            headers={"User-Agent": "VULNCLAW-tool-health/0.1"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status < 500
+    except Exception:
+        return False
+
+
+def ensure_thirdparty_tools(auto_install: bool | None = None) -> tuple:
+    """扫描/启动前的工具体检入口。
+
+    语义（尽力而为）：
+      - 无缺失 → (0, 0)，零开销返回
+      - 有缺失且 auto_install（默认取 settings.tool_auto_install）→ 尝试自动下载；
+        GitHub 不可达 / 下载失败 → 打警告继续，绝不阻塞扫描
+      - auto_install=False → 只提示手动 setup --download-thirdparty
+
+    返回: (ok_count, fail_count)
+    """
+    from vulnclaw.config.settings import settings as _st
+
+    auto = _st.tool_auto_install if auto_install is None else auto_install
+    missing = plan_tool_install()
+    if not missing:
+        return 0, 0
+    names = ", ".join(t["name"] for t in missing)
+    logger.info(f"🛠️ [工具体检] 缺失 {len(missing)} 个第三方工具: {names}")
+    if not auto:
+        logger.info(
+            f"🛠️ [工具体检] TOOL_AUTO_INSTALL=false，跳过自动安装；可手动: "
+            f"python scan.py setup --download-thirdparty"
+        )
+        return 0, len(missing)
+    if not _github_reachable():
+        logger.warning(
+            "🛠️ [工具体检] GitHub 不可达，跳过自动安装（扫描继续，可稍后手动补齐）"
+        )
+        return 0, len(missing)
+    try:
+        ok, fail = download_thirdparty_tools(only_missing=True, update_nuclei_templates=False)
+        logger.info(f"🛠️ [工具体检] 自动安装完成: 成功 {ok} / 失败 {fail}（失败项自动降级）")
+        return ok, fail
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"🛠️ [工具体检] 自动安装异常（忽略，继续扫描）: {e}")
+        return 0, len(missing)
+
+
 def download_thirdparty_tools(
     only_missing: bool = True,
     update_nuclei_templates: bool = True,
@@ -923,6 +1107,8 @@ def download_thirdparty_tools(
                 print(f"   🗜  提取 {bin_name} -> {dest_file}")
                 _tp_extract(archive_path, tmpdir, bin_name, dest_file)
                 ok += 1
+                # 方案②：SHA256 记录到 manifest（同版本重下时 hash 变化会告警）
+                _record_tool_manifest(third_dir, name, tool["ver"], dest_file)
                 # 清缓存，避免后续 get_tool_path 还认为它不存在
                 _TOOL_CACHE.pop(name, None)
             except Exception as e:
