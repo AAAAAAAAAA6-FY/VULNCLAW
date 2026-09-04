@@ -510,6 +510,7 @@ class V100Orchestrator:
         compress: bool = False,   # P1-2: 超长 Prompt 压缩为三元组
         use_cache: bool = False,  # P1-2: 语义缓存（1h TTL）
         task_type: str = "default",  # P2-1: verify→大模型 / filter→小模型
+        usage_site: str = "",  # A4.4/SP8: 成本台账调用点标签
     ) -> str:
         """带总超时的 AI 调用入口。
 
@@ -523,7 +524,7 @@ class V100Orchestrator:
             prompt = compress_prompt(prompt)
         try:
             return await asyncio.wait_for(
-                self._ask_ai_impl(prompt, system, temperature, max_tokens, use_cache=use_cache, task_type=task_type),
+                self._ask_ai_impl(prompt, system, temperature, max_tokens, use_cache=use_cache, task_type=task_type, usage_site=usage_site),
                 timeout=90.0,
             )
         except asyncio.TimeoutError as exc:
@@ -556,6 +557,7 @@ class V100Orchestrator:
                 wrap_data=True,          # 安全加固
                 retries=2,
                 use_cache=use_cache,     # P1-2
+                usage_site=usage_site or None,  # A4.4/SP8: 成本台账调用点
             )
             await self._record_model_result(model, True)
             return result
@@ -572,7 +574,8 @@ class V100Orchestrator:
                         temperature=temperature,
                         max_tokens=max_tokens,
                         wrap_data=True,
-                        retries=1
+                        retries=1,
+                        usage_site=usage_site or None,
                     )
                     await self._record_model_result(fallback_model, True)
                     return result
@@ -586,7 +589,8 @@ class V100Orchestrator:
                             temperature=temperature,
                             max_tokens=max_tokens,
                             wrap_data=True,
-                            retries=1
+                            retries=1,
+                            usage_site=usage_site or None,
                         )
                         await self._record_model_result(model_from_balancer, True)
                         return result
@@ -601,7 +605,8 @@ class V100Orchestrator:
                     temperature=temperature,
                     max_tokens=max_tokens,
                     wrap_data=True,
-                    retries=1
+                    retries=1,
+                    usage_site=usage_site or None,
                 )
                 await self._record_model_result(model_from_balancer, True)
                 return result
@@ -1161,6 +1166,29 @@ class V100Orchestrator:
         except Exception as _e:  # noqa: BLE001
             logger.debug(f"   [增量] 状态保存失败（忽略）: {_e}")
 
+    async def _save_target_profile_a32(self) -> None:
+        """A3.2: 目标画像持久化——recon brief → 指纹画像落库，下次增量只测变化面。
+
+        复用 IncrementalSaver.save_target_profile（此前零调用的预留 API）。
+        只在 incremental_scan 开启时写入；失败静默（不影响扫描主流程）。
+        """
+        try:
+            if not getattr(settings, "incremental_scan", False):
+                return
+            brief = getattr(self, "_recon_brief", None)
+            if not brief:
+                return
+            from vulnclaw.core_modules.asset_profile import build_asset_profile, save_profile
+
+            profile = build_asset_profile(self.target, brief)
+            await save_profile(self.target, profile)
+            logger.info(
+                f"   🗃️ [A3.2] 目标画像已落库: {len(profile.get('assets', {}))} 个端点指纹"
+                f"（TTL {getattr(settings, 'asset_profile_ttl_hours', 168.0)}h）"
+            )
+        except Exception as _e:  # noqa: BLE001
+            logger.debug(f"   [A3.2] 画像保存失败（忽略）: {_e}")
+
     async def _run_agent_coordinator(self) -> None:
         """P2-1: 多智能体协调器（strix 式可寻址 agent 树）——可选增强通道。
 
@@ -1405,6 +1433,8 @@ class V100Orchestrator:
             # S3.1: 扫描收尾——把本次关键发现写入 VectorMemory（跨会话学习）
             await self._persist_scan_memory()
             self._save_incremental_state()
+            # A3.2: 目标画像落库（增量扫描只测变化面的数据基础）
+            await self._save_target_profile_a32()
             # P5-1: 把 shared_knowledge 经验落盘，供续扫恢复 agent 记忆（A4.6）
             if self._checkpoint is not None:
                 try:
@@ -1438,6 +1468,7 @@ class V100Orchestrator:
             # S3.1: 扫描收尾——把本次关键发现写入 VectorMemory（跨会话学习）
             await self._persist_scan_memory()
             self._save_incremental_state()
+            await self._save_target_profile_a32()
             try:
                 self._emit_metrics()
             except Exception:

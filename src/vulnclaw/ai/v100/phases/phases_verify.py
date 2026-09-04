@@ -151,6 +151,7 @@ async def _verify_cross_batch(self, group: list) -> Optional[Dict[int, Dict]]:
             temperature=0.1,
             max_tokens=1500,
             task_type="verify",
+            usage_site="verify:batch",  # A4.4/SP8: 成本台账按调用点记账
         )
     except Exception as exc:  # noqa: BLE001
         logger.debug(f"🤖 [批量AI] 调用失败，回退逐条验证: {exc}")
@@ -292,6 +293,32 @@ async def _verify_all_findings(self):
         (idx, vuln) for idx, (action, vuln) in enumerate(verification_plan)
         if action == "verify"
     ]
+    # A4.4: 成本分层路由——便宜 filter 模型先批量粗筛，verify 大模型只验证放行候选；
+    # 同时挂 verify 档调用次数预算门，超门后剩余候选全部走本地规则/技术验证（0 LLM 成本）。
+    gate = None
+    prescreen_local: list = []
+    prescreen_total = len(verify_items)
+    if getattr(settings, "filter_first_verify", True) and verify_items:
+        try:
+            from vulnclaw.ai.cost_router import VerifyBudgetGate, pre_screen_candidates
+
+            gate = VerifyBudgetGate(int(getattr(settings, "verify_llm_call_budget", 120)))
+            self._a44_gate = gate
+            fp_ids, _ps_calls = await pre_screen_candidates(self, [v for _, v in verify_items])
+            if fp_ids:
+                _kept = []
+                for _iv in verify_items:
+                    if id(_iv[1]) in fp_ids:
+                        prescreen_local.append(_iv[1])
+                    else:
+                        _kept.append(_iv)
+                verify_items = _kept
+                logger.info(
+                    f"   [A4.4] 粗筛拦截 {len(prescreen_local)}/{prescreen_total} 候选"
+                    f"（转入本地规则复核，省约 {len(prescreen_local)} 次大模型投票）"
+                )
+        except Exception as _a44_exc:  # noqa: BLE001
+            logger.debug(f"[A4.4] 粗筛不可用，候选全量进 verify: {_a44_exc}")
     verification_semaphore = self._concurrency_semaphore
     async def verify_one(vuln, preset_ai_result=None):
         async with verification_semaphore:
@@ -304,6 +331,7 @@ async def _verify_all_findings(self):
                 f"{'Exploit' if plan['do_exploit'] else '无Exploit'}"
             )
             llm_degraded = self._llm_degraded()
+            budget_exhausted = False  # A4.4: verify 档预算门状态（仅预算分支置 True）
             if preset_ai_result is not None:
                 # 优化7: 复用同 (url, param) 组的批量 AI 判定，省去一次独立调用
                 ai_result = dict(preset_ai_result)
@@ -322,6 +350,19 @@ async def _verify_all_findings(self):
                     "votes": [],
                     "verification_method": "local_fallback",
                 }
+            elif gate is not None and not gate.consume():
+                # A4.4: verify 档调用次数超预算 → 本地规则/技术验证兜底（0 LLM 成本）
+                budget_exhausted = True
+                logger.warning(
+                    f"   [A4.4] verify 预算已满（{gate.max_calls} 次调用），"
+                    f"转本地规则/技术验证: {vuln.get('type', '未知')}"
+                )
+                ai_result = {
+                    "confirmed": False,
+                    "confidence": "low",
+                    "votes": [],
+                    "verification_method": "budget_fallback",
+                }
             else:
                 ai_result = await self._verify_cross(
                     vuln,
@@ -330,7 +371,7 @@ async def _verify_all_findings(self):
                 )
             # 降级时无条件做技术验证（HTTP 状态/响应差异/回显检测不依赖 LLM），
             # 正常路径仍按 severity 计划决定。
-            if plan["do_http_verify"] or llm_degraded:
+            if plan["do_http_verify"] or llm_degraded or budget_exhausted:
                 technical_result = await safe_verify_vulnerability(
                     vuln,
                     self.session,
@@ -354,7 +395,7 @@ async def _verify_all_findings(self):
                         ai_result["confirmed"] = True
                         ai_result["verification_method"] = "oob_engine_confirmed"
             # 技术验证未确认 → 本地规则兜底（引擎结构化标志 / evidence 关键词）
-            if llm_degraded and not ai_result.get("confirmed"):
+            if (llm_degraded or budget_exhausted) and not ai_result.get("confirmed"):
                 rule_hit = self._local_rule_verify(vuln)
                 if rule_hit:
                     ai_result["confirmed"] = True
@@ -385,6 +426,9 @@ async def _verify_all_findings(self):
         for members in groups.values():
             if len(members) < 2:
                 continue
+            if gate is not None and not gate.allow():
+                logger.info("   [A4.4] verify 预算已满，跳过剩余批量粗判（复用已有判定/逐条降级）")
+                break
             try:
                 batch = await self._verify_cross_batch(members)
             except Exception as exc:  # noqa: BLE001
@@ -392,6 +436,8 @@ async def _verify_all_findings(self):
                 batch = None
             if not batch:
                 continue
+            if gate is not None:
+                gate.consume()  # A4.4: 批量粗判消耗 1 次 verify 档调用额度
             batch_groups += 1
             for i, member in enumerate(members):
                 if i in batch:
@@ -501,6 +547,43 @@ async def _verify_all_findings(self):
                 self._add_finding(_downgrade_unconfirmed_verdict(vuln))
                 verified_count += 1
                 logger.warning(f"   ⚠️ AI验证失败，但置信度高，保留： {vuln_type}")
+    # A4.4: 粗筛否决候选 → 本地规则复核（与 LLM 降级路径同语义：命中即确认，未命中保守保留）
+    for vuln in prescreen_local:
+        rule_hit = self._local_rule_verify(vuln)
+        if rule_hit:
+            vuln["ai_verdict"] = "真实漏洞（本地规则确认）"
+            vuln["confidence"] = "medium"
+            vuln["verification_method"] = f"local_rule:{rule_hit}"
+            self._add_finding(_downgrade_unconfirmed_verdict(vuln))
+            verified_count += 1
+            logger.info(
+                f"   ✅ [A4.4] 粗筛候选本地规则命中 ({rule_hit}): {vuln.get('type', '未知')}"
+            )
+        else:
+            vuln["ai_verdict"] = "待人工复核（粗筛判误报，本地规则未命中）"
+            vuln["confidence"] = "低（粗筛误报候选）"
+            self._add_finding(_downgrade_unconfirmed_verdict(vuln))
+    # A4.4: 成本量化——UsageLedger site 维度对比（粗筛 vs 大模型投票），验收要求可量化
+    if gate is not None or prescreen_local:
+        try:
+            from vulnclaw.core_modules.metrics import UsageLedger
+
+            _sites = UsageLedger.breakdown(by=("site",))
+
+            def _site_tokens(name: str) -> int:
+                _a = _sites.get((name,), {}) or {}
+                return int(_a.get("prompt_tokens", 0)) + int(_a.get("completion_tokens", 0))
+
+            _gs = gate.stats() if gate is not None else {"used": 0, "max": 0}
+            logger.info(
+                f"   💰 [A4.4] 成本分层量化: 粗筛拦截 {len(prescreen_local)}/{prescreen_total}；"
+                f"verify 预算已用 {_gs['used']}/{_gs['max']} 次；tokens "
+                f"filter:prescreen={_site_tokens('filter:prescreen')} vs "
+                f"verify:cross={_site_tokens('verify:cross')} vs "
+                f"verify:batch={_site_tokens('verify:batch')}"
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("suppressed exception (core audit)")
     logger.info(f"   Cross verification complete: {verified_count}/{total} confirmed ({MAX_AI_VERIFY} AI quota)")
 async def _verify_cross(
     self,

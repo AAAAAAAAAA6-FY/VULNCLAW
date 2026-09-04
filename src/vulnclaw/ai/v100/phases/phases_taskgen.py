@@ -116,6 +116,30 @@ async def _generate_tasks(self):
     if not all_params:
         all_params = ["id", "page", "user", "file", "q", "s", "cat", "product", "order", "view"]
     all_params = cap(all_params, settings.max_url_params)
+    # A3.2: 目标画像增量——加载上次画像，未变资产相关任务不入队（只测变化面）
+    _a32_prev = None
+    _a32_assets = {}
+    _a32_target_unchanged = False
+    self._a32_skipped = 0
+    if getattr(settings, "incremental_scan", False):
+        try:
+            from vulnclaw.core_modules.asset_profile import (
+                crawl_asset_unchanged,
+                generic_asset_unchanged,
+                load_prev_profile,
+                profile_expired,
+                surface_fp,
+            )
+            _a32_prev = load_prev_profile(self.target)
+            if _a32_prev and not profile_expired(
+                _a32_prev, float(getattr(settings, "asset_profile_ttl_hours", 168.0))
+            ):
+                _a32_assets = _a32_prev.get("assets") or {}
+                _a32_target_unchanged = _a32_prev.get("surface_fp") == surface_fp(self._recon_brief)
+                if _a32_target_unchanged:
+                    logger.info("   [A3.2] 目标表面指纹与上次画像一致 → 参数级任务全部跳过（只测变化面）")
+        except Exception as _a32_exc:  # noqa: BLE001
+            logger.debug(f"   [A3.2] 画像加载失败（本次全量扫描）: {_a32_exc}")
     tech_stack = self._recon_brief.get("tech_stack", [])
     tech_lower = ' '.join(tech_stack).lower()
     engine_priority = {
@@ -233,6 +257,9 @@ async def _generate_tasks(self):
         engine_priority.pop("business_logic", None)
         engine_priority.pop("race_condition", None)
     for param in all_params:
+        if _a32_target_unchanged:
+            self._a32_skipped += 1
+            continue
         skip, reason = self.local_filter.should_skip(self.target, param, "", 0)
         if skip:
             logger.debug(f"   [skip] 跳过参数 {param}: {reason}")
@@ -307,6 +334,9 @@ async def _generate_tasks(self):
         logger.info(f"   ✅生成 {tasks_added} 个参数级派生任务")
     static_skipped = 0
     for api in cap(self._recon_brief.get("apis", []), settings.max_api_endpoints):
+        if _a32_target_unchanged or generic_asset_unchanged(_a32_assets, "api", api):
+            self._a32_skipped += 1
+            continue
         if _is_static_resource_url(api):
             static_skipped += 1
             continue
@@ -325,6 +355,9 @@ async def _generate_tasks(self):
             tasks_added += 1
     for js_api in cap(self._recon_brief.get("js_endpoints", []), settings.max_js_endpoints):
         if not isinstance(js_api, str) or not js_api:
+            continue
+        if _a32_target_unchanged or generic_asset_unchanged(_a32_assets, "js", js_api):
+            self._a32_skipped += 1
             continue
         if js_api.startswith('http'):
             full_api = js_api
@@ -370,6 +403,9 @@ async def _generate_tasks(self):
             continue
         _etarget = _ep_url.split('?')[0]  # 去掉 query，由 param 注入（避免 query 重复）
         _ep_params = [p for p in (_ep_params or []) if p and isinstance(p, str)]
+        if _a32_target_unchanged or crawl_asset_unchanged(_a32_assets, _ep_url, _ep_params):
+            self._a32_skipped += 1
+            continue
         _test_params = cap(_ep_params, settings.max_test_params_per_endpoint) or ["id"]
         _el = _etarget.lower()
         _hint = []
@@ -410,6 +446,11 @@ async def _generate_tasks(self):
             tasks_added += 1
     if static_skipped:
         logger.info(f"   🗑️ [静态资源过滤] 源头丢弃 {static_skipped} 个静态资源 URL")
+    if self._a32_skipped:
+        logger.info(
+            f"   🗃️ [A3.2] 增量扫描：跳过未变资产相关任务 {self._a32_skipped} 个"
+            f"（画像 TTL {getattr(settings, 'asset_profile_ttl_hours', 168.0)}h，二次扫描只测变化面）"
+        )
     global_engines = [
         "api_version_diff", "request_smuggling", "http2_ws",
         "cache_poison", "info_leak", "mobile_api",

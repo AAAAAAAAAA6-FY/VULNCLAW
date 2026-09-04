@@ -209,6 +209,8 @@ class Settings(BaseSettings):
     # E1: 增量扫描——基于上次状态文件跳过已扫端点/参数
     incremental_scan: bool = Field(False, alias="INCREMENTAL_SCAN")
     incremental_state_file: str = Field("", alias="INCREMENTAL_STATE_FILE")
+    # A3.2: 目标画像 TTL（小时）——画像超龄视为过期，全量重扫（防陈旧指纹掩盖真实变化）
+    asset_profile_ttl_hours: float = Field(168.0, alias="ASSET_PROFILE_TTL_HOURS")
     # E4: 请求复用（core/utils.get_shared_session）开关
     reuse_shared_session: bool = Field(True, alias="REUSE_SHARED_SESSION")
     # E6: 分布式分片（无 Redis 走 fakeredis 模拟）
@@ -218,6 +220,9 @@ class Settings(BaseSettings):
     # C3: 成本预算熔断（美元），超预算后自动降级为纯引擎模式（ai_mode=0）
     ai_cost_budget_usd: float = Field(0.5, alias="AI_COST_BUDGET_USD")
     ai_cost_circuit_breaker: bool = Field(True, alias="AI_COST_CIRCUIT_BREAKER")
+    # A4.4: 任务分层成本路由——filter 档便宜模型先粗筛，verify 档贵模型只做真验证
+    filter_first_verify: bool = Field(True, alias="FILTER_FIRST_VERIFY")
+    verify_llm_call_budget: int = Field(120, alias="VERIFY_LLM_CALL_BUDGET")
     # C9: LLM-as-Judge 去重（对疑似重复 finding 用模型二次判定）
     llm_as_judge_dedup: bool = Field(True, alias="LLM_AS_JUDGE_DEDUP")
     # C10: 幻觉抑制（强制 evidence 非空且可复现，否则降级为低置信）
