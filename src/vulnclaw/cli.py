@@ -254,6 +254,11 @@ def main(argv: list[str] | None = None) -> None:
         help="P5-1: 从 SQLite 断点恢复扫描（kill -9 后续跑，跳过已完成阶段）。",
     )
     scan_parser.add_argument(
+        "--diff",
+        action="store_true",
+        help="E3.2: 增量扫描——只测相对上次目标画像的变化面（复用 A3.2 画像，无基线自动全量建立）。",
+    )
+    scan_parser.add_argument(
         "--proxy",
         help="HTTP/HTTPS 代理地址，例如 http://127.0.0.1:8080 （用于通过 Burp 等工具转发流量）。",
     )
@@ -418,6 +423,8 @@ def main(argv: list[str] | None = None) -> None:
             fwd += ["--dangerous"]
         if getattr(args, "resume_scan", False):
             fwd += ["--resume-scan"]
+        if getattr(args, "diff", False):
+            fwd += ["--diff"]
         if args.proxy:
             fwd += ["--proxy", args.proxy]
         if args.metrics_port:

@@ -552,6 +552,21 @@ def run_resume(scan_id: str) -> int:
     return 0
 
 
+def _apply_diff_flag(args) -> bool:
+    """E3.2: --diff → 启用 A3.2 画像增量扫描（只测相对上次目标画像的变化面）。
+
+    返回 True 表示本次按增量模式跑；返回 False 表示未开启或开启失败（按全量兜底）。
+    """
+    if not getattr(args, "diff", False):
+        return False
+    try:
+        settings.incremental_scan = True
+        print("[E3.2] 增量扫描已启用（--diff）：只测相对上次目标画像的变化面")
+    except Exception as _de:  # noqa: BLE001
+        print(f"⚠️ 启用增量扫描失败（忽略，继续全量扫描）: {_de}")
+        return False
+    return True
+
 def main():
 
 
@@ -617,6 +632,8 @@ def main():
     parser.add_argument('--resume', action='store_true', help='从死信队列重放任务（需 --scan-id）')
     parser.add_argument('--resume-scan', dest='resume_scan', action='store_true',
                         help='P5-1: 从 SQLite 断点恢复扫描（kill -9 后续跑，跳过已完成阶段；与上者相互独立）')
+    parser.add_argument('--diff', action='store_true',
+                        help='E3.2: 增量扫描——只测相对上次目标画像的变化面（复用 A3.2 画像；无历史画像时自动全量建立基线）')
 
     parser.add_argument('--scan-id', default='', help='扫描 ID（resume 重放死信任务时使用）')
 
@@ -737,6 +754,20 @@ def main():
             settings.agent_coordinator_enabled = True
         except Exception as _ace:  # noqa: BLE001
             print(f"⚠️ 启用多智能体协调器失败（忽略，继续扫描）: {_ace}")
+
+    # --- E3.2: --diff 增量扫描（复用 A3.2 目标画像，只测变化面） ---
+    if _apply_diff_flag(args):
+        try:
+            _tgt = getattr(args, "target", None) or ""
+            if _tgt:
+                from vulnclaw.core_modules.asset_profile import load_prev_profile
+                try:
+                    if not load_prev_profile(_tgt):
+                        print("   [E3.2] 该目标暂无历史画像 → 本次全量扫描并建立基线，二次扫描起生效")
+                except Exception as _dbl:  # noqa: BLE001
+                    print("   [E3.2] 画像读取不可用 → 本次按全量扫描处理")
+        except Exception as _dfe:  # noqa: BLE001
+            print(f"⚠️ 增量扫描预检失败（忽略，继续扫描）: {_dfe}")
 
 
 
