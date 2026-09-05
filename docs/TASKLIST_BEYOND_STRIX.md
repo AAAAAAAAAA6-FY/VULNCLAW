@@ -950,3 +950,30 @@
   - smart_queue.py：新增 `is_protected_task()`（source 前缀 param_mining / live:）；`fail_all_pending(reason, protect=True)` 保留受保护任务（pending+queue 均保留）；`protected_pending_count()`；
   - phases_executor.py：`_deadline_enforcer` 先 protect=True 清普通任务，存在受保护任务时给宽限窗口（attack_dynamic_grace_s 默认 45s，getattr 带默认不落 settings）再全清；`_run_one_task` 预算耗尽时受保护任务不直接判败，给 min(60, grace) 上限；
   - 新增 tests/test_sp21_deadline_grace.py 10 例（保护判定/保留/全清/零回归/宽限全流程），test_phase_timeboxed 9 例相邻回归全绿；ruff 新增文件 0 错误。
+
+## 20. SP22 短板补全（2026-09-06，A 线 3 路并行 + 主线程，纯增量）
+> 对标 STRIX 四大短板按优先级并行补齐：自动修复补丁链路 / 记忆系统接线 / CI-CD workflow / ReAct+多Agent 默认开启；全部默认安全降级、零回归设计。
+
+### §20.1 自动修复补丁链路（SP22-1）
+- 新增 src/vulnclaw/core/autofix.py：`build_patch_plan`（按漏洞类型模板化：SQL 注入参数化 / XSS 转义 / 硬编码密钥环境化 / 默认路由守卫 / 未知类型跳过），`write_patch_files`（产出 patch_*.patch + autofix_manifest.json，含 confidence/tier/severity/找到文件才落盘），`apply_patches`（--apply 才落盘，绝不自动 git 提交）；
+- cli.py 新增 `vulnclaw autofix --report --out-dir [--repo --apply]` 子命令，默认 dry-run 不落盘；
+- 新增 tests/test_autofix.py 8 例（SQL/XSS/密钥/未知类型模板、manifest 生成、dry-run 与 apply 路径）；CLI 端到端冒烟：`autofix --report` 正确产出补丁 + manifest。
+
+### §20.2 记忆系统接线（SP22-2）
+- phases_recon.py：`_recon` 末尾新增 `_persist_recon_memory`（scan_memory_enabled 开关，默认 True；把 tech_stack/open_ports/apis 写入 VectorMemory，失败仅 debug 日志继续扫描）；
+- phases_taskgen.py：`_generate_tasks` 末尾新增 `_inject_task_memory_hints`（按 target+tech 召回 5 条经验，命中引擎注入 memory_hint 提示 + memory_boost≤0.3 加权，失败仅 debug 日志继续任务生成）；
+- 新增 tests/test_memory_feedback.py 11 例（memory 单测 6 例 + recon 接线 3 例 + taskgen 接线 2 例）；两处接线均 getattr 探测兼容无装饰器/无记忆库环境，零回归。
+
+### §20.3 CI/CD workflow 模板（SP22-3）
+- 新增 .github/workflows/scan.yml：workflow_dispatch（目标 URL 输入）+ schedule（每周一 02:00）+ PR 触发（src/** 等路径）；vulnclaw scan 非交互模式 --max-tasks/--initial-qps/--download-thirdparty；always() 归档 zip + upload-artifact；
+- 新增 .github/workflows/regression.yml：PR/定时跑 pytest + ruff，质量门禁；
+- 新增 tests/test_ci_workflow.py 4 例（scan.yml 必填项/workflow_dispatch+schedule+PR 三触发存在性、regression.yml 门禁存在性、YAML 可解析、禁用并发）。
+
+### §20.4 ReAct/多Agent 默认开启（SP22-4）
+- settings.py：`enable_react_dive` 默认 False→True（深挖受预算/无AI降级保护；--deep 或 env 显式控制）；
+- orchestrator.py：`_deep_dive_danger_allowed` 审批键 `remote_deep_penetrate`→非危险键 `react_dive_probe`（该键保留给 MCP 远程深渗透默认 deny，本地探测级 ReAct 深挖默认放行）；
+- tests/test_s1_deep_react.py 同步更新断言默认开启路径，全绿。
+
+### §20.5 收口
+- 4 项专项测试合跑 36 例全绿；全量回归仅剩 test_rule_bazaar 单测顺序依赖失败（隔离运行通过，与本次改动无关，按用户指示跳过）；
+- CLI 冒烟残留 _tmp_autofix_report.json 已清理；ruff 新增/改动文件 0 错误；TASKLIST §20 纯增量记录。

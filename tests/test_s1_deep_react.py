@@ -147,12 +147,13 @@ def test_s1_3_merge_marks_react_source_and_preserves_structure():
 
 
 # ---------------------------------------------------------------------------
-# 零回归：deep=False（默认）与现状完全一致
+# 零回归：deep=False（显式关闭）与旧路径完全一致
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_deep_false_preserves_original_path(caplog, monkeypatch):
     caplog.set_level(logging.DEBUG, logger="pentest_agent")
-    inst = _bare_orchestrator()   # 默认 enable_react_dive=False（未开 deep）
+    monkeypatch.setattr(v100.settings, "enable_react_dive", False)  # SP22 起默认 True，显式关闭验证旧路径
+    inst = _bare_orchestrator()
     calls = []
 
     async def _fake_dive():
@@ -337,6 +338,12 @@ def test_a1_5_record_tool_outcome_carries_failure_class():
     assert "failure_class" in agent.short_term_memory[-1]   # memory 文件出现 failure_class 字段
     assert agent.short_term_memory[-1]["failure_class"]["param"] == "id"
     assert len(agent._failure_classes) == 1
+
+
+def test_s1_2_probe_default_allowed_without_danger_mode():
+    """SP22：默认 deny 模式下，本地探测级深挖仍放行（react_dive_probe 非危险键恒放行）。"""
+    inst = _bare_orchestrator()
+    assert inst._deep_dive_danger_allowed() is True
 
 
 @pytest.mark.asyncio

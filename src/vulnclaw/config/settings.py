@@ -125,7 +125,7 @@ class Settings(BaseSettings):
     agent_consecutive_failures_threshold: int = Field(6, alias="AGENT_CONSECUTIVE_FAILURES_THRESHOLD")
     max_paths: int = Field(150, alias="MAX_PATHS")  # 默认提高到150，避免漏扫
     # ========== S1: ReActAgent 接入 V100 主链路（深挖阶段） ==========
-    enable_react_dive: bool = Field(False, alias="ENABLE_REACT_DIVE")  # --deep 或 env 开启
+    enable_react_dive: bool = Field(True, alias="ENABLE_REACT_DIVE")  # 默认开（深挖受预算/无AI降级保护）；--deep 或 env 显式控制
     react_dive_max_params: int = Field(3, alias="REACT_DIVE_MAX_PARAMS")  # 每轮最多深挖参数数
     react_dive_max_iterations: int = Field(5, alias="REACT_DIVE_MAX_ITERATIONS")  # 每参数 ReAct 轮数
     react_dive_budget: float = Field(150.0, alias="REACT_DIVE_BUDGET")  # 每参数总预算（秒）

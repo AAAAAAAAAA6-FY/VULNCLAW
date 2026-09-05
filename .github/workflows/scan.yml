@@ -1,0 +1,104 @@
+# VULNCLAW 无头扫描 CI workflow（PR / 定时 / 手动触发）
+#
+# 用法：
+#   1) 手动触发：Actions -> vulnclaw-scan -> Run workflow -> 填 target（必填建议）
+#   2) 定时触发：每周一凌晨 2 点（UTC），cron 写在本文件下方，可直接改
+#   3) PR 触发：仅当 src/ 或 thirdparty/ 变更时执行（paths 限定"扫描目标相关代码"的变更）
+#
+# 安全约定：
+#   - 扫描目标与 API Key 一律走 GitHub Secrets（Settings -> Secrets and variables -> Actions）：
+#     SCAN_TARGET（目标 URL）、SCAN_API_KEY（如平台需要外部 AI/情报接口的密钥，可选）
+#   - 日志/命令里不出现凭据明文；所有 ${{ secrets.XXX }} 由 Actions 运行时注入
+#   - 只允许对你有合法授权的目标发起扫描
+name: vulnclaw-scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "要扫描的目标 URL（留空则回退到 secrets.SCAN_TARGET）"
+        required: false
+        default: ""
+  schedule:
+    # 每周一凌晨 2 点（UTC）执行；如需调整频率/时间，直接改这一行 cron（分 时 日 月 周）
+    - cron: "0 2 * * 1"
+  pull_request:
+    # 限定扫描目标变更才触发：只有 src/ 与 thirdparty/ 变化时才跑无头扫描
+    paths:
+      - "src/**"
+      - "thirdparty/**"
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: Headless scan
+    runs-on: ubuntu-latest
+    # 扫描失败不阻塞 CI（continue-on-error），报告/日志仍通过后续 if: always() 步骤上传
+    continue-on-error: true
+    # 默认超时 90 分钟，防止扫描长时间挂起；可按需调整
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: 安装 VULNCLAW
+        run: |
+          python -m pip install --upgrade pip
+          pip install .
+
+      - name: 确定扫描目标（手动输入优先，空则回退 secrets.SCAN_TARGET）
+        id: target
+        env:
+          INPUT_TARGET: ${{ inputs.target }}
+          SECRET_TARGET: ${{ secrets.SCAN_TARGET }}
+        run: |
+          TARGET="${INPUT_TARGET:-${SECRET_TARGET:-}}"
+          if [ -z "$TARGET" ]; then
+            echo "未配置扫描目标：手动触发时填 target，或配置 secrets.SCAN_TARGET。跳过扫描。"
+            echo "target=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+
+      - name: 无头扫描目标（非交互，报告自动落盘 _runtime_cache/reports/）
+        if: steps.target.outputs.target != ''
+        env:
+          TARGET: ${{ steps.target.outputs.target }}
+          # 如平台需要外部 AI/情报接口密钥，通过 secrets 注入，禁止硬编码到文件
+          SCAN_API_KEY: ${{ secrets.SCAN_API_KEY }}
+        run: |
+          # 无头模式说明：vulnclaw scan 本身为非交互执行（无 input 等待）；
+          # 平台没有 --headless/--report-out 参数，报告/日志由扫描器自动写入
+          # _runtime_cache/（PROJECT_CACHE_DIR），report JSON 位于 _runtime_cache/reports/。
+          # --max-tasks/--initial-qps 限制并发与速率（CI 上放缓）；
+          # --download-thirdparty 自动补齐缺失的 nuclei/ffuf 等二进制工具；
+          # 需要更长时间/深度时可追加 --deep（深度侦察）或 --diff（增量扫描，见 pen.yml）。
+          vulnclaw scan -t "$TARGET" --max-tasks 20 --initial-qps 1 --download-thirdparty
+
+      - name: 归档最新报告为交付物（zip，可选步骤）
+        if: always() && steps.target.outputs.target != ''
+        run: |
+          # 取最近生成的报告 JSON 归档（ARCHIVE.md 清单 + zip），失败不阻断
+          if ls _runtime_cache/reports/*.json >/dev/null 2>&1; then
+            REPORT=$(ls -t _runtime_cache/reports/*.json | head -n 1)
+            echo "最新报告: $REPORT"
+            vulnclaw archive --scan-id "ci-$(date +%Y%m%d)" \
+              --report "$REPORT" --out-dir ./deliver --zip ./deliver/scan-ci.zip
+          else
+            echo "未生成报告，跳过归档（扫描可能被跳过或失败）。"
+          fi
+
+      - name: 上传报告/归档产物（扫描失败也上传，便于事后排查）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulnclaw-scan-artifacts
+          path: |
+            _runtime_cache/reports/
+            deliver/
+          if-no-files-found: ignore

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VULNCLAW Authors (see README & LICENSE)
 # This file is part of VULNCLAW / pentest_platform.
@@ -8,10 +7,10 @@
 import os
 import re
 import time
-from typing import Dict, List, Optional
+
+from vulnclaw.ai.v100.batch_processor import BatchProcessor
 from vulnclaw.core.logger import logger
 from vulnclaw.core.session_manager import get_session_manager
-from vulnclaw.ai.v100.batch_processor import BatchProcessor
 from vulnclaw.core.settings import settings
 from vulnclaw.core.utils import cap
 
@@ -131,7 +130,11 @@ async def _generate_tasks(self):
         try:
             from vulnclaw.core_modules.asset_profile import (
                 crawl_asset_unchanged as crawl_asset_unchanged,
+            )
+            from vulnclaw.core_modules.asset_profile import (
                 generic_asset_unchanged as generic_asset_unchanged,
+            )
+            from vulnclaw.core_modules.asset_profile import (
                 load_prev_profile,
                 profile_expired,
                 surface_fp,
@@ -378,9 +381,7 @@ async def _generate_tasks(self):
         _jq = full_api.split('?', 1)[1] if '?' in full_api else ''
         _jparams = [p.split('=')[0] for p in _jq.split('&') if '=' in p] or ["id"]
         _jl = full_api.lower()
-        if '/api' in _jl or '/graphql' in _jl:
-            _jengine = "sqli"
-        elif re.search(r'/sqli|/sql|/inject', _jl):
+        if '/api' in _jl or '/graphql' in _jl or re.search(r'/sqli|/sql|/inject', _jl):
             _jengine = "sqli"
         elif re.search(r'/xss|csp|/reflect', _jl):
             _jengine = "xss"
@@ -523,7 +524,11 @@ async def _generate_tasks(self):
             }, priority=6)
         tasks_added += 1
     logger.info(f"   📋 总任务数: {tasks_added}")
-async def _gen_cve_task(self) -> Optional[Dict]:
+    # S3.1c: 召回 VectorMemory 历史经验，命中高价值组合时给任务追加 memory_hint/memory_boost
+    _mem_injector = getattr(self, "_inject_task_memory_hints", None)
+    if _mem_injector is not None:
+        await _mem_injector()
+async def _gen_cve_task(self) -> dict | None:
     """Z1.2（=D2.4）：读 CVE 索引，按指纹组件生成高危 CVE 专项任务。
 
     数据腿闭环：cve_index（Z1.1）→ phases_taskgen 读索引 → nuclei 专项扫描（cve_scan）。
@@ -573,7 +578,7 @@ async def _gen_cve_task(self) -> Optional[Dict]:
         logger.debug(f"[CVE任务] 情报源同步失败（忽略）: {ie}")
 
     seen_ids: set = set()
-    hits: List = []
+    hits: list = []
     for comp in tech_stack[:8]:
         if not comp or not str(comp).strip():
             continue
@@ -622,4 +627,175 @@ async def _gen_cve_task(self) -> Optional[Dict]:
         "priority": 10,
         "created_at": time.time(),
     }
-__all__ = ['_scan_idor', '_check_default_creds', '_generate_tasks', '_gen_cve_task']
+# ==================================================================
+# S3.1c: 记忆读取注入——召回 VectorMemory 相似历史经验，命中高价值组合
+# （引擎 / URL 模式 / 参数）时给队列内任务追加 memory_hint / memory_boost。
+# 仅在既有任务结构上追加字段，不改任何已有键；任何失败都静默跳过。
+# ==================================================================
+_MEMORY_ENGINE_KEYWORDS = {
+    "sqli": ("sqli", "sql", "注入", "inject", "database"),
+    "xss": ("xss", "跨站", "script", "reflect"),
+    "lfi": ("lfi", "文件包含", "path traversal", "路径遍历"),
+    "rfi": ("rfi", "远程包含", "remote include"),
+    "cmdi": ("cmdi", "命令注入", "command", "rce"),
+    "ssti": ("ssti", "模板注入", "template"),
+    "ssrf": ("ssrf", "服务端请求伪造", "server-side"),
+    "xxe": ("xxe", "xml external", "xml 外部实体"),
+    "idor": ("idor", "越权", "authorization bypass", "权限绕过"),
+    "jwt": ("jwt", "json web token"),
+    "oauth": ("oauth",),
+    "graphql": ("graphql",),
+    "file_upload": ("file_upload", "upload", "上传"),
+    "el_injection": ("el_injection", "ognl", "spel"),
+    "nosql": ("nosql", "mongodb", "mongo"),
+    "csrf": ("csrf",),
+    "open_redirect": ("open_redirect", "redirect", "重定向"),
+    "info_leak": ("info_leak", "信息泄露", "sourcemap", "源码泄露"),
+    "nuclei": ("nuclei",),
+}
+
+
+def _normalize_engine_name(vuln_type: str) -> str:
+    """把历史经验的 vuln_type（可能是中文/别名）归一化为引擎名，未命中返回空串。"""
+    v = str(vuln_type or "").lower()
+    for engine, keywords in _MEMORY_ENGINE_KEYWORDS.items():
+        if any(k in v for k in keywords):
+            return engine
+    return ""
+
+
+def _extract_url_patterns(text: str) -> list[str]:
+    """从 payload/evidence 中提取 URL 路径模式（如 /admin），去重限长。"""
+    out = []
+    for m in re.findall(r'(/[a-zA-Z0-9_][a-zA-Z0-9_\-./]{2,})', str(text or "")):
+        p = m.rstrip('/')
+        if p and len(p) >= 3 and p not in out:
+            out.append(p)
+    return out[:8]
+
+
+def _extract_param_name(payload: str, evidence: str) -> str:
+    """从 payload/evidence 中提取参数名（query 形如 ?id= 或 param=xxx）。"""
+    text = f"{payload or ''!s} {evidence or ''!s}"
+    m = re.search(r'[?&]([a-zA-Z_][a-zA-Z0-9_]{1,32})=', text)
+    if m:
+        return m.group(1)
+    m = re.search(r'\b(?:param|parameter)s?\s*[=:]\s*([a-zA-Z_][a-zA-Z0-9_]{1,32})', text, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def _match_task_memory(task_data: dict, engine_hits: dict, url_hits: dict, param_hits: dict):
+    """命中判定：返回 (boost, hint_text, hint_confidence)，boost<=0 表示未命中。
+
+    优先级：URL 模式（最具体，且模式关联引擎在任务引擎池内）> 引擎 > 参数。
+    """
+    boost = 0.0
+    hint_conf = 0.0
+    hint_text = ""
+    td_type = str(task_data.get("type", "") or "")
+    engines: list[str] = []
+    if td_type == "engine_bundle":
+        engines = [str(e) for e in (task_data.get("engines") or [])]
+    elif td_type in ("engine_check", "api_check", "global_scan") and task_data.get("engine"):
+        engines = [str(task_data["engine"])]
+    target_url = str(task_data.get("target", "") or "")
+    param = str(task_data.get("param", "") or "")
+    for pattern, (conf, pattern_engine) in url_hits.items():
+        if pattern not in target_url:
+            continue
+        if pattern_engine and engines and pattern_engine not in engines:
+            continue
+        if conf > boost:
+            boost = conf
+            hint_conf = conf
+            hint_text = f"历史对 {pattern} 的 {pattern_engine or '漏洞'} 命中率高"
+    if boost <= 0:
+        for engine in engines:
+            conf = engine_hits.get(engine, 0.0)
+            if conf > boost:
+                boost = conf
+                hint_conf = conf
+                hint_text = f"历史对 {engine} 引擎命中率高"
+    if boost <= 0 and param and param in param_hits:
+        boost = param_hits[param]
+        hint_conf = param_hits[param]
+        hint_text = f"历史对参数 {param} 命中率高"
+    return boost, hint_text, hint_conf
+
+
+async def _inject_task_memory_hints(self):
+    """S3.1c: taskgen 收尾——召回 VectorMemory 相似历史经验并注入任务字段。
+
+    命中高价值组合（引擎/URL 模式/参数）时给队列内任务追加 memory_hint
+    （如 {"hint": "历史对 /admin 的 sqli 命中率高", "confidence": 0.8}）与
+    memory_boost（0-1）。查询失败 / 空库 / 开关关闭一律静默跳过，绝不抛错、
+    绝不改变既有任务结构。
+    """
+    if not getattr(settings, "scan_memory_enabled", True):
+        return
+    try:
+        memory = getattr(self, "memory", None)
+        if memory is None:
+            return
+        target = str(getattr(self, "target", "") or "")
+        if not target:
+            return
+        brief = getattr(self, "_recon_brief", None)
+        tech_stack = brief.get("tech_stack", []) if isinstance(brief, dict) else []
+        query = f"{target} {' '.join(str(t) for t in tech_stack[:5])}".strip()
+        topk = int(getattr(settings, "memory_recall_topk", 8))
+        recalled = await memory.recall(query, n_results=topk)
+        if not recalled:
+            return
+        import json as _json
+
+        engine_hits: dict = {}
+        url_hits: dict = {}
+        param_hits: dict = {}
+        for rank, raw in enumerate(recalled):
+            try:
+                entry = _json.loads(raw) if isinstance(raw, str) else (raw or {})
+            except Exception:  # noqa: BLE001,S112
+                continue
+            if not isinstance(entry, dict):
+                continue
+            conf = max(0.5, round(1.0 - 0.1 * rank, 2))
+            vt = str(entry.get("vuln_type", "") or "")
+            engine = _normalize_engine_name(vt)
+            if engine:
+                engine_hits[engine] = max(engine_hits.get(engine, 0.0), conf)
+            payload = str(entry.get("payload", "") or "")
+            evidence = str(entry.get("evidence", "") or "")
+            for pattern in _extract_url_patterns(payload + " " + evidence):
+                if pattern not in url_hits or conf > url_hits[pattern][0]:
+                    url_hits[pattern] = (conf, engine)
+            pname = _extract_param_name(payload, evidence)
+            if pname:
+                param_hits[pname] = max(param_hits.get(pname, 0.0), conf)
+        if not (engine_hits or url_hits or param_hits):
+            return
+        queue = getattr(self, "task_queue", None)
+        if queue is None:
+            return
+        pending = getattr(queue, "_pending_tasks", None) or {}
+        injected = 0
+        for task in pending.values():
+            td = getattr(task, "task_data", None)
+            if not isinstance(td, dict):
+                continue
+            boost, hint_text, hint_conf = _match_task_memory(td, engine_hits, url_hits, param_hits)
+            if boost <= 0:
+                continue
+            td["memory_hint"] = {"hint": hint_text, "confidence": round(hint_conf, 2)}
+            td["memory_boost"] = round(min(1.0, max(0.0, boost)), 2)
+            injected += 1
+        if injected:
+            logger.info(f"   [TaskMem] 历史经验注入 {injected} 个任务（memory_hint/memory_boost）")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[TaskMem] 记忆召回/注入失败（不影响任务生成）: {exc}")
+
+
+__all__ = ['_check_default_creds', '_gen_cve_task', '_generate_tasks', '_inject_task_memory_hints', '_scan_idor']
+

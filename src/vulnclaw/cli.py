@@ -17,6 +17,7 @@ import sys
 import vulnclaw.bootstrap  # noqa: F401  环境固化
 from vulnclaw.paths import PROJECT_ROOT  # noqa: F401  确保路径锚定加载
 
+
 def _run_scan_main(argv: list[str]) -> None:
     """以旧参数风格执行 scan_main（保留原 argparse 全量行为）。"""
     sys.argv = [str(PROJECT_ROOT / "scan.py")] + argv
@@ -555,6 +556,20 @@ def main(argv: list[str] | None = None) -> None:
     flywheel_parser.add_argument("--out", default="bandit_policy.json", help="策略输出路径（默认 bandit_policy.json）")
     flywheel_parser.add_argument("--min-samples", type=int, default=10, help="重训最少新增样本数（默认 10）")
 
+    autofix_parser = subparsers.add_parser(
+        "autofix",
+        help="SP22 自动修复：把确认漏洞转化为可应用代码补丁（默认 dry-run 不落盘）",
+        description="基于报告 vulnerabilities 生成补丁计划（SQL 参数化 / XSS 转义 / 密钥环境化等），"
+                    "默认只产出 patch 文件，--apply 才落盘，绝不自动 git 提交。",
+        epilog="示例:\n  vulnclaw autofix --report report.json --out-dir ./patches\n"
+               "  vulnclaw autofix --report report.json --out-dir ./patches --repo ./app --apply",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    autofix_parser.add_argument("--report", required=True, help="报告 JSON 路径")
+    autofix_parser.add_argument("--out-dir", default=".", help="补丁输出目录（默认当前目录）")
+    autofix_parser.add_argument("--repo", default="", help="源码仓库根目录（用于 --apply 落盘定位）")
+    autofix_parser.add_argument("--apply", action="store_true", help="实际应用到源码（默认 dry-run 只统计）")
+
     args = parser.parse_args(argv)
 
     if args.command == "scan":
@@ -645,6 +660,7 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(bandit_train.main(["--feed", args.feed, "--out", args.out]) or 0)
     elif args.command == "archive":
         import json
+
         from vulnclaw.core.archive import build_scan_archive, zip_archive
         with open(args.report, "r", encoding="utf-8") as _rf:
             data = json.load(_rf)
@@ -656,7 +672,13 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(0)
     elif args.command == "flywheel":
         import json
+
         from vulnclaw.ai.v100.bandit_flywheel import run_flywheel
         res = run_flywheel(args.feed, args.out, min_new_samples=args.min_samples)
         print(json.dumps(res, ensure_ascii=False, indent=2))
         sys.exit(0 if res.get("ran") else 1)
+    elif args.command == "autofix":
+        from vulnclaw.core.autofix import main as autofix_main
+        _extra = ["--apply"] if getattr(args, "apply", False) else []
+        sys.exit(autofix_main(["--report", args.report, "--out-dir", args.out_dir,
+                               "--repo", args.repo] + _extra) or 0)

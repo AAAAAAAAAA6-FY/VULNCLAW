@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """SP21 验证批次 A 线：PDF / CSV 报告的"真实后端"验证。
 
@@ -8,7 +7,6 @@
 """
 import csv
 import importlib
-import io
 
 import pytest
 
@@ -81,7 +79,7 @@ class TestExportCsvReal:
         with open(str(out), "rb") as fh:
             bom = fh.read(3)
         assert bom == b"\xef\xbb\xbf"
-        with io.open(str(out), encoding="utf-8-sig", newline="") as fh:
+        with open(str(out), encoding="utf-8-sig", newline="") as fh:
             rows = list(csv.reader(fh))
         assert rows[0] == ["type", "severity", "url", "parameter", "method",
                            "source", "remediation_tier", "remediation"]

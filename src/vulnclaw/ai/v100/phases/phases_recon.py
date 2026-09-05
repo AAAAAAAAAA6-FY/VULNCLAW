@@ -1,20 +1,23 @@
-# -*- coding: utf-8 -*-
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VULNCLAW Authors (see README & LICENSE)
 # This file is part of VULNCLAW / pentest_platform.
 # Licensed under GNU Affero General Public License v3.0 or later.
 
-import asyncio, json, os, re, time
+import asyncio
+import json
+import os
+import re
+import time
 from urllib.parse import urlparse
+
 from vulnclaw.core.logger import logger
-from vulnclaw.core.utils import async_get, limit_response_size, cap
 from vulnclaw.core.session_manager import get_session_manager
 from vulnclaw.core.settings import settings
+from vulnclaw.core.utils import async_get, cap, limit_response_size
 from vulnclaw.modules.vuln_scanner import run_arjun
-from typing import Dict, List, Optional
 
 
-def backfill_param_mining(brief: Dict, pool_path: Optional[str] = None) -> None:
+def backfill_param_mining(brief: dict, pool_path: str | None = None) -> None:
     """SP15.2 合流桥接（A 侧）：B 侧 D3.5 挖掘结果从池文件回灌 brief["param_mining"]。
 
     仅当 enable_param_mining 开启且池文件有候选时回灌；由 recon.brief_param_mining()
@@ -50,8 +53,8 @@ def backfill_param_mining(brief: Dict, pool_path: Optional[str] = None) -> None:
 def _host_is_ip(target: str) -> bool:
     """判断目标 host 是否为 IP 地址（IP 靶机无需做子域枚举等外部侦察）。"""
     try:
-        from urllib.parse import urlparse
         import ipaddress
+        from urllib.parse import urlparse
         netloc = urlparse(target).netloc
         if netloc.startswith('['):  # IPv6 字面量 [addr]:port
             end = netloc.find(']')
@@ -85,7 +88,7 @@ async def _recon(self):
             for part in self.target.split('?')[1].split('&'):
                 if '=' in part:
                     brief["url_params"].append(part.split('=')[0])
-        inputs = re.findall(r'<input[^>]+name=["\']([^"\']+)["\']', text, re.I)
+        inputs = re.findall(r'<input[^>]+name=["\']([^"\']+)["\']', text, re.IGNORECASE)
         brief["forms"] = cap(list(set(inputs)), settings.max_forms)
         api_patterns = [
             r'["\'](/api/[^"\']+)["\']',
@@ -187,17 +190,21 @@ async def _recon(self):
     for m, count in model_stats.get('per_model', {}).items():
         logger.info(f"      {m}: {count}")
     logger.info("=" * 60)
-async def _deep_recon(self, brief: Dict):
+    # S3.1b: recon 收尾——把侦察发现写入 VectorMemory（跨会话学习，供 taskgen 阶段召回）
+    _mem_writer = getattr(self, "_persist_recon_memory", None)
+    if _mem_writer is not None:
+        await _mem_writer()
+async def _deep_recon(self, brief: dict):
     logger.info("   🚀 [深度侦察] 启动...")
     domain = brief["domain"]
     try:
         await asyncio.wait_for(self._deep_recon_internal(brief, domain), timeout=600)
         logger.info("   ✅ [深度侦察] 完成")
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.warning("   ⚠️ [深度侦察] 超时 (600s)，跳过剩余阶段，继续扫描")
     except Exception as e:
         logger.warning(f"   ⚠️ [深度侦察] 异常: {e}")
-async def _deep_recon_internal(self, brief: Dict, domain: str):
+async def _deep_recon_internal(self, brief: dict, domain: str):
     subs = []
     alive = []
     async def recon_subdomains():
@@ -211,7 +218,7 @@ async def _deep_recon_internal(self, brief: Dict, domain: str):
                 get_subdomains_async(domain, compliant=False),
                 timeout=120
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning("      Subdomain collection timeout (120s), skipping")
         except Exception as e:
             logger.warning(f"      ⚠️ 子域名收集失败: {e}")
@@ -228,7 +235,7 @@ async def _deep_recon_internal(self, brief: Dict, domain: str):
                 loop.run_in_executor(None, lambda: alive_scan(subs, False)),
                 timeout=180
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning("      Alive scan timeout (180s), skipping")
         except Exception as e:
             logger.warning(f"      ⚠️ 存活探测失败: {e}")
@@ -278,7 +285,7 @@ async def _deep_recon_internal(self, brief: Dict, domain: str):
                         self._nuclei_findings += 1
             else:
                 logger.info("      Nuclei found no high-severity issues")
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning("      Nuclei scan timeout (150s), skipping")
         except Exception as e:
             logger.warning(f"      ⚠️ Nuclei 扫描失败: {e}")
@@ -301,7 +308,7 @@ async def _deep_recon_internal(self, brief: Dict, domain: str):
                         content = limit_response_size(content, 50000) if len(content) > 50000 else content
                         return await asyncio.wait_for(
                             analyze_js_deep(content, base_url=self.target, source_url=full_url), timeout=25)
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         logger.debug(f"         ⚠️ JS 分析超时（单JS）: {js_url[:100]}")
                         return {}
                     except Exception as e:
@@ -337,7 +344,7 @@ async def _deep_recon_internal(self, brief: Dict, domain: str):
                 loop.run_in_executor(None, lambda: port_scan(domain, False)), timeout=90)
             brief["open_ports"] = [p for p in ports if p in [80, 443, 8080, 8443, 3000, 5000, 7000, 8000, 9000]]
             logger.info(f"         Open ports found: {len(brief['open_ports'])}")
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning("      Port scan timeout (90s), skipping")
         except Exception as e:
             logger.warning(f"      ⚠️ 端口扫描失败: {e}")
@@ -359,7 +366,7 @@ async def _deep_recon_internal(self, brief: Dict, domain: str):
                         "source": "ffuf", "confidence": "high",
                     })
             logger.info(f"         Directories found: {len(dirs)}")
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning("      Directory brute-force timeout (120s), skipping")
         except Exception as e:
             logger.warning(f"      ⚠️ 目录爆破失败: {e}")
@@ -438,7 +445,7 @@ async def _deep_recon_internal(self, brief: Dict, domain: str):
         if isinstance(result, Exception):
             logger.warning(f"      ⚠️ 步骤 {index} 异常（不影响主流程）: {result}")
     logger.info(f"      ✅ [并发组2] 完成，耗时 {time.time() - group2_start:.2f}s")
-async def _iterative_api_explorer(self, seed_urls: List[str], max_rounds: int = 8) -> List[str]:
+async def _iterative_api_explorer(self, seed_urls: list[str], max_rounds: int = 8) -> list[str]:
     discovered = set()
     queue = list(seed_urls)
     round_num = 0; visited = set()
@@ -461,7 +468,7 @@ async def _iterative_api_explorer(self, seed_urls: List[str], max_rounds: int = 
                     continue
                 discovered.add(url)
                 if '<html' in text.lower() or '<a ' in text.lower():
-                    hrefs = re.findall(r'href=["\']([^"\']+)["\']', text, re.I)
+                    hrefs = re.findall(r'href=["\']([^"\']+)["\']', text, re.IGNORECASE)
                     for h in hrefs:
                         if h.startswith('/') and not h.endswith(('.css', '.js', '.png', '.jpg', '.svg', '.ico', '.woff', '.woff2', '.ttf')):
                             full = urlparse(self.target)._replace(path=h).geturl()
@@ -497,7 +504,7 @@ async def _iterative_api_explorer(self, seed_urls: List[str], max_rounds: int = 
         logger.info(f"      ✅第{round_num} 轮完成！发现 {len(queue)} 个新URL")
     logger.info(f"   ✅ [多轮迭代] 完成，共发现 {len(discovered)} 个唯一URL")
     return list(discovered)
-def _extract_strings_from_json(self, obj, depth=0) -> List[str]:
+def _extract_strings_from_json(self, obj, depth=0) -> list[str]:
     if depth > 5:
         return []
     results = []
@@ -513,12 +520,12 @@ def _extract_strings_from_json(self, obj, depth=0) -> List[str]:
 def _is_likely_id(self, value: str) -> bool:
     if re.match(r'^\d+$', value) and len(value) > 1:
         return True
-    if re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', value, re.I):
+    if re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', value, re.IGNORECASE):
         return True
-    if re.match(r'^[0-9a-f]{32,64}$', value, re.I):
+    if re.match(r'^[0-9a-f]{32,64}$', value, re.IGNORECASE):
         return True
     return False
-async def _fetch_from_burp(self, brief: Dict):
+async def _fetch_from_burp(self, brief: dict):
     logger.info("   🔌 [Burp] 获取历史数据...")
     try:
         history = await self.burp_client.get_history_since(0, limit=100)
@@ -563,7 +570,7 @@ async def _fetch_from_burp(self, brief: Dict):
     # 当作目标漏洞加入 findings，属于严重误报，已移除。
     # 真实的 Burp 扫描结果应通过 send_to_scanner 提交后用
     # get_scan_issues(scan_id) 拉取（见 orchestrator 集成，步骤3）。
-async def _get_collaborator_domain(self) -> Optional[str]:
+async def _get_collaborator_domain(self) -> str | None:
     if not self.burp_available:
         return None
     try:
@@ -593,7 +600,7 @@ async def _check_collaborator_callback(self):
                 })
     except Exception as e:
         logger.debug(f"Collaborator 回调检查失败: {e}")
-def _detect_tech(self, headers: Dict, text: str) -> List[str]:
+def _detect_tech(self, headers: dict, text: str) -> list[str]:
     techs = []
     server = headers.get("Server", "")
     if server:
@@ -613,4 +620,47 @@ def _detect_tech(self, headers: Dict, text: str) -> List[str]:
         if kw in text_lower:
             techs.append(name)
     return list(set(techs))[:10]
-__all__ = ['_recon', '_deep_recon', '_deep_recon_internal', '_iterative_api_explorer', '_extract_strings_from_json', '_is_likely_id', '_fetch_from_burp', '_get_collaborator_domain', '_check_collaborator_callback', '_detect_tech']
+async def _persist_recon_memory(self):
+    """S3.1b: recon 收尾——把本次侦察发现（host/URL/技术栈/端口）写入 VectorMemory。
+
+    与扫描收尾 _persist_scan_memory 互补，让 taskgen 阶段能召回同指纹历史经验。
+    开关 scan_memory_enabled=False / 无 memory / 空 brief 一律静默跳过，绝不抛错。
+    """
+    if not getattr(settings, "scan_memory_enabled", True):
+        return
+    try:
+        memory = getattr(self, "memory", None)
+        if memory is None:
+            return
+        brief = getattr(self, "_recon_brief", None)
+        if not isinstance(brief, dict):
+            return
+        target = str(getattr(self, "target", "") or "")
+        if not target:
+            return
+        tech_stack = brief.get("tech_stack") or []
+        open_ports = brief.get("open_ports") or []
+        apis = brief.get("apis") or []
+        host = urlparse(target).netloc or target
+        parts = []
+        if tech_stack:
+            parts.append("tech=" + ",".join(str(t) for t in tech_stack[:5]))
+        if open_ports:
+            parts.append("ports=" + ",".join(str(p) for p in open_ports[:10]))
+        if apis:
+            parts.append("apis=" + ",".join(str(a) for a in apis[:5]))
+        evidence = " | ".join(parts)
+        await memory.add_experience(
+            target=target,
+            vuln_type="recon_profile",
+            payload=host,
+            success=True,
+            evidence=evidence[:500],
+        )
+        logger.info("   [ScanMemory] recon 写入 1 条侦察经验（tech/ports/apis）到 VectorMemory")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[ScanMemory] recon 写入失败（不影响侦察）: {exc}")
+
+
+__all__ = ['_check_collaborator_callback', '_deep_recon', '_deep_recon_internal', '_detect_tech', '_extract_strings_from_json', '_fetch_from_burp', '_get_collaborator_domain', '_is_likely_id', '_iterative_api_explorer', '_persist_recon_memory', '_recon']
+

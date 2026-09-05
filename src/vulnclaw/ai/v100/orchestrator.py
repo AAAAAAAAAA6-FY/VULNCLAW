@@ -1346,18 +1346,20 @@ class V100Orchestrator:
         return await self._run_react_deep_dive()
 
     def _deep_dive_danger_allowed(self) -> bool:
-        """S1.2: deep 深挖属探测级——执行前咨询 danger_guard。
+        """S1.2: 本地 ReAct 深挖属探测级（读响应/验证参数），默认放行。
 
         返回 True=放行 LLM 深挖；False=降级为本地确定性兜底。
-        danger 放行配置缺失（默认 deny）或 danger_guard 异常时一律返回 False，
-        绝不中断扫描。复用 DANGEROUS_OPS 中已有的单点深度渗透 op 作审批键。
+        SP22 变更：不再套用"远程 Agent 实际攻击"审批键 remote_deep_penetrate
+        （该键保留给 MCP 远程深渗透，保持默认 deny），改用非危险键 react_dive_probe
+        ——danger_guard 对非危险操作恒放行并保留审计；guard 异常时仍按 deny
+        降级本地兜底，绝不中断扫描。企业如需彻底关闭深挖：ENABLE_REACT_DIVE=false。
         """
         try:
             from vulnclaw.core.danger_guard import guard
             return bool(
                 guard.require_approval(
-                    'remote_deep_penetrate',
-                    detail=f"V100 主链路 ReAct 深挖 target={getattr(self, 'target', '')}",
+                    'react_dive_probe',
+                    detail=f"V100 本地 ReAct 探测级深挖 target={getattr(self, 'target', '')}",
                 )
             )
         except Exception:  # noqa: BLE001

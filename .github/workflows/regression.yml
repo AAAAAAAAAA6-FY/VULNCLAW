@@ -1,0 +1,40 @@
+# VULNCLAW 回归质量门禁：全量测试 + 全量 lint
+#
+# 触发：push 到 master/main 或任意 PR 时执行；
+# 作用：pytest 全量跑 + ruff 全量检查（src + tests），任一失败即红，作为合入门禁。
+# 本地等价命令：
+#   pip install -e ".[dev]"
+#   ruff check src tests
+#   pytest tests -q
+name: vulnclaw-regression
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    name: pytest + ruff
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖（含开发依赖 ruff/pytest）
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: ruff 静态检查（src + tests）
+        run: ruff check src tests
+
+      - name: 全量 pytest
+        run: pytest tests -q
