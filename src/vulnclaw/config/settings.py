@@ -300,6 +300,15 @@ class Settings(BaseSettings):
     live_intake_enabled: bool = Field(False, alias="LIVE_INTAKE_ENABLED")
     live_intake_min_score: int = Field(8, alias="LIVE_INTAKE_MIN_SCORE")   # >=8 仅带参注入面放行
     live_intake_priority: int = Field(8, alias="LIVE_INTAKE_PRIORITY")          # D3.5 挖掘器本体开关（探测侧，默认关控成本；scan_param_mining 为消费侧）             # D3.5 参数挖掘结果入任务生成（消费侧总开关）
+    # ---- SP16.1 RL 决策层：上下文多臂老虎机（A 线；默认关零行为回归）----
+    rl_bandit_enabled: bool = Field(False, alias="RL_BANDIT_ENABLED")
+    rl_bandit_influence: int = Field(2, alias="RL_BANDIT_INFLUENCE")            # 浮/降权幅度上限（试验超参）
+    rl_bandit_feed_dir: str = Field("", alias="RL_BANDIT_FEED_DIR")             # 空=不落盘；JSONL 反馈飞轮目录
+    # ---- SP16.2 TLS 指纹伪装（A 线；curl_cffi 可选后端，默认关零行为回归）----
+    http_impersonate: bool = Field(False, alias="HTTP_IMPERSONATE")
+    http_impersonate_browser: str = Field("chrome", alias="HTTP_IMPERSONATE_BROWSER")
+    # ---- SP16.3 调用链上下文（A 线；enrich_findings 入口可达性证据增强）----
+    scan_callgraph: bool = Field(False, alias="SCAN_CALLGRAPH")
     max_param_mining: int = Field(0, alias="MAX_PARAM_MINING")                   # 参数挖掘条目喂给引擎的上限（0=不限制）
     max_crawl_seed_urls: int = Field(0, alias="MAX_CRAWL_SEED_URLS")       # 迭代爬虫种子 URL
     max_crawl_batch: int = Field(0, alias="MAX_CRAWL_BATCH")               # 每轮爬虫批处理 URL

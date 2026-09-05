@@ -39,6 +39,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from vulnclaw.core.logger import logger
+from vulnclaw.core.settings import settings
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -529,6 +530,16 @@ def run_static_audit(repo_path: str, config: Optional[StaticAuditConfig] = None,
                                   "dry_run" if dry_run else "runtime_unavailable")
     for rel in truncated:
         ledger.record_skipped(rel, "deepsec.cli", "budget_truncated")
+    # SP16.3 调用链上下文增强（全量审计完成后统一 enrich，符号索引只建一次）
+    if settings.scan_callgraph and findings:
+        try:
+            from vulnclaw.code.graph import enrich_findings
+            for _f in findings:
+                _f["abs_path"] = os.path.join(repo_path, _f.get("file", "").replace("/", os.sep))
+            findings = enrich_findings(findings, [repo_path])
+        except Exception:  # noqa: BLE001 - 增强失败不阻断审计主流程
+            logger.debug("[SP16.3] enrich_findings 失败，跳过调用链增强")
+
 
     # 缓存写回（含 hash 与命中计数）
     cache_updated = False

@@ -751,3 +751,41 @@
   不收录、同端点去重。单测补反例（base_len 阈值 / signal 判定）。
 - [ ] B-SP15.4-B recon_brief 回灌补齐—— 真扫路径下挖掘池结果在 recon_brief[`param_mining`]
   的出现时机与格式与 A 侧消费字段完全一致（{param,url,base_len,signal}），报告侧无痛读到。
+### §11.2 完成记录（2026-09-06，A 线勾状态收口；B 线 3 项待其自证后合流）
+- [x] A-SP15.2 参数挖掘端到端融验（离线段）—— 离线链路闭环，消费侧 (url,param) 组合去重；
+  tests/test_sp15_param_mining_e2e.py 5 例全绿。真扫段依赖 B-SP15.4-B 回灌待合流联调。
+- [x] A-SP15.3 D4.2 采集→任务实时生成—— modules/live_intake.py + orchestrator _feed_live_intake
+  接线（crawler 端点实时入队），settings 补 live_intake_enabled/min_score/priority 三配置
+  （默认关，零行为回归）；tests/test_live_intake.py 11 例全绿。
+- [x] A-SP15.5 D4.5 采集质量评分—— acq_score 落 request_feed.py，低于阈值不进实时任务生成。
+- [x] A 线全量回归确认：SP15 专项 71 例全绿（test_sp15_param_mining_e2e.py / test_live_intake.py /
+  test_param_pool_backfill.py / test_param_mining_taskgen.py / test_request_feed.py /
+  test_oob_evidence.py / test_z24_oob_evidence.py）；全量回归仅 2 例 test_usage_ledger 环境抖动
+  （离线无模型调用，单跑 6 例全过），与历史基线一致。
+
+## 12. SP16 三大能力补齐（2026-09-06，A 线单方；与 B 线 SP15 合流并行，文件零交集）
+
+> 背景：对照前沿审计 3 处"相对薄弱"环节（RL 决策层 / 调用链语义 / TLS 指纹隐身）。
+> 纪律不变：纯增量、默认关零行为回归、低误报；新依赖一律 optional + 优雅降级。
+> 文件边界：全部 A 侧独占（smart_queue.py / http_client.py / core/anti_detection.py /
+> code/graph.py 新建 / settings.py / tests/test_sp16_*），不触碰 B 侧既有文件。
+
+### A 线（我方，3 项按序实施）
+- [x] **A-SP16.1 RL 决策层：上下文多臂老虎机**（ai\v100\smart_queue.py）——
+  静态 priority 之上叠 (target,param,engine) 命中表 + Thompson 采样浮/降权；
+  引擎出口结果回注（hit/fail）→ 可选 JSONL 反馈飞轮（未来 RL 训练数据）；
+  settings 加 rl_bandit_enabled（默认关）。新增 tests\test_sp16_bandit.py。
+- [x] **A-SP16.2 TLS 指纹隐身**（core\http_client.py 扩展 + core\anti_detection.py）——
+  curl_cffi 可选后端 impersonate="chrome"（JA3+HTTP2 指纹+头序），缺依赖自动降级
+  aiohttp/http2；settings 加 http_impersonate（默认关）；反检测策略链可挂伪装通道。
+  新增 tests\test_sp16_impersonate.py。
+- [x] **A-SP16.3 调用链上下文**（新 code\graph.py + code\engines findings 增强）——
+  tree-sitter 可选 AST 调用链图，计算 semgrep/codeql finding 的 sink 可达性
+  （request 入口 -> 危险函数）；缺依赖降级纯 stdlib 符号索引；finding 增
+  reachability 证据字段（不新增误报）。新增 tests\test_sp16_callgraph.py。
+
+### §12 完成记录（2026-09-06，A 线三项全部完成并勾状态收口；B 线 SP15 合流并行不受影响）
+- A-SP16.1 RL 决策层：新增 ai\v100\bandit.py（ContextualBandit：Thompson 采样浮/降权，clamp 1..10，可选 JSONL 反馈飞轮）；smart_queue 注入 bandit，入队动态调权，complete_task(success=False) 回注 fail 样本（成功不降权，保守策略）；orchestrator 发现漏洞回注 hit 样本；settings 加 rl_bandit_enabled/influence/feed_dir（默认关）。新增 tests\test_sp16_bandit.py（11 用例）。
+- A-SP16.2 TLS 指纹隐身：新增 core\impersonate.py（curl_cffi 可选后端，impersonate浏览器指纹+ 超时 retry + 会话复用）；scanner.safe_request 通道排序 impersonate > http2 > aiohttp，缺依赖/失败自动降级；settings 加 http_impersonate/http_impersonate_browser（默认关）。新增 tests\test_sp16_impersonate.py。
+- A-SP16.3 调用链上下文：新增 code\graph.py（tree-sitter 可选 AST 定义表，缺失自动降级纯 stdlib正则符号索引；同文件调用图 + BFS 入口可达性判定 reachable/unreachable/unknown；unknown 不写字段不参与判定，零新增误报）；static_audit 审计全量完成后统一 enrich，finding 增 abs_path + reachability 证据字段（settings.scan_callgraph 默认关）。新增 tests\test_sp16_graph.py（11 用例）。
+- 回归：SP16 专项 3 文件 33 用例全过；全量回归仅 2 项已知环境抖动 （test_usage_ledger 模型调用失败，非本次改动引入）；清除了根目录残留 _tmp_poll/_tmp_verify（守卫 test_layout_guard 复过）。

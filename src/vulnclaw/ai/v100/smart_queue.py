@@ -15,6 +15,7 @@ import heapq
 import time
 from dataclasses import dataclass, field
 
+from vulnclaw.ai.v100.bandit import ContextualBandit, key_from_task  # SP16.1
 from vulnclaw.core.logger import logger
 from typing import Dict, List, Optional, Tuple
 
@@ -63,7 +64,9 @@ class SmartTaskQueue:
     - 支持限流感知
     """
 
-    def __init__(self, max_size: int = 10000):
+    def __init__(self, max_size: int = 10000, bandit: ContextualBandit | None = None):
+        # SP16.1 RL 决策层：可选注入上下文老虎机（默认 None，零行为回归）
+        self._bandit = bandit
         self._queue: List[PrioritizedTask] = []
         self._max_size = max_size
         self._lock = asyncio.Lock()
@@ -111,7 +114,12 @@ class SmartTaskQueue:
                 self._pending_tasks.pop(lowest.task_id, None)
                 self._stats["total_added"] -= 1
 
-            task = PrioritizedTask(priority, time.time(), task_id, task_data, 0, 3)
+            _final_priority = priority
+            if self._bandit is not None:
+                _bk = key_from_task(task_data)
+                if _bk and self._bandit.has_sample(_bk):
+                    _final_priority = self._bandit.adjust(priority, _bk)
+            task = PrioritizedTask(_final_priority, time.time(), task_id, task_data, 0, 3)
             heapq.heappush(self._queue, task)
             self._pending_tasks[task_id] = task
             self._stats["total_added"] += 1
@@ -208,12 +216,19 @@ class SmartTaskQueue:
     async def complete_task(self, task_id: str, success: bool = True):
         """标记任务完成"""
         async with self._lock:
+            task = self._pending_tasks.get(task_id)
             self._completed_tasks.add(task_id)
             self._pending_tasks.pop(task_id, None)
             if success:
                 self._stats["total_success"] += 1
             else:
                 self._stats["total_failed"] += 1
+            # SP16.1 回注：执行失败 → bandit 负样本
+            # 保守策略：成功但无产出不降权（避免误伤慢热组合），仅失败落地
+            if self._bandit is not None and not success and task is not None:
+                _bk = key_from_task(task.task_data)
+                if _bk:
+                    self._bandit.record(_bk, hit=False)
 
     async def fail_all_pending(self, reason: str = "deadline") -> int:
         """attack 预算截止：把所有未完成任务直接判失败并清空队列。

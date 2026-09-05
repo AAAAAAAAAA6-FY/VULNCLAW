@@ -367,6 +367,24 @@ def _http2_request_api():
         return None, None
 
 
+def _impersonate_available() -> bool:
+    """TLS 伪装是否可用（curl_cffi 可用 + settings.http_impersonate=True）。"""
+    try:
+        from vulnclaw.core.impersonate import impersonate_enabled
+        return impersonate_enabled()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _impersonate_request_api():
+    """惰性导入伪装请求函数；不可用时返回 (None, None)。"""
+    try:
+        from vulnclaw.core.impersonate import impersonate_get, impersonate_post
+        return impersonate_get, impersonate_post
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
 def _get_anti_adapter():
     """惰性获取 WAF 反检测策略适配器；不可用时返回 None。"""
     try:
@@ -418,13 +436,19 @@ async def safe_request(
             except Exception:
                 logger.debug("suppressed exception (core audit)")
             if method.upper() == "GET":
-                if _http2_available():
+                if _impersonate_available():
+                    _imp_get, _ = _impersonate_request_api()
+                    resp = await _imp_get(url, session=session, timeout=timeout, **kwargs, allow_redirects=False)
+                elif _http2_available():
                     _http2_get, _ = _http2_request_api()
                     resp = await _http2_get(url, session=session, timeout=timeout, **kwargs, allow_redirects=False)
                 else:
                     resp = await async_get(url, session=session, timeout=timeout, no_retry=True, **kwargs, allow_redirects=False)
             elif method.upper() == "POST":
-                if _http2_available():
+                if _impersonate_available():
+                    _, _imp_post = _impersonate_request_api()
+                    resp = await _imp_post(url, session=session, timeout=timeout, **kwargs)
+                elif _http2_available():
                     _, _http2_post = _http2_request_api()
                     resp = await _http2_post(url, session=session, timeout=timeout, **kwargs)
                 else:
