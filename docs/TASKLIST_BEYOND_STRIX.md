@@ -942,3 +942,11 @@
 
 ### 19.4 收口
 - 真扫联调按用户指示跳过（SP15-SP20 全部离线专项 + 全量回归已覆盖链路）；TASKLIST §19 增量记录。
+
+### §19.5 SP21.2 动态补测任务宽限窗口（2026-09-06，A 线；B 侧 §11.3 观察项收口）
+- 背景：B 侧真扫联调记录唯一未闭环环——param_mining 回灌补测任务 task_22 撞 attack 阶段固定墙钟预算（attack_node_budget=130s）被 fail_all_pending 误杀判败出队（调度预算观察项，修正归 A 线）。
+- 根因：`_deadline_enforcer` 固定 sleep(attack_budget) 后无条件清空队列；动态补测任务（param_mining / live:*）在阶段中后期才入队，天然排在静态计划任务后，最易被墙钟砍掉。
+- 修复（零回归，无受保护任务时行为与旧版完全一致）：
+  - smart_queue.py：新增 `is_protected_task()`（source 前缀 param_mining / live:）；`fail_all_pending(reason, protect=True)` 保留受保护任务（pending+queue 均保留）；`protected_pending_count()`；
+  - phases_executor.py：`_deadline_enforcer` 先 protect=True 清普通任务，存在受保护任务时给宽限窗口（attack_dynamic_grace_s 默认 45s，getattr 带默认不落 settings）再全清；`_run_one_task` 预算耗尽时受保护任务不直接判败，给 min(60, grace) 上限；
+  - 新增 tests/test_sp21_deadline_grace.py 10 例（保护判定/保留/全清/零回归/宽限全流程），test_phase_timeboxed 9 例相邻回归全绿；ruff 新增文件 0 错误。

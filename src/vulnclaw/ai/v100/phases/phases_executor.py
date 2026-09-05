@@ -20,6 +20,7 @@ from vulnclaw.engines.auxiliary_engines import APIVersionDiffEngine, RequestSmug
 from vulnclaw.engines.http_engines import CachePoisonEngine
 from vulnclaw.engines.base import annotate_chain_info
 from vulnclaw.deepsec.sqlmap_wrapper import SQLMapWrapper
+from vulnclaw.ai.v100.smart_queue import is_protected_task
 async def _run_business_logic_scan(self):
     try:
         logger.info("🧬 [BusinessLogic] 全局扫描...")
@@ -297,10 +298,27 @@ async def _execute_with_limiting(self):
     watchdog = asyncio.create_task(_watchdog())
 
     async def _deadline_enforcer():
-        """预算耗尽时清空未执行任务并通知 worker 收尾。"""
+        """预算耗尽时清空未执行任务并通知 worker 收尾。
+
+        SP21.2：清空前先保留动态补测任务（param_mining / live:*），给宽限窗口
+        执行完，避免固定墙钟误杀阶段中后期入队的补测任务（真扫观察项收口）；
+        无受保护任务时行为与旧版完全一致（零回归）。
+        """
         await asyncio.sleep(attack_budget)
         try:
-            n = await self.task_queue.fail_all_pending(reason=f"attack 预算 {attack_budget:.0f}s 耗尽")
+            grace = float(getattr(settings, "attack_dynamic_grace_s", 45.0))
+            n = await self.task_queue.fail_all_pending(
+                reason=f"attack 预算 {attack_budget:.0f}s 耗尽", protect=True
+            )
+            protected = await self.task_queue.protected_pending_count()
+            if protected:
+                logger.warning(
+                    f"   [deadline] 保留 {protected} 个动态补测任务, 宽限 {grace:.0f}s"
+                )
+                await asyncio.sleep(grace)
+                n += await self.task_queue.fail_all_pending(
+                    reason=f"宽限 {grace:.0f}s 结束", protect=False
+                )
             queue_ended.set()
             logger.warning(
                 f"   [deadline] attack 预算 {attack_budget:.0f}s 耗尽: "
@@ -336,14 +354,20 @@ async def _run_one_task(self, task: Dict, task_id: str, semaphore: asyncio.Semap
     3. 超时/异常一律判败出队，不再 requeue（240s x 3 重试 = 960s 是耗时失控主因）。
     """
     deadline_ts = getattr(self, "_attack_deadline_ts", None)
+    _is_dynamic = is_protected_task(task)
     if deadline_ts is not None:
         budget = deadline_ts - time.time()
-        if budget <= 0:
+        if budget <= 0 and not _is_dynamic:
             logger.warning(f"   [deadline] 预算已耗尽，任务直接判败出队: {task_id}")
             if hasattr(self.task_queue, 'complete_task'):
                 await self.task_queue.complete_task(task_id, success=False)
             return None
-        timeout = max(10.0, min(240.0, budget))
+        if budget > 0:
+            timeout = max(10.0, min(240.0, budget))
+        else:
+            # SP21.2: 动态补测任务在预算耗尽后仍给宽限窗口（<=60s 上限）
+            grace = float(getattr(settings, "attack_dynamic_grace_s", 45.0))
+            timeout = max(10.0, min(60.0, grace))
     else:
         timeout = 240.0
 

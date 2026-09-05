@@ -28,6 +28,18 @@ from typing import Dict, List, Optional, Tuple
 # ============================================================
 DONE_SENTINEL_TASK_ID = "__SMART_TASK_QUEUE_DONE__"
 
+# SP21.2 动态补测任务保护：param_mining 回灌 / live_intake 实时任务在 attack
+# 预算耗尽时不随普通任务一起被误杀，给宽限窗口执行完（真扫观察项收口）。
+_PROTECTED_SOURCE_PREFIXES = ("param_mining", "live:")
+
+
+def is_protected_task(task_data) -> bool:
+    """动态补测/实时任务识别：source 命中受保护前缀。"""
+    if not isinstance(task_data, dict):
+        return False
+    src = task_data.get("source") or ""
+    return any(str(src).startswith(p) for p in _PROTECTED_SOURCE_PREFIXES)
+
 
 def _is_sentinel(task_data) -> bool:
     return isinstance(task_data, dict) and task_data.get("__done_sentinel__") is True
@@ -230,26 +242,44 @@ class SmartTaskQueue:
                 if _bk:
                     self._bandit.record(_bk, hit=False)
 
-    async def fail_all_pending(self, reason: str = "deadline") -> int:
+    async def fail_all_pending(self, reason: str = "deadline", protect: bool = False) -> int:
         """attack 预算截止：把所有未完成任务直接判失败并清空队列。
 
         使 is_drained() 能尽快变 True → sentinel 正常广播，worker 有序退出。
         仅清未执行任务；worker 正在执行的任务由调用方的生命周期超时兜底。
+        protect=True（SP21.2）：保留动态补测任务（param_mining / live:*），
+        由调用方宽限窗口内续跑或再清，避免固定墙钟误杀阶段中后期入队的补测任务；
+        无受保护任务时行为与旧版完全一致（零回归）。
         """
         async with self._lock:
             n = 0
+            kept: List[PrioritizedTask] = []
             for tid in list(self._pending_tasks.keys()):
                 if tid == DONE_SENTINEL_TASK_ID:
+                    continue
+                task = self._pending_tasks[tid]
+                if protect and is_protected_task(task.task_data):
+                    kept.append(task)
                     continue
                 self._failed_tasks[tid] = -1
                 self._pending_tasks.pop(tid, None)
                 self._stats["total_failed"] += 1
                 n += 1
             self._queue = [t for t in self._queue if t.task_id == DONE_SENTINEL_TASK_ID]
+            self._queue.extend(kept)
             heapq.heapify(self._queue)
             if n:
                 logger.warning(f"📋 [{reason}]: {n} 个未执行任务判失败出队")
             return n
+
+    async def protected_pending_count(self) -> int:
+        """统计 pending 中受保护动态补测任务数（SP21.2 宽限窗口判定用）。"""
+        async with self._lock:
+            return sum(
+                1
+                for tid, task in self._pending_tasks.items()
+                if tid != DONE_SENTINEL_TASK_ID and is_protected_task(task.task_data)
+            )
 
     async def retry_task(self, task_id: str) -> bool:
         """重试任务"""
@@ -333,4 +363,4 @@ class SmartTaskQueue:
         heapq.heappush(self._queue, sentinel)
 
 
-__all__ = ['SmartTaskQueue', 'DONE_SENTINEL_TASK_ID', '_is_sentinel']
+__all__ = ['DONE_SENTINEL_TASK_ID', 'SmartTaskQueue', '_is_sentinel', 'is_protected_task']
