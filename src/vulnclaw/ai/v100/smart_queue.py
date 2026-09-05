@@ -32,15 +32,26 @@ def _is_sentinel(task_data) -> bool:
     return isinstance(task_data, dict) and task_data.get("__done_sentinel__") is True
 
 
-@dataclass(order=True)
+@dataclass
 class PrioritizedTask:
-    """带优先级的任务"""
+    """带优先级的任务
+
+    priority: 1-10，数值越大优先级越高、越先被弹出执行。
+    注意：heapq 是最小堆（默认数值小者先出队），与"10 最高"语义相反，
+    曾导致 priority=6 的全局任务先于 priority=8-10 的 crawl 端点任务执行，
+    高价值 XSS/SQLi 端点任务在 attack 预算内未被执行而漏检。
+    修复：自定义 __lt__ 反转比较，使堆按 priority 降序出队。
+    """
     priority: int
     created_at: float = field(compare=False)
     task_id: str = field(compare=False)
     task_data: Dict = field(compare=False)
     retry_count: int = field(compare=False, default=0)
     max_retries: int = field(compare=False, default=3)
+
+    def __lt__(self, other: "PrioritizedTask") -> bool:
+        # heapq 弹出的"最小"对象 → priority 数值大者判为更小 → 先出队
+        return self.priority > other.priority
 
 
 class SmartTaskQueue:
@@ -89,16 +100,15 @@ class SmartTaskQueue:
         async with self._lock:
             # 检查队列大小
             if len(self._queue) >= self._max_size:
-                # 移除最低优先级的任务
-                min_priority = self._queue[-1].priority if self._queue else 0
-                if priority <= min_priority:
+                # 移除最低优先级的任务（priority 数值最小者）
+                lowest = min(self._queue, key=lambda t: t.priority)
+                if priority <= lowest.priority:
                     # 新任务优先级更低，不添加
                     return task_id
-                # 移除最低优先级任务
-                removed = heapq.heapreplace(self._queue, PrioritizedTask(
-                    priority, time.time(), task_id, task_data, 0, 3
-                ))
-                self._pending_tasks.pop(removed.task_id, None)
+                # 移除最低优先级任务并插入新任务
+                self._queue.remove(lowest)
+                heapq.heapify(self._queue)
+                self._pending_tasks.pop(lowest.task_id, None)
                 self._stats["total_added"] -= 1
 
             task = PrioritizedTask(priority, time.time(), task_id, task_data, 0, 3)
@@ -166,8 +176,9 @@ class SmartTaskQueue:
     async def mark_production_done(self, num_consumers: int = 1) -> None:
         """瓶颈3：通知 num_consumers 个并发消费者"生产端封板"。
 
-        具体做法：向堆内以最高优先级(priority=0)塞入 N 个 sentinel，
-        保证消费者很快就能各收到一个 → 全部退出 while 循环。
+        具体做法：向堆内以 priority=0 塞入 N 个 sentinel（调用方守护者
+        已确认队列 drained，sentinel 会立即被弹出），消费者各收到一个
+        → 全部退出 while 循环。
         num_consumers 必须和实际 worker 数一致，否则会"剩一个 worker 一直等"或
         "sentinel 多塞了被 get_next 当成 None 丢"。
         """
