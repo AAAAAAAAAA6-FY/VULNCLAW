@@ -899,3 +899,20 @@
 
 ### 17.4 收口
 - SP19 专项 30 例全绿 + 相关回归 74 例全绿；新增行 emoji 红线复核通过（存量 emoji 未动）；TASKLIST §17 增量记录。
+
+## 18. SP20 分布式模块测试补齐（2026-09-06，A 线 3 路并行，文件零交集）
+> 前提：SP19 提交 72a9075 后全量 TODO 扫描仅剩 worker.py 1 处过时注释（_execute_node 已实现真实 DAG 执行）；盘出 distributed 模块（--distributed 已接线 master/worker/scan 三模式）零测试覆盖，补齐。
+
+### 18.1 worker 线（SP20-1）
+- worker.py：清理 execute_task 内过时 DAGNode 骨架注释（5 行注释 + 1 行死代码 task.get("params")），逻辑未动；
+- 测试 test_sp20_worker.py 7 例（mock Redis 不连真库：pull_task 消费组/TTL 过期 ACK/空队列、execute_task 真实走 NODE_EXECUTORS[subgraph] 链路、未知类型 failed、report_result ACK+结果入队、get_stats）。
+
+### 18.2 master 线（SP20-2）
+- 测试 test_sp20_master.py 21 例：submit_task/submit_batch（xadd 序列化、缺 id 自动生成、ttl 默认 660）、register_worker/heartbeat/check_workers（alive/dead 划分）、get_result（轮询超时/命中/失败态）、handle_dead_worker（assigned 回收 + pending 重投递双分支）、start_monitor/stop、get_cluster_status（xlen 异常降级）；master.py 只读未改。
+
+### 18.3 redis_backend 线（SP20-3）
+- 修复真 bug：RedisContext 的 asyncio.Lock 不可重入，update/get_and_clear/get_all 在持锁中嵌套调用 get/set → Redis 路径必然死锁；改为持锁内直接操作 _redis（get/set/deserialize），语义等价；
+- 测试 test_sp20_redis_backend.py 39 例（双路径：降级内存 fallback 11 例 + 降级锁定不重连 + Redis 路径序列化 12 例 + update 合并 4 例 + 单次失败降级 3 例 + 序列化 round-trip 8 例）。
+
+### 18.4 收口
+- SP20 专项 67 例全绿 + 全量回归通过（清理根目录遗留 _tmp_lock_check.py 后）；新增行 emoji 红线复核通过；TASKLIST §18 增量记录。

@@ -180,18 +180,20 @@ class RedisContext:
                 self._update_in_memory(key, value)
                 return
 
+            # 注意：_lock 不可重入，直接操作 Redis，避免嵌套调用 get/set 造成死锁
             try:
-                current = await self.get(key, None)
+                raw = await self._redis.get(self._make_key(key))
+                current = self._deserialize(raw) if raw is not None else None
                 if current is None:
-                    await self.set(key, value)
+                    await self._redis.set(self._make_key(key), self._serialize(value))
                 elif isinstance(current, list) and isinstance(value, list):
                     current.extend(value)
-                    await self.set(key, current)
+                    await self._redis.set(self._make_key(key), self._serialize(current))
                 elif isinstance(current, dict) and isinstance(value, dict):
                     current.update(value)
-                    await self.set(key, current)
+                    await self._redis.set(self._make_key(key), self._serialize(current))
                 else:
-                    await self.set(key, value)
+                    await self._redis.set(self._make_key(key), self._serialize(value))
             except Exception as exc:
                 logger.warning(f"⚠️ [RedisContext] update 失败，降级: {exc}")
                 self._update_in_memory(key, value)
@@ -220,9 +222,9 @@ class RedisContext:
                 return self._fallback_data.pop(key, None)
 
             try:
-                data = await self.get(key)
+                raw = await self._redis.get(self._make_key(key))
                 await self._redis.delete(self._make_key(key))
-                return data
+                return self._deserialize(raw)
             except Exception as exc:
                 logger.warning(f"⚠️ [RedisContext] get_and_clear 失败: {exc}")
                 return self._fallback_data.pop(key, None)
@@ -245,7 +247,9 @@ class RedisContext:
                     key_str = raw_key.decode("utf-8") if isinstance(raw_key, bytes) else raw_key
                     # 去掉 prefix 前缀
                     short_key = key_str[len(self._prefix) + 1:]
-                    result[short_key] = await self.get(short_key)
+                    result[short_key] = self._deserialize(
+                        await self._redis.get(self._make_key(short_key))
+                    )
                 return result
             except Exception as exc:
                 logger.warning(f"⚠️ [RedisContext] get_all 失败: {exc}")

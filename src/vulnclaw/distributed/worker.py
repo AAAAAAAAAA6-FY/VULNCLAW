@@ -203,19 +203,10 @@ class DistributedWorker:
             执行结果字典。
         """
         task_type = task.get("type", "")
-        task.get("params", {})
 
         logger.info(f"🔧 [Worker:{self._worker_id}] 执行: {task_type}")
 
         try:
-            # 动态导入执行器
-
-            # 创建节点对象
-            # TODO: 根据 task 构造 DAGNode
-            # node = DAGNode(node_id=task["task_id"], node_type=task_type, ...)
-            # context = DAGContext() 或 RedisContext
-
-            # 模拟执行
             result = await asyncio.wait_for(
                 self._execute_node(task),
                 timeout=self.TASK_TIMEOUT,
