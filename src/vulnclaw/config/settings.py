@@ -321,18 +321,18 @@ class Settings(BaseSettings):
     # scan_param_mining：挖掘结果入任务生成（消费侧总开关，可与探测侧独立控制）。
     scan_param_mining: bool = Field(True, alias="SCAN_PARAM_MINING")
     enable_param_mining: bool = Field(True, alias="ENABLE_PARAM_MINING")
-    # ---- D4.2 采集→任务实时生成（SP15.3/SP15.5，A 线；默认关，零行为回归）----
+    # ---- D4.2 采集→任务实时生成（SP15.3/SP15.5，A 线；默认开，含预算软截止保护）----
     live_intake_enabled: bool = Field(True, alias="LIVE_INTAKE_ENABLED")
     live_intake_min_score: int = Field(8, alias="LIVE_INTAKE_MIN_SCORE")   # >=8 仅带参注入面放行
     live_intake_priority: int = Field(8, alias="LIVE_INTAKE_PRIORITY")
-    # ---- SP16.1 RL 决策层：上下文多臂老虎机（A 线；默认关零行为回归）----
+    # ---- SP16.1 RL 决策层：上下文多臂老虎机（A 线；默认开，飞轮反馈 feed 目录为空时不落盘）----
     rl_bandit_enabled: bool = Field(True, alias="RL_BANDIT_ENABLED")
     rl_bandit_influence: int = Field(2, alias="RL_BANDIT_INFLUENCE")            # 浮/降权幅度上限（试验超参）
     rl_bandit_feed_dir: str = Field("", alias="RL_BANDIT_FEED_DIR")             # 空=不落盘；JSONL 反馈飞轮目录
-    # ---- SP16.2 TLS 指纹伪装（A 线；curl_cffi 可选后端，默认关零行为回归）----
+    # ---- SP16.2 TLS 指纹伪装（A 线；curl_cffi 可选后端，默认开，缺库自动降级 aiohttp）----
     http_impersonate: bool = Field(True, alias="HTTP_IMPERSONATE")
     http_impersonate_browser: str = Field("chrome", alias="HTTP_IMPERSONATE_BROWSER")
-    # ---- SP17.3 TLS 指纹链（A 线；基于 SP16.2，把"单指纹"升级为"指纹链"；默认全关/空池零行为回归）----
+    # ---- SP17.3 TLS 指纹链（A 线；基于 SP16.2，把"单指纹"升级为"指纹链"；池默认非空+轮换默认开，仅 http2 编排位保持关闭）----
     # 可用的指纹轮换池（兼容 JSON 数组与逗号串，见 parse_list；默认值即出厂默认）
     http_impersonate_pool: Annotated[List[str], NoDecode] = Field(
         default_factory=lambda: ["chrome", "firefox", "safari"],
