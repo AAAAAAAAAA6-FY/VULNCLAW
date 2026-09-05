@@ -340,8 +340,6 @@ class Settings(BaseSettings):
     )
     # 轮换开关：开着时请求按池 round-robin 轮换，命中（连续成功 N 次）保持当前指纹
     http_impersonate_rotate: bool = Field(True, alias="HTTP_IMPERSONATE_ROTATE")
-    # HTTP2 SETTINGS 显式编排/声明开关（curl_cffi 已内置浏览器指纹，本开关控制额外显式编排输出层）
-    http_impersonate_http2: bool = Field(False, alias="HTTP_IMPERSONATE_HTTP2")
     # ---- SP16.3 调用链上下文（A 线；enrich_findings 入口可达性证据增强）----
     scan_callgraph: bool = Field(True, alias="SCAN_CALLGRAPH")
     # ---- SH17.1 阶段预算：per-phase wall-clock 上限（带默认值启用；单阶段超时只中断本阶段跳过继续）----

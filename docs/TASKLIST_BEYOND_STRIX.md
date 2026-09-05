@@ -1084,3 +1084,13 @@
 - test_sp17_impersonate_pool：默认值断言校正为 rotate=True，rotate 用例显式钉死 pool；
 - 新增 test_sp26_report_diff.py 5 例（签名/diff/开关/首扫建基线/二次 diff/显式基线只读）；
 - 全量回归无 FAILED（仅环境警告），ruff 新增文件全绿。
+## 26. 注释/字段收口批次（2026-09-06）
+
+### §26.1 死字段删除：http_impersonate_http2
+- 原因：0 处代码消费（纯功能位占位），curl_cffi 已内置浏览器 HTTP2 指纹，该"显式编排输出层"未落地实现；SP26 确认技术未实现后用户决定删除。
+- 删除范围（4 处）：settings.py 字段+注释、.env.example 行、test_sp17 断言、impersonate.py 模块注释提及。
+- 影响：settings 对象不再含该属性；全项目已 rescan 无残留引用；sp17/sp16/report_diff 专项回归通过。
+
+### §26.2 section 注释过期同步（e9b89b2/6bebacb）
+- D3.5 参数挖掘双开关注释块补齐（探测侧 enable_param_mining / 消费侧 scan_param_mining，消除与 live_intake_priority 行尾撞车）；
+- D4.2/SP16.1/SP16.2/SP17.3 四处"默认关零回归"注释更正为当前默认开状态。

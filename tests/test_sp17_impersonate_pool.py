@@ -23,7 +23,6 @@ from vulnclaw.core.settings import settings
 def test_settings_defaults_zero_regression():
     # SP24 §22.2 后 http_impersonate_rotate 已默认打开（TLS 指纹轮换，curl_cffi 缺失自动降级）
     assert settings.http_impersonate_rotate is True
-    assert settings.http_impersonate_http2 is False
     assert list(settings.http_impersonate_pool or []) == ["chrome", "firefox", "safari"]
 
 

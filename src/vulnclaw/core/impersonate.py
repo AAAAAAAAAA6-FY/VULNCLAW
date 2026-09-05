@@ -19,7 +19,7 @@ SP17.3：在"单指纹"基础上升级为"指纹链"——
   HTTP2 SETTINGS / HEADER ORDER），此处不手写 SETTINGS 帧，只把"显式编排"做成可配置、可查阅的输出。
 
 - 开关：settings.http_impersonate（默认 False）+ http_impersonate_browser（默认 chrome）
-           + http_impersonate_pool / http_impersonate_rotate / http_impersonate_http2（默认关/空池）
+           + http_impersonate_pool / http_impersonate_rotate（池默认非空，轮换默认开）
 - 可用性：curl_cffi 可导入 且 开关打开，否则 impersonate_enabled() False（零行为回归）
 - 接口：(status, text, headers) | None，与 core.utils.async_get / http_client.http2_get 兼容；
   调用方 scanner.py 不变（impersonate_get / impersonate_post 透出，池语义留在本模块内部）。
