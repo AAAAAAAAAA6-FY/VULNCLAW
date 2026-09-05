@@ -640,3 +640,22 @@
 
 > 交接提示：全部完成后按既有收口格式在本节追加"- [x] 已实现（date, commit）"增量记录；
 > 合并前 git pull 最新 main；与本批次无关的文件改动不要混入同一 commit。
+
+
+## 10.1 SP14 并行分工与接口约定（2026-09-05 增补，双方据此并行）
+
+> 双方无共同文件交集，可同时开工；各自完成后合并最新 main，由 A 侧统一收口验证。
+
+### A 线（我方，A 侧）
+- SP14.1 消费侧：`phases_taskgen.py` 读取参数池并生成任务 + `settings.py` 开关（`scan_param_mining`，默认开，带上限）
+- SP14.2 全部：**新建** `modules/request_feed.py`（三源归一 + 去重，B 侧不得新建文件故归 A 侧）
+- SP14.3 集成侧：`engines/base.py` enrich 挂接 + `report_generator.py` 写出 `evidence.oob_*`
+
+### B 线（对面，B 侧，仅定点改既有独占文件）
+- SP14.1 挖掘器本体：**仅** `modules/recon.py`（词典 + 差异判定），挖掘结果写入 `recon_brief["param_mining"]`
+- SP14.3 数据源：**仅** `core/oob_channel.py`（回调结构化记录 + 查询接口）
+
+### 接口约定（字段先行，各自独立实现）
+- 参数池：`recon_brief["param_mining"] = [ {"param": str, "url": str, "base_len": int, "signal": str}, ... ]`；A 侧按其生成任务，source=param_mining
+- OOB 证据：B 侧在 `core/oob_channel.py` 提供查询接口（可返回 `{"ts": iso时间戳, "channel": "dns|http", "token": str, "detail": str}` 或 None）；A 侧在 base.py 挂"有则写、无则跳过"的 enrich，并在 JSON/HTML/SARIF 写出 `evidence.oob_*`
+- B 侧接口未就绪期间：A 侧以 try-import + 无回调返回 None 优雅降级，互不阻塞
