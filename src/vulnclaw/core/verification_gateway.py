@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VULNCLAW Authors (see README & LICENSE)
 # This file is part of VULNCLAW / pentest_platform.
@@ -22,7 +21,7 @@ import asyncio
 import json
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from vulnclaw.core.audit_receipt import build_receipt_chain, verify_receipt_chain
 from vulnclaw.core.logger import logger
@@ -58,7 +57,7 @@ def _sev_rank(sev: Any) -> int:
 # ============================================================
 # 归一化：SARIF 2.1 / findings JSON → 规范 finding
 # ============================================================
-def normalize_input(data: Any, source: str = "") -> Tuple[List[Dict], str]:
+def normalize_input(data: Any, source: str = "") -> tuple[list[dict], str]:
     """识别输入格式并归一化。返回 (findings, detected_format)。"""
     if isinstance(data, dict) and isinstance(data.get("runs"), list) and data.get("version"):
         return _normalize_sarif(data, source), "sarif"
@@ -69,8 +68,8 @@ def normalize_input(data: Any, source: str = "") -> Tuple[List[Dict], str]:
     return [], "unknown"
 
 
-def _normalize_sarif(data: Dict, source: str) -> List[Dict]:
-    out: List[Dict] = []
+def _normalize_sarif(data: dict, source: str) -> list[dict]:
+    out: list[dict] = []
     for run in data.get("runs") or []:
         driver = ((run.get("tool") or {}).get("driver") or {})
         tool_name = str(driver.get("name") or source or "sarif")
@@ -95,8 +94,8 @@ def _normalize_sarif(data: Dict, source: str) -> List[Dict]:
     return out
 
 
-def _normalize_plain(items: List[Dict], source: str) -> List[Dict]:
-    out: List[Dict] = []
+def _normalize_plain(items: list[dict], source: str) -> list[dict]:
+    out: list[dict] = []
     for it in items or []:
         if not isinstance(it, dict):
             continue
@@ -115,10 +114,10 @@ def _normalize_plain(items: List[Dict], source: str) -> List[Dict]:
 # ============================================================
 # 去重 + 多源佐证
 # ============================================================
-def dedup_and_corroborate(findings: List[Dict]) -> List[Dict]:
+def dedup_and_corroborate(findings: list[dict]) -> list[dict]:
     """(type, url, parameter) 相同的发现合并为一条，记录来源与佐证次数。"""
-    merged: Dict[Tuple[str, str, str], Dict] = {}
-    order: List[Tuple[str, str, str]] = []
+    merged: dict[tuple[str, str, str], dict] = {}
+    order: list[tuple[str, str, str]] = []
     for f in findings:
         key = (str(f.get("type", "")).lower(), str(f.get("url", "")), str(f.get("parameter", "")))
         if key not in merged:
@@ -143,8 +142,41 @@ def dedup_and_corroborate(findings: List[Dict]) -> List[Dict]:
 # ============================================================
 # 证据分诊 + 本地规则 + 可选层
 # ============================================================
-def static_triage(f: Dict) -> Dict:
+# ============================================================
+# P0-3: finding 证据三分类（RAPTOR 语义，与 confidence 形成二维可信度）
+# ============================================================
+# 证据类型：fact（可验证的具体信号）/ inference（有依据的推断）/
+#           unproven_hypothesis（无证据的假设/推测）
+_EVIDENCE_FACT_MARKERS = (
+    "http", "https", "200", "302", "403", "500", "uid=", "root:", "error",
+    "syntax", "alert(", "<script", "onerror", "mysql", "postgres", "sqlite",
+    "callback", "oob", "dnslog", "接收", "命中", "回显", "响应头", "cookie",
+)
+
+
+def classify_evidence(f: dict) -> str:
+    """对 finding 判定证据类型（fact / inference / unproven_hypothesis）。
+
+    规则（宁保守分级，不误升实锤）：
+    - 无 evidence 文本 → unproven_hypothesis（与无证据降档语义一致）；
+    - evidence 含可验证的强信号（URL/状态码/错误特征/回显/回调）→ fact；
+    - evidence 有内容但弱于实证 → inference。
+    """
+    ev = str(f.get("evidence") or "").strip()
+    if not ev:
+        return "unproven_hypothesis"
+    low = ev.lower()
+    hits = sum(1 for m in _EVIDENCE_FACT_MARKERS if m in low)
+    # 至少两个独立可验证特征才认为构成"实证"，否则仅属推断
+    if hits >= 2 or any(m in low for m in ("uid=", "root:", "onerror", "dnslog", "callback")):
+        return "fact"
+    return "inference"
+
+
+def static_triage(f: dict) -> dict:
     """证据分诊：无 evidence → 严重级降一档并打标（幻觉抑制语义）。"""
+    # P0-3: 证据三分类（fact/inference/unproven_hypothesis），二维可信度的横轴
+    f["evidence_class"] = classify_evidence(f)
     has_ev = bool(str(f.get("evidence", "")).strip())
     f["evidence_present"] = has_ev
     sig = list(f.get("triage_signals") or [])
@@ -162,7 +194,7 @@ def static_triage(f: Dict) -> Dict:
     return f
 
 
-def _rule_verify(f: Dict) -> str:
+def _rule_verify(f: dict) -> str:
     """复用主验证链的本地规则语义（phases_verify._local_rule_verify，self 未使用）。
 
     懒加载 + 失败兜底：任何导入/运行异常都返回 ""（规则层缺席不阻断网关）。
@@ -176,7 +208,7 @@ def _rule_verify(f: Dict) -> str:
         return ""
 
 
-async def _llm_prescreen(batch: List[Dict]) -> Optional[Dict[int, Dict]]:
+async def _llm_prescreen(batch: list[dict]) -> dict[int, dict] | None:
     """可选 LLM 粗筛（filter 档，A4.4 同源）。任何失败返回 None（整层跳过）。
 
     语义与 A4.4 一致：宁漏筛勿误杀——LLM 只打"高把握误报"标记，供降分，
@@ -210,7 +242,7 @@ async def _llm_prescreen(batch: List[Dict]) -> Optional[Dict[int, Dict]]:
         data = safe_extract_json(raw)
         if isinstance(data, dict):
             data = data.get("verdicts") or []
-        out: Dict[int, Dict] = {}
+        out: dict[int, dict] = {}
         for item in data or []:
             if isinstance(item, dict):
                 try:
@@ -226,7 +258,7 @@ async def _llm_prescreen(batch: List[Dict]) -> Optional[Dict[int, Dict]]:
         return None
 
 
-async def _probe_one(f: Dict, session) -> Dict:
+async def _probe_one(f: dict, session) -> dict:
     """可选 HTTP 重放探测：基线 vs 载荷（复用砖 1 的 Repeater 判定语义）。"""
     try:
         from vulnclaw.core.utils import async_get, build_attack_url
@@ -286,7 +318,7 @@ BLIND_REPRO_VERSION = "1.0.0"
 _BLIND_VIEW_KEYS = ("url", "parameter", "category")
 
 # 大类 -> SafeExploit 验证器链（按顺序尝试，任一 exploitable 即 confirmed）
-_BLIND_VERIFIER_CHAIN: Dict[str, Tuple[str, ...]] = {
+_BLIND_VERIFIER_CHAIN: dict[str, tuple[str, ...]] = {
     "sqli": ("verify_sqli", "verify_sqli_time_based"),
     "cmdi": ("verify_cmdi",),
     "ssti": ("verify_ssti",),
@@ -297,7 +329,7 @@ _BLIND_VERIFIER_CHAIN: Dict[str, Tuple[str, ...]] = {
 }
 
 # vuln_category 未覆盖、仅凭原 type 字符串识别的补充路由
-_BLIND_TYPE_EXTRA: Tuple[Tuple[str, str], ...] = (
+_BLIND_TYPE_EXTRA: tuple[tuple[str, str], ...] = (
     ("idor", "idor"), ("越权", "idor"),
 )
 
@@ -315,7 +347,7 @@ except Exception as exc:
 '''
 
 
-def blind_category(f: Dict) -> str:
+def blind_category(f: dict) -> str:
     """盲复现用的漏洞大类：vuln_category 归一 + idor/xxe 等补充识别。"""
     try:
         from vulnclaw.core.utils import vuln_category
@@ -330,7 +362,7 @@ def blind_category(f: Dict) -> str:
     return cat
 
 
-def blind_view(f: Dict) -> Dict:
+def blind_view(f: dict) -> dict:
     """盲视图：只保留目标与参数，物理裁掉 evidence/payload/描述等一切"发现者的说法"。
 
     验证器签名只接受 (url, parameter)，类型层面就拿不到原始推理/载荷——
@@ -343,7 +375,7 @@ def blind_view(f: Dict) -> Dict:
     }
 
 
-def blind_verifier_chain(f: Dict) -> Tuple[str, ...]:
+def blind_verifier_chain(f: dict) -> tuple[str, ...]:
     """盲视图类别 -> 验证器方法名链；无对应验证器返回空元组（inconclusive）。"""
     return _BLIND_VERIFIER_CHAIN.get(blind_category(f), ())
 
@@ -357,8 +389,8 @@ def _sandbox_snippet(method: str) -> str:
 
 
 async def _blind_repro_one(
-    f: Dict, session, semaphore: asyncio.Semaphore, sandbox: bool = False
-) -> Dict:
+    f: dict, session, semaphore: asyncio.Semaphore, sandbox: bool = False
+) -> dict:
     """单条 finding 的盲复现：盲视图 -> 独立验证器 -> 三态裁决。"""
     view = blind_view(f)
     f["blind_view"] = view
@@ -388,7 +420,7 @@ async def _blind_repro_one(
     except Exception:  # noqa: BLE001 - 门卫不可用视为放行（网关层另有审计）
         logger.debug("[BlindRepro] 权限门卫不可用（按放行处理）")
 
-    tried: List[str] = []
+    tried: list[str] = []
     async with semaphore:
         for method in chain:
             tried.append(method)
@@ -414,7 +446,7 @@ async def _blind_repro_one(
     return f
 
 
-async def _run_verifier(method: str, view: Dict, session, sandbox: bool) -> Dict:
+async def _run_verifier(method: str, view: dict, session, sandbox: bool) -> dict:
     """执行单个验证器：沙箱模式走隔离进程，否则直接调用（session=None 保干净上下文）。"""
     if sandbox:
         return await _run_verifier_sandboxed(method, view)
@@ -427,7 +459,7 @@ async def _run_verifier(method: str, view: Dict, session, sandbox: bool) -> Dict
     return await verifier(view["url"], view["parameter"], None)
 
 
-async def _run_verifier_sandboxed(method: str, view: Dict) -> Dict:
+async def _run_verifier_sandboxed(method: str, view: dict) -> dict:
     """在隔离进程/容器内跑同一验证器（docker 优先，不可用降级进程隔离并标记 degraded）。"""
     import sys
 
@@ -439,7 +471,7 @@ async def _run_verifier_sandboxed(method: str, view: Dict) -> Dict:
         timeout=60,
     )
     out = str(res.get("stdout") or "").strip()
-    parsed: Dict = {}
+    parsed: dict = {}
     if out:
         import json as _json
 
@@ -455,12 +487,12 @@ async def _run_verifier_sandboxed(method: str, view: Dict) -> Dict:
 
 
 async def run_blind_repro_gate(
-    findings: List[Dict],
+    findings: list[dict],
     session=None,
     sandbox: bool = False,
     max_targets: int = 40,
     concurrency: int = 8,
-) -> Dict[str, int]:
+) -> dict[str, int]:
     """盲复现闸门批量入口。返回统计字典（confirmed/refuted/inconclusive/skipped）。"""
     stats = {"confirmed": 0, "refuted": 0, "inconclusive": 0, "skipped": 0}
     if not findings:
@@ -487,7 +519,7 @@ async def run_blind_repro_gate(
 # ============================================================
 # 评分 + SARIF 输出
 # ============================================================
-def score_confidence(f: Dict) -> int:
+def score_confidence(f: dict) -> int:
     score = 40
     if f.get("evidence_present"):
         score += 25
@@ -512,7 +544,7 @@ def score_confidence(f: Dict) -> int:
     return max(0, min(100, int(score)))
 
 
-def status_of(f: Dict) -> str:
+def status_of(f: dict) -> str:
     # 盲复现打不中 → 不进 verified 台账（降级待复核，不删除：保护凭证链不可变）
     if str(f.get("blind_repro") or "") == "refuted":
         return "needs_review"
@@ -526,10 +558,10 @@ def status_of(f: Dict) -> str:
     return "unverified"
 
 
-def build_verified_sarif(findings: List[Dict], gateway_version: str = GATEWAY_VERSION) -> Dict:
+def build_verified_sarif(findings: list[dict], gateway_version: str = GATEWAY_VERSION) -> dict:
     """verified findings → SARIF 2.1.0（结果带 properties 审计字段）。"""
-    rules: Dict[str, Dict] = {}
-    results: List[Dict] = []
+    rules: dict[str, dict] = {}
+    results: list[dict] = []
     for f in findings:
         rid = str(f.get("type") or "unknown")
         rules.setdefault(rid, {"id": rid, "shortDescription": {"text": rid}})
@@ -552,6 +584,8 @@ def build_verified_sarif(findings: List[Dict], gateway_version: str = GATEWAY_VE
                 "blind_repro": f.get("blind_repro", ""),
                 "blind_method": f.get("blind_method", ""),
                 "blind_evidence": f.get("blind_evidence", ""),
+                # P0-3: 证据三分类（fact/inference/unproven_hypothesis），不参与凭证链哈希
+                "evidence_class": f.get("evidence_class", ""),
                 # 以下四项为凭证链出证字段的**全量原值**——审计反查
                 # （verify_gateway_output）据此重建哈希输入，缺一即链式暴露
                 "parameter": str(f.get("parameter", "")),
@@ -589,7 +623,7 @@ async def run_gateway(
     blind_repro: bool = False,
     blind_sandbox: bool = False,
     blind_max: int = 40,
-) -> Dict:
+) -> dict:
     """验证网关主流程。返回 summary dict（ok=False 时含 error）。
 
     blind_repro：启用盲复现闸门（调外呼，默认关，CI 安全）；
@@ -639,10 +673,10 @@ async def run_gateway(
             from vulnclaw.core.utils import close_shared_session
 
             await close_shared_session()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001 - 会话清理失败静默降级
+            logger.debug(f"[Gateway] 共享会话关闭失败（忽略）: {exc}")
 
-    blind_stats: Dict[str, int] = {}
+    blind_stats: dict[str, int] = {}
     if blind_repro:
         try:
             blind_stats = await run_blind_repro_gate(
@@ -678,7 +712,7 @@ async def run_gateway(
     )
     rc_path.write_text(json.dumps(receipt, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    counts: Dict[str, int] = {}
+    counts: dict[str, int] = {}
     for f in findings:
         counts[f["status"]] = counts.get(f["status"], 0) + 1
     summary = {
@@ -705,7 +739,7 @@ async def run_gateway(
 
 def verify_gateway_output(
     output_path: str, receipt_path: str = "", secret: str = ""
-) -> Dict:
+) -> dict:
     """审计校验入口：重算链并比对（供 CI/人工复核收据真伪）。"""
     out = Path(output_path)
     rc = Path(receipt_path) if receipt_path else out.with_name(out.stem + ".receipt.json")
@@ -742,10 +776,12 @@ def verify_gateway_output(
 
 
 __all__ = [
-    "run_gateway", "verify_gateway_output", "normalize_input", "normalize_severity",
-    "dedup_and_corroborate", "static_triage", "score_confidence", "status_of",
-    "build_verified_sarif", "GATEWAY_VERSION",
     # 盲复现闸门
-    "blind_view", "blind_category", "blind_verifier_chain", "run_blind_repro_gate",
     "BLIND_REPRO_VERSION",
+    # 网关主流程
+    "GATEWAY_VERSION",
+    "blind_category", "blind_verifier_chain", "blind_view",
+    "build_verified_sarif", "dedup_and_corroborate", "normalize_input",
+    "normalize_severity", "run_blind_repro_gate", "run_gateway",
+    "score_confidence", "static_triage", "status_of", "verify_gateway_output",
 ]

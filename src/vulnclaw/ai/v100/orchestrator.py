@@ -846,12 +846,17 @@ class V100Orchestrator:
                 self._stream_touched_keys |= batch_keys
                 # 合并回：保留原始 pending 的顺序（因为我们不会从中删 touched，只是为了未来 debug 完整）。
                 # 注意：_verify_all_findings 内部不会清空 _pending_verify，因此这里简单 restore 即可。
-                # 把 batch 中原本在 saved_pending 里的元素也放回去（为了保持后续调试信息一致）。
+                # 关键修复（漏检根因）：验证期间 phases_executor 会无锁 append 新 finding 到
+                # 临时替换的 list(batch) 上，若仅重建 saved_pending 会把这些新条目静默丢弃
+                # （SQLi 在批次验证窗口排队 → finally 重建后条目标记丢失 → 不进最终报告）。
+                # 因此先取回临时 list 的当前内容，与 saved_pending / batch 合并去重。
+                transient_items = list(self._pending_verify)
                 merged: List[Dict] = list(saved_pending)
                 seen_keys = {self._finding_verify_key(v) for v in merged}
-                for v in batch:
+                for v in [*batch, *transient_items]:
                     if self._finding_verify_key(v) not in seen_keys:
                         merged.append(v)
+                        seen_keys.add(self._finding_verify_key(v))
                 self._pending_verify = merged
 
 
@@ -1214,6 +1219,51 @@ class V100Orchestrator:
         except Exception as e:
             logger.warning(f"⚠️ [AgentCoordinator] 执行失败（不影响主链路）: {e}")
 
+    async def _run_react_gated_deep_dive(self) -> None:
+        """S1: ReActAgent 深挖阶段门卫入口（V100 主链路插桩，插在 taskgen 之后、全局扫描之前）。
+
+        S1.1：deep 开启（settings.enable_react_dive，由 --deep / ENABLE_REACT_DIVE 触发）时，
+              输出阶段节点日志 [S1] 深度挖掘（段前缀标识），作为深挖阶段起点节点。
+        S1.2：agent 执行前过 danger_guard——deep 深挖属探测级；danger 放行配置缺失
+              （默认 deny，未显式 --dangerous）时自动降级为本地确定性兜底：
+              跳过 LLM 多轮深挖，但绝不中断扫描（复用 danger_guard 默认 deny=步骤跳过、
+              扫描继续 语义）。
+        S1.3：深挖 finding 由 orchestrator._add_finding 回写并标记 source=react_agent
+              （见 phases_executor._merge_react_findings），与引擎来源（engine）区分，
+              进入 verify 与报告；不破坏既有 finding 结构，source 为新增可选字段。
+        """
+        if not getattr(settings, "enable_react_dive", False):
+            # 未开启 deep：保持与现状完全一致，交给 _run_react_deep_dive 打印"未开启"后返回。
+            return await self._run_react_deep_dive()
+        logger.info(
+            "[S1] 深度挖掘 阶段启动（ReActAgent 单点深度：V100=广度覆盖，ReAct=深度推理）"
+        )
+        if not self._deep_dive_danger_allowed():
+            logger.warning(
+                "[S1] 深度挖掘 danger_guard 未放行，降级为本地确定性兜底（扫描继续，不启用 LLM 深挖）"
+            )
+            return None
+        return await self._run_react_deep_dive()
+
+    def _deep_dive_danger_allowed(self) -> bool:
+        """S1.2: deep 深挖属探测级——执行前咨询 danger_guard。
+
+        返回 True=放行 LLM 深挖；False=降级为本地确定性兜底。
+        danger 放行配置缺失（默认 deny）或 danger_guard 异常时一律返回 False，
+        绝不中断扫描。复用 DANGEROUS_OPS 中已有的单点深度渗透 op 作审批键。
+        """
+        try:
+            from vulnclaw.core.danger_guard import guard
+            return bool(
+                guard.require_approval(
+                    'remote_deep_penetrate',
+                    detail=f"V100 主链路 ReAct 深挖 target={getattr(self, 'target', '')}",
+                )
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("[S1] danger_guard 不可用，按 deny 处理（降级本地确定性兜底）")
+            return False
+
     # ============================================================
     # P5-1: 断点续扫阶段定义 + 阶段检查点上下文管理器
     # 阶段顺序即 run() 执行顺序；每一阶段在开始前写 start、结束后写 done，
@@ -1374,7 +1424,8 @@ class V100Orchestrator:
                 # S1: ReActAgent 深挖阶段（插桩点：_generate_tasks 之后、全局扫描之前）。
                 # 对 engine_bundle 首次执行结果全部 low/info 或判定模糊的参数，
                 # 用 ReActAgent 做多轮深度渗透（V100=广度覆盖，ReAct=单点深度）。
-                await self._run_react_deep_dive()
+                # deep 触发 by --deep/ENABLE_REACT_DIVE；执行前过 danger_guard 门卫（S1.2）。
+                await self._run_react_gated_deep_dive()
 
             async with self._stage("agent_coordinator"):
                 # P2-1: 多智能体协调器（strix 式可寻址 agent 树）——可选增强通道。

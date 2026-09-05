@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VULNCLAW Authors (see README & LICENSE)
 # This file is part of VULNCLAW / pentest_platform.
@@ -15,17 +14,16 @@
 - run_gateway 端到端（临时 SARIF 输入 → verified.sarif + receipt，全离线）
 - PR 评论 markdown 构建（E3.3 的可测半边）
 """
-import json
-
-import pytest
-
-from vulnclaw.core.audit_receipt import build_receipt_chain, verify_receipt_chain
-import vulnclaw.core.verification_gateway as gw
-
 # build_pr_markdown 在 scripts/pr_comment.py（scripts 不在 src 包内），
 # 用路径导入以保持"纯增量不挪文件"。
 import importlib.util as _ilu
+import json
 from pathlib import Path as _Path
+
+import pytest
+
+import vulnclaw.core.verification_gateway as gw
+from vulnclaw.core.audit_receipt import build_receipt_chain, verify_receipt_chain
 
 _SCRIPT = _Path(__file__).resolve().parents[1] / "scripts" / "pr_comment.py"
 _spec = _ilu.spec_from_file_location("pr_comment", _SCRIPT)
@@ -96,7 +94,7 @@ def test_dedup_and_corroboration():
         {"type": "xss", "url": "http://t/b", "parameter": "", "severity": "low",
          "evidence": "x", "source": "strix"},
     ])
-    sqli = [f for f in merged if f["type"].lower() == "sqli"][0]
+    sqli = next(f for f in merged if f["type"].lower() == "sqli")
     assert sqli["corroboration"] == 2 and set(sqli["sources"]) == {"strix", "burp"}
     assert sqli["severity"] == "critical"  # 双源冲突取高
     assert len(merged) == 2
@@ -217,7 +215,7 @@ def test_pr_markdown_empty_verified():
 # ============================================================
 # 盲复现验证闸门
 # ============================================================
-import asyncio  # noqa: E402  （仅本段异步用例使用，保持文件其余部分零改动）
+import asyncio
 
 
 def _guard():
@@ -386,3 +384,48 @@ class TestBlindGateEndToEnd:
             receipt_path=str(tmp_path / "in.verified.receipt.json"),
         )
         assert audit["ok"] is True, audit
+
+
+# ============================================================
+# P0-3: finding 证据三分类
+# ============================================================
+class TestEvidenceClass:
+    def test_no_evidence_is_unproven(self):
+        from vulnclaw.core.verification_gateway import classify_evidence
+        assert classify_evidence({"type": "xss", "url": "http://t"}) == "unproven_hypothesis"
+
+    def test_empirical_signal_is_fact(self):
+        from vulnclaw.core.verification_gateway import classify_evidence
+        f = {"type": "sqli", "url": "http://t/id=1", "evidence": "HTTP 200 with error: syntax error near mysql"}
+        assert classify_evidence(f) == "fact"
+
+    def test_weak_desc_is_inference(self):
+        from vulnclaw.core.verification_gateway import classify_evidence
+        f = {"type": "xss", "url": "http://t", "evidence": "页面参数被整体回显但无执行标记"}
+        assert classify_evidence(f) == "inference"
+
+    def test_static_triage_adds_class(self):
+        from vulnclaw.core.verification_gateway import static_triage
+        f = static_triage({"type": "x", "url": "http://t", "evidence": "", "severity": "critical"})
+        assert f["evidence_class"] == "unproven_hypothesis"
+        assert f["evidence_missing"] is True
+        assert f["severity"] != "critical"  # 无证据降档仍生效（互不干扰）
+
+    def test_sarif_property_present(self):
+        from vulnclaw.core.verification_gateway import build_verified_sarif, static_triage
+        f = static_triage({"type": "sqli", "url": "http://t", "parameter": "id",
+                           "evidence": "HTTP 500 syntax error", "severity": "high"})
+        f["status"] = "verified"
+        f["confidence"] = 80
+        sarif = build_verified_sarif([f])
+        props = sarif["runs"][0]["results"][0]["properties"]
+        assert props["evidence_class"] == "fact"
+
+    def test_verdict_confidence_dimension_unchanged(self):
+        # evidence_class 是横轴，confidence 纵轴保持独立，互不覆盖
+        from vulnclaw.core.verification_gateway import classify_evidence, static_triage
+        f = {"type": "x", "url": "http://t", "evidence": "alert(1) onerror", "confidence": 90}
+        assert classify_evidence(f) == "fact"
+        f["confidence"] = 90
+        assert static_triage(f)["evidence_class"] == "fact"
+        assert f["confidence"] == 90

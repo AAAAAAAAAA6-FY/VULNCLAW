@@ -198,11 +198,6 @@ class ReActAgent:
         self._failed_params: set = set()
         self._param_fail_count: Dict[str, int] = {}
 
-        # 计划模式状态
-        self.current_plan: List[str] = []
-        self.plan_step: int = 0
-        self.plan_fail_count: int = 0
-
         # 场景缓存
         self._scene_cache: Dict[str, Dict] = {}
         self._cache_hit_count: int = 0
@@ -218,13 +213,16 @@ class ReActAgent:
         self._compress_threshold = 15
         self._compressed_summary = ""
         # A1.2: Plan-then-Act——分阶段计划（recon/assume/verify/exploit）与消费游标。
-        # 修复：current_plan/plan_step 此前未在 __init__ 初始化（零调用=零实战藏 bug），
-        # _decide_action 直接读 self.current_plan[self.plan_step] 会 AttributeError。
+        # current_plan 为结构化步骤列表：每步 {phase, tool, reason, expected_observation}
         self.current_plan: List[Dict] = []
-        self.plan_step = 0
-        # A1.3: 反思循环——连续失败计数与策略切换次数
-        self._consecutive_failures = 0
-        self._strategy_switched = 0
+        self.plan_step: int = 0
+        self.plan_fail_count: int = 0
+        # A1.3: 反思循环——策略切换次数、强制切换标志、最近执行工具（换策略时避开）与近期工具序列（信息增益衰减）
+        self._strategy_switched: int = 0
+        self._force_strategy_switch: bool = False
+        self._last_action_tool: Optional[str] = None
+        self._strategy_note: str = ""
+        self._tool_recent: List[str] = []
         # Z3.4: OOB 盲打假设验证去重（target|param|payload 模板），每假设只打一次
         self._oob_attempted: set = set()
         # 外询专家去重：同一问题只委派一次，控制开销与外部调用次数
@@ -297,8 +295,30 @@ class ReActAgent:
         return base
 
     def _rank_tools(self, tool_names: List[str]) -> List[str]:
-        ranked = sorted(tool_names, key=lambda name: (-self._estimate_tool_success(name), name))
+        ranked = sorted(tool_names, key=lambda name: (-self._objective_score(name), name))
         return ranked
+
+    def _expected_info_gain(self, tool_name: str) -> float:
+        """A1.4: 预期信息增益（0~1），确定性启发式，不依赖 LLM。
+
+        - 完全未尝试的工具信息增益最大（探索优先）；
+        - 已多次调用的工具边际增益递减；
+        - 近期已用过的工具衰减，避免重复打同一枪。
+        """
+        stats = self.tool_stats.get(tool_name, {"success": 0, "failure": 0})
+        total = stats.get("success", 0) + stats.get("failure", 0)
+        if total == 0:
+            base = 1.0
+        else:
+            base = max(0.1, 1.0 - total / 10.0)
+        recent = getattr(self, "_tool_recent", [])
+        if tool_name in recent[-3:]:
+            base *= 0.5
+        return min(1.0, base)
+
+    def _objective_score(self, tool_name: str) -> float:
+        """A1.4: 目标函数 = 历史成功率 × 预期信息增益。"""
+        return self._estimate_tool_success(tool_name) * self._expected_info_gain(tool_name)
 
     def _share_knowledge(self, other_agent: Optional["ReActAgent"] = None) -> Dict:
         shared = self._ensure_shared_knowledge()
@@ -351,12 +371,64 @@ class ReActAgent:
             return
         if observation.get("type") == "error":
             self.plan_fail_count += 1
-            if self.current_plan and tool_name in self.current_plan:
-                self.current_plan = [t for t in self.current_plan if t != tool_name]
-                logger.info(f"🛠️ [PlanFeedback] tool={tool_name} failed; removing it from current plan")
+            if self.current_plan and any(s.get("tool") == tool_name for s in self.current_plan):
+                self.current_plan = [s for s in self.current_plan if s.get("tool") != tool_name]
+                logger.info(f"[PlanFeedback] tool={tool_name} failed; removing it from current plan")
         elif observation.get("type") in ("finding", "findings"):
             self.plan_fail_count = max(0, self.plan_fail_count - 1)
-            logger.info(f"🎯 [PlanFeedback] tool={tool_name} produced a valid finding; reinforcing plan")
+            logger.info(f"[PlanFeedback] tool={tool_name} produced a valid finding; reinforcing plan")
+
+    # ---- A1.3 强制反思辅助方法 ----
+    async def _reflect(self, thought: str, action: Dict, result: Any, observation: Dict) -> Dict:
+        """A1.3: 每轮 execute→verify 后强制自评（优先 LLM，缺失则本地启发式）。
+
+        返回 {verdict: 'continue'|'switch', note}。
+        """
+        if self.llm:
+            try:
+                prompt = (
+                    "你是渗透测试Agent的自我审查器。基于本轮行动与结果，判断当前策略是否有效。\n"
+                    f"【思考】{thought[:300]}\n"
+                    f"【行动】{json.dumps(action, ensure_ascii=False)[:200]}\n"
+                    f"【结果】{str(result)[:300]}\n"
+                    f"【观察】{json.dumps(observation, ensure_ascii=False)[:200]}\n"
+                    f"【连续失败】{self._consecutive_failures} 次。\n"
+                    "若当前策略已连续失效或明显走入死胡同，输出 {\"verdict\":\"switch\",\"note\":\"...\"}；"
+                    "否则 {\"verdict\":\"continue\",\"note\":\"...\"}。只输出JSON。"
+                )
+                resp = await self.llm.ask(prompt, temperature=0.2, max_tokens=200, task_type="reflect")
+                m = re.search(r'\{.*\}', resp, re.DOTALL)
+                if m:
+                    data = json.loads(m.group())
+                    verdict = data.get("verdict", "continue")
+                    self._strategy_note = str(data.get("note", ""))[:200]
+                    logger.info("[Reflect] 自评: %s | %s", verdict, self._strategy_note)
+                    return {"verdict": verdict, "note": self._strategy_note}
+            except Exception as e:  # noqa: BLE001
+                logger.debug("[Reflect] 自评失败，走本地启发式: %s", e)
+        # 本地启发式：连续失败>=2 即建议换策略
+        verdict = "switch" if self._consecutive_failures >= 2 else "continue"
+        self._strategy_note = f"连续失败 {self._consecutive_failures} 次" if verdict == "switch" else ""
+        return {"verdict": verdict, "note": self._strategy_note}
+
+    async def _post_step_reflection(self, thought, action, result, observation, is_valid) -> None:
+        """A1.3: 每轮反思——累计失败并强制自评，必要时触发策略切换。"""
+        reflection = await self._reflect(thought, action, result, observation)
+        if is_valid:
+            self._consecutive_failures = 0
+        else:
+            self._consecutive_failures += 1
+        if self._consecutive_failures >= 2 or reflection.get("verdict") == "switch":
+            if not self._force_strategy_switch:
+                self._strategy_switched += 1
+            self._force_strategy_switch = True
+            if self.current_plan:
+                self.current_plan = []
+                self.plan_step = 0
+            logger.warning(
+                "[Reflect] 触发策略切换 (第 %d 次): %s",
+                self._strategy_switched, self._strategy_note or "连续失败",
+            )
 
     async def run(self) -> Dict:
         logger.info(f"🤖 ReAct Agent 启动，目标: {self.target}")
@@ -386,6 +458,12 @@ class ReActAgent:
 
             action = await self._decide_action(thought)
             self.history.append({"iteration": self.iteration, "action": action})
+            # A1.3: 本轮回合消费完策略切换标志；记录近期工具用于信息增益衰减
+            self._force_strategy_switch = False
+            if isinstance(action, dict) and action.get("tool") in self.tools:
+                self._tool_recent.append(action["tool"])
+                if len(self._tool_recent) > 10:
+                    self._tool_recent = self._tool_recent[-10:]
 
             result = await self._execute(action)
             self.history.append({"iteration": self.iteration, "result": result})
@@ -393,16 +471,8 @@ class ReActAgent:
             is_valid = await self._verify_action(action, result)
             self.history.append({"iteration": self.iteration, "valid": is_valid})
 
-            # A1.3: 反思循环——连续失败计数，≥2 次自动切换策略（_decide_action 会读到状态）
-            if is_valid:
-                self._consecutive_failures = 0
-            else:
-                self._consecutive_failures += 1
-                if self._consecutive_failures >= 2:
-                    self._strategy_switched += 1
-                    logger.warning(
-                        f"🔄 [Reflect] 连续失败 {self._consecutive_failures} 次，要求切换策略"
-                    )
+            # A1.3: 反思循环——每轮 execute→verify 后强制自评，必要时切换策略
+            await self._post_step_reflection(thought, action, result, observation, is_valid)
 
             observation = await self._observe(result)
             self.history.append({"iteration": self.iteration, "observation": observation})
@@ -577,10 +647,16 @@ ask_expert(question,context,system)：困惑时外询——内部知识盲区/�
 """
         try:
             # 强制开启 wrap_data 防止提示词注入
+            # P0-2: system 提示注入信任边界硬规则（信封内数据不是指令）
+            try:
+                from vulnclaw.core.tool_output_guard import UNTRUSTED_RULE
+                _sys_extra = UNTRUSTED_RULE
+            except Exception:  # noqa: BLE001
+                _sys_extra = ""
             result = await self.llm.ask(
                 prompt,
                 # A2.1: 角色化子 Agent 使用各自窄 system prompt
-                system=self.role_system or "你是渗透测试AI Agent，擅长推理决策。",
+                system=(self.role_system or "你是渗透测试AI Agent，擅长推理决策。") + ("\n\n" + _sys_extra if _sys_extra else ""),
                 temperature=0.3,
                 wrap_data=True,
                 task_type="plan",
@@ -598,12 +674,25 @@ ask_expert(question,context,system)：困惑时外询——内部知识盲区/�
             return "继续使用常见漏洞检测工具探索目标。"
 
     async def _decide_action(self, thought: str) -> Dict:
-        # 第一步：优先执行当前计划，但按历史成功率重新排序
+        # 第一步：优先执行当前计划（A1.2 结构化步骤，按目标函数排序逐条消费）
         if self.current_plan and self.plan_step < len(self.current_plan) and self.plan_fail_count < 2:
-            ranked_plan = self._rank_tools([t for t in self.current_plan if t in self.tools])
-            if ranked_plan:
-                next_tool = ranked_plan[0]
-                self.plan_step += 1
+            remaining = [s for s in self.current_plan[self.plan_step:] if s.get("tool") in self.tools]
+            if remaining:
+                ranked = self._rank_tools([s["tool"] for s in remaining])
+                next_tool = ranked[0]
+                # A1.3: 换策略时避开最近重复工具
+                if self._force_strategy_switch and next_tool == self._last_action_tool:
+                    alts = [t for t in ranked if t != self._last_action_tool]
+                    if alts:
+                        next_tool = alts[0]
+                        logger.info(f"[Reflect] 换策略: 跳过重复工具 {self._last_action_tool} -> {next_tool}")
+                # 推进游标到该步骤之后
+                for i in range(self.plan_step, len(self.current_plan)):
+                    if self.current_plan[i].get("tool") == next_tool:
+                        self.plan_step = i + 1
+                        break
+                self._last_action_tool = next_tool
+                step = next((s for s in remaining if s["tool"] == next_tool), remaining[0])
 
                 real_params = self._recon_observation.get('params', [])
                 fallback_param = 'id'
@@ -614,13 +703,14 @@ ask_expert(question,context,system)：困惑时外询——内部知识盲区/�
                         fallback_param = real_params[0]
 
                 logger.info(
-                    f"📋 [执行计划] tool={next_tool} success_rate={self._estimate_tool_success(next_tool):.2f} "
-                    f"step={self.plan_step}/{len(self.current_plan)}"
+                    f"[PLAN] 执行计划 step={self.plan_step}/{len(self.current_plan)} "
+                    f"tool={next_tool} phase={step.get('phase', '?')} score={self._objective_score(next_tool):.2f}"
                 )
                 return {
                     "tool": next_tool,
                     "params": {"url": self.target, "param": fallback_param},
-                    "reason": f"执行多步计划中的 {next_tool}（按成功率优先）"
+                    "reason": f"执行多步计划中的 {next_tool}（{step.get('phase', '')}）",
+                    "expected_observation": step.get("expected_observation", ""),
                 }
             self.current_plan = []
 
@@ -712,13 +802,15 @@ ask_expert(question,context,system)：困惑时外询——内部知识盲区/�
                 if match:
                     action = json.loads(match.group())
 
-                    # 第三步：解析并保存计划
+                    # 第三步：解析并保存计划（转为结构化步骤）
                     if action.get("plan") and isinstance(action["plan"], list):
-                        # 过滤掉工具库中不存在的
-                        self.current_plan = [t for t in action["plan"] if t in self.tools][:5]
+                        self.current_plan = [
+                            s for s in (self._normalize_plan_step(t) for t in action["plan"])
+                            if s and s["tool"] in self.tools
+                        ][:5]
                         self.plan_step = 0
                         self.plan_fail_count = 0
-                        logger.info(f"🗺️ 生成新计划: {self.current_plan}")
+                        logger.info(f"[PLAN] 生成新计划: {[s.get('tool') for s in self.current_plan]}")
 
                     # 获取当前动作
                     action["tool"] = action.get("current_action", action.get("tool"))
@@ -730,6 +822,13 @@ ask_expert(question,context,system)：困惑时外询——内部知识盲区/�
                             "tool": "finish",
                             "reason": f"参数 {param} 已失败多次，跳过"
                         }
+                    # A1.3: 换策略时避开最近重复工具
+                    if self._force_strategy_switch and action.get("tool") == self._last_action_tool:
+                        alts = [t for t in self._rank_tools(list(self.tools.keys())) if t != self._last_action_tool]
+                        if alts:
+                            logger.info(f"[Reflect] 换策略: 避开重复工具 {self._last_action_tool} -> {alts[0]}")
+                            action["tool"] = alts[0]
+                    self._last_action_tool = action.get("tool")
                     return action
 
                 if attempt == 0:
@@ -782,7 +881,11 @@ ask_expert(question,context,system)：困惑时外询——内部知识盲区/�
             elif 'url' in param_lower or 'redirect' in param_lower:
                 candidate_tools = ['ssrf', 'open_redirect', 'xss'] + [t for t in candidate_tools if t not in ['ssrf', 'open_redirect', 'xss']]
 
-            available_tools = self._rank_tools([t for t in candidate_tools if t in self.tools])
+            # A1.3: 换策略时排除最近重复工具，强制换思路
+            cands = candidate_tools
+            if self._force_strategy_switch and self._last_action_tool:
+                cands = [t for t in candidate_tools if t != self._last_action_tool] or candidate_tools
+            available_tools = self._rank_tools([t for t in cands if t in self.tools])
 
             if available_tools:
                 selected_tool = available_tools[0]
@@ -790,6 +893,7 @@ ask_expert(question,context,system)：困惑时外询——内部知识盲区/�
                     f"🔧 降级使用: {selected_tool} (success_rate={self._estimate_tool_success(selected_tool):.2f}, "
                     f"tech_stack={tech_stack}, param={fallback_param})"
                 )
+                self._last_action_tool = selected_tool
                 return {
                     "tool": selected_tool,
                     "params": {"url": self.target, "param": fallback_param},
@@ -797,6 +901,7 @@ ask_expert(question,context,system)：困惑时外询——内部知识盲区/�
                 }
             else:
                 logger.warning("⚠️ 无可用工具，降级为信息泄露检测")
+                self._last_action_tool = "info_leak"
                 return {
                     "tool": "info_leak",
                     "params": {"url": self.target},
@@ -804,6 +909,7 @@ ask_expert(question,context,system)：困惑时外询——内部知识盲区/�
                 }
         else:
             logger.warning("⚠️ 无可用参数，降级为信息泄露检测")
+            self._last_action_tool = "info_leak"
             return {
                 "tool": "info_leak",
                 "params": {"url": self.target},
@@ -1076,6 +1182,15 @@ ask_expert(question,context,system)：困惑时外询——内部知识盲区/�
 
     async def _observe(self, result: Any) -> Dict:
         if isinstance(result, dict):
+            # P0-2: 工具输出信任信封——外部原始输出包 <UNTRUSTED_TOOL_OUTPUT>，
+            # 命中注入信号落 quarantine 台账；异常保守放行，绝不阻断扫描。
+            try:
+                from vulnclaw.core.tool_output_guard import sanitize_tool_result
+                result, _signals = sanitize_tool_result(
+                    result, tool="react", target=getattr(self, "target", "")
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug("suppressed exception (tool output guard)")
             # A4.3: 工具输出裁剪（原始 stdout 千行只入日志，喂 LLM 用摘要）
             result = self._clip_tool_output(result)
             # A2.2: 端点写入共享黑板（结构化 state，非自然语言全量互传）
@@ -1364,12 +1479,13 @@ ask_expert(question,context,system)：困惑时外询——内部知识盲区/�
         return result
 
     async def _generate_plan(self) -> None:
-        """A1.2: Plan-then-Act——执行前先产出分阶段计划（recon→assume→verify→exploit）。
+        """A1.2: Plan-then-Act——执行前先产出 JSON 分阶段计划（recon→assume→verify→exploit）。
 
-        current_plan 为按阶段排序的工具名列表（与 _decide_action 的消费逻辑兼容）；
-        LLM 不可用/失败时降级为动态决策。
+        结构化步骤：每步 {phase, tool, reason, expected_observation}；
+        LLM 不可用/失败时降级为按目标函数排序的线性工具序列。
         """
         if not self.llm:
+            self._current_plan_fallback()
             return
         obs = self._recon_observation or {}
         params = obs.get("params") or []
@@ -1382,20 +1498,74 @@ ask_expert(question,context,system)：困惑时外询——内部知识盲区/�
             f"【侦察】target={obs.get('target')} status={obs.get('status')} "
             f"tech_stack={obs.get('tech_stack')} params={param_names}\n"
             f"【可选工具】{known_tools}\n"
-            "【要求】输出 JSON 数组，按 侦察/假设/验证/利用 四阶段顺序排列，"
-            "每项仅含工具名（必须来自可选工具）。数量 3-6 个。只输出 JSON 数组。"
+            "【要求】按 侦察(recon)→假设(assume)→验证(verify)→利用(exploit) 四阶段，"
+            "输出 JSON 数组，每项 {\"phase\":..., \"tool\":工具名, \"reason\":理由, "
+            "\"expected_observation\":预期观察}。工具必须来自可选工具，数量 3-6 个。"
+            "只输出 JSON 数组。"
         )
         try:
-            resp = await self.llm.ask(prompt, temperature=0.3, max_tokens=400, task_type="plan")
-            data = json.loads(resp)
-            if isinstance(data, list) and data:
-                plan = [str(t) for t in data if str(t) in self.tools]
-                if plan:
-                    self.current_plan = plan
-                    self.plan_step = 0
-                    logger.info(f"🗺️ [Plan] 预生成 {len(plan)} 步计划: {plan}")
+            resp = await self.llm.ask(prompt, temperature=0.3, max_tokens=600, task_type="plan")
+            plan = self._parse_plan(json.loads(resp))
+            if plan:
+                self.current_plan = plan
+                self.plan_step = 0
+                self._log_plan_node(plan)
+                return
         except Exception as e:  # noqa: BLE001
             logger.debug(f"[Plan] 计划预生成失败，降级为动态决策: {e}")
+        self._current_plan_fallback()
+
+    def _current_plan_fallback(self) -> None:
+        """A1.2: 降级计划——按目标函数排序的线性工具序列，保证有可消费计划。"""
+        self.current_plan = [
+            {"phase": "attack", "tool": t, "reason": "按目标函数优先级兜底", "expected_observation": ""}
+            for t in self._rank_tools(list(self.tools.keys()))[:5]
+        ]
+        self.plan_step = 0
+        logger.debug("[PLAN] 采用降级线性计划")
+
+    def _log_plan_node(self, plan: List[Dict]) -> None:
+        """A1.2: 日志输出 plan 节点（结构化计划概览）。"""
+        logger.info("[PLAN] 预生成 %d 步计划:", len(plan))
+        for i, s in enumerate(plan, 1):
+            logger.info(
+                "  %d. [%s] %s | %s | 预期: %s",
+                i, s.get("phase", "?"), s.get("tool", "?"),
+                (s.get("reason") or "-")[:60], (s.get("expected_observation") or "-")[:60],
+            )
+
+    def _normalize_plan_step(self, item) -> Optional[Dict]:
+        """将 LLM 返回的计划项（字符串工具名或字典）归一为结构化步骤。"""
+        if isinstance(item, str):
+            tool = item
+        elif isinstance(item, dict):
+            tool = item.get("tool") or item.get("name") or item.get("step")
+            if not tool:
+                return None
+            return {
+                "phase": item.get("phase", "attack"),
+                "tool": tool,
+                "reason": item.get("reason", "") or item.get("rationale", ""),
+                "expected_observation": item.get("expected_observation", "") or item.get("expected", ""),
+            }
+        else:
+            return None
+        if str(tool) in self.tools:
+            return {"phase": "attack", "tool": str(tool), "reason": "", "expected_observation": ""}
+        return None
+
+    def _parse_plan(self, data) -> List[Dict]:
+        """解析 LLM 计划为结构化步骤列表，过滤不可识工具，补齐字段，最多 6 步。"""
+        if not isinstance(data, list) or not data:
+            return []
+        steps = []
+        for item in data:
+            s = self._normalize_plan_step(item)
+            if s and s["tool"] in self.tools:
+                steps.append(s)
+            if len(steps) >= 6:
+                break
+        return steps
 
     def _format_plan_progress(self) -> str:
         """A1.2: 展示计划中尚未消费的步骤（供 _decide_action 参考）。"""
@@ -1404,7 +1574,9 @@ ask_expert(question,context,system)：困惑时外询——内部知识盲区/�
         pending = self.current_plan[self.plan_step:]
         if not pending:
             return "计划已全部执行"
-        return " -> ".join(str(t) for t in pending[:5])
+        return " -> ".join(
+            f"{s.get('phase', '?')}:{s.get('tool', '?')}" for s in pending[:5]
+        )
 
     def _format_tools(self) -> str:
         names = list(self.tools.keys())

@@ -304,9 +304,9 @@
 | 编号 | 小方向 | 落地 | P | 验收 |
 |---|---|---|---|---|
 | D7.1 | 本地靶场矩阵：DVWA/testphp/java 靶场 Docker 化一键起（docker-compose 扩展） | `tests/fixtures/targets/` | P0 | 一条命令起 ≥3 靶场 |
-| D7.2 | benchmark 剧本化：已知漏洞清单 vs 扫描发现，输出检出率/误报率/耗时三角数据（scripts/benchmark.py 扩展） | `scripts/benchmark.py` | P0 | 每次大改动后出 benchmark 对比 |
+| D7.2 | benchmark 剧本化：已知漏洞清单 vs 扫描发现，输出检出率/误报率/耗时三角数据（scripts/benchmark.py 扩展） | `scripts/benchmark.py` | P0 | 每次大改动后出 benchmark 对比  （✅ 已实现 2026-09-05：--mode eval 剧本化评估 + SARIF/JSON 归一 + 类型别名映射 + scan_runner vulnerabilities 真实产物形态；基线 report 落 scripts/benchmarks/；真扫 127.0.0.1:8090 验证：XSS/File Upload 命中、SQLi 因验证队列被文件上传挤占漏检 → 红线正确 FAIL 0.8）|
 | D7.3 | 引擎级回归：每个引擎配 1 正例+1 反例 fixture，CI 强制跑 | `tests/` | P1 | 新引擎必须带 fixture 才能合入 |
-| D7.4 | 检出率红线：D 组改动合并前跑 benchmark，检出率不得低于基线（红线进 CI 门禁） | `.github/workflows/ci.yml` | P1 | CI 失败即阻断合并 |
+| D7.4 | 检出率红线：D 组改动合并前跑 benchmark，检出率不得低于基线（红线进 CI 门禁） | `.github/workflows/ci.yml` | P1 | CI 失败即阻断合并  （✅ 已实现 2026-09-05：--min-recall 红线 sys.exit(1) 阻断 + CI gate 已接入 .github/workflows/ci.yml）|
 
 ### 组 Z：0day / 复杂漏洞检出能力专项（v3 新增，16 项）
 
@@ -573,6 +573,12 @@
     - 方向5 本地规则集市 growth/rule_bazaar.py（RuleBazaar：外部/社区 nuclei YAML 导入 -> 必需段/severity 校验 -> 指纹去重 -> 来源信誉 x 成长命中率评分 -> export_pool 落可加载复用池；社区网络侧 community_publish 占位注明依赖用户生态，暂不实现）
     - 接线 growth/bridges.py：扫描主流程两处钩子（开始前 maybe_ingest_cves / 结束后 maybe_absorb_scan），开关全部走 settings 动态 getattr 默认关，失败静默，对现有扫描行为零影响；方向3/4/5 显式函数调用（不挂扫描钩子，与对面封装零共享文件交集）
     - 测试：tests/test_feedback_ledger.py + tests/test_cve_ingest.py + tests/test_target_lab.py + tests/test_distill_data.py + tests/test_rule_bazaar.py（growth 组 55 例全绿）
+- [x] **SP13 线1收口：安全增强 + 评测闭环（P0-2/P0-3/D7.2/D7.4，2026-09-05 落地）** ——
+    - P0-2 工具输出信任信封：新 `core/tool_output_guard.py`（8 类注入信号正则 + <UNTRUSTED_TOOL_OUTPUT> 信封包裹 + quarantine JSONL 台账 + 系统提示硬规则）；ReActAgent._observe 挂接、_think 注入硬规则。测试 `tests/test_tool_output_guard.py`（18 例）。
+    - P0-3 finding 证据三分类：`core/verification_gateway.py` static_triage 注入 evidence_class（fact/inference/unproven_hypothesis），与 confidence 构成二维可信度，SARIF properties 透传。测试 `tests/test_verification_gateway.py` 追加用例。
+    - D7.2 评测场：`scripts/benchmark.py` --mode eval（剧本 YAML 期望 vs 扫描报告检出率/精确率/耗时三角）+ _VULN_TYPE_ALIASES 类型归一 + SARIF 2.1 报告解析。测试 `tests/test_benchmark_eval.py`。
+    - D7.4 红线门禁：benchmark --min-recall 不达标 exit(1) + `.github/workflows/ci.yml` Detection benchmark gate。
+    - 回归：全量 705 passed / 0 failed / 16 skipped（较基线无回退）；ruff 干净。
 
 
 ***
