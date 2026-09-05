@@ -761,6 +761,149 @@ def _tp_arch_suffix() -> str:
     return "amd64"
 
 
+_TP_UA = "VULNCLAW-setup/0.2"
+# 本进程内判死的下载源（连接级失败标记，避免同一批里后续工具反复撞墙）
+_TP_DEAD_CANDIDATES: set = set()
+
+
+def _tp_mirrors() -> list:
+    """镜像前缀列表（TOOL_DOWNLOAD_MIRRORS，逗号分隔；镜像 URL=前缀+原始完整 GitHub URL）。"""
+    from vulnclaw.config.settings import settings as _st
+    raw = str(getattr(_st, "tool_download_mirrors", "") or "")
+    return [m.strip().rstrip("/") for m in raw.split(",") if m.strip()]
+
+
+def _tp_candidate_urls(url: str) -> list:
+    """候选下载源：直连在前，镜像按配置顺序追加。"""
+    urls = [url]
+    for m in _tp_mirrors():
+        cand = m + "/" + url
+        if cand not in urls:
+            urls.append(cand)
+    return urls
+
+
+def _tp_is_connect_error(e: Exception) -> bool:
+    """连接级失败（超时/重置/拒连/DNS）判定——这类失败按"源"标记跳过；HTTP 4xx/5xx 是 URL 级问题不标记。"""
+    import urllib.error as _uerr
+    if isinstance(e, _uerr.HTTPError):
+        return False
+    if isinstance(e, (TimeoutError, ConnectionError, socket.timeout)):
+        return True
+    reason = getattr(e, "reason", None)
+    if isinstance(reason, (TimeoutError, ConnectionError, OSError)):
+        return True
+    text = str(e).lower()
+    return any(k in text for k in (
+        "timed out", "timeout", "connection reset", "connection refused",
+        "unreachable", "getaddrinfo failed", "temporary failure",
+        "10054", "10060", "10013",
+    ))
+
+
+def _tp_fetch_text(url: str, timeout: int = 30) -> Optional[str]:
+    """拉取小文本（checksums 等）：走候选源（直连+镜像），全部失败返回 None（软失败）。"""
+    import urllib.request
+    for cand in _tp_candidate_urls(url):
+        try:
+            req = urllib.request.Request(cand, headers={"User-Agent": _TP_UA})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read().decode("utf-8", errors="replace")
+        except Exception:
+            continue
+    return None
+
+
+# 只对确认发布 <repo>_<ver>_checksums.txt 的官方源做硬校验
+# （2026-09-05 实测：PD/ffuf 命名正确；trivy 该命名 404，tomnomnom/gau/gospider 不发布 → 均不硬校验）
+_TP_CHECKSUM_OWNERS = {"projectdiscovery", "ffuf"}
+
+
+def _tp_checksum_url(tool: dict) -> Optional[str]:
+    owner = tool.get("owner", "")
+    if owner not in _TP_CHECKSUM_OWNERS:
+        return None
+    repo, ver = tool["repo"], tool["ver"]
+    return (
+        f"https://github.com/{owner}/{repo}/releases/download/"
+        f"v{ver}/{repo}_{ver}_checksums.txt"
+    )
+
+
+def _tp_verify_archive_checksum(archive: Path, tool: dict, asset_name: str) -> str:
+    """官方 checksums 硬校验。
+
+    返回 ""（校验通过）或软告警文案（官方无 checksums/拉取失败/无条目 → 放行并提示）；
+    哈希不匹配 → raise ValueError（硬拒装，防投毒/损坏）。
+    """
+    csum_url = _tp_checksum_url(tool)
+    if not csum_url:
+        return "该工具官方未发布 checksums，改用本地 manifest 比对"
+    text = _tp_fetch_text(csum_url)
+    if not text:
+        return "官方 checksums 拉取失败，跳过本轮硬校验（仍记入本地 manifest 比对）"
+    want = None
+    aname = (asset_name or archive.name).lower()
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[1].lstrip("*").lower() == aname:
+            want = parts[0].lower()
+            break
+    if not want:
+        return f"官方 checksums 中无 {aname} 条目，跳过硬校验"
+    import hashlib
+    h = hashlib.sha256()
+    with open(archive, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    got = h.hexdigest()
+    if got != want:
+        raise ValueError(
+            f"SHA256 与官方不符，已拒装（可能被篡改/损坏）：官方 {want[:16]}… / 实际 {got[:16]}…"
+        )
+    return ""
+
+
+def _tp_api_assets(owner: str, repo: str, ver: str) -> list:
+    """GitHub API 拉取 release assets（仅直连 api.github.com，尽力而为）。"""
+    import urllib.request
+    api = f"https://api.github.com/repos/{owner}/{repo}/releases/tags/v{ver}"
+    req = urllib.request.Request(
+        api, headers={"User-Agent": _TP_UA, "Accept": "application/vnd.github+json"}
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return (json.loads(resp.read().decode("utf-8")) or {}).get("assets", []) or []
+
+
+def _tp_api_asset_url(tool: dict) -> Optional[str]:
+    """固定 URL 失败的兜底：按当前平台提示词从 API assets 里挑匹配资产（防上游改 Release 命名结构）。"""
+    try:
+        assets = _tp_api_assets(tool["owner"], tool["repo"], tool["ver"])
+    except Exception:
+        return None
+    os_key = _tp_os_key()
+    arch = _tp_arch_suffix()
+    os_hints = {"win": ("windows",), "linux": ("linux",),
+                "darwin": ("macos", "darwin", "mac")}[os_key]
+    arch_hints = {"amd64": ("amd64", "x86_64", "64bit"), "arm64": ("arm64", "aarch64"),
+                  "386": ("386", "i386")}[arch]
+    best, best_score = None, -1
+    for a in assets:
+        n = str(a.get("name") or "").lower()
+        if not n.endswith((".zip", ".tar.gz", ".tgz")):
+            continue
+        if "checksums" in n or ".sbom" in n or n.endswith(".json"):
+            continue
+        if not any(h in n for h in os_hints):
+            continue
+        if not any(h in n for h in arch_hints):
+            continue
+        score = sum(1 for h in os_hints if h in n) + sum(1 for h in arch_hints if h in n)
+        if score > best_score:
+            best, best_score = a.get("browser_download_url"), score
+    return best
+
+
 def _tp_release_url(tool: dict) -> tuple[str, str]:
     """返回 (download_url, archive_ext)。ext 不带点，如 'zip' / 'tar.gz'。"""
     owner = tool["owner"]
@@ -845,12 +988,13 @@ def _tp_release_url(tool: dict) -> tuple[str, str]:
 
     # -------- jaeles-project/gospider --------
     if owner == "jaeles-project":
-        # 例: https://github.com/jaeles-project/gospider/releases/download/v1.1.6/gospider_1.1.6_windows_amd64.zip
-        os_name = {"win": "windows", "linux": "linux", "darwin": "darwin"}[os_key]
-        ext = "zip" if os_key in ("win", "darwin") else "tar.gz"
+        # 实际资产命名: <repo>_v<ver>_<os>_<arch>.zip（os=windows, arch=x86_64/386/arm64）
+        os_name = "windows" if os_key == "win" else ("linux" if os_key == "linux" else "macos")
+        arch_name = ("x86_64" if arch == "amd64" else arch)
+        ext = "zip"
         url = (
             f"https://github.com/{owner}/{repo}/releases/download/"
-            f"v{ver}/{repo}_{ver}_{os_name}_{arch}.{ext}"
+            f"v{ver}/{repo}_v{ver}_{os_name}_{arch_name}.{ext}"
         )
         return url, ext
 
@@ -869,14 +1013,12 @@ def _tp_progress(rep: str, downloaded: int, total: int | None) -> None:
     sys.stdout.flush()
 
 
-def _tp_download(url: str, dest: Path, tool_label: str) -> None:
+def _tp_fetch(url: str, dest: Path, timeout: int) -> None:
+    """单次下载尝试（成功写满 dest；失败可能留下半截文件，由调用方清理）。"""
     import urllib.request
     # 加 UA，否则一些 GitHub asset CDN 会 403
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "VULNCLAW-setup/0.1 (+https://github.com/AAAAAAAAAA6-FY/VULNCLAW)"},
-    )
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    req = urllib.request.Request(url, headers={"User-Agent": _TP_UA})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         total = resp.headers.get("Content-Length")
         total_i = int(total) if total and total.isdigit() else None
         done = 0
@@ -888,9 +1030,46 @@ def _tp_download(url: str, dest: Path, tool_label: str) -> None:
                     break
                 f.write(buf)
                 done += len(buf)
-                _tp_progress(tool_label, done, total_i)
+                _tp_progress(url.rsplit("/", 1)[-1][:28], done, total_i)
     sys.stdout.write("\n")
     sys.stdout.flush()
+
+
+def _tp_download(url: str, dest: Path, tool_label: str, timeout: int = 60) -> str:
+    """多候选（直连+镜像）+ 有限轮退避重试的下载入口。
+
+    - 每轮遍历全部候选源，连接级失败的源本进程内标死（后续工具不再撞墙）；
+    - 每次失败清理半截文件；
+    - 返回实际下载成功的 URL；全部失败 raise RuntimeError。
+    """
+    from vulnclaw.config.settings import settings as _st
+    import time as _time
+    attempts = max(1, int(getattr(_st, "tool_download_retries", 3) or 3))
+    total_cands = len(_tp_candidate_urls(url))
+    last_err: Exception | None = None
+    for attempt in range(attempts):
+        cands = [c for c in _tp_candidate_urls(url) if c not in _TP_DEAD_CANDIDATES]
+        if not cands:
+            break
+        for cand in cands:
+            try:
+                _tp_fetch(cand, dest, timeout)
+                return cand
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                if _tp_is_connect_error(e):
+                    _TP_DEAD_CANDIDATES.add(cand)
+                try:
+                    dest.unlink()
+                except OSError:
+                    pass
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+        if attempt < attempts - 1:
+            _time.sleep(0.5 * (attempt + 1))
+    raise RuntimeError(
+        f"{tool_label}: {attempts} 轮 × {total_cands} 个下载源全部失败: {last_err}"
+    )
 
 
 def _tp_extract(archive: Path, dest_dir: Path, bin_src_name: str, bin_dest: Path) -> None:
@@ -1013,6 +1192,23 @@ def _github_reachable(timeout: int = 5) -> bool:
         return False
 
 
+def _mirror_reachable(timeout: int = 3) -> bool:
+    """镜像前缀连通性预检：GitHub 直连不可达但镜像可用时，仍尝试自动安装（经镜像下载）。"""
+    mirrors = _tp_mirrors()
+    if not mirrors:
+        return False
+    import urllib.request
+    for m in mirrors[:3]:
+        try:
+            req = urllib.request.Request(m, method="HEAD", headers={"User-Agent": _TP_UA})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if resp.status < 500:
+                    return True
+        except Exception:
+            continue
+    return False
+
+
 def ensure_thirdparty_tools(auto_install: bool | None = None) -> tuple:
     """扫描/启动前的工具体检入口。
 
@@ -1038,9 +1234,9 @@ def ensure_thirdparty_tools(auto_install: bool | None = None) -> tuple:
             f"python scan.py setup --download-thirdparty"
         )
         return 0, len(missing)
-    if not _github_reachable():
+    if not _github_reachable() and not _mirror_reachable():
         logger.warning(
-            "🛠️ [工具体检] GitHub 不可达，跳过自动安装（扫描继续，可稍后手动补齐）"
+            "🛠️ [工具体检] GitHub 直连与镜像均不可达，跳过自动安装（扫描继续，可稍后手动补齐）"
         )
         return 0, len(missing)
     try:
@@ -1100,9 +1296,42 @@ def download_thirdparty_tools(
                 continue
 
             archive_path = tmpdir / f"{name}-{tool['ver']}.{ext}"
+            asset_name = url.rsplit("/", 1)[-1]
             print(f"\n⬇️  {name:<20s} v{tool['ver']}  {url}")
             try:
                 _tp_download(url, archive_path, f"{name} v{tool['ver']}")
+            except Exception as e:
+                # 兜底①：GitHub API 按资产名挑匹配平台的文件（防上游改 Release 命名结构）
+                alt = _tp_api_asset_url(tool)
+                if not alt:
+                    fail += 1
+                    print(f"   ❌ 失败: {e}")
+                    continue
+                alt_ext = "zip" if alt.lower().endswith(".zip") else "tar.gz"
+                archive_path = tmpdir / f"{name}-{tool['ver']}.{alt_ext}"
+                asset_name = alt.rsplit("/", 1)[-1]
+                print(f"   ↻ 固定链接失败（{e}），API 兜底: {asset_name}")
+                try:
+                    _tp_download(alt, archive_path, f"{name} v{tool['ver']}")
+                except Exception as e2:
+                    fail += 1
+                    print(f"   ❌ 失败: {e2}")
+                    continue
+            # 兜底②：官方 checksums 硬校验（拉不到→软告警放行；不匹配→拒装防投毒）
+            try:
+                cnote = _tp_verify_archive_checksum(archive_path, tool, asset_name=asset_name)
+                if cnote:
+                    print(f"   ⚠️  {cnote}")
+            except ValueError as e:
+                fail += 1
+                print(f"   ❌ {e}")
+                if archive_path.exists():
+                    try:
+                        archive_path.unlink()
+                    except Exception:
+                        logger.debug("suppressed exception (core audit)")
+                continue
+            try:
                 print(f"   ✔ 下载完成 ({archive_path.stat().st_size / 1024 / 1024:.2f} MB)")
                 print(f"   🗜  提取 {bin_name} -> {dest_file}")
                 _tp_extract(archive_path, tmpdir, bin_name, dest_file)
@@ -1148,6 +1377,8 @@ def download_thirdparty_tools(
         print(f"✅ 全部就绪。现在可以直接： python scan.py scan -t https://example.com")
     else:
         print(f"ℹ️  失败项会自动降级；可重跑 setup --download-thirdparty（会只补缺失的，很快）。")
+        if not _tp_mirrors():
+            print("   国内网络可在 .env 设 TOOL_DOWNLOAD_MIRRORS=https://gh-proxy.com/,https://ghproxy.net/ 启用镜像加速（逗号分隔多个）。")
     print("=" * 68)
     return ok, fail
 

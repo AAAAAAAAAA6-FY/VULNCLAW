@@ -162,6 +162,10 @@ class Settings(BaseSettings):
     nuclei_template_dir: str = Field(os.path.expanduser("~/nuclei-templates"), alias="NUCLEI_TEMPLATE_DIR")
     # 方案②：工具体检——缺失第三方工具启动时尽力而为自动安装（默认开，GitHub 不通静默跳过）
     tool_auto_install: bool = Field(True, alias="TOOL_AUTO_INSTALL")
+    # 方案②+：下载健壮性——GitHub 直连失败时按序尝试的镜像前缀（逗号分隔，镜像 URL=前缀+原始完整 URL；空=仅直连）
+    tool_download_mirrors: str = Field("https://gh-proxy.com/,https://ghproxy.net/", alias="TOOL_DOWNLOAD_MIRRORS")
+    # 方案②+：单个工具下载重试轮数（每轮遍历 直连+全部镜像；连接级失败的源本进程内自动跳过）
+    tool_download_retries: int = Field(3, alias="TOOL_DOWNLOAD_RETRIES")
 
     # ========== P4: 外围工具集成 ==========
     # P4-1 情报补全（Shodan / Censys）
