@@ -182,6 +182,9 @@ class V100Orchestrator:
         # G4 可观测性：每引擎统计（调用/命中/超时/错误/耗时）+ 每阶段耗时
         self._engine_metrics: Dict[str, Dict] = {}
         self._phase_timings: Dict[str, float] = {}
+        # SP18 编排可观测性：协调阶段（chain_router/react_deep_dive/agent_coordinator）起止时间
+        self._orchestration_stages: Dict[str, Tuple[float, float]] = {}
+        self._coord_dispatch_count: int = 0  # SP18 协调器派发子 agent 数
         # SH17.1 阶段预算：per-phase wall-clock 上限（settings 带默认值；<=0 不限制）
         self._phase_timeouts_hit: List[str] = []
         self._phase_budgets: Dict[str, int] = {}
@@ -1275,6 +1278,7 @@ class V100Orchestrator:
             await coord.coordinate()
             coord.bridge_into(self)  # 把多 agent 共享知识（含 recon 产出）并入 findings/黑板
             await coord.persist_memory()
+            self._coord_dispatch_count = int(getattr(coord, "nodes", None) and len(coord.nodes) or 0)
             logger.info(
                 f"🌲 [AgentCoordinator] 完成: agents={len(coord.nodes)}, "
                 f"snapshot={coord.snapshot.version}, 黑板={coord.snapshot.blackboard.digest()}"
@@ -1414,6 +1418,51 @@ class V100Orchestrator:
             logger.warning(f"⏱️ [SH17.1] 阶段超时: {name}（预算 {budget}s），跳过继续")
             return None
 
+    def _coord_enabled(self, name: str) -> bool:
+        """SP18: 协调阶段是否被配置启用（关闭时跳过，不写 0 假值）。"""
+        if name == "chain_router":
+            return bool(getattr(settings, "enable_chain_router", True))
+        if name == "react_deep_dive":
+            return bool(getattr(settings, "enable_react_dive", False))
+        if name == "agent_coordinator":
+            return bool(getattr(settings, "agent_coordinator_enabled", False))
+        return True
+
+    async def _record_coord_timing(self, name: str, enabled_stage: bool, coro):
+        """SP18: 执行协调阶段协程，仅当阶段实际启用时写入耗时与编排账本起止时间。"""
+        _start = time.monotonic()
+        result = await coro
+        if enabled_stage and self._coord_enabled(name):
+            self._phase_timings[name] = time.monotonic() - _start
+            self._orchestration_stages[name] = (_start, time.monotonic())
+        return result
+
+    def orchestration_ledger(self) -> Dict:
+        """SP18: 返回各协调阶段的决策摘要账本（阶段名 -> 起止/耗时/关键决策计数）。
+
+        决策计数复用既有可观测来源：chain 路由合入的 finding 数（source=chain_router）、
+        ReAct 深挖合入数（source=react_agent）、协调器派发子 agent 数（node 数）；
+        无计数器时仅提供耗时，绝不新造复杂机制。
+        """
+        ledger: Dict[str, Dict] = {}
+        stages = getattr(self, "_orchestration_stages", None) or {}
+        findings = getattr(self, "findings", None) or []
+        chain_routes = sum(1 for f in findings if isinstance(f, dict) and f.get("source") == "chain_router")
+        dive_count = sum(1 for f in findings if isinstance(f, dict) and f.get("source") == "react_agent")
+        for name in ("chain_router", "react_deep_dive", "agent_coordinator"):
+            if name not in stages:
+                continue
+            start, end = stages[name]
+            entry: Dict = {"start": start, "end": end, "elapsed": end - start}
+            if name == "chain_router":
+                entry["chain_routes"] = chain_routes
+            elif name == "react_deep_dive":
+                entry["dive_count"] = dive_count
+            elif name == "agent_coordinator":
+                entry["agents_dispatched"] = int(getattr(self, "_coord_dispatch_count", 0) or 0)
+            ledger[name] = entry
+        return ledger
+
     def _seed_resume_state(self) -> None:
         """续扫：把断点中已落盘的发现 / 已扫三元组 / agent 记忆回填进本次运行。"""
         if self._checkpoint is None or not self._resume:
@@ -1534,22 +1583,25 @@ class V100Orchestrator:
             # C3: 成本预算熔断——扫描阶段累计 AI 成本超预算则降级纯引擎模式，防失控
             self._maybe_trip_cost_breaker()
 
-            async with self._stage("chain_router"):
+            async with self._stage("chain_router") as _ran_chain:
                 # S2: 跨引擎攻击链路由——基于 S2.1 链信息把已确认发现串成后续动作
                 #（SSRF->内网探测/Redis 未授权，文件上传/LFI->RCE 链）。
-                await self._run_phase_timeboxed("chain_router", self._run_chain_router())
+                await self._record_coord_timing("chain_router", _ran_chain,
+                    self._run_phase_timeboxed("chain_router", self._run_chain_router()))
 
-            async with self._stage("react_deep_dive"):
+            async with self._stage("react_deep_dive") as _ran_react:
                 # S1: ReActAgent 深挖阶段（插桩点：_generate_tasks 之后、全局扫描之前）。
                 # 对 engine_bundle 首次执行结果全部 low/info 或判定模糊的参数，
                 # 用 ReActAgent 做多轮深度渗透（V100=广度覆盖，ReAct=单点深度）。
                 # deep 触发 by --deep/ENABLE_REACT_DIVE；执行前过 danger_guard 门卫（S1.2）。
-                await self._run_phase_timeboxed("react_deep_dive", self._run_react_gated_deep_dive())
+                await self._record_coord_timing("react_deep_dive", _ran_react,
+                    self._run_phase_timeboxed("react_deep_dive", self._run_react_gated_deep_dive()))
 
-            async with self._stage("agent_coordinator"):
+            async with self._stage("agent_coordinator") as _ran_coord:
                 # P2-1: 多智能体协调器（strix 式可寻址 agent 树）——可选增强通道。
                 # 默认关闭，开启后作为主链路之外的补充深扫，复用确定性引擎并把发现合并进 findings。
-                await self._run_phase_timeboxed("agent_coordinator", self._run_agent_coordinator())
+                await self._record_coord_timing("agent_coordinator", _ran_coord,
+                    self._run_phase_timeboxed("agent_coordinator", self._run_agent_coordinator()))
 
             async with self._stage("extras"):
                 # SH17.1：extras 阶段预算（settings.phase_timeout_extras_s），超时跳过未完成补充分支
@@ -1586,6 +1638,7 @@ class V100Orchestrator:
             # SH17.1: 实际命中的阶段超时写进报告（账本可查）
             if isinstance(report, dict):
                 report["phase_timeouts"] = list(self._phase_timeouts_hit)
+                report["orchestration"] = self.orchestration_ledger()
             self._emit_metrics(report)
             # P5-1: 标记正常完成（后续 --resume-scan 不会误判为可恢复断点）
             if self._checkpoint is not None:

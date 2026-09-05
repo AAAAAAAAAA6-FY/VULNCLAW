@@ -6,7 +6,7 @@
 
 """统一 CLI 入口 - VULNCLAW v103
 
-子命令：vulnclaw scan / code / health / bandit-report / bandit-train
+子命令：vulnclaw scan / code / health / bandit-report / bandit-train / archive / flywheel
 兼容：不带子命令时按旧 scan.py 参数风格转发（python scan.py --health 等）。
 """
 from __future__ import annotations
@@ -209,7 +209,7 @@ def main(argv: list[str] | None = None) -> None:
         # P1-3: python scan.py resume --scan-id xxx -> 转发为 --resume --scan-id xxx
         _run_scan_main(["--resume", *argv[1:]])
         return
-    elif argv[0] not in ("scan", "code", "health", "mcp", "setup", "verify", "tools", "bandit-report", "bandit-train"):
+    elif argv[0] not in ("scan", "code", "health", "mcp", "setup", "verify", "tools", "bandit-report", "bandit-train", "archive", "flywheel"):
         # 兼容模式：非子命令 -> 旧 scan.py 风格直接转发（保留全量旧参数行为）
         _run_scan_main(argv)
         return
@@ -532,6 +532,29 @@ def main(argv: list[str] | None = None) -> None:
     bandit_train_parser.add_argument("--feed", required=True, help="bandit_feedback.jsonl 路径")
     bandit_train_parser.add_argument("--out", default="bandit_policy.json", help="策略输出路径（默认当前目录 bandit_policy.json）")
 
+    archive_parser = subparsers.add_parser(
+        "archive",
+        help="SP18 商业化：把扫描报告归档为交付物（含 ARCHIVE.md，可选 zip）",
+        description="归档报告 JSON/HTML/CSV 到 out-dir/<scan-id>/，生成 ARCHIVE.md 清单，可选整体打包 zip。",
+        epilog="示例:\n  vulnclaw archive --scan-id S001 --report report.json --out-dir ./deliver --zip ./deliver/S001.zip",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    archive_parser.add_argument("--scan-id", required=True, help="扫描 ID（归档目录名）")
+    archive_parser.add_argument("--report", required=True, help="报告 JSON 路径")
+    archive_parser.add_argument("--out-dir", default=".", help="归档输出根目录（默认当前目录）")
+    archive_parser.add_argument("--zip", default="", help="可选：额外打包 zip 的路径（默认不打包）")
+
+    flywheel_parser = subparsers.add_parser(
+        "flywheel",
+        help="SP18 数据飞轮：聚合样本并重新训练策略（样本不足自动跳过）",
+        description="扫描 feed 目录下 bandit_feedback*.jsonl，新增样本达到阈值即重训并写策略。",
+        epilog="示例:\n  vulnclaw flywheel --feed ./bandit_feed --out bandit_policy.json --min-samples 10",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    flywheel_parser.add_argument("--feed", required=True, help="反馈样本目录（含 bandit_feedback*.jsonl）")
+    flywheel_parser.add_argument("--out", default="bandit_policy.json", help="策略输出路径（默认 bandit_policy.json）")
+    flywheel_parser.add_argument("--min-samples", type=int, default=10, help="重训最少新增样本数（默认 10）")
+
     args = parser.parse_args(argv)
 
     if args.command == "scan":
@@ -620,3 +643,20 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "bandit-train":
         from vulnclaw.ai.v100 import bandit_train
         sys.exit(bandit_train.main(["--feed", args.feed, "--out", args.out]) or 0)
+    elif args.command == "archive":
+        import json
+        from vulnclaw.core.archive import build_scan_archive, zip_archive
+        with open(args.report, "r", encoding="utf-8") as _rf:
+            data = json.load(_rf)
+        arch = build_scan_archive(args.scan_id, data, args.out_dir)
+        print("archive:", arch)
+        if args.zip:
+            z = zip_archive(arch, args.zip)
+            print("zip:", z)
+        sys.exit(0)
+    elif args.command == "flywheel":
+        import json
+        from vulnclaw.ai.v100.bandit_flywheel import run_flywheel
+        res = run_flywheel(args.feed, args.out, min_new_samples=args.min_samples)
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        sys.exit(0 if res.get("ran") else 1)

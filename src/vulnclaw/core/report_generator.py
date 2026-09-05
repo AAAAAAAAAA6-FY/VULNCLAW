@@ -1520,6 +1520,109 @@ def diff_reports(baseline: Dict, current: Dict) -> Dict:
     }
 
 
+# ============================================================
+# SP17.4.3: 商业交付导出 - CSV / PDF 双格式（A 线）
+#   - export_csv: findings 明细导出 CSV（UTF-8 BOM，Excel 友好），纯 stdlib
+#   - export_pdf: 优先 weasyprint（复用 render_html 产物）或 reportlab（简易表格）；
+#                 可选依赖未装则优雅降级返回 None + logger.warning，绝不抛错
+# ============================================================
+_CSV_COLUMNS = (
+    "type", "severity", "url", "parameter", "method",
+    "source", "remediation_tier", "remediation",
+)
+
+
+def export_csv(report_data, path):
+    """SP17.4.3: 把 findings 明细导出为 CSV，返回写入的绝对路径。
+
+    列：type/severity/url/parameter/method/source/remediation_tier/remediation；
+    找到的字段才写，找不到的字段置空串；纯 stdlib（csv 模块）。
+    """
+    import csv
+    enrich_report(report_data)
+    findings = report_data.get("vulnerabilities", []) or []
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=_CSV_COLUMNS)
+        writer.writeheader()
+        for v in findings:
+            writer.writerow({
+                col: ("" if v.get(col) is None else str(v.get(col)))
+                for col in _CSV_COLUMNS
+            })
+    return os.path.abspath(path)
+
+
+def _export_pdf_weasyprint(report_data, path):
+    """weasyprint 后端：直接复用 render_html 的 HTML 字符串转 PDF。"""
+    from weasyprint import HTML
+    html_content = render_html(report_data)
+    HTML(string=html_content).write_pdf(path)
+    return os.path.abspath(path)
+
+
+def _export_pdf_reportlab(report_data, path):
+    """reportlab 后端：单页 PDF（标题/统计摘要/简易表格），不做复杂排版。"""
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import (Paragraph, SimpleDocTemplate, Spacer,
+                                    Table, TableStyle)
+    enrich_report(report_data)
+    vulns = report_data.get("vulnerabilities", []) or []
+    by_severity = (report_data.get("distribution") or {}).get("by_severity") or {}
+    styles = getSampleStyleSheet()
+    doc = SimpleDocTemplate(path, pagesize=landscape(A4))
+    story = [
+        Paragraph("渗透测试报告 - %s" % str(report_data.get("target", "")), styles["Title"]),
+        Spacer(1, 10),
+        Paragraph(
+            "漏洞总数: %d  严重:%s 高:%s 中:%s 低:%s 信息:%s" % (
+                len(vulns),
+                by_severity.get("critical", 0), by_severity.get("high", 0),
+                by_severity.get("medium", 0), by_severity.get("low", 0),
+                by_severity.get("info", 0),
+            ),
+            styles["Normal"],
+        ),
+        Spacer(1, 10),
+    ]
+    rows = [list(_CSV_COLUMNS)]
+    for v in vulns[:200]:
+        rows.append([
+            ("" if v.get(c) is None else str(v.get(c))) for c in _CSV_COLUMNS
+        ])
+    table = Table(rows, repeatRows=1)
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.grey),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("FONTSIZE", (0, 0), (-1, -1), 6),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    ]))
+    story.append(table)
+    doc.build(story)
+    return os.path.abspath(path)
+
+
+def export_pdf(report_data, path):
+    """SP17.4.3: 导出单页 PDF，返回写入绝对路径或 None。
+
+    优先 weasyprint（复用 render_html 产物渲染），否则 reportlab（简易表格）；
+    两者均未安装时优雅降级：返回 None 并 logger.warning 提示缺失依赖，绝不抛错。
+    """
+    import importlib.util as _ilu
+    try:
+        if _ilu.find_spec("weasyprint"):
+            return _export_pdf_weasyprint(report_data, path)
+        if _ilu.find_spec("reportlab"):
+            return _export_pdf_reportlab(report_data, path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[SP17.4.3] PDF 导出失败（忽略）: %s", exc)
+        return None
+    logger.warning("[SP17.4.3] 未安装 weasyprint/reportlab，跳过 PDF 导出（可选依赖缺失）")
+    return None
+
+
 __all__ = [
     "suggest_remediation",
     "build_distribution",
@@ -1530,6 +1633,8 @@ __all__ = [
     "render_html",
     "generate_sarif",
     "diff_reports",
+    "export_csv",
+    "export_pdf",
     "_render_lifecycle_block",
     "build_fix_snippet",
     "_build_poc_python",

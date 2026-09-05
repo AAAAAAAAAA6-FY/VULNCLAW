@@ -849,3 +849,35 @@
 ### 15.5 收口
 - SP17 专项 78 例全绿（7 个测试文件：SP16 x 3 兼容 + SP17 x 4 新增）；ruff 新文件 14 项自动修复清零（存量错误不动）；
 - 全量回归结果与提交见上（§12-§14 同栏记账表迁移至 git log）。
+
+## 16. SP18 大批次（2026-09-06，A 线 6 路并行 + 主线程收口）
+> 并行纪律：每线独占文件 + 独立测试；CLI 接线路主线程统一做（避免多线并发写 cli.py）；settings 预算应用主线程统一做。
+
+### 16.1 商业化（SP18-1）
+- core/archive.py（新）：build_scan_archive（归档报告 JSON/HTML/CSV + ARCHIVE.md 清单）、zip_archive（整体打包）、batch_targets（多目标批量规划，同 host 串行/异 host 并行、热点串行纪律）；
+- cli：archive 子命令（--scan-id/--report/--out-dir/--zip）；
+- 测试 test_sp18_archive.py 7 例。
+
+### 16.2 数据飞轮（SP18-2）
+- ai/v100/bandit_flywheel.py（新）：run_flywheel（多 feed 文件聚合 + min_new_samples 防抖，样本足才重训并写策略）；
+- cli：flywheel 子命令；
+- 测试 test_sp18_flywheel.py 5 例 + test_bandit_flywheel 兼容。
+
+### 16.3 能力深化：编排可观测（SP18-3）
+- orchestrator.py：chain_router/react_deep_dive/agent_coordinator 三协调阶段补 phase_timings 记账（启用才写，关闭不写假 0；墙钟 49% 未归因问题解除）；orchestration_ledger() 决策账本（耗时 + 路由/深潜/派发计数）；report["orchestration"] 只增键；
+- 测试 test_sp18_orch_observability.py 5 例 + test_phase_timeboxed 兼容（12 例）。
+
+### 16.4 报告导出补齐（SP17.4.3 认领项）
+- report_generator.py：export_csv（UTF-8 BOM Excel 友好）、export_pdf（weasyprint→reportlab 双后端，未装优雅降级 None + warning）；
+- 测试 test_sp17_export.py（37 passed 1 skipped，skip=依赖未装预期）。
+
+### 16.5 模型链路根因修复
+- 根因：provider_failover 模块级全局单例把熔断状态带进 pytest 会话——一次真实失败 3 次后 zhipu 熔断 OPEN，后续用例被直接跳过，终态 last_error=None 抛误导性“所有模型调用均失败: None”；
+- 修复：ai/core.py 区分“真失败”vs“被熔断跳过”并给可操作指引（熔断清单/查 Key/网络/AI_MODE=0 逃生）；test_usage_ledger 用隔离熔断器 + 清黑名单 fixture + 新增熔断回归用例；.env.example 注释占位 Key 并提示 AI_MODE=0；
+- 结果：test_usage_ledger 7 例全绿（原 2 红根治），c1/c2/c3 42 例无破坏。
+
+### 16.6 阶段预算默认值校准
+- 依据 3 份真扫账本（metrics_20260906_02/034630/034723）校准：recon 300→240 / taskgen 180→60 / scan 900→600 / verify 420→120 / report 120→60（中位数远低预算收紧，深扫 152 引擎 130s 仍有余量）；chain_router/react_deep_dive/agent_coordinator/extras 0 样本维持现状（现已被 16.3 补记账，下期可再校准）；
+
+### 16.7 收口
+- SP18 专项 33 例 + SP17 相关全部全绿；CLI 冒烟：bandit-report/flywheel/archive 输出正确；全量回归（见提交说明）；TASKLIST §16 增量记录。

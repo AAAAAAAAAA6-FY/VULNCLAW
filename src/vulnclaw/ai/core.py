@@ -483,6 +483,8 @@ class LLMClient:
             backoff_base = 2.0
         last_error = None
         dead_models: set = set()
+        breaker_skipped: set = set()  # 因 Provider 熔断(OPEN)被跳过的模型，用于给出可操作错误而非 "均失败: None"
+        attempted = False  # 本 ask() 是否真正发起过至少一次模型请求
         for round_idx in range(1 + extra_rounds):
             transient_seen = False
             for model in models_to_use:
@@ -494,8 +496,10 @@ class LLMClient:
                     breaker = self._failover._breakers.get(provider)
                     if breaker and breaker.state == "OPEN":
                         logger.info(f"🔌 [Failover] {provider} 熔断中，跳过模型 {model}")
+                        breaker_skipped.add(model)
                         continue
                 try:
+                    attempted = True  # 真正发起一次请求（区别于被熔断跳过）
                     result = await self._call_model_once(
                         model=model,
                         prompt=processed_prompt,
@@ -574,6 +578,19 @@ class LLMClient:
                 logger.warning(f"⏳ [Backoff] 第 {round_idx + 1} 轮全模型未成功（存在瞬时错误），退避 {delay:.1f}s 后重试")
                 await asyncio.sleep(delay)
 
+        if not attempted and breaker_skipped:
+            raise RuntimeError(
+                f"所有模型均被熔断跳过（{sorted(breaker_skipped)}），未发起任何请求——"
+                "对应 Provider 此前连续失败已达熔断阈值，请检查 API Key/网络可达性；"
+                "或等待熔断超时后自动恢复（测试/纯引擎环境可设置 AI_MODE=0 或隔离故障转移状态）"
+            )
+        if last_error is None:
+            raise RuntimeError(
+                "所有模型调用均失败且无具体错误——请检查模型配置是否缺失或不可达："
+                "AI_PROVIDER/AI_API_KEY/AI_API_BASE（或 AI_MODEL_CONFIGS）是否已配置，"
+                "AI_MODEL_ALIASES/AI_MODELS 中的模型名是否存在；"
+                "测试/纯引擎环境可设置 AI_MODE=0 关闭 AI 调用"
+            )
         raise RuntimeError(f"所有模型调用均失败: {last_error}")
 
     async def _call_model_once(

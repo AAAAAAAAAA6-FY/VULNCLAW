@@ -6,6 +6,18 @@ from vulnclaw.core_modules.metrics import UsageLedger
 from vulnclaw.ai.core import LLMClient, TokenBudget
 
 
+@pytest.fixture(autouse=True)
+def _isolate_provider_failover(monkeypatch):
+    """隔离全局 ProviderFailover 熔断状态与模型黑名单，保证台账链路用例不被跨用例状态污染。"""
+    from vulnclaw.ai.provider_failover import ProviderFailover
+
+    monkeypatch.setattr(
+        "vulnclaw.ai.provider_failover._failover",
+        ProviderFailover(priority=["__test__"]),
+    )
+    monkeypatch.setattr(LLMClient, "_blocked_models", set())
+
+
 class TestUsageLedger:
     def test_record_and_breakdown(self, tmp_path, monkeypatch):
         monkeypatch.setattr(UsageLedger, "path", lambda: tmp_path / "usage.jsonl")
@@ -93,3 +105,32 @@ async def test_ask_default_site_is_empty(tmp_path, monkeypatch):
     c._session = None
     await c.ask("hi", use_cache=False)
     assert UsageLedger.rows()[-1]["site"] == ""
+
+
+@pytest.mark.asyncio
+async def test_ask_breaker_skipped_raises_actionable_error(tmp_path, monkeypatch):
+    """全部模型被熔断跳过（而非调用失败）时：报错必须可操作（含被跳过模型与处置建议），
+    不再出现笼统的 "所有模型调用均失败: None"。"""
+    import time as _time
+
+    from vulnclaw.ai.provider_failover import ProviderFailover
+
+    async def _should_not_be_called(self, model, prompt, system, temperature,
+                                    max_tokens, usage_site=None):
+        raise AssertionError("熔断跳过场景不应真正发起模型调用")
+
+    monkeypatch.setattr(LLMClient, "_call_model_once", _should_not_be_called)
+    fo = ProviderFailover(priority=["zhipu"])
+    fo._breakers["zhipu"]._state = "OPEN"
+    # 未来时间戳保持 OPEN 不自动转 HALF_OPEN（模拟熔断期内）
+    fo._breakers["zhipu"]._last_fail_time = _time.time() + 9999
+    c = LLMClient(provider="zhipu", api_key="k", models=["m1"], api_base="http://x",
+                  budget=TokenBudget(max_total_tokens=1_000_000, max_rounds=999999))
+    c._failover = fo
+    c._semaphore = None
+    c._session = None
+    with pytest.raises(RuntimeError) as ei:
+        await c.ask("hi", use_cache=False)
+    msg = str(ei.value)
+    assert "熔断" in msg
+    assert "均失败: None" not in msg
