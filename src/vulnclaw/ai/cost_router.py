@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VULNCLAW Authors (see README & LICENSE)
 # This file is part of VULNCLAW / pentest_platform.
@@ -17,9 +16,12 @@
 成本量化：粗筛调用打 usage_site="filter:prescreen"，verify 投票/批量分别打
 "verify:cross"/"verify:batch"，UsageLedger site 维度即可出前后对比成本表。
 """
-from vulnclaw.core.logger import logger
+import asyncio
 
-__all__ = ["pre_screen_candidates", "VerifyBudgetGate"]
+from vulnclaw.core.logger import logger
+from vulnclaw.core.settings import settings
+
+__all__ = ["VerifyBudgetGate", "pre_screen_candidates"]
 
 PRESCREEN_SITE = "filter:prescreen"
 
@@ -48,13 +50,59 @@ def _parse_fp_indices(raw, batch_len: int) -> set:
     return out
 
 
-async def pre_screen_candidates(orch, candidates: list, batch_size: int = 40) -> tuple:
+async def _tier_ask_ai(orch, tier, prompt, system, temperature, max_tokens, usage_site):
+    """档位路由辅助：开关开启且能取到档位客户端时走档位直调，否则回退 orch._ask_ai。
+
+    任何异常（未配置开关/取客户端失败/档位调用失败）一律回退原路径，绝不破坏扫描；
+    开关关闭时行为与旧版完全一致。
+    """
+    try:
+        if not getattr(settings, "model_tier_routing", False):
+            return await orch._ask_ai(
+                prompt, system=system, temperature=temperature,
+                max_tokens=max_tokens, task_type="filter", usage_site=usage_site,
+            )
+        from vulnclaw.ai.v100.provider_balancer import get_tier_client
+
+        client, _provider_key, _model = await get_tier_client(tier)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[A4.4] 档位客户端不可用，回退 orch._ask_ai: {exc}")
+        return await orch._ask_ai(
+            prompt, system=system, temperature=temperature,
+            max_tokens=max_tokens, task_type="filter", usage_site=usage_site,
+        )
+    # 档位直调：与 orchestrator._ask_ai 同口径的 90s 硬超时，失败回退原路径
+    try:
+        return await asyncio.wait_for(
+            client.ask(
+                prompt,
+                system=system,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                wrap_data=True,
+                retries=2,
+                use_cache=False,
+                usage_site=usage_site or None,
+            ),
+            timeout=90.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[A4.4] 档位直调失败，回退 orch._ask_ai: {exc}")
+        return await orch._ask_ai(
+            prompt, system=system, temperature=temperature,
+            max_tokens=max_tokens, task_type="filter", usage_site=usage_site,
+        )
+
+
+async def pre_screen_candidates(orch, candidates: list, batch_size: int = 40, tier: str = "cheap") -> tuple:
     """A4.4 第一段（便宜）：filter 档模型批量粗筛明显误报。
 
     Args:
         orch: orchestrator（用其 _ask_ai 以复用模型路由/降级链）。
         candidates: 候选 finding dict 列表。
         batch_size: 单次粗筛打包条数（prompt 有界）。
+        tier: 模型档位（默认 cheap 便宜快档）。开关 model_tier_routing 关闭时
+              自动回退 orch._ask_ai 原路径，行为与旧版一致。
 
     Returns:
         (fp_ids, calls)：fp_ids = 判为明显误报的 id(vuln) 集合；calls = 实际粗筛调用次数。
@@ -83,12 +131,13 @@ async def pre_screen_candidates(orch, candidates: list, batch_size: int = 40) ->
         )
         try:
             calls += 1  # 尝试即计数（含失败调用，便于量化粗筛开销）
-            raw = await orch._ask_ai(
+            raw = await _tier_ask_ai(
+                orch,
+                tier,
                 prompt,
                 system="只输出 JSON，不要解释。",
                 temperature=0.0,
                 max_tokens=400,
-                task_type="filter",
                 usage_site=PRESCREEN_SITE,
             )
         except Exception as exc:  # noqa: BLE001

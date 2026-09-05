@@ -115,6 +115,11 @@ class Settings(BaseSettings):
         alias="AI_TASK_ALLOCATION"
     )
     ai_timeout: int = Field(300, alias="AI_TIMEOUT")
+
+    # ========== A4.4: 任务分层模型路由（便宜粗筛 / 贵验证，复用 AI_MODE 档位 + provider_failover） ==========
+    model_tier_routing: bool = Field(False, alias="MODEL_TIER_ROUTING")  # 默认关=零行为变更；开=粗筛/分类走 cheap 档，验证/计划走 expensive 档
+    tier_cheap_codes: List[str] = Field(default_factory=lambda: ["1", "2"], alias="TIER_CHEAP_CODES")  # 便宜快模型码（粗筛/分类）
+    tier_expensive_codes: List[str] = Field(default_factory=lambda: ["4", "5"], alias="TIER_EXPENSIVE_CODES")  # 贵模型码（验证/计划）
     ai_api_base: str = Field("https://open.bigmodel.cn/api/paas/v4/", alias="AI_API_BASE")
     ai_api_key: str = Field("", alias="AI_API_KEY")
 
