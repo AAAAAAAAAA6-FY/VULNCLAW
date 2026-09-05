@@ -15,6 +15,7 @@
 import pytest
 
 from vulnclaw.core.settings import settings
+from vulnclaw.modules import live_intake as li_mod
 from vulnclaw.modules.live_intake import LiveIntake
 from vulnclaw.modules.request_feed import RequestFeed, RequestRecord, acq_score
 
@@ -123,3 +124,87 @@ def test_multi_params_multi_tasks():
     tasks = li.hit("http://t/z?a=1&b=2", params={"a": "1", "b": "2"})
     assert tasks and len(tasks) == 2
     assert {td["param"] for td in tasks} == {"a", "b"}
+
+
+# ---- R2-A S1: render / burp 两源全局回注 ----
+class TestFeedLiveGlobal:
+    def test_off_short_circuits(self):
+        _off()
+        li_mod.set_live_intake(LiveIntake())
+        try:
+            assert li_mod.feed_live("http://t/search?q=1",
+                                    params={"q": "1"}, source="render") is None
+        finally:
+            li_mod.set_live_intake(None)
+
+    def test_render_source_goes_pending(self):
+        _on()
+        li_mod.set_live_intake(LiveIntake())
+        try:
+            tasks = li_mod.feed_live("http://t.example.com/search?q=1&page=2",
+                                     params={"q": "1", "page": "2"}, source="render")
+            assert tasks and all(t["source"] == "live:render" for t in tasks)
+            assert li_mod.pending_count() == len(tasks)  # 无 emit → 进 pending
+            assert li_mod.drain_pending() == tasks
+            assert li_mod.pending_count() == 0
+        finally:
+            li_mod.set_live_intake(None)
+            _off()
+
+    def test_burp_source_uses_emit(self):
+        _on()
+        got = []
+        li_mod.set_live_intake(LiveIntake(emit=got.append))
+        try:
+            tasks = li_mod.feed_live("http://t.example.com/api?id=1",
+                                     params={"id": "1"}, source="burp")
+            assert tasks and got == tasks          # 有 emit → 直接回调
+            assert li_mod.pending_count() == 0     # 不进 pending
+            assert all(t["source"] == "live:burp" for t in tasks)
+        finally:
+            li_mod.set_live_intake(None)
+            _off()
+
+    def test_low_score_no_task(self):
+        _on()
+        li_mod.set_live_intake(LiveIntake())
+        try:
+            # 静态资源 acq_score=0 → 低于阈值不出任务
+            assert li_mod.feed_live("http://t/app.css?x=1",
+                                    params={"x": "1"}, source="render") is None
+        finally:
+            li_mod.set_live_intake(None)
+            _off()
+
+    def test_duplicate_injection_face_once(self):
+        _on()
+        li_mod.set_live_intake(LiveIntake())
+        try:
+            first = li_mod.feed_live("http://t.example.com/api?uid=1",
+                                     params={"uid": "1"}, source="render")
+            second = li_mod.feed_live("http://t.example.com/api?uid=2",
+                                      params={"uid": "2"}, source="burp")
+            assert first and second is None  # 同注入面第二次被 emit 去重滤除
+        finally:
+            li_mod.drain_pending()
+            li_mod.set_live_intake(None)
+            _off()
+
+    def test_burp_client_history_feed(self):
+        """Burp 流：_feed_live_from_history 逐条回注，非法 URL/脏数据跳过。"""
+        _on()
+        li_mod.set_live_intake(LiveIntake())
+        try:
+            from vulnclaw.ai.burp import BurpClient
+            c = BurpClient()
+            fed = c._feed_live_from_history([
+                {"url": "http://t.example.com/api?id=1", "method": "GET"},
+                {"url": "http://t.example.com/api?id=2", "method": "GET"},  # 同注入面去重
+                {"url": "not-a-url", "method": "GET"},
+                None,
+            ])
+            assert fed == 1 and li_mod.pending_count() == 1
+        finally:
+            li_mod.drain_pending()
+            li_mod.set_live_intake(None)
+            _off()

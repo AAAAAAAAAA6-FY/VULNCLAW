@@ -1696,6 +1696,15 @@ async def crawl_same_origin(target: str, session=None, max_depth: int = 2, max_u
                     resp = await pg.goto(url, timeout=15000, wait_until="networkidle")
                     status = resp.status if resp is not None else 200
                     html = await pg.content()
+                    # R2-A S1: 浏览器渲染流 → LiveIntake 回注（开关关时零成本短路）
+                    try:
+                        from urllib.parse import urlparse as _up, parse_qs as _pq
+                        from vulnclaw.modules.live_intake import feed_live
+                        _q = _pq(_up(url).query, keep_blank_values=True)
+                        feed_live(url, params={k: (v[0] if v else "") for k, v in _q.items()},
+                                  source="render")
+                    except BaseException:
+                        logger.debug("suppressed exception (live intake render)")
                     await b.close()
                     return status, html
             except BaseException:

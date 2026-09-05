@@ -80,9 +80,67 @@ class LiveIntake:
         return tasks or None
 
     # ---- 统计 / 测试钩子 ----
+    def has_emit(self) -> bool:
+        """是否挂了 emit 回调（无回调时任务进全局 pending 等主链路统一入队）。"""
+        return self._emit is not None
+
     def stats(self) -> dict:
         return {
             "feed_records": len(self._feed),
             "emitted": self._emitted_count,
             "rejected_low_score": self._rejected_low_score,
         }
+
+
+# ============================================================
+# R2-A S1: 采集点全局回注入口（浏览器 render 流 / Burp 流量流）
+#
+# 背景：SP15.3 只接了 crawler 一源（orchestrator._feed_live_intake 喂
+# crawled_endpoints）。render/burp 两源的采集点拿不到 orchestrator 实例，
+# 故在此提供进程级单例 + 同步可用的 feed_live()：
+#   - 开关关闭 / 无实例 → 立即返回 None（零成本短路，零行为回归）；
+#   - 有 emit 回调 → 任务直接交回调；
+#   - 无 emit（多数同步采集上下文）→ 任务进 pending，由 orchestrator
+#     _feed_live_intake 统一异步入队（本轮即入队，不等下一轮扫描）。
+# ============================================================
+_LIVE: "LiveIntake | None" = None
+_LIVE_PENDING: list = []
+
+
+def set_live_intake(live: "LiveIntake | None") -> None:
+    """登记/注销全局 LiveIntake（主链路构造好后调用；扫描结束传 None 清理）。"""
+    global _LIVE
+    _LIVE = live
+
+
+def get_live_intake() -> "LiveIntake | None":
+    return _LIVE
+
+
+def feed_live(url: str, method: str = "GET",
+              params: dict[str, str] | None = None,
+              source: str = "live") -> list[dict] | None:
+    """采集点回注一次经手请求（同步可用，异常全吞）。返回生成的任务或 None。"""
+    live = _LIVE
+    if live is None or not getattr(settings, "live_intake_enabled", False):
+        return None
+    try:
+        tasks = live.hit(url, method=method, params=params, source=source)
+    except Exception:  # noqa: BLE001 - 采集侧回注失败绝不影响采集主流程
+        return None
+    if not tasks:
+        return None
+    if not live.has_emit():
+        _LIVE_PENDING.extend(tasks)
+    return tasks
+
+
+def drain_pending() -> list[dict]:
+    """取出并清空累积的补测任务（主链路统一异步入队）。"""
+    global _LIVE_PENDING
+    out, _LIVE_PENDING = list(_LIVE_PENDING), []
+    return out
+
+
+def pending_count() -> int:
+    return len(_LIVE_PENDING)

@@ -464,6 +464,8 @@ def render_html(enhanced_report):
         curl_cmd = html_escape.escape(_build_curl_command(v))
         repro_steps = _build_reproduction_steps(v)
         repro_html = "".join(f"<li>{html_escape.escape(s)}</li>" for s in repro_steps)
+        # R2-A S2: 来源溯源徽标（param_mining / live:*）
+        source_badge = _source_badge(v)
         # C1.4: 已落盘 PoC 产物 → 该漏洞条目内附产物链接
         poc_link_html = ""
         if v.get('poc_file'):
@@ -498,6 +500,7 @@ def render_html(enhanced_report):
             <span style="color:#666;">严重性: </span><strong>{vuln_severity}</strong>
             {f'<br><span style="color:#666;">参数: </span>{vuln_param}' if vuln_param else ''}
             {f'<br><span style="color:#666;">置信度: </span><strong>{vuln_confidence}</strong>' if vuln_confidence else ''}
+            {source_badge}
             <br>
             <span style="color:#666;">证据: </span>
             <pre style="background:#f8f9fa; padding:8px; border-radius:4px; overflow-x:auto; white-space:pre-wrap; word-wrap:break-word; max-height:300px; font-size:12px; margin:4px 0;">{evidence}</pre>
@@ -525,6 +528,8 @@ def render_html(enhanced_report):
     lifecycle_block = _render_lifecycle_block(enhanced_report)
     # C1.4: PoC 产物清单段（generate_poc_artifacts 已在 generate_html_report 前置落盘）
     poc_artifacts_html = _render_poc_artifacts_section(enhanced_report)
+    # R2-A S2: 溯源来源分布段
+    source_attribution_html = _render_source_attribution_section(vulns)
 
     html_content = f"""
 <!DOCTYPE html>
@@ -624,6 +629,8 @@ def render_html(enhanced_report):
         <div id="vulnList">{vuln_section}</div>
 
         {poc_artifacts_html}
+
+        {source_attribution_html}
 
         <h2>🟠 待人工复核漏洞</h2>
         {render_pending_review_section(vulns)}
@@ -875,6 +882,10 @@ def generate_markdown_report(report_data, output_path):
                     lines.append("```")
                     lines.append(str(_oob.get("detail"))[:MAX_EVIDENCE_LENGTH])
                     lines.append("```")
+            _src = str(v.get("source") or "").strip()
+            if _src:  # R2-A S2: 单条溯源标记
+                _label, _ = _source_label(_src)
+                lines.append(f"- **溯源来源**: {_label}（`{_src}`）")
             lines.append("---")
         if len(vulns) > 30:
             lines.append(f"\n... 共 {len(vulns)} 个漏洞，仅显示前 30 个。请查看 JSON 报告获取完整列表。")
@@ -891,6 +902,22 @@ def generate_markdown_report(report_data, output_path):
             lines.append(f"- **{v.get('type', '未知')}** @ `{v.get('url', '')}` "
                          f"(参数: {v.get('parameter', '') or '-'}) — "
                          f"{v.get('ai_verdict', v.get('confidence', ''))}")
+
+    # R2-A S2: 溯源来源分布段
+    _src_counter = {}
+    for _v in vulns:
+        _s = str((_v or {}).get("source") or "").strip()
+        if _s:
+            _src_counter[_s] = _src_counter.get(_s, 0) + 1
+    if _src_counter:
+        _total = sum(_src_counter.values())
+        lines.append("")
+        lines.append("## 溯源来源分布（S2）")
+        lines.append("")
+        for _s, _n in sorted(_src_counter.items(), key=lambda kv: (-kv[1], kv[0])):
+            _label, _ = _source_label(_s)
+            _pct = round(_n / _total * 100, 1) if _total else 0.0
+            lines.append(f"- **{_label}**（`{_s}`）：{_n} 条（{_pct}%）")
 
     # C1.4: PoC 产物清单段
     arts = report_data.get("poc_artifacts") or []
@@ -1111,6 +1138,75 @@ def _render_poc_artifacts_section(report_data: Dict) -> str:
     return ('<div style="background:#f0f7ff;border:1px solid #c8dcf0;border-radius:8px;padding:12px;margin:16px 0;">'
             '<h3 style="margin:0 0 8px;">PoC 产物（C1.4，可运行脚本随报告交付）</h3>'
             '<ul style="margin:0;padding-left:18px;line-height:1.9;">%s</ul></div>') % rows
+
+
+# ============================================================
+# R2-A S2: 漏洞来源溯源可视化（source=param_mining / live:* ）
+# 让"这条洞是从哪条采集/挖掘链路来的"在报告里一眼可见：
+#   条目内徽标（单条溯源） + 列表后汇总段（各来源检出占比）。
+# 无 source 字段的历史 finding 不渲染（向后兼容，零噪音）。
+# ============================================================
+_SOURCE_LABELS = {
+    "param_mining": ("参数挖掘 D3.5", "#6f42c1"),
+    "live:crawl": ("实时采集 · 爬虫", "#0d6efd"),
+    "live:render": ("实时采集 · 渲染", "#0d6efd"),
+    "live:burp": ("实时采集 · Burp", "#0d6efd"),
+}
+_SOURCE_COLORS = {"live": "#0d6efd"}
+
+
+def _source_label(src: str) -> tuple:
+    """来源串 → (中文标签, 颜色)。未登记来源按原样展示。"""
+    src = str(src or "").strip()
+    if src in _SOURCE_LABELS:
+        return _SOURCE_LABELS[src]
+    if src.startswith("live:"):
+        chan = src.split(":", 1)[1]
+        return f"实时采集 · {chan}", _SOURCE_COLORS["live"]
+    return f"来源 {src}", "#6c757d"
+
+
+def _source_badge(vuln: Dict) -> str:
+    """单条 finding 的溯源徽标（无 source 字段返回空串）。"""
+    import html as _html_escape
+    src = str(vuln.get("source") or "").strip()
+    if not src:
+        return ""
+    label, color = _source_label(src)
+    return (f'<br><span style="display:inline-block;margin:4px 0;padding:2px 8px;'
+            f'border-radius:10px;background:{color};color:#fff;font-size:12px;">'
+            f'溯源: {_html_escape.escape(label)}</span>')
+
+
+def _render_source_attribution_section(vulns: List[Dict]) -> str:
+    """R2-A S2: 来源汇总段（各来源检出数与占比）。全部无 source 时返回空串。"""
+    import html as _html_escape
+    from collections import Counter
+    counter: Counter = Counter()
+    for v in vulns or []:
+        src = str((v or {}).get("source") or "").strip()
+        if src:
+            counter[src] += 1
+    if not counter:
+        return ""
+    total = sum(counter.values())
+    rows = []
+    for src, n in sorted(counter.items(), key=lambda kv: (-kv[1], kv[0])):
+        label, color = _source_label(src)
+        pct = round(n / total * 100, 1) if total else 0.0
+        rows.append(
+            f'<li><span style="display:inline-block;min-width:150px;">'
+            f'<span style="display:inline-block;padding:2px 8px;border-radius:10px;'
+            f'background:{color};color:#fff;font-size:12px;">'
+            f'{_html_escape.escape(label)}</span></span> '
+            f'{n} 条（{pct}%）</li>')
+    return ('<div style="background:#f8f9fa;border:1px solid #e2e6ea;border-radius:8px;'
+            'padding:12px;margin:16px 0;">'
+            '<h3 style="margin:0 0 8px;">溯源来源分布（S2）</h3>'
+            '<p style="margin:0 0 8px;color:#666;font-size:13px;">'
+            f'共 {total} 条发现带来源标记（参数挖掘 / 实时采集补测链路）</p>'
+            '<ul style="margin:0;padding-left:18px;line-height:1.9;">'
+            f'{"".join(rows)}</ul></div>')
 
 
 # ============================================================

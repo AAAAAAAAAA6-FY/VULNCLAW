@@ -988,7 +988,9 @@ class BurpClient:
                 )
                 entries = self._parse_history_response(result, 0)
             if entries:
-                return entries[:num] if num else entries
+                _out = entries[:num] if num else entries
+                self._feed_live_from_history(_out)
+                return _out
         except Exception as e:
             logger.debug(f"Burp proxy history 获取失败: {e}")
 
@@ -997,7 +999,36 @@ class BurpClient:
             self._bridge_checked = True
             if self.get_bridge_status():
                 logger.info("🌉 检测到 Burp 扩展桥，被动采集走 JSONL 通道")
-        return self.get_history_from_bridge(limit=num)
+        _bridge_entries = self.get_history_from_bridge(limit=num)
+        self._feed_live_from_history(_bridge_entries)  # R2-A S1: Burp 流回注
+        return _bridge_entries
+
+    def _feed_live_from_history(self, entries: List[Dict]) -> int:
+        """R2-A S1: Burp 流量流 → LiveIntake 回注（开关关时零成本短路）。
+
+        每条历史条目的 URL 与其 query 参数构成注入面；重复/低分由 LiveIntake
+        内部双层防重与评分阈值滤除。异常全吞，绝不影响被动采集主流程。
+        """
+        try:
+            from urllib.parse import parse_qs, urlparse
+            from vulnclaw.modules.live_intake import feed_live
+        except Exception:  # noqa: BLE001
+            return 0
+        fed = 0
+        for e in entries or []:
+            try:
+                url = str((e or {}).get("url") or "").strip()
+                if not url.lower().startswith(("http://", "https://")):
+                    continue
+                q = parse_qs(urlparse(url).query, keep_blank_values=True)
+                params = {k: (v[0] if v else "") for k, v in q.items()}
+                if feed_live(url, method=str((e or {}).get("method") or "GET"),
+                             params=params, source="burp"):
+                    fed += 1
+            except Exception:  # noqa: BLE001
+                logger.debug("suppressed exception (live intake burp)")
+                continue
+        return fed
 
     def _parse_history_response(self, result: Any, min_timestamp: float) -> List[Dict]:
         if not isinstance(result, dict):

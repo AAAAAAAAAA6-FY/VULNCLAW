@@ -12,6 +12,41 @@ from vulnclaw.core.session_manager import get_session_manager
 from vulnclaw.core.settings import settings
 from vulnclaw.modules.vuln_scanner import run_arjun
 from typing import Dict, List, Optional
+
+
+def backfill_param_mining(brief: Dict, pool_path: Optional[str] = None) -> None:
+    """SP15.2 合流桥接（A 侧）：B 侧 D3.5 挖掘结果从池文件回灌 brief["param_mining"]。
+
+    仅当 enable_param_mining 开启且池文件有候选时回灌；由 recon.brief_param_mining()
+    幂等合并（已有条目优先、强信号优先截断）。默认关/无文件/坏行均静默降级。
+    """
+    if not getattr(settings, "enable_param_mining", False):
+        return
+    try:
+        from vulnclaw.modules.recon import brief_param_mining, param_pool_path
+    except Exception:  # noqa: BLE001
+        return
+    path = pool_path if pool_path is not None else param_pool_path()
+    pool = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as _pf:
+            for _line in _pf:
+                _line = _line.strip()
+                if not _line:
+                    continue
+                try:
+                    _it = json.loads(_line)
+                except Exception:  # noqa: BLE001
+                    continue
+                if isinstance(_it, dict) and _it.get("url") and _it.get("param"):
+                    pool.append(_it)
+    except FileNotFoundError:
+        return
+    except Exception:  # noqa: BLE001
+        return
+    if pool and callable(brief_param_mining):
+        brief["param_mining"] = brief_param_mining(brief, pool)
+        logger.info(f"   [SP15.2] 参数池回灌 brief: {len(pool)} 条候选入 brief")
 def _host_is_ip(target: str) -> bool:
     """判断目标 host 是否为 IP 地址（IP 靶机无需做子域枚举等外部侦察）。"""
     try:
@@ -125,6 +160,7 @@ async def _recon(self):
         await enrich_brief_with_intel(brief, domain=brief.get("domain", ""))
     except Exception as e:
         logger.debug(f"情报补全跳过: {e}")
+    backfill_param_mining(brief)
     self._recon_brief = brief
     if self.burp_available:
         self._collaborator_domain = await self._get_collaborator_domain()

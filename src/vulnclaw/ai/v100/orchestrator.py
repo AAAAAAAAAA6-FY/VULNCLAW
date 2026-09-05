@@ -51,7 +51,7 @@ from vulnclaw.engines.auxiliary_engines import APIVersionDiffEngine, RequestSmug
 from vulnclaw.engines.http_engines import CachePoisonEngine
 from .phases import bind_phase_methods
 from vulnclaw.core_modules.metrics import get_metrics
-from vulnclaw.modules.live_intake import LiveIntake
+from vulnclaw.modules.live_intake import LiveIntake, drain_pending, set_live_intake
 class V100Orchestrator:
     """v100 facade coordinating the scan phases."""
     _safe_params = {
@@ -920,6 +920,12 @@ class V100Orchestrator:
             except Exception as exc:  # noqa: BLE001
                 logger.debug(f"finding 后处理跳过: {exc}")
             self.findings.append(finding)
+            # SP16.1 回注：产出 finding → bandit 正样本（默认关，无代价）
+            if self._bandit is not None:
+                try:
+                    self._bandit.record(self._bandit.key_from_finding(finding), hit=True)
+                except Exception:  # noqa: BLE001
+                    logger.debug("[SP16.1] bandit hit 回注失败，跳过", exc_info=True)
             # P5-1: 增量持久化 finding 到 SQLite 检查点（kill -9 不丢，续扫自动并入）
             if getattr(self, "_checkpoint", None) is not None:
                 try:
@@ -1233,6 +1239,10 @@ class V100Orchestrator:
                 return
             brief = self._recon_brief or {}
             fed = 0
+            # R2-A S1: 浏览器 render 流 / Burp 流量流回注的待入队任务（本轮统一入队）
+            for td in drain_pending():
+                await self.task_queue.add_task(td, td.get("priority", 8))
+                fed += 1
             for ep in brief.get("crawled_endpoints", []) or []:
                 if not isinstance(ep, dict) or not ep.get("url"):
                     continue
@@ -1401,8 +1411,17 @@ class V100Orchestrator:
             self.rate_limiter = get_rate_limiter(self.initial_qps)
             self.batch_processor = BatchProcessor(max_batch_size=5)
             self.local_filter = get_local_filter()
-            self.task_queue = SmartTaskQueue(max_size=2000)
+            self._bandit = None
+            if getattr(settings, "rl_bandit_enabled", False):
+                from vulnclaw.ai.v100.bandit import ContextualBandit
+                self._bandit = ContextualBandit(
+                    influence=int(getattr(settings, "rl_bandit_influence", 2) or 2),
+                    feed_dir=str(getattr(settings, "rl_bandit_feed_dir", "") or ""),
+                )
+            self.task_queue = SmartTaskQueue(max_size=2000, bandit=self._bandit)
             self._live_intake = LiveIntake()  # SP15.3 D4.2 实时补测管线（默认关）
+            # R2-A S1: 登记全局实例，供 render/Burp 采集点无 orchestrator 引用时回注
+            set_live_intake(self._live_intake)
 
             # P5-1: 续扫——回填断点中的 findings / 已扫三元组 / agent 记忆
             self._seed_resume_state()

@@ -149,3 +149,72 @@ class TestPocArtifacts:
         generate_markdown_report(rep, str(md))
         text = md.read_text(encoding="utf-8")
         assert "可运行 PoC 产物" in text and "poc/poc_" in text
+
+
+# ============================================================
+# R2-A S2: 漏洞来源溯源可视化（source=param_mining / live:* ）
+# ============================================================
+class TestSourceAttribution:
+    def test_badge_param_mining(self):
+        from vulnclaw.core.report_generator import _source_badge
+        html = _source_badge({"source": "param_mining"})
+        assert "参数挖掘 D3.5" in html and "#6f42c1" in html
+
+    def test_badge_live_channels(self):
+        from vulnclaw.core.report_generator import _source_badge
+        for chan, label in (("live:crawl", "爬虫"), ("live:render", "渲染"),
+                            ("live:burp", "Burp")):
+            html = _source_badge({"source": chan})
+            assert label in html and "实时采集" in html
+
+    def test_no_badge_without_source(self):
+        from vulnclaw.core.report_generator import _source_badge
+        assert _source_badge({}) == ""
+        assert _source_badge({"source": ""}) == ""
+
+    def test_unknown_source_falls_back(self):
+        from vulnclaw.core.report_generator import _source_badge, _source_label
+        assert "custom_src" in _source_badge({"source": "custom_src"})
+        assert _source_label("zzz")[1] == "#6c757d"
+
+    def test_attribution_section_counts(self):
+        from vulnclaw.core.report_generator import _render_source_attribution_section
+        vulns = [
+            {"url": "http://t/1", "type": "SQL注入", "source": "param_mining"},
+            {"url": "http://t/2", "type": "XSS", "source": "live:render"},
+            {"url": "http://t/3", "type": "XSS", "source": "live:render"},
+            {"url": "http://t/4", "type": "LFI", "source": ""},  # 无来源不计入
+        ]
+        html = _render_source_attribution_section(vulns)
+        assert "溯源来源分布" in html
+        assert "共 3 条发现带来源标记" in html
+        assert "66.7%" in html  # live:render 2/3
+
+    def test_attribution_empty_when_no_source(self):
+        from vulnclaw.core.report_generator import _render_source_attribution_section
+        assert _render_source_attribution_section([{"url": "http://t/1"}]) == ""
+        assert _render_source_attribution_section([]) == ""
+
+    def test_html_and_markdown_render_attribution(self, tmp_path):
+        from vulnclaw.core.report_generator import render_html
+        rep = {
+            "target": "http://t.example.com",
+            "vulnerabilities": [
+                {"url": "http://t.example.com/a?debug=1", "type": "SQL注入",
+                 "severity": "High", "parameter": "debug", "source": "param_mining"},
+                {"url": "http://t.example.com/b?q=1", "type": "XSS",
+                 "severity": "Medium", "parameter": "q", "source": "live:burp"},
+            ],
+        }
+        html_file = tmp_path / "r.html"
+        generate_html_report(rep, str(html_file))
+        html = html_file.read_text(encoding="utf-8")
+        assert "溯源: 参数挖掘 D3.5" in html
+        assert "溯源: 实时采集 · Burp" in html
+        assert "溯源来源分布（S2）" in html
+
+        md = tmp_path / "r.md"
+        generate_markdown_report(rep, str(md))
+        text = md.read_text(encoding="utf-8")
+        assert "- **溯源来源**: 参数挖掘 D3.5（`param_mining`）" in text
+        assert "## 溯源来源分布（S2）" in text and "`live:burp`" in text

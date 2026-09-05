@@ -789,3 +789,23 @@
 - A-SP16.2 TLS 指纹隐身：新增 core\impersonate.py（curl_cffi 可选后端，impersonate浏览器指纹+ 超时 retry + 会话复用）；scanner.safe_request 通道排序 impersonate > http2 > aiohttp，缺依赖/失败自动降级；settings 加 http_impersonate/http_impersonate_browser（默认关）。新增 tests\test_sp16_impersonate.py。
 - A-SP16.3 调用链上下文：新增 code\graph.py（tree-sitter 可选 AST 定义表，缺失自动降级纯 stdlib正则符号索引；同文件调用图 + BFS 入口可达性判定 reachable/unreachable/unknown；unknown 不写字段不参与判定，零新增误报）；static_audit 审计全量完成后统一 enrich，finding 增 abs_path + reachability 证据字段（settings.scan_callgraph 默认关）。新增 tests\test_sp16_graph.py（11 用例）。
 - 回归：SP16 专项 3 文件 33 用例全过；全量回归仅 2 项已知环境抖动 （test_usage_ledger 模型调用失败，非本次改动引入）；清除了根目录残留 _tmp_poll/_tmp_verify（守卫 test_layout_guard 复过）。
+
+## 13. R2-A 批次收口（2026-09-06，A 线代收原线在途改动，纯增量）
+> 背景：浏览器 render 流 / Burp 流量流此前只做被动采集，未回注任务生成；漏洞报告缺来源溯源（无法区分 D3.5 挖参命中与实时采集命中）。本批补齐双源回注 + 溯源可视化，并桥接 SP15.2 参数池回灌缺口。纪律不变：全部开关默认关 / 短路零成本 / 异常全吞绝不影响主流程。
+
+### R2-A S1 采集点全局回注（render / burp 两源 -> LiveIntake）
+- modules/live_intake.py：新增进程级单例 feed_live() + pending/drain_pending 机制（无 emit 回调的同步采集上下文 -> 任务进 pending，由 orchestrator 本轮统一异步入队）；开关关/无实例立即短路返回 None。
+- modules/recon.py：crawl_same_origin 浏览器渲染流（playwright 通道）解析 query 参数回注；
+- ai/burp.py：_feed_live_from_history 逐条回注 Burp 历史流（非法 URL/脏数据跳过）；
+- ai/v100/orchestrator.py：_feed_live_intake 前置 drain_pending 统一入队 + 登记全局单例。
+
+### R2-A S2 漏洞来源溯源可视化
+- core/report_generator.py：_source_badge/_source_label/_render_source_attribution_section，HTML 报告单条溯源徽标 + 全报告来源分布段，Markdown 报告单条溯源行 + 分布段；未知 source 兜底灰标，无来源不渲染。
+
+### R2-A 桥接 backfill_param_mining
+- ai/v100/phases/phases_recon.py：D3.5 参数池(param_candidates.jsonl) 回灌 brief[param_mining]（enable_param_mining 开关；坏行/缺字段过滤；池缺失优雅跳过；幂等合并交给 brief_param_mining）。
+
+### 完成记录（2026-09-06，A 线代收）
+- 测试：tests/test_live_intake.py +6（feed_live 短路/两源/emit 直抛/低分去重/重复注入面）、tests/test_sarif_attack_graph.py +7（badge/分布段/HTML/MD 渲染）、tests/test_param_pool_backfill.py +4（默认关/回灌/脏行/缺池）——17 例全绿；
+- 全量回归：仅剩 2 例已知 usage_ledger 并发抖动（单跑通过）；unclosed session 警告来自既有 TestPocArtifacts 用例（PoC 产物链路），非本批引入，单列记录待后续清理；
+- 本批含此前 SP16.1 orchestrator 的 bandit 接线（同文件混动，随本批落盘）。
