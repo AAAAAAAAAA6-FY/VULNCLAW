@@ -698,12 +698,12 @@
 - [ ] A-SP15.5 D4.5 采集质量评分（依赖 SP15.3，P2 后置）—— 响应码/内容新颖度降权（静态/404 不生成任务）。
 
 ### B 线（对面，并行 3 项，仅定点既有独占文件）
-- [ ] B-SP15.1 OOB 数据源合流自证—— get_oob_evidence 回查真实轮询记录（DNS/HTTP 两通道结构一致）、JSONL 落盘去重、
+- [x] B-SP15.1 OOB 数据源合流自证—— get_oob_evidence 回查真实轮询记录（DNS/HTTP 两通道结构一致）、JSONL 落盘去重、
   超时/无回调返回空列表（不抛错）。测试 +3（含双通道 + 空回查）。
-- [ ] B-SP15.2 挖掘器真扫自证—— local_lab 开 enable_param_mining=1：mine_params 命中差异入池
+- [x] B-SP15.2 挖掘器真扫自证—— local_lab 开 enable_param_mining=1：mine_params 命中差异入池
   （param_candidates.jsonl 字段 param/url/base_len/signal 正确）、目标噪声（5xx/429/0）不收录、
   同端点去重不重复收录。单测补反例（base_len 阈值 / signal 判定）。
-- [ ] B-SP15.4 recon_brief 回灌补齐—— 真扫路径下挖掘池结果在 recon_brief[`param_mining`] 的出现时机与格式
+- [x] B-SP15.4 recon_brief 回灌补齐—— 真扫路径下挖掘池结果在 recon_brief[`param_mining`] 的出现时机与格式
   与 A 侧消费字段完全一致（{param,url,base_len,signal}），print/report 侧可无痛读到。
 
 ### §11 完成记录（2026-09-06，commit b34041b）
@@ -744,13 +744,20 @@
   降权，静态/404 低价值请求不进任务生成。
 
 ### B 线（对面，3 项并行）
-- [ ] B-SP15.1-B OOB 数据源自证—— get_oob_evidence 回查真实轮询记录（interactsh/dnslog 双通道
+- [x] B-SP15.1-B OOB 数据源自证—— get_oob_evidence 回查真实轮询记录（interactsh/dnslog 双通道
   结构一致）、JSONL 落盘去重、超时/无回调返回空列表不抛错。测试 +3。
-- [ ] B-SP15.2-B 挖掘器真扫自证—— local_lab 开 enable_param_mining=1：mine_params 命中差异
+- [x] B-SP15.2-B 挖掘器真扫自证—— local_lab 开 enable_param_mining=1：mine_params 命中差异
   入池（param_candidates.jsonl 字段 param/url/base_len/signal 正确）、目标噪声（5xx/429/0）
   不收录、同端点去重。单测补反例（base_len 阈值 / signal 判定）。
-- [ ] B-SP15.4-B recon_brief 回灌补齐—— 真扫路径下挖掘池结果在 recon_brief[`param_mining`]
+- [x] B-SP15.4-B recon_brief 回灌补齐—— 真扫路径下挖掘池结果在 recon_brief[`param_mining`]
   的出现时机与格式与 A 侧消费字段完全一致（{param,url,base_len,signal}），报告侧无痛读到。
+### §11.3 完成记录（2026-09-06，B 线 SP15 三项自证 + 真扫联调收口）
+
+- [x] B-SP15.1-B OOB 数据源自证—— `oob_channel.py` `poll()` 已全包 try/except（超时/网络抖动/无通道一律返回空列表不抛错）；`get_oob_evidence(token)` 模块级查询就位（A 侧一行调用）；`_record_interaction` 走 `_OOB_AUDIT_SEEN` 进程内去重 + JSONL 跨进程落盘；双通道 interactsh/dnslog 结构一致。tests/test_oob_channel.py +5 钉死（四键/通道退化/优先级/落盘去重/四路空回查）。
+- [x] B-SP15.2-B 挖掘器真扫自证—— `mine_params_for_endpoints` 端点去重；真扫 local_lab（ENABLE_PARAM_MINING=1）实测入池（recon 面板"参数挖掘：1 个候选（入池 1）"，池文件四字段 param/url/base_len/signal 正确，样本 `q@/xss reflected`）；噪声（5xx/429/0）不收录、同端点去重由 Semaphore + 进程内 (url,param) 去重保证。tests/test_unit_recon.py +10 反例钉死（base_len 阈值/signal 判定/404 不计/静态跳过）。
+- [x] B-SP15.4-B recon_brief 回灌补齐—— `recon.brief_param_mining` 写 `brief["param_mining"]`（{param,url,base_len,signal} 四字段与 A 侧 phases_taskgen 消费完全对齐）；确定性排序 reflected>diff_len>status_change 保强信号先被 cap 留下；(url,param) 幂等合并。真扫联调实证：A 侧 `phases_recon.backfill_param_mining` 真扫调用 B 侧回灌（日志 `[SP15.2] 参数池回灌 brief: 1 条候选入 brief`）；消费侧生成 `task_22 xss/q`（source=param_mining）补测任务入队，63 任务全部被 pick。唯一未闭环环：task_22 撞 attack 阶段 130s 预算 deadline 判败出队（调度预算观察项，非链路缺陷；修正归 A 线）。
+- 定点测试：test_unit_recon + test_oob_channel **61 例全绿**；lint 0。**B 线 SP15 整批收口（commit 2fdbe2c + 本收口记录）**。
+
 ### §11.2 完成记录（2026-09-06，A 线勾状态收口；B 线 3 项待其自证后合流）
 - [x] A-SP15.2 参数挖掘端到端融验（离线段）—— 离线链路闭环，消费侧 (url,param) 组合去重；
   tests/test_sp15_param_mining_e2e.py 5 例全绿。真扫段依赖 B-SP15.4-B 回灌待合流联调。
