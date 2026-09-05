@@ -324,6 +324,55 @@ class POCGenerator:
         param = finding.get("parameter", "")
         payload = finding.get("payload", "")
         vuln_type = finding.get("vuln_type") or finding.get("type", "unknown")
+        method = str(finding.get("method", "GET") or "GET").upper()
+
+        # SP19: 按漏洞类型生成 verify() 验证判断逻辑（生成代码字符串，不实际执行）
+        vt = str(vuln_type).lower()
+        if "sql" in vt or "sqli" in vt:
+            verify_block = (
+                '    # SQL 注入验证：响应文本匹配数据库错误特征\n'
+                '    sql_markers = ("sql syntax", "you have an error", "mysql", "ora-",\n'
+                '                   "sqlite", "microsoft ole db", "unclosed quotation mark")\n'
+                '    low = resp.text.lower()\n'
+                '    if any(m in low for m in sql_markers):\n'
+                '        print("[+] SQL 错误特征命中")\n'
+                '        return True\n'
+                '    return False\n'
+            )
+        elif "xss" in vt:
+            verify_block = (
+                '    # XSS 验证：payload 去空格后反射回显检查\n'
+                '    if PAYLOAD.replace(" ", "") in resp.text.replace(" ", ""):\n'
+                '        print("[+] Payload 反射回显，XSS 确认")\n'
+                '        return True\n'
+                '    return False\n'
+            )
+        elif "rce" in vt or "command" in vt or "cmd" in vt:
+            verify_block = (
+                '    # 命令执行验证：响应含命令回显特征或 payload 随机 token 反射\n'
+                '    rce_markers = ("uid=", "id=")\n'
+                '    low = resp.text.lower()\n'
+                '    if any(m in low for m in rce_markers) or PAYLOAD in resp.text:\n'
+                '        print("[+] 命令执行回显确认")\n'
+                '        return True\n'
+                '    return False\n'
+            )
+        elif "ssrf" in vt:
+            verify_block = (
+                '    # SSRF 验证：命中内网/云元数据特征\n'
+                '    ssrf_markers = ("instance-id", "ami-", "169.254")\n'
+                '    low = resp.text.lower()\n'
+                '    if any(m in low for m in ssrf_markers):\n'
+                '        print("[+] SSRF 元数据回显确认")\n'
+                '        return True\n'
+                '    return False\n'
+            )
+        else:
+            # 默认兜底：未知类型保持探测型（仅打印 Status/Response）
+            verify_block = (
+                '    # 探测型：仅打印响应，交由人工研判\n'
+                '    return True\n'
+            )
 
         return f'''#!/usr/bin/env python3
 """
@@ -335,17 +384,18 @@ import requests
 TARGET = "{url}"
 PARAMETER = "{param}"
 PAYLOAD = "{payload}"
+METHOD = "{method}"
 
 def verify():
     """验证漏洞是否存在。"""
-    # TODO: 根据漏洞类型实现验证逻辑
     params = {{PARAMETER: PAYLOAD}}
-    resp = requests.get(TARGET, params=params, timeout=10)
+    if METHOD == "POST":
+        resp = requests.post(TARGET, data=params, timeout=10)
+    else:
+        resp = requests.get(TARGET, params=params, timeout=10)
     print(f"Status: {{resp.status_code}}")
     print(f"Response: {{resp.text[:500]}}")
-    # TODO: 添加漏洞验证判断逻辑
-    return True
-
+{verify_block}
 if __name__ == "__main__":
     if verify():
         print(f"[+] 漏洞确认: {vuln_type} @ {{TARGET}}")

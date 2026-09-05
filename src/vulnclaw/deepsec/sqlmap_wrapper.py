@@ -476,16 +476,110 @@ class SQLMapWrapper:
             elif "current user:" in line.lower():
                 result["current_user"] = line.split(":", 1)[1].strip()
             elif "available databases" in line.lower():
-                # TODO: 解析数据库列表
-                pass
+                # 解析数据库列表：优先本行内联（"available databases [N]: db1, db2"），
+                # 否则收集后续形如 "[*] db1" / "[x] db2" / 2-3 空格缩进 + 名称 的行。
+                _dbs: list[str] = []
+                _, _, _inline = line.partition(":")
+                if _inline.strip():
+                    _dbs = [d.strip() for d in _inline.split(",") if d.strip()]
+                else:
+                    _lines = stdout.splitlines()
+                    _idx = next(
+                        (i for i, l in enumerate(_lines) if l.strip() == line),
+                        -1,
+                    )
+                    for _nxt in _lines[_idx + 1:]:
+                        _raw = _nxt
+                        _s = _raw.strip()
+                        if not _s or "available databases" in _s.lower():
+                            continue
+                        if _s.startswith(("[*] ", "[x] ")):
+                            _dbs.append(_s.split("]", 1)[1].strip())
+                        elif (
+                            len(_raw) - len(_raw.lstrip()) in (2, 3)
+                            and not _s.startswith("[")
+                        ):
+                            _dbs.append(_s)
+                        else:
+                            break
+                if _dbs:
+                    # 去重保序合并到结果
+                    _seen = set(result["databases"])
+                    for _d in _dbs:
+                        if _d not in _seen:
+                            _seen.add(_d)
+                            result["databases"].append(_d)
 
         # 解析 JSON 结果文件（如果存在）
+        raw = None
         if os.path.exists(output_file):
             try:
                 raw = json.loads(open(output_file, "r", encoding="utf-8").read())
-                # TODO: 根据 SQLMap JSON 格式解析完整结果
                 result["raw"] = raw
             except (json.JSONDecodeError, OSError):
+                raw = None
+                logger.debug("suppressed exception (core audit)")
+
+        # 解析 SQLMap JSON 结果。结构一：{"data": [{"url": ..., "value": {...}}]}；
+        # 结构二：{db_name: {"tables": {tb: {"entries": [...]}}}}。缺失键/异常一律
+        # 优雅降级：不抛异常、不破坏返回结构、不覆盖已有字段值。
+        if isinstance(raw, dict):
+            try:
+                _items = raw.get("data") if isinstance(raw.get("data"), list) else None
+                if _items:
+                    for _item in _items:
+                        _value = _item.get("value") if isinstance(_item, dict) else None
+                        if not isinstance(_value, dict):
+                            continue
+                        if not result["banner"] and _value.get("banner"):
+                            result["banner"] = str(_value["banner"])
+                        _db = _value.get("current_db") or _value.get("db")
+                        if not result["current_db"] and _db:
+                            result["current_db"] = str(_db)
+                        _user = _value.get("current_user") or _value.get("user")
+                        if not result["current_user"] and _user:
+                            result["current_user"] = str(_user)
+                        _dbs = _value.get("databases")
+                        if isinstance(_dbs, dict):
+                            _dbs = list(_dbs)
+                        if isinstance(_dbs, list):
+                            for _d in _dbs:
+                                if (
+                                    isinstance(_d, str)
+                                    and _d
+                                    and _d not in result["databases"]
+                                ):
+                                    result["databases"].append(_d)
+                        if not result["tables"] and isinstance(_value.get("tables"), dict):
+                            result["tables"] = _value["tables"]
+                        if not result["columns"] and isinstance(_value.get("columns"), dict):
+                            result["columns"] = _value["columns"]
+                        if not result["dump"]:
+                            _dump = _value.get("dump")
+                            if isinstance(_dump, list):
+                                result["dump"] = _dump[:5]
+                            elif isinstance(_dump, dict) and _dump:
+                                result["dump"] = _dump
+                            elif isinstance(_value.get("entries"), list):
+                                result["dump"] = _value["entries"][:5]
+                else:
+                    # 结构二：顶层键即库名（含 tables / entries 元数据的键）
+                    for _dbname, _meta in raw.items():
+                        if not isinstance(_dbname, str) or not isinstance(_meta, dict):
+                            continue
+                        if "tables" not in _meta and "entries" not in _meta:
+                            continue
+                        if _dbname not in result["databases"]:
+                            result["databases"].append(_dbname)
+                        if not result["tables"] and isinstance(_meta.get("tables"), dict):
+                            result["tables"] = _meta["tables"]
+                        for _tb, _tmeta in (_meta.get("tables") or {}).items():
+                            if (
+                                isinstance(_tmeta, dict)
+                                and isinstance(_tmeta.get("entries"), list)
+                            ):
+                                result["dump"][_tb] = _tmeta["entries"][:5]
+            except Exception:  # noqa: BLE001
                 logger.debug("suppressed exception (core audit)")
 
         return result
@@ -531,6 +625,8 @@ class SQLMapWrapper:
         Returns:
             {"has_waf": bool, "waf_type": str}
         """
+        import re as _re
+
         sqlmap = self._get_sqlmap_path()
         cmd = _invoke(sqlmap) + ["-u", url, "--batch", "--identify-waf"]
 
@@ -547,11 +643,42 @@ class SQLMapWrapper:
             has_waf = "is behind" in output.lower() or "WAF" in output
             waf_type = ""
             if has_waf:
-                # TODO: 提取 WAF 类型
-                for line in output.splitlines():
-                    if "WAF" in line:
-                        waf_type = line.strip()
+                # 用常见 WAF 特征关键词识别类型；无匹配时回退首个含 "WAF" 的行。
+                _waf_kws = (
+                    ("cloudflare", "cloudflare"),
+                    ("akamai", "akamai"),
+                    ("modsecurity", "modsecurity"),
+                    ("big-ip", "f5 big-ip"),
+                    ("f5", "f5"),
+                    ("aws waf", "aws waf"),
+                    ("amazon", "aws waf"),
+                    ("imperva", "imperva"),
+                    ("barracuda", "barracuda"),
+                    ("safedog", "safedog"),
+                    ("安全狗", "safedog"),
+                    ("宝塔", "baota"),
+                    ("btwaf", "baota"),
+                    ("阿里云", "aliyun waf"),
+                    ("aliyun", "aliyun waf"),
+                    ("腾讯云", "tencent waf"),
+                    ("tencent", "tencent waf"),
+                    ("qianxin", "360 waf"),
+                    ("360", "360 waf"),
+                )
+                _lower = output.lower()
+                for _kw, _typ in _waf_kws:
+                    if _kw.isascii():
+                        _hit = _re.search(r"\b" + _re.escape(_kw) + r"\b", _lower)
+                    else:
+                        _hit = _kw in _lower
+                    if _hit:
+                        waf_type = _typ
                         break
+                if not waf_type:
+                    for line in output.splitlines():
+                        if "WAF" in line:
+                            waf_type = line.strip()
+                            break
             return {"has_waf": has_waf, "waf_type": waf_type}
         except Exception:
             return {"has_waf": False, "waf_type": "", "error": "check failed"}

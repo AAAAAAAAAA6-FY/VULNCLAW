@@ -881,3 +881,21 @@
 
 ### 16.7 收口
 - SP18 专项 33 例 + SP17 相关全部全绿；CLI 冒烟：bandit-report/flywheel/archive 输出正确；全量回归（见提交说明）；TASKLIST §16 增量记录。
+
+## 17. SP19 深度链路实扫补全（2026-09-06，A 线 3 路并行，文件零交集）
+> 前提：SP18 收口提交 6448fc7 后，盘出 deepsec 深度链路遗留 3 处真实 TODO 桩（sqlmap 结果解析 / POC 验证 / RCE 确认），其余 NotImplementedError 均为抽象基类方法非桩。
+
+### 17.1 sqlmap 结果解析补全（SP19-1）
+- sqlmap_wrapper.py：available databases 列表解析（内联逗号 + 多行 [*]/缩进记录，去重保序）；SQLMap JSON 完整解析（data[].value 抽 banner/current_db/current_user/databases/tables/columns/dump 前 5 行，兼兼容 {db:{tables:{tb:{entries}}}} 结构，坏 JSON/缺键优雅降级不抛错）；check_waf 关键词表识别 WAF 类型（cloudflare/akamai/modsecurity/f5/aws/imperva/barracuda/safedog/宝塔/阿里云/腾讯云/360，无命中回退含 WAF 行文本）；
+- 测试 test_sp19_sqlmap_parse.py 19 例。
+
+### 17.2 POC 通用验证逻辑（SP19-2）
+- poc_generator.py：_generate_generic 按 vuln_type 分支生成 verify() 验证代码（sql 错误特征 / xss 反射回显 / rce 命令回显 / ssrf 云元数据特征 / unknown 探测兜底），POST 方法分支（requests.post data=params）；生成脚本均 compile 通过；
+- 测试 test_sp19_poc_verify.py 7 例 + test_poc_generator 6 例回归。
+
+### 17.3 exploit_chain RCE 确认（SP19-3）
+- exploit_chain.py：_exploit_rce dangerous 模式每条命令成功判定（非空且无 not found/failed/error/timeout 标记），新增 rce_confirmed/commands_tried/commands_confirmed 键（只增键），evidence 只留有效回显，全败标注未确认；execute_command 异常兜底结构完整；清理 2 处方法内 TODO + L219 过时 TODO；
+- 测试 test_sp19_rce_confirm.py 4 例 + danger_guard/attack_graph/skill_payload_bridge/sprint3 49 例回归。
+
+### 17.4 收口
+- SP19 专项 30 例全绿 + 相关回归 74 例全绿；新增行 emoji 红线复核通过（存量 emoji 未动）；TASKLIST §17 增量记录。
