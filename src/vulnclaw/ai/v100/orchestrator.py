@@ -1566,6 +1566,12 @@ class V100Orchestrator:
                 logger.warning("⚠️ ChromaDB 初始化超时，降级到内存模式")
                 self.memory = None
 
+            # DualAgent：广度（主链路 scan）+ 深度（AgentCoordinator）并行开关判定。
+            # 需 dual_agent_parallel 与 agent_coordinator_enabled 同时开启；任一关闭走原串行路径。
+            _dual = bool(getattr(settings, "dual_agent_parallel", False)) and self._coord_enabled("agent_coordinator")
+            self._dual_agent_coord_elapsed = 0.0
+            if _dual:
+                logger.info("   [DualAgent] 已启用双智能体并行：广度 scan 与深度 AgentCoordinator 同时执行")
             _pt = time.monotonic()
             async with self._stage("recon"):
                 await self._run_phase_timeboxed("recon", self._recon())
@@ -1579,7 +1585,25 @@ class V100Orchestrator:
                 # 在任务执行之前启动流水线验证后台协程，任务边产出 finding 边验证。
                 self._start_stream_verify()
                 _pt = time.monotonic()
-                await self._run_phase_timeboxed("scan", self._execute_with_limiting())
+                if _dual:
+                    # DualAgent：广度（10 worker 引擎扫描）与深度（AgentCoordinator
+                    # recon/analysis/exploit/verify agent 树）gather 并行——
+                    # 共享同一 rate_limiter / session / adaptive_concurrency（LLM 与目标双限流），
+                    # 副 agent findings 经 bridge_into -> _add_finding 双重去重合并；
+                    # 副 agent 受 phase_timeout_agent_coordinator_s 软截止，到点收割不拖累主链路，
+                    # 汇合墙钟 = max(主链路, 副通道) 而非串行相加。
+                    _t0 = time.monotonic()
+                    await asyncio.gather(
+                        self._run_phase_timeboxed("scan", self._execute_with_limiting()),
+                        self._run_phase_timeboxed("agent_coordinator", self._run_agent_coordinator()),
+                        return_exceptions=True,
+                    )
+                    self._dual_agent_coord_elapsed = time.monotonic() - _t0
+                    logger.info(
+                        f"   [DualAgent] 广度+深度并行汇合（副 agent 段耗时 {self._dual_agent_coord_elapsed:.0f}s）"
+                    )
+                else:
+                    await self._run_phase_timeboxed("scan", self._execute_with_limiting())
                 self._phase_timings['scan'] = time.monotonic() - _pt
 
             # C3: 成本预算熔断——扫描阶段累计 AI 成本超预算则降级纯引擎模式，防失控
@@ -1602,8 +1626,14 @@ class V100Orchestrator:
             async with self._stage("agent_coordinator") as _ran_coord:
                 # P2-1: 多智能体协调器（strix 式可寻址 agent 树）——可选增强通道。
                 # 默认关闭，开启后作为主链路之外的补充深扫，复用确定性引擎并把发现合并进 findings。
-                await self._record_coord_timing("agent_coordinator", _ran_coord,
-                    self._run_phase_timeboxed("agent_coordinator", self._run_agent_coordinator()))
+                if _dual:
+                    # DualAgent 模式：已在 scan stage 内与主链路 gather 并行执行过，
+                    # 此处仅补计时/账本（_STAGES 顺序与 P5-1 checkpoint 语义保持不变，不重复执行）。
+                    self._phase_timings['agent_coordinator'] = float(getattr(self, "_dual_agent_coord_elapsed", 0.0))
+                    logger.info("   [DualAgent] agent_coordinator 已随 scan 并行执行，本段仅记账不重复跑")
+                else:
+                    await self._record_coord_timing("agent_coordinator", _ran_coord,
+                        self._run_phase_timeboxed("agent_coordinator", self._run_agent_coordinator()))
 
             async with self._stage("extras"):
                 # SH17.1：extras 阶段预算（settings.phase_timeout_extras_s），超时跳过未完成补充分支

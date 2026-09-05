@@ -148,6 +148,11 @@ class Settings(BaseSettings):
     react_dive_budget: float = Field(150.0, alias="REACT_DIVE_BUDGET")  # 每参数总预算（秒）
     # ========== P2: AgentCoordinator 多智能体协调器（strix 式 agent 树，Tier-1 确定性引擎） ==========
     agent_coordinator_enabled: bool = Field(False, alias="AGENT_COORDINATOR_ENABLED")  # 默认关闭；env/配置开启后并入主链路
+    # ========== DualAgent 双智能体并行（广度=主链路 scan 与 深度=AgentCoordinator 同时执行） ==========
+    # 开启后 agent_coordinator 不再串行追加在 scan 之后，而是与 scan 阶段 gather 并行：
+    # 副 agent 仍受 phase_timeout_agent_coordinator_s 预算软截止（到点结果照常合并），
+    # 总墙钟 = max(主链路, 副通道) 而非相加。默认关闭=零行为变更。
+    dual_agent_parallel: bool = Field(False, alias="DUAL_AGENT_PARALLEL")
     # ========== P5: 韧性（LLM 调用指数退避） ==========
     llm_retry_rounds: int = Field(2, alias="LLM_RETRY_ROUNDS")  # 全模型轮询外的额外重试轮数（0=单轮兼容旧行为）
     llm_backoff_base: float = Field(2.0, alias="LLM_BACKOFF_BASE")  # 退避基数秒：2s→4s→8s…（+抖动，封顶 30s）
@@ -342,6 +347,12 @@ class Settings(BaseSettings):
     phase_timeout_scan_s: int = Field(600, alias="PHASE_TIMEOUT_SCAN_S")
     phase_timeout_chain_router_s: int = Field(90, alias="PHASE_TIMEOUT_CHAIN_ROUTER_S")
     phase_timeout_react_deep_dive_s: int = Field(180, alias="PHASE_TIMEOUT_REACT_DEEP_DIVE_S")
+    # ---- attack 阶段内部预算（P0 预算口径统一：原 getattr 兜底 130s 硬编码收口为正式字段）----
+    # attack_node_budget 必须小于 phase_timeout_scan_s（外层 wait_for 兜底），
+    # 默认 500s：给 10 worker×多任务留足执行窗口，同时保留 100s 余量给宽限/收尾。
+    attack_node_budget: float = Field(500.0, alias="ATTACK_NODE_BUDGET")
+    # SP21.2 动态补测任务（param_mining / live:*）宽限窗口（原 getattr 兜底 45s 收口为正式字段）
+    attack_dynamic_grace_s: float = Field(45.0, alias="ATTACK_DYNAMIC_GRACE_S")
     phase_timeout_agent_coordinator_s: int = Field(120, alias="PHASE_TIMEOUT_AGENT_COORDINATOR_S")
     phase_timeout_extras_s: int = Field(240, alias="PHASE_TIMEOUT_EXTRAS_S")
     phase_timeout_verify_s: int = Field(120, alias="PHASE_TIMEOUT_VERIFY_S")

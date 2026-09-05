@@ -182,9 +182,10 @@ async def _execute_with_limiting(self):
         logger.warning("⚠️ [_execute_with_limiting] 自动创建 rate_limiter（兜底）")
     logger.info("⚔️ [攻击执行] 开始执行（多消费者并发模式）...")
     MAX_CONCURRENT = int(getattr(settings, "orchestrator_max_concurrent", 10))
-    # 第3次修复：attack 阶段预算硬顶。LLM QPS 降级(1.5~2.1)时任务墙钟时间不可控，
-    # 用 deadline 保证 attack 节点耗时上限（目标 <=130s）。超预算任务判败出队，
-    # 已产出的 finding 已进 StreamVerify 队列，不受影响。
+    # 第3次修复：attack 阶段预算硬顶（settings.attack_node_budget，P0 已收口为正式字段，
+    # 默认 500s 且须小于外层 phase_timeout_scan_s=600）。LLM QPS 降级(1.5~2.1)时任务
+    # 墙钟时间不可控，用 deadline 保证 attack 节点耗时上限。超预算任务判败出队
+    # （SP21.2：动态补测任务 protected 保留宽限窗口），已产出的 finding 已进 StreamVerify 队列。
     attack_budget = float(getattr(settings, "attack_node_budget", 130.0))
     self._attack_deadline_ts = time.time() + attack_budget
     logger.info(f"   [deadline] attack 阶段预算: {attack_budget:.0f}s")

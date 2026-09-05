@@ -18,15 +18,21 @@ from vulnclaw.config.settings import settings
 
 
 # ---------------------------------------------------------------------------
-# 1) 开关
+# 1) 开关（SP24 §22.2 已把 enable_agent_race 批量默认打开——默认值断言随之校正）
 # ---------------------------------------------------------------------------
-def test_race_disabled_by_default():
-    assert getattr(settings, "enable_agent_race", False) is False
+def test_race_default_matches_settings():
+    """默认值与 settings 实际字段一致（SP24 后默认 True，均具降级/成本上限保护）。"""
+    assert getattr(settings, "enable_agent_race") is True
 
 
 def test_race_enabled_flag(monkeypatch):
     monkeypatch.setattr(settings, "enable_agent_race", True)
     assert AgentCoordinator("http://t", None)._race_enabled() is True
+
+
+def test_race_disabled_flag(monkeypatch):
+    monkeypatch.setattr(settings, "enable_agent_race", False)
+    assert AgentCoordinator("http://t", None)._race_enabled() is False
 
 
 # ---------------------------------------------------------------------------
