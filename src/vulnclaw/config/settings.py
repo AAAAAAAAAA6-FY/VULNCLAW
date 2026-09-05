@@ -98,7 +98,7 @@ class Settings(BaseSettings):
     # 任务委派路由：{"本地工具名": "远程 Agent 名"}，未指定 agent 时走首个可用 Agent
     remote_task_routing: Dict[str, str] = Field(default_factory=dict, alias="REMOTE_TASK_ROUTING")
     # 是否启用远程深度渗透（scan.deep_remote 工具）
-    remote_deep_enabled: bool = Field(False, alias="REMOTE_DEEP_ENABLED")
+    remote_deep_enabled: bool = Field(True, alias="REMOTE_DEEP_ENABLED")
     ai_task_allocation: Dict[str, Any] = Field(
         default_factory=lambda: {
             "verify": {
@@ -147,19 +147,19 @@ class Settings(BaseSettings):
     react_dive_max_iterations: int = Field(5, alias="REACT_DIVE_MAX_ITERATIONS")  # 每参数 ReAct 轮数
     react_dive_budget: float = Field(150.0, alias="REACT_DIVE_BUDGET")  # 每参数总预算（秒）
     # ========== P2: AgentCoordinator 多智能体协调器（strix 式 agent 树，Tier-1 确定性引擎） ==========
-    agent_coordinator_enabled: bool = Field(False, alias="AGENT_COORDINATOR_ENABLED")  # 默认关闭；env/配置开启后并入主链路
+    agent_coordinator_enabled: bool = Field(True, alias="AGENT_COORDINATOR_ENABLED")  # 默认开：与 enable_agent_roles 协同深挖（预算软截止保护）
     # ========== DualAgent 双智能体并行（广度=主链路 scan 与 深度=AgentCoordinator 同时执行） ==========
     # 开启后 agent_coordinator 不再串行追加在 scan 之后，而是与 scan 阶段 gather 并行：
     # 副 agent 仍受 phase_timeout_agent_coordinator_s 预算软截止（到点结果照常合并），
     # 总墙钟 = max(主链路, 副通道) 而非相加。默认关闭=零行为变更。
-    dual_agent_parallel: bool = Field(False, alias="DUAL_AGENT_PARALLEL")
+    dual_agent_parallel: bool = Field(True, alias="DUAL_AGENT_PARALLEL")
     # ========== P5: 韧性（LLM 调用指数退避） ==========
     llm_retry_rounds: int = Field(2, alias="LLM_RETRY_ROUNDS")  # 全模型轮询外的额外重试轮数（0=单轮兼容旧行为）
     llm_backoff_base: float = Field(2.0, alias="LLM_BACKOFF_BASE")  # 退避基数秒：2s→4s→8s…（+抖动，封顶 30s）
     # ========== P3/P7: 沙箱执行层（高危动作隔离；exploit_verify 联动） ==========
     # 注：这几个字段此前从未定义，而 P3 的 sandbox_run 用 getattr 默认值读取，
     # 导致沙箱"实现存在但永远关闭"——与 agent_coordinator_enabled 同型陷阱。
-    sandbox_enabled: bool = Field(False, alias="SANDBOX_ENABLED")  # 总开关（默认 False=零行为变更）
+    sandbox_enabled: bool = Field(True, alias="SANDBOX_ENABLED")  # 总开关（默认开：local 进程隔离沙箱，后端不可用自动降级）
     sandbox_backend: str = Field("local", alias="SANDBOX_BACKEND")  # local / docker
     sandbox_image: str = Field("alpine:latest", alias="SANDBOX_IMAGE")
     sandbox_mem_limit: str = Field("512m", alias="SANDBOX_MEM_LIMIT")
@@ -291,9 +291,9 @@ class Settings(BaseSettings):
 
     # ========== 其他 ==========
     alert_webhook: str = Field("", alias="ALERT_WEBHOOK")
-    enable_metrics: bool = Field(False, alias="ENABLE_METRICS")
-    metrics_port: int = Field(0, alias="METRICS_PORT")
-    http2: bool = Field(False, alias="HTTP2")
+    enable_metrics: bool = Field(True, alias="ENABLE_METRICS")
+    metrics_port: int = Field(9090, alias="METRICS_PORT")
+    http2: bool = Field(True, alias="HTTP2")
     max_response_size_mb: int = Field(50, alias="MAX_RESPONSE_SIZE_MB")
     cache_ttl: int = Field(7200, alias="CACHE_TTL")
     cache_backend: str = Field("memory", alias="CACHE_BACKEND")

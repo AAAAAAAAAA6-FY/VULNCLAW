@@ -1061,3 +1061,26 @@
 - orchestrator.py：dual_agent_parallel + agent_coordinator_enabled 同时开启时，scan 主链路与 agent_coordinator 副通道 asyncio.gather 并行（共享 rate_limiter/session/双限流，副 agent 软截止到点收割不拖累主链路，汇合墙钟=max 而非相加）；串行路径阶段仅记账不重复执行，_STAGES 顺序与 P5-1 checkpoint 语义不变；
 - phases_executor.py：attack 预算注释同步（deadline 硬顶语义 + SP21.2 protected 宽限）。
 - 测试：test_sp24_agent_race.py 校正默认值断言 + 新增 disabled flag 用例，专项 12 例全绿。
+## 25. SP26 参数默认值收口批次（2026-09-06，默认开放/修复/接线，全量回归全绿）
+
+### §25.1 环境问题类（条件补齐）
+- sandbox_enabled 默认开：local 进程隔离沙箱（Docker 可用自动优先，均不可用自动降级普通执行），安全无副作用；
+- enable_metrics 接线 + 默认开：scan_runner 在未显式指定端口且 ENABLE_METRICS=true 时用默认 9090 启动 Prometheus；
+- http2 默认开：pyproject 基础依赖加 httpx[http2]（含 h2 协议库），http_client 已有完整 httpx/h2 后端+缺库自动降级 aiohttp；
+- scan_diff 自动基线（新功能）：新增 core/report_diff.py，报告落盘后自动建基线（.env SCAN_DIFF_BASELINE 显式指定则只读比对不写回，否则 _runtime_cache/baseline/<target>.json 自动存取），输出新增/已修复增量；异常绝不影响主报告。
+
+### §25.2 主动选择类（决策）
+- dangerous_mode（deny）/danger_level_write / danger_level_destructive 保持默认拒绝——自动发送真实攻击载荷需显式授权（--dangerous / DANGEROUS_ALLOW），法律合规红线；
+- remote_deep_enabled 默认开：仅开 MCP 入口 gate（不自动触发攻击），实际打点仍需 danger 放行；
+- nuclei_tags_from_stack / compliant 保持关闭：覆盖全量与全速优先于提速（质量红线）；
+- agent_coordinator_enabled + dual_agent_parallel 默认开：深度覆盖增强，受 120s 软截止与墙钟=max 保护，成本可控。
+
+### §25.3 不能开（技术未验证）
+- http_impersonate_http2 保持关（死开关，无消费代码；curl_cffi 已内置浏览器 h2 指纹）。
+
+### §25.4 测试兼容修正
+- test_param_pool_backfill：enable_param_mining 默认开，test_default_off_no_backfill 改为显式关掉验证零回灌；
+- test_sp16_impersonate：_on 钉死 rotate=False + pool=[browser]（默认 rotate 开后单例语义），_off 恢复 rotate/pool 原默认值防单例污染；
+- test_sp17_impersonate_pool：默认值断言校正为 rotate=True，rotate 用例显式钉死 pool；
+- 新增 test_sp26_report_diff.py 5 例（签名/diff/开关/首扫建基线/二次 diff/显式基线只读）；
+- 全量回归无 FAILED（仅环境警告），ruff 新增文件全绿。

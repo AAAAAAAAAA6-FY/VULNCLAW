@@ -21,7 +21,8 @@ from vulnclaw.core.settings import settings
 # ---------- a) settings 默认值 ----------
 
 def test_settings_defaults_zero_regression():
-    assert settings.http_impersonate_rotate is False
+    # SP24 §22.2 后 http_impersonate_rotate 已默认打开（TLS 指纹轮换，curl_cffi 缺失自动降级）
+    assert settings.http_impersonate_rotate is True
     assert settings.http_impersonate_http2 is False
     assert list(settings.http_impersonate_pool or []) == ["chrome", "firefox", "safari"]
 
@@ -136,6 +137,7 @@ def test_rotate_on_request_uses_pool(monkeypatch):
     monkeypatch.setattr(imp_mod, "CURL_CFFI_AVAILABLE", True)
     monkeypatch.setattr(imp_mod, "AsyncSession", _RotFakeAsyncSession)
     settings.http_impersonate_rotate = True
+    settings.http_impersonate_pool = ["chrome", "firefox", "safari"]
     try:
         pool = imp_mod.get_impersonate_pool(force_new=True)  # 用 fake 会话重建
         body = asyncio.run(imp_mod.impersonate_get("http://t/x"))

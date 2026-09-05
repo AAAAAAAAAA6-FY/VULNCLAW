@@ -32,7 +32,9 @@ def _mkbrief():
     return {"status": 200, "url_params": [], "crawled_endpoints": []}
 
 
-def test_default_off_no_backfill(tmp_path, monkeypatch):
+def test_off_no_backfill(tmp_path, monkeypatch):
+    # SP24 §22.2 后 enable_param_mining 默认开；显式关掉验证零回灌（默认路径由 test_on_... 覆盖）
+    settings.enable_param_mining = False
     pool = tmp_path / "param_candidates.jsonl"
     _write_pool(pool, [{"url": "http://t/x", "param": "p1", "base_len": 1, "signal": "diff_len"}])
     monkeypatch.setattr("vulnclaw.modules.recon.param_pool_path", lambda: str(pool))

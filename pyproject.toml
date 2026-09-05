@@ -21,6 +21,8 @@ dependencies = [
     "psutil>=5.9.0",
     # 2.34+ cookie/SSL 默认行为已回归验证；对应 Dependabot PR #4
     "requests>=2.34.2",
+    # P0-1 HTTP/2 后端（httpx[http2] 含 h2 协议库；未装时 http2_enabled()=False 自动降级 aiohttp）
+    "httpx[http2]>=0.27.0",
     "aiofiles",
     "beautifulsoup4",
     "dnspython",

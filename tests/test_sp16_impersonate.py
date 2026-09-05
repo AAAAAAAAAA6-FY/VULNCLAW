@@ -25,10 +25,16 @@ from vulnclaw.core.settings import settings
 def _on(browser: str = "chrome") -> None:
     settings.http_impersonate = True
     settings.http_impersonate_browser = browser
+    # SP24 §22.2 后 http_impersonate_rotate 默认开：钉死单元素池=单例语义，避免轮换首取非预期 browser
+    settings.http_impersonate_pool = [browser]
+    settings.http_impersonate_rotate = False
 
 
 def _off() -> None:
     settings.http_impersonate = False
+    settings.http_impersonate_browser = "chrome"
+    settings.http_impersonate_rotate = True       # 恢复 SP24 默认值（防单例跨测试污染）
+    settings.http_impersonate_pool = ["chrome", "firefox", "safari"]
 
 
 # ---------- 开关 / 降级 ----------

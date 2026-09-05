@@ -1125,6 +1125,9 @@ async def main_async(args):
 
     # P0-5: --metrics-port 启动 Prometheus 指标服务器
     metrics_port = getattr(args, 'metrics_port', 0) or getattr(settings, 'metrics_port', 0)
+    # P0-5b: ENABLE_METRICS=true 且未显式指定端口时使用默认 9090（默认开后的接线）
+    if not metrics_port and getattr(settings, 'enable_metrics', False):
+        metrics_port = int(getattr(settings, 'metrics_port', 0) or 9090)
     if metrics_port:
         try:
             from vulnclaw.core_modules.metrics import start_metrics_server
@@ -2468,6 +2471,13 @@ async def main_async(args):
         print(f"📄 SARIF报告: {sarif_path}")
     except Exception as e:
         print(f"⚠️ SARIF报告生成异常（忽略）: {e}")
+
+    # P4-6: scan_diff 自动基线（报告后存基线 + 增量 diff；异常绝不影响主报告）
+    try:
+        from vulnclaw.core.report_diff import maybe_diff_baseline
+        maybe_diff_baseline(report, str(target), safe_target, json_path)
+    except Exception as e:
+        print(f"⚠️ scan_diff 基线处理异常（忽略）: {e}")
 
     # P4-2: 机器事实覆盖账本 coverage.json（审计口径：检查了什么/谁被跳过失败）
     try:
