@@ -821,3 +821,31 @@
 ### 完成记录（2026-09-06）
 - tests/test_phase_timeboxed.py 7 例全绿（默认配置/预算内执行/超时跳过/无预算透传/不污染后续阶段/run() 全 stage 包装完整性）；orchestrator 相邻测试 35 例全绿；
 - 全量回归 0 新增；真扫验证见 §12 联调记录（真扫按阶段账本推断卡点，不再 600s 顶层猜）。
+
+## 15. SP17 大批次（4 项能力补齐，2026-09-06，A 线 4 路并行）
+> 并行模式：4 个后台 Agent 同时开工，文件级零重叠（每线独占文件+独立测试），主线程收口。
+
+### 15.1 RL 反馈飞轮（SP17.1）
+- bandit_report.py（新）：JSONL 反馈样本聚合报表（by_engine/top_combos，JSON+人读双出）；
+- bandit_train.py（新）：真实样本训练轻量策略（baseline 判定 boost/penalty/hold，calibrated_influence 按样本量 1/2/3）；
+- bandit.py：ContextualBandit.from_policy/load_policy（策略命中组合优先按 action 调权，未命中回退 Thompson，未加载零回归）；
+- cli.py：bandit-report / bandit-train 两子命令；
+- 测试 test_bandit_flywheel.py 9 例 + test_sp16_bandit.py 兼容；
+
+### 15.2 调用链二期（SP17.2）
+- graph.py：import_index（纯 stdlib 正则解析绝对/相对导入）、build_cross_graph（module.func 跨文件调用图，别名归一化）、entry_reachability/enrich_findings 新增 cross/use_cross 可选参数（缺省与旧版逐字一致）；
+- static_audit.py：scan_callgraph 开启时 enrich_findings(use_cross=True)（主线程集成）；
+- 测试 test_sp17_callgraph_cross.py 13 例 + test_sp16_graph.py 兼容；
+
+### 15.3 TLS 指纹链（SP17.3）
+- settings：http_impersonate_pool/rotate/http2 三配置（默认 rotate 关=SP16.2 单例路径零回归）；
+- impersonate.py：ImpersonatePool（线程安全轮换池，命中保持 hit_streak_keep=3、失败切换）、get_impersonate_pool 单例、http2_fingerprint 指纹概要，scanner.py 免改；
+- 测试 test_sp17_impersonate_pool.py + test_sp16_impersonate.py 14 例；
+
+### 15.4 企业级报告（SP17.4）
+- report_generator.py：build_distribution（type x severity 交叉统计+ranked_targets）、suggest_remediation（四级修复模板，已有 remediation 时 append 不覆盖）、enrich_report 注入 HTML/Markdown/SARIF 三路径（只增键不改既有键）；
+- 测试 test_sp17_report.py 14 例 + 既有报告相关 123 例；
+
+### 15.5 收口
+- SP17 专项 78 例全绿（7 个测试文件：SP16 x 3 兼容 + SP17 x 4 新增）；ruff 新文件 14 项自动修复清零（存量错误不动）；
+- 全量回归结果与提交见上（§12-§14 同栏记账表迁移至 git log）。

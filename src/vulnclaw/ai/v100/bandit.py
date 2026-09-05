@@ -19,6 +19,9 @@ SP16.1 上下文多臂老虎机（轻量在线 RL 决策层）
         加到基础 priority 上并 clamp 到 1..10
 - 无样本组合返回基础值原样（默认关 / 无数据时零行为回归）
 - 可选 JSONL 反馈飞轮：feedback 逐条落盘，作为未来正式 RL 策略网络的训练数据
+- SP17.1 可选策略加载：ContextualBandit.from_policy / load_policy 加载
+  bandit_policy.json，adjust() 在命中的策略组合上按 action（boost/penalty/hold）
+  调整，无策略记录时回退 Thompson 采样（未加载策略时行为与纯 Thompson 完全一致）。
 
 纪律：无 emoji、轻量、异常优雅降级（B heap 规则同源）。
 """
@@ -65,7 +68,34 @@ class ContextualBandit:
         self._feed_dir = str(feed_dir or "")
         self.enabled = enabled
         self._stats: dict[str, dict[str, int]] = {}
+        self._policy_combos: dict[str, str] = {}  # key -> boost|penalty|hold
+        self._policy_influence: int = self._influence
         self._lock = threading.Lock()
+
+    # ---------- 策略加载（SP17.1 可选） ----------
+    @classmethod
+    def from_policy(cls, policy_path: str, influence: int = 2, feed_dir: str = "", enabled: bool = True):
+        """从策略文件构造（SP17.1）：加载轻量训练策略，命中组合按 action 调整。"""
+        bandit = cls(influence=influence, feed_dir=feed_dir, enabled=enabled)
+        bandit.load_policy(policy_path)
+        return bandit
+
+    def load_policy(self, policy_path: str) -> bool:
+        """加载策略文件（bandit_policy.json）。失败优雅降级为纯 Thompson（返回 False）。"""
+        try:
+            data = json.loads(Path(policy_path).read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            logger.debug("[SP17.1] bandit 策略加载失败，保持默认 Thompson", exc_info=True)
+            return False
+        combos = data.get("combos") or {}
+        with self._lock:
+            self._policy_combos = {
+                str(k): str((v or {}).get("action") or "hold")
+                for k, v in combos.items() if isinstance(v, dict)
+            }
+            inf = data.get("calibrated_influence")
+            self._policy_influence = max(1, int(inf)) if isinstance(inf, (int, float)) else self._influence
+        return True
 
     # ---------- 查询 ----------
     def has_sample(self, key: str) -> bool:
@@ -76,8 +106,21 @@ class ContextualBandit:
             return key in self._stats
 
     def adjust(self, base: int, key: str) -> int:
-        """Thompson 采样决策：返回调整后的优先级（clamp 1..10）。"""
-        if not self.enabled or not key or not self.has_sample(key):
+        """决策：有策略记录按策略 action 调整，否则回退 Thompson 采样（clamp 1..10）。"""
+        if not self.enabled or not key:
+            return int(base)
+        # 策略优先：命中组合按 action 调整
+        if self._policy_combos:
+            with self._lock:
+                action = self._policy_combos.get(key)
+            if action is not None:
+                if action == "boost":
+                    return max(1, min(10, int(base) + self._policy_influence))
+                if action == "penalty":
+                    return max(1, min(10, int(base) - self._policy_influence))
+                return int(base)  # hold：不调整
+        # 回退：Thompson 采样
+        if not self.has_sample(key):
             return int(base)
         with self._lock:
             st = self._stats[key]

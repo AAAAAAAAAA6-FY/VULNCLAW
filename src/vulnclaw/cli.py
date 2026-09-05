@@ -6,7 +6,7 @@
 
 """统一 CLI 入口 - VULNCLAW v103
 
-子命令：vulnclaw scan / code / health
+子命令：vulnclaw scan / code / health / bandit-report / bandit-train
 兼容：不带子命令时按旧 scan.py 参数风格转发（python scan.py --health 等）。
 """
 from __future__ import annotations
@@ -209,7 +209,7 @@ def main(argv: list[str] | None = None) -> None:
         # P1-3: python scan.py resume --scan-id xxx -> 转发为 --resume --scan-id xxx
         _run_scan_main(["--resume", *argv[1:]])
         return
-    elif argv[0] not in ("scan", "code", "health", "mcp", "setup", "verify", "tools"):
+    elif argv[0] not in ("scan", "code", "health", "mcp", "setup", "verify", "tools", "bandit-report", "bandit-train"):
         # 兼容模式：非子命令 -> 旧 scan.py 风格直接转发（保留全量旧参数行为）
         _run_scan_main(argv)
         return
@@ -512,6 +512,26 @@ def main(argv: list[str] | None = None) -> None:
         help="查看调用审计尾部 + 健康状态 + 治理事件链根",
     )
 
+    bandit_report_parser = subparsers.add_parser(
+        "bandit-report",
+        help="RL 反馈飞轮：聚合 bandit_feedback.jsonl 为统计报表",
+        description="读取 ContextualBandit 落盘的 JSONL 反馈样本，输出聚合报表（JSON + 文本）。",
+        epilog="示例:\n  vulnclaw bandit-report --feed bandit_feedback.jsonl --out report.json",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    bandit_report_parser.add_argument("--feed", required=True, help="bandit_feedback.jsonl 路径")
+    bandit_report_parser.add_argument("--out", default="", help="可选：JSON 报表输出路径（默认 stdout）")
+
+    bandit_train_parser = subparsers.add_parser(
+        "bandit-train",
+        help="RL 反馈飞轮：用反馈样本训练轻量决策策略",
+        description="基于真实 JSONL 样本训练决策策略（输出 bandit_policy.json）。",
+        epilog="示例:\n  vulnclaw bandit-train --feed bandit_feedback.jsonl --out bandit_policy.json",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    bandit_train_parser.add_argument("--feed", required=True, help="bandit_feedback.jsonl 路径")
+    bandit_train_parser.add_argument("--out", default="bandit_policy.json", help="策略输出路径（默认当前目录 bandit_policy.json）")
+
     args = parser.parse_args(argv)
 
     if args.command == "scan":
@@ -594,3 +614,9 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(0 if result.get("ok") else 2)
     elif args.command == "tools":
         sys.exit(_run_tools(args))
+    elif args.command == "bandit-report":
+        from vulnclaw.ai.v100 import bandit_report
+        sys.exit(bandit_report.main(["--feed", args.feed, "--out", args.out]) or 0)
+    elif args.command == "bandit-train":
+        from vulnclaw.ai.v100 import bandit_train
+        sys.exit(bandit_train.main(["--feed", args.feed, "--out", args.out]) or 0)

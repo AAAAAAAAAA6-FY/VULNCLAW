@@ -377,6 +377,88 @@ def normalize_vulns(vulns):
     return unique
 
 
+# ============================================================
+# SP17.4 企业级报告增强（A 线）：
+#   - suggest_remediation：按严重级返回分级修复建议（可单测）
+#   - build_distribution：按 (type, severity) 交叉统计漏洞分布
+#   - enrich_report：为报告 dict 注入 distribution 与逐条 remediation_tier
+# 只增不改既有字段；空 findings 给出空结构不抛错；可幂等重复调用。
+# ============================================================
+_REMEDIATION_TIER_TEMPLATES = {
+    "critical": "立即修复：漏洞已对系统核心资产构成即时威胁，请立即下线受影响组件/封堵入口并部署直接缓解动作",
+    "high": "限期修复：请在近期安排补丁更新或配置动作（参数化查询/访问控制/最小权限等），完成后回归验证",
+    "medium": "计划修复：纳入加固计划，逐步落实输入校验、安全配置与纵深防御加固动作",
+    "low": "观察项：持续评估该风险，定期复核研判并跟踪处置阈值",
+}
+
+
+def suggest_remediation(severity, existing_remediation=""):
+    """SP17.4：按严重级返回分级修复建议文本。
+
+    - 已有 remediation 文本时在其后追加模板（不覆盖，原有内容保留在前）；
+    - 否则以分级模板为主。
+    """
+    sev = str(severity or "").strip().lower()
+    template = _REMEDIATION_TIER_TEMPLATES.get(sev, _REMEDIATION_TIER_TEMPLATES["medium"])
+    existing = str(existing_remediation or "").strip()
+    if existing:
+        return existing + "；" + template
+    return template
+
+
+def _target_host(url) -> str:
+    """从 URL 提取主机名（用于排名目标统计）；无有效主机返回空串。"""
+    u = str(url or "").strip()
+    if not u:
+        return ""
+    u = u.split("://", 1)[-1]
+    return (u.split("/", 1)[0] or "").strip()
+
+
+def build_distribution(findings):
+    """SP17.4：按 (type, severity) 交叉统计漏洞分布。
+
+    返回 {"by_type": {type: {severity: count}}, "by_severity": {severity: count},
+          "ranked_targets": [{"host":.., "count":n}, ...]}。
+    """
+    by_type = {}
+    by_severity = {}
+    target_counter = {}
+    for f in findings or []:
+        ftype = str(f.get("type") or "unknown")
+        sev = str(f.get("severity") or "").strip().lower() or "unknown"
+        inner = by_type.setdefault(ftype, {})
+        inner[sev] = inner.get(sev, 0) + 1
+        by_severity[sev] = by_severity.get(sev, 0) + 1
+        host = _target_host(f.get("url"))
+        if host:
+            target_counter[host] = target_counter.get(host, 0) + 1
+    ranked_targets = [
+        {"host": h, "count": c}
+        for h, c in sorted(target_counter.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
+    return {
+        "by_type": by_type,
+        "by_severity": by_severity,
+        "ranked_targets": ranked_targets,
+    }
+
+
+def enrich_report(report_data):
+    """SP17.4：为报告 dict 注入 distribution 与逐条 remediation_tier。
+
+    仅新增额外字段（report_data["distribution"]、finding["remediation_tier"]），
+    不改写任何既有键；幂等可重复调用。返回原 report_data（便于链式/单测）。
+    """
+    vulns = report_data.get("vulnerabilities") or []
+    report_data["distribution"] = build_distribution(vulns)
+    for f in vulns:
+        f["remediation_tier"] = suggest_remediation(
+            str(f.get("severity") or "").lower(), f.get("remediation")
+        )
+    return report_data
+
+
 def _is_pending_review(vuln: Dict) -> bool:
     """判定 finding 是否处于“待人工复核”状态（验证层未能 AI 确认但保留）。"""
     text = " ".join(str(vuln.get(k, "")) for k in
@@ -417,6 +499,9 @@ def render_pending_review_section(vulns: List[Dict]) -> str:
 def render_html(enhanced_report):
     """渲染 HTML 报告内容 - 修复：证据截断"""
     import html as html_escape
+
+    # SP17.4：注入 distribution 与逐条 remediation_tier（只增不改既有字段）
+    enrich_report(enhanced_report)
 
     target = enhanced_report.get('target', '')
     vulns = normalize_vulns(enhanced_report.get('vulnerabilities', []))
@@ -839,6 +924,7 @@ def render_ai_test_guide(clue):
 def generate_markdown_report(report_data, output_path):
     """生成 Markdown 报告"""
     lines = []
+    enrich_report(report_data)  # SP17.4：注入 distribution 与 remediation_tier
     lines.append(f"# 渗透测试报告 - {report_data.get('target', 'Unknown')}")
     lines.append("")
     lines.append(f"**生成时间**: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -1215,6 +1301,7 @@ def _render_source_attribution_section(vulns: List[Dict]) -> str:
 def generate_sarif(report_data: Dict, out_path: str = "") -> Dict:
     """把报告漏洞列表转换为 SARIF 2.1.0 JSON 结构，可写入 out_path（若提供）。"""
     import json as _json
+    enrich_report(report_data)  # SP17.4：注入 distribution 与 remediation_tier
     rule_ids = {}
     sarif_rules = []
     results = []
@@ -1434,6 +1521,10 @@ def diff_reports(baseline: Dict, current: Dict) -> Dict:
 
 
 __all__ = [
+    "suggest_remediation",
+    "build_distribution",
+    "enrich_report",
+
     "generate_markdown_report",
     "generate_html_report",
     "render_html",

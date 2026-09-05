@@ -536,7 +536,8 @@ def run_static_audit(repo_path: str, config: Optional[StaticAuditConfig] = None,
             from vulnclaw.code.graph import enrich_findings
             for _f in findings:
                 _f["abs_path"] = os.path.join(repo_path, _f.get("file", "").replace("/", os.sep))
-            findings = enrich_findings(findings, [repo_path])
+            # SP17.2 二期：scan_callgraph 开启时走跨文件 import 调用图（缺省 use_cross=False 保持同文件语义）
+            findings = enrich_findings(findings, [repo_path], use_cross=True)
         except Exception:  # noqa: BLE001 - 增强失败不阻断审计主流程
             logger.debug("[SP16.3] enrich_findings 失败，跳过调用链增强")
 

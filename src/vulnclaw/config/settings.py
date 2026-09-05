@@ -307,6 +307,16 @@ class Settings(BaseSettings):
     # ---- SP16.2 TLS 指纹伪装（A 线；curl_cffi 可选后端，默认关零行为回归）----
     http_impersonate: bool = Field(False, alias="HTTP_IMPERSONATE")
     http_impersonate_browser: str = Field("chrome", alias="HTTP_IMPERSONATE_BROWSER")
+    # ---- SP17.3 TLS 指纹链（A 线；基于 SP16.2，把"单指纹"升级为"指纹链"；默认全关/空池零行为回归）----
+    # 可用的指纹轮换池（兼容 JSON 数组与逗号串，见 parse_list；默认值即出厂默认）
+    http_impersonate_pool: Annotated[List[str], NoDecode] = Field(
+        default_factory=lambda: ["chrome", "firefox", "safari"],
+        alias="HTTP_IMPERSONATE_POOL",
+    )
+    # 轮换开关：开着时请求按池 round-robin 轮换，命中（连续成功 N 次）保持当前指纹
+    http_impersonate_rotate: bool = Field(False, alias="HTTP_IMPERSONATE_ROTATE")
+    # HTTP2 SETTINGS 显式编排/声明开关（curl_cffi 已内置浏览器指纹，本开关控制额外显式编排输出层）
+    http_impersonate_http2: bool = Field(False, alias="HTTP_IMPERSONATE_HTTP2")
     # ---- SP16.3 调用链上下文（A 线；enrich_findings 入口可达性证据增强）----
     scan_callgraph: bool = Field(False, alias="SCAN_CALLGRAPH")
     # ---- SH17.1 阶段预算：per-phase wall-clock 上限（带默认值启用；单阶段超时只中断本阶段跳过继续）----
@@ -713,7 +723,7 @@ class Settings(BaseSettings):
                 return {}
         return v
 
-    @field_validator("proxy_list", "common_dirs", "dangerous_allow_list", mode="before")
+    @field_validator("proxy_list", "common_dirs", "dangerous_allow_list", "http_impersonate_pool", mode="before")
     @classmethod
     def parse_list(cls, v):
         # 兼容两种写法：JSON 数组 '["a","b"]'（旧 .env 格式）与 逗号串 'a,b'
