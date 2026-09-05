@@ -2145,8 +2145,16 @@ class AgentCoordinator:
             recon_node = await self.spawn("recon", "root")
             recon_findings = await recon_node.run(self.target, self.session)
 
-        tasks = []
+        # A2.4: 竞争协作（默认关）——exploit 高价值目标派 2 个不同策略子 Agent，取先确认者
+        race_enabled = self._race_enabled()
+        tasks: List[asyncio.Task] = []
+        race_tasks: List[asyncio.Task] = []
         for role in rest:
+            if race_enabled and role == "exploit":
+                race_nodes = await self._spawn_race(role)
+                for rn in race_nodes:
+                    race_tasks.append(asyncio.create_task(rn.run(self.target, self.session)))
+                continue
             node = await self.spawn(role, "root")
             tasks.append(asyncio.create_task(node.run(self.target, self.session)))
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -2158,6 +2166,10 @@ class AgentCoordinator:
                 logger.warning(f"[Coordinator] agent 执行异常: {r}")
                 continue
             all_findings.extend(r)
+
+        # A2.4: 竞争组聚合——取先确认者（首个有效发现），其余弃权计损耗
+        race_findings, race_losers = await self._collect_race(race_tasks)
+        all_findings.extend(race_findings)
 
         # 回收 mailbox 中 agent 主动 post 的发现（兜底，避免漏收）
         root_msgs = await self.mailbox.drain(self.root_addr)
@@ -2176,7 +2188,102 @@ class AgentCoordinator:
             "agents": {a: n.status for a, n in self.nodes.items()},
             "findings": all_findings,
             "blackboard": self.snapshot.blackboard.digest(),
+            "race": {
+                "enabled": bool(race_tasks),
+                "nodes": len(race_tasks),
+                "losers": race_losers,
+            } if race_tasks else None,
         }
+
+    # ---------------- A2.4: 竞争协作（同一高价值目标派 2 个不同策略子 Agent，取先确认者） ----------------
+    def _race_enabled(self) -> bool:
+        """A2.4: 竞争协作总开关（默认关=零行为变更）；复用 enable_agent_race 预留字段。"""
+        try:
+            from vulnclaw.config.settings import settings
+            return bool(getattr(settings, "enable_agent_race", False))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _race_candidates(self, role: str, max_n: int = 0) -> list[str]:
+        """提取竞争候选 focus：共享黑板端点参数 + notes.params，高价值关键字优先，受成本上限裁剪。"""
+        if max_n <= 0:
+            try:
+                from vulnclaw.config.settings import settings
+                max_n = int(getattr(settings, "agent_race_max_targets", 2))
+            except Exception:  # noqa: BLE001
+                max_n = 2
+        cands: list[str] = []
+        try:
+            for ep in (self.snapshot.blackboard.read("endpoints") or []):
+                if isinstance(ep, str) and "=" in ep:
+                    _, _, params = _parse_target(ep)
+                    for p in params:
+                        if p not in cands:
+                            cands.append(p)
+            notes = self.snapshot.blackboard.read("notes") or {}
+            for p in (notes.get("params") or []):
+                if isinstance(p, str) and p not in cands:
+                    cands.append(p)
+        except Exception:  # noqa: BLE001
+            logger.debug("[Race] 黑板读取失败，使用空候选")
+        _KEYWORDS = ("id", "file", "url", "name", "path", "redirect", "callback", "next")
+
+        def _score(p: str) -> int:
+            lp = p.lower()
+            return -max((1 for k in _KEYWORDS if k in lp), default=0)
+
+        cands.sort(key=_score)
+        return cands[:max_n]
+
+    async def _spawn_race(self, role: str) -> list[AgentNode]:
+        """为同一高价值目标派生最多 2 个不同策略子 Agent（不同 focus 参数）；无参数回退单节点。"""
+        params = self._race_candidates(role)
+        if not params:
+            return [await self.spawn(role, "root")]
+        nodes: list[AgentNode] = []
+        for i, p in enumerate(params):
+            addr = role if i == 0 else f"{role}.race{i + 1}"
+            async with self._tree_lock:
+                if addr in self.nodes:
+                    nodes.append(self.nodes[addr])
+                    continue
+                node = AgentNode(self, addr, role, self.root, focus=p)
+                self.root.children.append(node)
+                self.nodes[addr] = node
+                nodes.append(node)
+        return nodes
+
+    async def _collect_race(self, race_tasks: list[asyncio.Task]) -> tuple[list[dict], int]:
+        """竞争组取先确认者：按完成序首个产出有效发现的节点胜出，其余取消并计弃权损耗。"""
+        if not race_tasks:
+            return [], 0
+        winners: list[dict] = []
+        losers = 0
+        pending = set(race_tasks)
+        while pending and not winners:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for t in done:
+                if winners:
+                    # 胜者已定：同一批完成的其余节点也计弃权（竞速并列取首个）
+                    losers += 1
+                    continue
+                try:
+                    res = t.result()
+                except Exception as e:  # noqa: BLE001
+                    logger.debug(f"[Race] 竞争节点异常（弃权）: {e}")
+                    losers += 1
+                    continue
+                findings = [f for f in (res or []) if isinstance(f, dict)]
+                if findings:
+                    winners.extend(findings)
+                else:
+                    losers += 1  # 完成但无产出：计弃权
+            if winners:
+                losers += len(pending)  # 尚未完成者弃权
+                for rest_t in pending:
+                    rest_t.cancel()
+                pending = set()
+        return winners, losers
 
     def bridge_into(self, orchestrator) -> None:
         """把协调器的共享知识（黑板 + findings）并入主编排器状态，供最终报告使用。

@@ -593,7 +593,7 @@
 
 - [x] **A2.1 角色化子 Agent** ✅ 已实现（dispatcher AGENT_ROLES 4 角色窄 prompt + 工具白名单）
     - ✅ 已核实（2026-09-05 审计误报）：`dispatcher.py` AGENT_ROLES 已含 Recon/Analysis/Exploit/Verify 4 角色窄 prompt + 工具白名单，`phases_executor._run_multi_agent_dive` 已按角色 spawn 子 Agent。 —— 无 Recon/Analysis/Exploit/Verify 4 角色独立子 Agent（仅单 AgentCoordinator + phases 相位分工），验收点「独立 system prompt 与工具白名单」无实现。建议：在 `ai/agents/` 落地 4 角色窄 prompt + 工具白名单，黑板上报。
-- [ ] **A2.4 竞争协作**
+- [x] **A2.4 竞争协作** ✅ 已实现（dispatcher AgentCoordinator._spawn_race 双策略派生 + _collect_race 取先确认者，开关 enable_agent_race）
     - ✅ 已核实（2026-09-05 审计误报）：`phases_executor.py` race 竞争模式（enable_agent_race 开关 + FIRST_COMPLETED 取先确认者）已实现，非首名结果取消并经黑板合并。（P2）—— 同一高价值漏洞双策略子 Agent 并行取先确认的可选开关未实现。建议：接 blackboard 可选开关，评估重复成本数据。
 - [x] **A5.6 阶段动态裁剪工具清单** ✅ 已实现（dispatcher stage_tool_keys + STAGE_TO_ROLE 阶段→角色工具裁剪）
     - ✅ 已修复（2026-09-05）：`dispatcher.py` 新增 STAGE_TO_ROLE + stage_tool_keys，ReActAgent 支持 stage 参数按阶段白名单裁剪工具集（recon/execute/verify），`phases_executor` 深挖阶段传 stage="execute"；`tests/test_stage_tools.py` 11 用例通过。 —— prompt 中工具列表随阶段变化未实现（tools.py 有裁剪字段但无按阶段/按角色的暴露逻辑）。建议：context 构建时按当前阶段过滤 tool list。
@@ -998,3 +998,10 @@
 
 ### §21.4 收口
 - 两 Agent 新测试合跑 42 例全绿；未触 settings.py 冲突热区（字段由主线程收口补齐）；TASKLIST §21 纯增量记录。
+
+
+### §21.5 A2.4 竞争协作（2026-09-06，主线程）
+- dispatcher.py AgentCoordinator 新增：`_race_enabled`（读 enable_agent_race，默认关=零行为变更）、`_race_candidates`（黑板端点参数 + notes.params 提取，高价值关键字优先，agent_race_max_targets 成本上限默认 2）、`_spawn_race`（同一高价值目标派生 ≤2 个不同 focus 策略子 Agent，addr 错开规避 spawn 去重；无参数回退单节点）、`_collect_race`（asyncio.wait FIRST_COMPLETED 按完成序取先确认者，后到者 cancel 计弃权损耗，异常/无产出计弃权）；
+- coordinate() 接线：race 开启时 exploit 角色走竞争路径，其余角色原样；返回 dict 增 race 观测（enabled/nodes/losers）；
+- 新增 tests/test_sp24_agent_race.py 11 例（开关默认关 / 候选提取与高价值排序 / 上限裁剪 / 双节点派生 / 无参数回退 / 取先确认者取消后到者 / 异常弃权 / coordinate 集成竞速）；test_s1_deep_react 18 例相邻回归全绿；ruff 新增代码 0 错误（既有 baseline 违规不动）；
+- 成本评估（P2 验收项）：race 默认关不产生重复成本；开启时仅 exploit 角色且目标参数 ≤2 参与竞速，损耗以 losers 计数可观测。
