@@ -158,3 +158,8 @@ thirdparty/extensions/BurpExtender_Full.py
 thirdparty/BurpExtender.py                # 老版单文件 Python extender，已淘汰
 thirdparty/extensions/                    # 整个 extensions 旧目录（只有一个 BurpExtender_Full.py，上面已 ignore）
 
+
+
+# ---------- 2026-09-05 未跟踪大项（注释与规则分开行，规则行不带行尾注释） ----------
+thirdparty/BurpSuite V2026.7.3/
+vulnclaw-backup-*.bundle

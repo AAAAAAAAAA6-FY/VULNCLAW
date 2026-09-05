@@ -260,6 +260,231 @@ async def _probe_one(f: Dict, session) -> Dict:
 
 
 # ============================================================
+# 盲复现验证闸门（Blind Reproduction Gate，L5 级压误报）
+# ============================================================
+"""盲复现闸门：验证者不接收发现者的推理与载荷，独立重打目标，打不中不进主台账。
+
+对应业界两条最硬的压误报范式：
+  - pwnkit 的"盲复现"：验证者不看原始推理链，只拿目标重打一遍；
+  - defending-code 的"独立环境复现"：验证在 find 没碰过的干净环境执行，防环境污染造假阳性。
+
+本闸门五条硬约束：
+  1. 盲：只向验证器传 (url, parameter)，物理裁掉 evidence/payload/描述——
+     不是"约定不看"，而是数据结构上没有这些字段（单测锁死）；
+  2. 独立弹药：复用 SafeExploit 的独立复检器（自带唯一标记/标准载荷），
+     绝不复用发现者那条 payload，避免"照抄答案"式自证；
+  3. 干净上下文：session=None 每次新建会话，不复用主流程连接池/cookie；
+     --blind-sandbox 时进一步把验证动作放进隔离进程（docker 优先、进程兜底）；
+  4. 三态裁决：confirmed / refuted / inconclusive。refuted 降级 needs_review
+     而非删除——凭证链要求记录不可删，等价于"不进 verified 台账"；
+  5. 权限独立：走 danger_guard 的 blind_repro 探测级权限点；被拒 = inconclusive，
+     不扣分、不阻断（与网关"任何一层失败自动跳过"语义一致）。
+"""
+BLIND_REPRO_VERSION = "1.0.0"
+
+# 盲视图白名单：只有这三项能进入验证器
+_BLIND_VIEW_KEYS = ("url", "parameter", "category")
+
+# 大类 -> SafeExploit 验证器链（按顺序尝试，任一 exploitable 即 confirmed）
+_BLIND_VERIFIER_CHAIN: Dict[str, Tuple[str, ...]] = {
+    "sqli": ("verify_sqli", "verify_sqli_time_based"),
+    "cmdi": ("verify_cmdi",),
+    "ssti": ("verify_ssti",),
+    "xss": ("verify_xss",),
+    "lfi": ("verify_lfi",),
+    "ssrf": ("verify_ssrf",),
+    "idor": ("verify_idor",),
+}
+
+# vuln_category 未覆盖、仅凭原 type 字符串识别的补充路由
+_BLIND_TYPE_EXTRA: Tuple[Tuple[str, str], ...] = (
+    ("idor", "idor"), ("越权", "idor"),
+)
+
+# 沙箱内执行的验证脚本模板：与主流程同一套验证器，只换执行环境（不分叉判定逻辑）
+_BLIND_SANDBOX_SNIPPET = r'''
+import asyncio, json, sys
+sys.path.insert(0, {src!r})
+from vulnclaw.core.exploit_verify import SafeExploit
+url, param, method = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    res = asyncio.run(getattr(SafeExploit, method)(url, param, None))
+    print(json.dumps(res if isinstance(res, dict) else {{"exploitable": False}}, ensure_ascii=False))
+except Exception as exc:
+    print(json.dumps({{"exploitable": False, "error": str(exc)[:200]}}, ensure_ascii=False))
+'''
+
+
+def blind_category(f: Dict) -> str:
+    """盲复现用的漏洞大类：vuln_category 归一 + idor/xxe 等补充识别。"""
+    try:
+        from vulnclaw.core.utils import vuln_category
+
+        cat = vuln_category(str(f.get("type", "") or ""))
+    except Exception:  # noqa: BLE001
+        cat = "misc"
+    t = str(f.get("type", "") or "").lower()
+    for needle, mapped in _BLIND_TYPE_EXTRA:
+        if needle in t:
+            return mapped
+    return cat
+
+
+def blind_view(f: Dict) -> Dict:
+    """盲视图：只保留目标与参数，物理裁掉 evidence/payload/描述等一切"发现者的说法"。
+
+    验证器签名只接受 (url, parameter)，类型层面就拿不到原始推理/载荷——
+    这是"盲"的强保证，而非流程约定。
+    """
+    return {
+        "url": str(f.get("url", "") or "").strip(),
+        "parameter": str(f.get("parameter", "") or "").strip(),
+        "category": blind_category(f),
+    }
+
+
+def blind_verifier_chain(f: Dict) -> Tuple[str, ...]:
+    """盲视图类别 -> 验证器方法名链；无对应验证器返回空元组（inconclusive）。"""
+    return _BLIND_VERIFIER_CHAIN.get(blind_category(f), ())
+
+
+def _sandbox_snippet(method: str) -> str:
+    """生成沙箱验证脚本（绝对路径注入 src，避免沙箱环境剥离 PYTHONPATH）。"""
+    from vulnclaw.paths import PROJECT_ROOT as _ROOT
+
+    src = str(_ROOT / "src")
+    return _BLIND_SANDBOX_SNIPPET.format(src=src)
+
+
+async def _blind_repro_one(
+    f: Dict, session, semaphore: asyncio.Semaphore, sandbox: bool = False
+) -> Dict:
+    """单条 finding 的盲复现：盲视图 -> 独立验证器 -> 三态裁决。"""
+    view = blind_view(f)
+    f["blind_view"] = view
+    f["blind_repro"] = "inconclusive"
+
+    if not view["url"].startswith(("http://", "https://")):
+        f["blind_repro"] = "inconclusive"
+        f.setdefault("signals", []).append("blind_skip:no_url")
+        return f
+    if not view["parameter"]:
+        f["blind_repro"] = "inconclusive"
+        f.setdefault("signals", []).append("blind_skip:no_param")
+        return f
+
+    chain = blind_verifier_chain(f)
+    if not chain:
+        f.setdefault("signals", []).append(f"blind_skip:unsupported:{view['category']}")
+        return f
+
+    # 权限门：blind_repro 探测级独立权限点（被拒 = inconclusive，不惩罚）
+    try:
+        from vulnclaw.core.danger_guard import guard
+
+        if not guard.require_approval("blind_repro", f"type={f.get('type')} url={view['url']}"):
+            f.setdefault("signals", []).append("blind_skip:danger_denied")
+            return f
+    except Exception:  # noqa: BLE001 - 门卫不可用视为放行（网关层另有审计）
+        logger.debug("[BlindRepro] 权限门卫不可用（按放行处理）")
+
+    tried: List[str] = []
+    async with semaphore:
+        for method in chain:
+            tried.append(method)
+            try:
+                res = await _run_verifier(method, view, session, sandbox)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"[BlindRepro] {method} 异常（跳过）: {exc}")
+                f["blind_error"] = str(exc)[:200]
+                continue
+            if isinstance(res, dict) and res.get("exploitable"):
+                f["blind_repro"] = "confirmed"
+                f["blind_method"] = str(res.get("method") or method)
+                f["blind_evidence"] = str(res.get("evidence") or "")[:500]
+                f.setdefault("signals", []).append(f"blind_confirmed:{res.get('method') or method}")
+                f["blind_tried"] = tried
+                return f
+    f["blind_tried"] = tried
+    if f.get("blind_error"):
+        f.setdefault("signals", []).append("blind_skip:error")
+    else:
+        f["blind_repro"] = "refuted"
+        f.setdefault("signals", []).append("blind_refuted")
+    return f
+
+
+async def _run_verifier(method: str, view: Dict, session, sandbox: bool) -> Dict:
+    """执行单个验证器：沙箱模式走隔离进程，否则直接调用（session=None 保干净上下文）。"""
+    if sandbox:
+        return await _run_verifier_sandboxed(method, view)
+    from vulnclaw.core.exploit_verify import SafeExploit
+
+    verifier = getattr(SafeExploit, method, None)
+    if verifier is None:
+        return {"exploitable": False, "reason": f"no_verifier:{method}"}
+    # session 传 None：每次独立会话，不复用主流程连接池/cookie（干净上下文）
+    return await verifier(view["url"], view["parameter"], None)
+
+
+async def _run_verifier_sandboxed(method: str, view: Dict) -> Dict:
+    """在隔离进程/容器内跑同一验证器（docker 优先，不可用降级进程隔离并标记 degraded）。"""
+    import sys
+
+    from vulnclaw.core.exploit_verify import SafeExploit
+
+    script = _sandbox_snippet(method)
+    res = await SafeExploit.run_in_sandbox(
+        [sys.executable, "-c", script, view["url"], view["parameter"], method],
+        timeout=60,
+    )
+    out = str(res.get("stdout") or "").strip()
+    parsed: Dict = {}
+    if out:
+        import json as _json
+
+        try:
+            parsed = _json.loads(out.splitlines()[-1])
+        except Exception:  # noqa: BLE001
+            parsed = {}
+    if isinstance(parsed, dict) and parsed:
+        parsed["sandbox"] = res.get("sandbox", {})
+        return parsed
+    return {"exploitable": False, "reason": "sandbox_no_output",
+            "sandbox": res.get("sandbox", {}), "stderr": str(res.get("stderr") or "")[:200]}
+
+
+async def run_blind_repro_gate(
+    findings: List[Dict],
+    session=None,
+    sandbox: bool = False,
+    max_targets: int = 40,
+    concurrency: int = 8,
+) -> Dict[str, int]:
+    """盲复现闸门批量入口。返回统计字典（confirmed/refuted/inconclusive/skipped）。"""
+    stats = {"confirmed": 0, "refuted": 0, "inconclusive": 0, "skipped": 0}
+    if not findings:
+        return stats
+    sem = asyncio.Semaphore(max(1, concurrency))
+    targets = findings[: max(1, max_targets)]
+    await asyncio.gather(*[_blind_repro_one(f, session, sem, sandbox) for f in targets])
+    for f in findings[max(1, max_targets):]:
+        f["blind_repro"] = "inconclusive"
+        f.setdefault("signals", []).append("blind_skip:cap")
+    for f in findings:
+        key = str(f.get("blind_repro") or "inconclusive")
+        if key in stats:
+            stats[key] += 1
+        if "blind_skip:cap" in (f.get("signals") or []):
+            stats["skipped"] += 1
+    logger.info(
+        f"🧪 [BlindRepro] 盲复现闸门: 确认 {stats['confirmed']} / 打不中 {stats['refuted']} / "
+        f"不适用 {stats['inconclusive']} / 超限跳过 {stats['skipped']}"
+    )
+    return stats
+
+
+# ============================================================
 # 评分 + SARIF 输出
 # ============================================================
 def score_confidence(f: Dict) -> int:
@@ -276,10 +501,21 @@ def score_confidence(f: Dict) -> int:
         score -= 15
     if f.get("evidence_missing"):
         score -= 25
+    # 盲复现：独立重打是最强可信信号，确认加分、打不中重扣、不适用不罚
+    blind = str(f.get("blind_repro") or "")
+    if blind == "confirmed":
+        score += 25
+        if f.get("blind_method") == "browser_execution":
+            score += 10  # 真实浏览器执行确认（最强实锤）
+    elif blind == "refuted":
+        score -= 30
     return max(0, min(100, int(score)))
 
 
 def status_of(f: Dict) -> str:
+    # 盲复现打不中 → 不进 verified 台账（降级待复核，不删除：保护凭证链不可变）
+    if str(f.get("blind_repro") or "") == "refuted":
+        return "needs_review"
     if f.get("probe_confirmed") or f.get("rule_hit"):
         return "verified"
     score = int(f.get("confidence") or 0)
@@ -312,6 +548,10 @@ def build_verified_sarif(findings: List[Dict], gateway_version: str = GATEWAY_VE
                 "sources": f.get("sources", []),
                 "corroboration": f.get("corroboration", 1),
                 "severity": normalize_severity(f.get("severity")),
+                # 盲复现闸门结论（不参与凭证链哈希：records 只取下方固定字段）
+                "blind_repro": f.get("blind_repro", ""),
+                "blind_method": f.get("blind_method", ""),
+                "blind_evidence": f.get("blind_evidence", ""),
                 # 以下四项为凭证链出证字段的**全量原值**——审计反查
                 # （verify_gateway_output）据此重建哈希输入，缺一即链式暴露
                 "parameter": str(f.get("parameter", "")),
@@ -346,8 +586,16 @@ async def run_gateway(
     use_llm: bool = False,
     source: str = "",
     receipt_key: str = "",
+    blind_repro: bool = False,
+    blind_sandbox: bool = False,
+    blind_max: int = 40,
 ) -> Dict:
-    """验证网关主流程。返回 summary dict（ok=False 时含 error）。"""
+    """验证网关主流程。返回 summary dict（ok=False 时含 error）。
+
+    blind_repro：启用盲复现闸门（调外呼，默认关，CI 安全）；
+    blind_sandbox：盲复现在隔离进程/容器内执行（docker 优先、进程兜底）；
+    blind_max：单轮盲复现目标上限（成本控制，超出标记 skipped 不惩罚）。
+    """
     started = time.time()
     inp = Path(input_path)
     if not inp.is_file():
@@ -394,6 +642,14 @@ async def run_gateway(
         except Exception:  # noqa: BLE001
             pass
 
+    blind_stats: Dict[str, int] = {}
+    if blind_repro:
+        try:
+            blind_stats = await run_blind_repro_gate(
+                findings, None, sandbox=blind_sandbox, max_targets=blind_max)
+        except Exception as exc:  # noqa: BLE001 - 闸门整体失败不阻断主流程
+            logger.warning(f"🛡️ [Gateway] 盲复现闸门异常（跳过该层）: {exc}")
+
     for f in findings:
         f["confidence"] = score_confidence(f)
         f["status"] = status_of(f)
@@ -415,7 +671,9 @@ async def run_gateway(
     receipt = build_receipt_chain(
         records,
         meta={"input": inp.name, "gateway_version": GATEWAY_VERSION,
-              "probe": probe, "llm": use_llm},
+              "probe": probe, "llm": use_llm,
+              "blind_repro": bool(blind_repro), "blind_sandbox": bool(blind_sandbox),
+              "blind_repro_version": BLIND_REPRO_VERSION if blind_repro else ""},
         secret=receipt_key or None,
     )
     rc_path.write_text(json.dumps(receipt, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -430,6 +688,8 @@ async def run_gateway(
         "total": len(findings),
         "status_counts": counts,
         "corroborated": sum(1 for f in findings if int(f.get("corroboration") or 1) > 1),
+        "blind_repro": blind_stats or None,
+        "blind_repro_enabled": bool(blind_repro),
         "output": str(out_path),
         "receipt": str(rc_path),
         "chain_root": receipt["chain_root"],
@@ -485,4 +745,7 @@ __all__ = [
     "run_gateway", "verify_gateway_output", "normalize_input", "normalize_severity",
     "dedup_and_corroborate", "static_triage", "score_confidence", "status_of",
     "build_verified_sarif", "GATEWAY_VERSION",
+    # 盲复现闸门
+    "blind_view", "blind_category", "blind_verifier_chain", "run_blind_repro_gate",
+    "BLIND_REPRO_VERSION",
 ]

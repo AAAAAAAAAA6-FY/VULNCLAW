@@ -12,9 +12,12 @@
 import atexit
 import shutil
 import tempfile
-from typing import Any, Optional, List, Dict
+from typing import Annotated, Any, Optional, List, Dict
 from pydantic import Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+# NoDecode：禁止 pydantic-settings 在 source 层对复杂字段做 JSON 解析（否则
+# DANGEROUS_ALLOW="op1,op2" 这类逗号串写法会在 validator 之前就抛 SettingsError 崩溃）。
+# 解析交给下方 parse_list（同时兼容 JSON 数组与逗号串）。
+from pydantic_settings import BaseSettings, SettingsConfigDict, NoDecode
 import json
 import os
 import re
@@ -35,14 +38,14 @@ class Settings(BaseSettings):
     # deny=默认拒绝 / prompt=交互确认 / allow=放行（CLI --dangerous 或 DANGEROUS_MODE=allow）
     dangerous_mode: str = Field("deny", alias="DANGEROUS_MODE")
     # 在 deny 模式下单独放行的操作，逗号分隔（如 DANGEROUS_ALLOW="exploit_verify"）
-    dangerous_allow_list: List[str] = Field(default_factory=list, alias="DANGEROUS_ALLOW")
+    dangerous_allow_list: Annotated[List[str], NoDecode] = Field(default_factory=list, alias="DANGEROUS_ALLOW")
 
     # ========== 网络与性能 ==========
     rps: float = Field(2.0, alias="RPS")
     timeout: int = Field(30, alias="TIMEOUT")
     max_concurrent: int = Field(10, alias="MAX_CONCURRENT")
     proxy: Optional[str] = Field(None, alias="PROXY")
-    proxy_list: List[str] = Field(default_factory=list, alias="PROXY_LIST")
+    proxy_list: Annotated[List[str], NoDecode] = Field(default_factory=list, alias="PROXY_LIST")
     max_scan_time: int = Field(3600, alias="MAX_SCAN_TIME")
     # E5.1 scope 硬约束白名单（逗号分隔：example.com 匹配自身及子域；*.*.example.com 通配；10.0.0.0/8 CIDR；精确 IP）
     allowed_scope: str = Field("", alias="ALLOWED_SCOPE")
@@ -336,7 +339,7 @@ class Settings(BaseSettings):
 
     # 目录爆破字典（200+ 条，按 OWASP 常见路径分类）
     # 也支持通过环境变量 COMMON_DIRS="/path/to/dict.txt" 指定外部文件
-    common_dirs: List[str] = Field(
+    common_dirs: Annotated[List[str], NoDecode] = Field(
         default_factory=lambda: [
             # ===== 登录/后台 =====
             "admin", "admin.php", "admin.asp", "admin.aspx", "admin/login",
@@ -684,8 +687,21 @@ class Settings(BaseSettings):
     @field_validator("proxy_list", "common_dirs", "dangerous_allow_list", mode="before")
     @classmethod
     def parse_list(cls, v):
+        # 兼容两种写法：JSON 数组 '["a","b"]'（旧 .env 格式）与 逗号串 'a,b'
+        # （danger_guard 文档即逗号串）。NoDecode 已禁止 source 层 JSON 预解析，
+        # 此处统一收口，避免两种写法任取其一导致另一种崩溃。
         if isinstance(v, str):
-            return [item.strip() for item in v.split(",") if item.strip()]
+            s = v.strip()
+            if not s:
+                return []
+            if s.startswith("["):
+                try:
+                    data = json.loads(s)
+                except BaseException:
+                    data = None
+                if isinstance(data, list):
+                    return [str(x).strip() for x in data if str(x).strip()]
+            return [item.strip() for item in s.split(",") if item.strip()]
         return v
 
     model_config = SettingsConfigDict(

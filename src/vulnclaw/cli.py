@@ -438,7 +438,10 @@ def main(argv: list[str] | None = None) -> None:
                "  vulnclaw verify --input strix-output.sarif\n"
                "  vulnclaw verify --input burp.json --probe          # 附加 HTTP 重放探测\n"
                "  vulnclaw verify --input n.sarif --use-llm --receipt-key $RC_KEY\n"
-               "  vulnclaw verify --input x.sarif --verify-only      # 只做收据审计校验",
+               "  vulnclaw verify --input x.sarif --verify-only      # 只做收据审计校验\n"
+               "  DANGEROUS_ALLOW=blind_repro vulnclaw verify --input x.sarif --blind-repro\n"
+               "  DANGEROUS_ALLOW=blind_repro vulnclaw verify --input x.sarif --blind-repro"
+               " --blind-sandbox  # 隔离环境复现",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     verify_parser.add_argument(
@@ -464,6 +467,19 @@ def main(argv: list[str] | None = None) -> None:
     verify_parser.add_argument(
         "--use-llm", action="store_true",
         help="启用 LLM 粗筛（filter 档；默认关；失败自动跳过不阻断）",
+    )
+    verify_parser.add_argument(
+        "--blind-repro", action="store_true",
+        help="启用盲复现闸门：不看发现者推理/载荷，独立重打目标，打不中不进 verified 台账"
+             "（需 danger 放行：--dangerous 或 DANGEROUS_ALLOW=blind_repro）",
+    )
+    verify_parser.add_argument(
+        "--blind-sandbox", action="store_true",
+        help="盲复现在隔离进程/容器内执行（docker 优先、不可用降级进程隔离）",
+    )
+    verify_parser.add_argument(
+        "--blind-max", type=int, default=40,
+        help="单轮盲复现目标上限（默认 40，超出标记 skipped 不惩罚）",
     )
     verify_parser.add_argument(
         "--source", default="",
@@ -570,6 +586,9 @@ def main(argv: list[str] | None = None) -> None:
             use_llm=bool(args.use_llm),
             source=args.source or "",
             receipt_key=args.receipt_key or "",
+            blind_repro=bool(getattr(args, "blind_repro", False)),
+            blind_sandbox=bool(getattr(args, "blind_sandbox", False)),
+            blind_max=int(getattr(args, "blind_max", 40) or 40),
         ))
         print(json.dumps(result, ensure_ascii=False, indent=2))
         sys.exit(0 if result.get("ok") else 2)

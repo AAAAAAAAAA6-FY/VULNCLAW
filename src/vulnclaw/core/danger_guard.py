@@ -25,6 +25,7 @@ from vulnclaw.config.settings import settings
 # 危险操作注册表（op_id -> 中文说明）
 DANGEROUS_OPS: Dict[str, str] = {
     "exploit_verify": "对已确认漏洞执行利用验证（发送真实攻击载荷）",
+    "blind_repro": "盲复现验证：不看发现者推理/载荷，独立重打目标以压误报（探测级，不提数不提权）",
     "exploit_chain": "执行深度利用链（POC 生成 + 自动利用 + 回连确认）",
     "msf_exploit": "通过 Metasploit RPC 实际执行漏洞利用模块",
     "msf_shell_write": "向已建立的 MSF 会话 shell 写入命令",
