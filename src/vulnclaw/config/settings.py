@@ -309,6 +309,18 @@ class Settings(BaseSettings):
     http_impersonate_browser: str = Field("chrome", alias="HTTP_IMPERSONATE_BROWSER")
     # ---- SP16.3 调用链上下文（A 线；enrich_findings 入口可达性证据增强）----
     scan_callgraph: bool = Field(False, alias="SCAN_CALLGRAPH")
+    # ---- SH17.1 阶段预算：per-phase wall-clock 上限（带默认值启用；单阶段超时只中断本阶段跳过继续）----
+    phase_timeout_recon_s: int = Field(300, alias="PHASE_TIMEOUT_RECON_S")
+    phase_timeout_taskgen_s: int = Field(180, alias="PHASE_TIMEOUT_TASKGEN_S")
+    phase_timeout_scan_s: int = Field(900, alias="PHASE_TIMEOUT_SCAN_S")
+    phase_timeout_chain_router_s: int = Field(90, alias="PHASE_TIMEOUT_CHAIN_ROUTER_S")
+    phase_timeout_react_deep_dive_s: int = Field(180, alias="PHASE_TIMEOUT_REACT_DEEP_DIVE_S")
+    phase_timeout_agent_coordinator_s: int = Field(120, alias="PHASE_TIMEOUT_AGENT_COORDINATOR_S")
+    phase_timeout_extras_s: int = Field(240, alias="PHASE_TIMEOUT_EXTRAS_S")
+    phase_timeout_verify_s: int = Field(420, alias="PHASE_TIMEOUT_VERIFY_S")
+    phase_timeout_report_s: int = Field(120, alias="PHASE_TIMEOUT_REPORT_S")
+    phase_timeout_fallback_s: int = Field(180, alias="PHASE_TIMEOUT_FALLBACK_S")
+
     max_param_mining: int = Field(0, alias="MAX_PARAM_MINING")                   # 参数挖掘条目喂给引擎的上限（0=不限制）
     max_crawl_seed_urls: int = Field(0, alias="MAX_CRAWL_SEED_URLS")       # 迭代爬虫种子 URL
     max_crawl_batch: int = Field(0, alias="MAX_CRAWL_BATCH")               # 每轮爬虫批处理 URL

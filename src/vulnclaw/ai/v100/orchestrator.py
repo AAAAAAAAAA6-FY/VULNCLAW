@@ -182,6 +182,13 @@ class V100Orchestrator:
         # G4 可观测性：每引擎统计（调用/命中/超时/错误/耗时）+ 每阶段耗时
         self._engine_metrics: Dict[str, Dict] = {}
         self._phase_timings: Dict[str, float] = {}
+        # SH17.1 阶段预算：per-phase wall-clock 上限（settings 带默认值；<=0 不限制）
+        self._phase_timeouts_hit: List[str] = []
+        self._phase_budgets: Dict[str, int] = {}
+        for _n in self._STAGES:
+            _b = int(getattr(settings, f'phase_timeout_{_n}_s', 0) or 0)
+            if _b > 0:
+                self._phase_budgets[_n] = _b
         self._direct_findings = 0
         self._burp_findings = 0
         self._burp_scan_task = None  # 步骤3：并行 Burp 扫描任务句柄
@@ -1112,6 +1119,55 @@ class V100Orchestrator:
         if error:
             m["errors"] += 1
 
+    async def _run_extras_block(self) -> None:
+        """SH17.1：extras 阶段主体（与 Burp 并行，收尾合并）。"""
+        # 步骤3：并行提交 Burp 扫描（与下面各全局扫描同时进行，收尾前合并结果）
+        self._burp_scan_task = asyncio.create_task(self._run_burp_scan())
+
+        if self._collaborator_domain:
+            await self._check_collaborator_callback()
+
+        if self._enable_idor:
+            await self._scan_idor()
+
+        if self._enable_default_creds:
+            await self._check_default_creds()
+
+        if self._enable_business_logic:
+            await self._run_business_logic_scan()
+        if self._enable_api_version:
+            await self._run_api_version_scan()
+        if self._enable_smuggling:
+            await self._run_smuggling_scan()
+        if self._enable_http2_ws:
+            await self._run_http2_ws_scan()
+        await self._run_cache_poison_scan()
+
+        # 步骤3：等待并行 Burp 扫描完成并合并其结果
+        if self._burp_scan_task is not None:
+            try:
+                await self._burp_scan_task
+            except Exception as e:
+                logger.warning(f"⚠️ Burp 扫描任务异常: {e}")
+            finally:
+                self._burp_scan_task = None
+
+    async def _run_verify_block(self) -> None:
+        """SH17.1：verify 阶段主体（流式停 + 全量验证 + C9/C10 后处理）。"""
+        # 等所有流式 verify 把存量 pending 跑完；再收尾剩余未被流式 pick 的。
+        await self._stop_stream_verify(wait_pending=True)
+        _pt = time.monotonic()
+        await self._verify_all_findings()
+        # C9/C10: AI 去重 + 幻觉抑制（配置默认开启；异常则保留原始结果，绝不阻断出报告）
+        try:
+            if getattr(settings, "llm_as_judge_dedup", False) or getattr(settings, "hallucination_suppression", False):
+                from vulnclaw.ai.v100.phases.phases_verify import llm_judge_dedup, hallucination_suppress
+                self.findings = await llm_judge_dedup(self, self.findings)
+                self.findings = hallucination_suppress(self, self.findings)
+        except Exception as _ce:  # noqa: BLE001
+            logger.warning(f"⚠️ C9/C10 后处理异常，保留原始 findings: {_ce}")
+        self._phase_timings['verify'] = time.monotonic() - _pt
+
     def _emit_metrics(self, report: Optional[Dict] = None) -> None:
         """G4 可观测性：扫描结束输出指标（落盘 _runtime_cache/metrics/ + 日志摘要）。"""
         try:
@@ -1346,6 +1402,18 @@ class V100Orchestrator:
                 except Exception:  # noqa: BLE001
                     logger.debug("suppressed exception (core audit)")
 
+    async def _run_phase_timeboxed(self, name: str, coro):
+        """SH17.1 阶段预算：单阶段 wall-clock 超时只中断本阶段，跳过继续（不整扫报废）。"""
+        budget = self._phase_budgets.get(name, 0)
+        if not budget:
+            return await coro
+        try:
+            return await asyncio.wait_for(coro, timeout=float(budget))
+        except asyncio.TimeoutError:
+            self._phase_timeouts_hit.append(name)
+            logger.warning(f"⏱️ [SH17.1] 阶段超时: {name}（预算 {budget}s），跳过继续")
+            return None
+
     def _seed_resume_state(self) -> None:
         """续扫：把断点中已落盘的发现 / 已扫三元组 / agent 记忆回填进本次运行。"""
         if self._checkpoint is None or not self._resume:
@@ -1449,18 +1517,18 @@ class V100Orchestrator:
 
             _pt = time.monotonic()
             async with self._stage("recon"):
-                await self._recon()
+                await self._run_phase_timeboxed("recon", self._recon())
             self._phase_timings['recon'] = time.monotonic() - _pt
             _pt = time.monotonic()
             async with self._stage("taskgen"):
-                await self._generate_tasks()
+                await self._run_phase_timeboxed("taskgen", self._generate_tasks())
             self._phase_timings['taskgen'] = time.monotonic() - _pt
             await self._feed_live_intake()
             async with self._stage("scan"):
                 # 在任务执行之前启动流水线验证后台协程，任务边产出 finding 边验证。
                 self._start_stream_verify()
                 _pt = time.monotonic()
-                await self._execute_with_limiting()
+                await self._run_phase_timeboxed("scan", self._execute_with_limiting())
                 self._phase_timings['scan'] = time.monotonic() - _pt
 
             # C3: 成本预算熔断——扫描阶段累计 AI 成本超预算则降级纯引擎模式，防失控
@@ -1469,66 +1537,27 @@ class V100Orchestrator:
             async with self._stage("chain_router"):
                 # S2: 跨引擎攻击链路由——基于 S2.1 链信息把已确认发现串成后续动作
                 #（SSRF->内网探测/Redis 未授权，文件上传/LFI->RCE 链）。
-                await self._run_chain_router()
+                await self._run_phase_timeboxed("chain_router", self._run_chain_router())
 
             async with self._stage("react_deep_dive"):
                 # S1: ReActAgent 深挖阶段（插桩点：_generate_tasks 之后、全局扫描之前）。
                 # 对 engine_bundle 首次执行结果全部 low/info 或判定模糊的参数，
                 # 用 ReActAgent 做多轮深度渗透（V100=广度覆盖，ReAct=单点深度）。
                 # deep 触发 by --deep/ENABLE_REACT_DIVE；执行前过 danger_guard 门卫（S1.2）。
-                await self._run_react_gated_deep_dive()
+                await self._run_phase_timeboxed("react_deep_dive", self._run_react_gated_deep_dive())
 
             async with self._stage("agent_coordinator"):
                 # P2-1: 多智能体协调器（strix 式可寻址 agent 树）——可选增强通道。
                 # 默认关闭，开启后作为主链路之外的补充深扫，复用确定性引擎并把发现合并进 findings。
-                await self._run_agent_coordinator()
+                await self._run_phase_timeboxed("agent_coordinator", self._run_agent_coordinator())
 
             async with self._stage("extras"):
-                # 步骤3：并行提交 Burp 扫描（与下面各全局扫描同时进行，收尾前合并结果）
-                self._burp_scan_task = asyncio.create_task(self._run_burp_scan())
-
-                if self._collaborator_domain:
-                    await self._check_collaborator_callback()
-
-                if self._enable_idor:
-                    await self._scan_idor()
-
-                if self._enable_default_creds:
-                    await self._check_default_creds()
-
-                if self._enable_business_logic:
-                    await self._run_business_logic_scan()
-                if self._enable_api_version:
-                    await self._run_api_version_scan()
-                if self._enable_smuggling:
-                    await self._run_smuggling_scan()
-                if self._enable_http2_ws:
-                    await self._run_http2_ws_scan()
-                await self._run_cache_poison_scan()
-
-                # 步骤3：等待并行 Burp 扫描完成并合并其结果
-                if self._burp_scan_task is not None:
-                    try:
-                        await self._burp_scan_task
-                    except Exception as e:
-                        logger.warning(f"⚠️ Burp 扫描任务异常: {e}")
-                    finally:
-                        self._burp_scan_task = None
+                # SH17.1：extras 阶段预算（settings.phase_timeout_extras_s），超时跳过未完成补充分支
+                await self._run_phase_timeboxed("extras", self._run_extras_block())
 
             async with self._stage("verify"):
-                # 等所有流式 verify 把存量 pending 跑完；再收尾剩余未被流式 pick 的。
-                await self._stop_stream_verify(wait_pending=True)
-                _pt = time.monotonic()
-                await self._verify_all_findings()
-                # C9/C10: AI 去重 + 幻觉抑制（配置默认开启；异常则保留原始结果，绝不阻断出报告）
-                try:
-                    if getattr(settings, "llm_as_judge_dedup", False) or getattr(settings, "hallucination_suppression", False):
-                        from vulnclaw.ai.v100.phases.phases_verify import llm_judge_dedup, hallucination_suppress
-                        self.findings = await llm_judge_dedup(self, self.findings)
-                        self.findings = hallucination_suppress(self, self.findings)
-                except Exception as _ce:  # noqa: BLE001
-                    logger.warning(f"⚠️ C9/C10 后处理异常，保留原始 findings: {_ce}")
-                self._phase_timings['verify'] = time.monotonic() - _pt
+                # SH17.1：verify 阶段预算（settings.phase_timeout_verify_s），超时保留原始 findings
+                await self._run_phase_timeboxed("verify", self._run_verify_block())
 
             self._force_gc()
             await self._finalize_nuclei_update()
@@ -1552,8 +1581,11 @@ class V100Orchestrator:
                     except Exception:  # noqa: BLE001
                         logger.debug("suppressed exception (core audit)")
                 _pt = time.monotonic()
-                report = await self._generate_report()
+                report = await self._run_phase_timeboxed("report", self._generate_report())
                 self._phase_timings['report'] = time.monotonic() - _pt
+            # SH17.1: 实际命中的阶段超时写进报告（账本可查）
+            if isinstance(report, dict):
+                report["phase_timeouts"] = list(self._phase_timeouts_hit)
             self._emit_metrics(report)
             # P5-1: 标记正常完成（后续 --resume-scan 不会误判为可恢复断点）
             if self._checkpoint is not None:

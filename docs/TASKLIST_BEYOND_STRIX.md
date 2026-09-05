@@ -809,3 +809,15 @@
 - 测试：tests/test_live_intake.py +6（feed_live 短路/两源/emit 直抛/低分去重/重复注入面）、tests/test_sarif_attack_graph.py +7（badge/分布段/HTML/MD 渲染）、tests/test_param_pool_backfill.py +4（默认关/回灌/脏行/缺池）——17 例全绿；
 - 全量回归：仅剩 2 例已知 usage_ledger 并发抖动（单跑通过）；unclosed session 警告来自既有 TestPocArtifacts 用例（PoC 产物链路），非本批引入，单列记录待后续清理；
 - 本批含此前 SP16.1 orchestrator 的 bandit 接线（同文件混动，随本批落盘）。
+
+## 14. SH17.1 阶段预算（per-phase wall-clock 超时，2026-09-06，A 线）
+> 背景：真扫联调时 600s 顶层 CLI 超时被杀；任务级已有预算（executor 240s/任务）但挡不住任务多——30 任务 x 240s + 队列/AI 90s 链式调用让总时长可冲十几分钟，只能顶层一刀切（不知道卡在哪、该加多少）。用户提议：不给阶段整体极大放宽，而是每个阶段内对具体进程/子步骤独立设限——即补「阶段预算层」。
+
+### 设计（默认值启用，逐项 env 可覆盖，<=0 不限制）
+- settings：phase_timeout_{recon,taskgen,scan,chain_router,react_deep_dive,agent_coordinator,extras,verify,report}_s + phase_timeout_fallback_s 兜底；默认 recon 300 / taskgen 180 / scan 900 / chain_router 90 / react_deep_dive 180 / agent_coordinator 120 / extras 240 / verify 420 / report 120。
+- orchestrator：__init__ 按 _STAGES 读取预算；_run_phase_timeboxed(name, coro) 用 asyncio.wait_for 包裹，超时只中断本阶段（phase_timeouts 记录 + log），跳过后继续后续阶段，不整扫报废；extras/verify 两处多分支块抽 _run_extras_block/_run_verify_block 统一受管。
+- 报告：report["phase_timeouts"] 落盘实际命中的阶段超时清单（账本可查，与 _phase_timings 对齐）。
+
+### 完成记录（2026-09-06）
+- tests/test_phase_timeboxed.py 7 例全绿（默认配置/预算内执行/超时跳过/无预算透传/不污染后续阶段/run() 全 stage 包装完整性）；orchestrator 相邻测试 35 例全绿；
+- 全量回归 0 新增；真扫验证见 §12 联调记录（真扫按阶段账本推断卡点，不再 600s 顶层猜）。
