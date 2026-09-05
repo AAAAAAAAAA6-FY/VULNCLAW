@@ -126,8 +126,37 @@ def jaccard_url_similarity(url_a: str, url_b: str) -> float:
         return key_sim
     return 0.7 * path_sim + 0.3 * key_sim
 
+"""D4.5 采集质量评分（SP15.3/SP15.5，A 线）。
+
+0-10 分：带参 > 无参；短 URL 优；静态资源直接 0（不进任务生成）；
+来源加权（browser/render、burp 高于被动爬取）。低于
+settings.live_intake_min_score 的样本不进实时任务生成（控噪声预算）。
+"""
+_STATIC_PATH_HINTS = (
+    ".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
+    ".woff", ".woff2", ".ttf", ".eot", ".map", ".webp", ".avif",
+)
+
+
+def acq_score(record: "RequestRecord") -> int:
+    path = (urlparse(record.url).path or "/").lower()
+    if path.endswith(_STATIC_PATH_HINTS):
+        return 0
+    score = 6
+    if record.params:
+        score += 2
+        if len(record.params) >= 2:
+            score += 1
+    if len(record.url) <= 200:
+        score += 1
+    src = (record.source or "").lower()
+    if "render" in src or "browser" in src or "burp" in src:
+        score += 1
+    return min(score, 10)
+
 
 @dataclass
+
 class RequestRecord:
     """统一请求记录（三源归一后的最小信息集）。"""
 

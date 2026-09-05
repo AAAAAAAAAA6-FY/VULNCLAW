@@ -705,3 +705,49 @@
   同端点去重不重复收录。单测补反例（base_len 阈值 / signal 判定）。
 - [ ] B-SP15.4 recon_brief 回灌补齐—— 真扫路径下挖掘池结果在 recon_brief[`param_mining`] 的出现时机与格式
   与 A 侧消费字段完全一致（{param,url,base_len,signal}），print/report 侧可无痛读到。
+
+### §11 完成记录（2026-09-06，commit b34041b）
+- [x] SP15.0：A 线 SP14 全部提交；SP15.0b settings 补 `enable_param_mining`（探测侧，默认 False）
+- [x] A-SP15.1：OOB 证据合流适配完成——base.py `_query_oob_via_module` 双接口（B 实供
+  `get_oob_evidence->List[evidence_view]` 优先 + 旧约定 `query_oob_evidence->dict` 兼容），
+  通道串 provider:protocol 支持生成 curl；test_oob_evidence.py +4 例（映射/curl/空回查/异常）
+  并强化 fake 隔离；全量回归绿（同基线 2 例 usage_ledger 环境抖动，单跑通过）
+
+### §11.1 完成记录（2026-09-06，A 线；B 线 3 项待其自证后合流）
+- [x] A-SP15.2 参数挖掘端到端融验（离线段）—— 消费侧新增 (url,param) 组合去重
+  （同端点同参数只补测一次，防重复检测费钱）；新增 tests/test_sp15_param_mining_e2e.py 5 例
+  （多条目多任务/剥 query/同参不同端点保留/同端点不同参保留/调度出口高优先+字段完整）。
+  真扫段依赖 B-SP15.4-B 回灌（brief[param_mining]），待合流联调，离线链路已闭环。
+- [x] A-SP15.3 D4.2 采集→任务实时生成—— request_feed.py 追加 D4.5 acq_score（SP15.5 一并落地）；
+  新建 modules/live_intake.py（LiveIntake.hit：feed 去重 + (path,param) 发射去重双层防重、
+  score 阈值控噪声、emit 可挂）；orchestrator 接线（import/初始化/taskgen 后 _feed_live_intake
+  喂 crawler 端点、任务实时入队）；settings 补 live_intake_enabled(默认关)/min_score(8)/priority(8)，
+  默认关零行为回归。tests/test_live_intake.py 11 例全绿。
+- [x] A-SP15.5 D4.5 采集质量评分—— 静态资源 0 分/带参高分/多参加分/短 URL 加分/来源加权，
+  低于 live_intake_min_score(8) 不进实时任务生成。
+## 11.1 下一轮并行分工（2026-09-06，双方同时开工，文件零交集）
+
+> 本轮双方各 3 项，无共同文件、无先后依赖，可同时开工；完成后合并 main 各自追加收口记录。
+> 文件边界：A 侧全在主链路热区 + 自有新文件（modules/request_feed.py / dispatcher.py /
+> phases_taskgen.py / settings.py / tests/test_sp15_*）；B 侧仅既有独占（modules/recon.py /
+> core/oob_channel.py / tests/test_oob_channel.py / tests/test_unit_recon.py）。
+
+### A 线（我方，3 项并行）
+- [ ] **A-SP15.2 参数挖掘端到端融验**（真扫 local_lab 开 enable_param_mining=1）——
+  recon 挖参 → param_candidates.jsonl → recon_brief[param_mining] → 消费侧 engine_bundle 任务
+  → 检出隐蔽参数注入 → report 溯源 source=param_mining；叠加 SP15.0b 开关联动验证。
+  新增 tests/test_sp15_param_mining_e2e.py（mock 挖参产物直填 brief，离线不触网）。
+- [ ] **A-SP15.3 D4.2 采集→任务实时生成**（modules/request_feed.py 续 + 主链路接入点）——
+  RequestFeed 接入三源写入点（crawler_bfs 回调节点 + dispatcher 采集回调），add 时 acq_score
+  打分阈值化，实时入引擎队列（延迟<10s 目标）；总开关默认关、零行为回归；不做删除降级。
+- [ ] A-SP15.5 D4.5 采集质量评分（依赖 SP15.3 的接入点，P2 低风险后置）—— 响应码/内容新颖度
+  降权，静态/404 低价值请求不进任务生成。
+
+### B 线（对面，3 项并行）
+- [ ] B-SP15.1-B OOB 数据源自证—— get_oob_evidence 回查真实轮询记录（interactsh/dnslog 双通道
+  结构一致）、JSONL 落盘去重、超时/无回调返回空列表不抛错。测试 +3。
+- [ ] B-SP15.2-B 挖掘器真扫自证—— local_lab 开 enable_param_mining=1：mine_params 命中差异
+  入池（param_candidates.jsonl 字段 param/url/base_len/signal 正确）、目标噪声（5xx/429/0）
+  不收录、同端点去重。单测补反例（base_len 阈值 / signal 判定）。
+- [ ] B-SP15.4-B recon_brief 回灌补齐—— 真扫路径下挖掘池结果在 recon_brief[`param_mining`]
+  的出现时机与格式与 A 侧消费字段完全一致（{param,url,base_len,signal}），报告侧无痛读到。

@@ -453,6 +453,7 @@ async def _generate_tasks(self):
     # C: param_mining（B 侧 recon.py 写入的 D3.5 参数挖掘结果）-> 参数池补测
     if getattr(settings, "scan_param_mining", True):
         _pmined = self._recon_brief.get("param_mining", []) or []
+        _pm_seen = set()
         for _item in cap(_pmined, getattr(settings, "max_param_mining", 0)):
             _pu = _item.get("url") if isinstance(_item, dict) else None
             _pp = _item.get("param") if isinstance(_item, dict) else None
@@ -465,6 +466,10 @@ async def _generate_tasks(self):
                 continue
             if _is_credential_param(_pm_param):
                 continue
+            _pm_seen_key = (_pm_target, _pm_param)
+            if _pm_seen_key in _pm_seen:
+                continue  # SP15.2 消费侧去重：同端点同参数只补测一次，防重复检测费钱
+            _pm_seen.add(_pm_seen_key)
             _es = sorted(engine_priority.items(), key=lambda x: x[1], reverse=True)
             _sel = [e for e, _ in cap(_es, settings.max_engines_per_param)]
             task_data = {

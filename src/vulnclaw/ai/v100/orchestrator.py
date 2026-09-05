@@ -51,6 +51,7 @@ from vulnclaw.engines.auxiliary_engines import APIVersionDiffEngine, RequestSmug
 from vulnclaw.engines.http_engines import CachePoisonEngine
 from .phases import bind_phase_methods
 from vulnclaw.core_modules.metrics import get_metrics
+from vulnclaw.modules.live_intake import LiveIntake
 class V100Orchestrator:
     """v100 facade coordinating the scan phases."""
     _safe_params = {
@@ -1219,6 +1220,35 @@ class V100Orchestrator:
         except Exception as e:
             logger.warning(f"⚠️ [AgentCoordinator] 执行失败（不影响主链路）: {e}")
 
+    async def _feed_live_intake(self) -> None:
+        """SP15.3 D4.2: recon 采集端点 -> 实时补测任务入队（开关默认关, 零行为回归）。
+
+        仅喂 crawler 采集结果（crawled_endpoints）；浏览器流/Burp 流由各自
+        写入点回注（后续增强）。评分不达标/重复注入面由 LiveIntake 内部滤除。
+        """
+        try:
+            if not getattr(settings, "live_intake_enabled", False):
+                return
+            if getattr(self, "_live_intake", None) is None:
+                return
+            brief = self._recon_brief or {}
+            fed = 0
+            for ep in brief.get("crawled_endpoints", []) or []:
+                if not isinstance(ep, dict) or not ep.get("url"):
+                    continue
+                params = {k: "" for k in (ep.get("params") or [])}
+                tasks = self._live_intake.hit(
+                    url=str(ep["url"]), source="crawl", params=params)
+                if not tasks:
+                    continue
+                for td in tasks:
+                    await self.task_queue.add_task(td, td["priority"])
+                    fed += 1
+            if fed:
+                logger.info(f"   [SP15.3] 实时补测: 采集->任务 {fed} 条联邦入队")
+        except Exception:
+            logger.warning("[SP15.3] live intake feed 失败，跳过", exc_info=True)
+
     async def _run_react_gated_deep_dive(self) -> None:
         """S1: ReActAgent 深挖阶段门卫入口（V100 主链路插桩，插在 taskgen 之后、全局扫描之前）。
 
@@ -1372,6 +1402,7 @@ class V100Orchestrator:
             self.batch_processor = BatchProcessor(max_batch_size=5)
             self.local_filter = get_local_filter()
             self.task_queue = SmartTaskQueue(max_size=2000)
+            self._live_intake = LiveIntake()  # SP15.3 D4.2 实时补测管线（默认关）
 
             # P5-1: 续扫——回填断点中的 findings / 已扫三元组 / agent 记忆
             self._seed_resume_state()
@@ -1405,6 +1436,7 @@ class V100Orchestrator:
             async with self._stage("taskgen"):
                 await self._generate_tasks()
             self._phase_timings['taskgen'] = time.monotonic() - _pt
+            await self._feed_live_intake()
             async with self._stage("scan"):
                 # 在任务执行之前启动流水线验证后台协程，任务边产出 finding 边验证。
                 self._start_stream_verify()
