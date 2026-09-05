@@ -110,7 +110,7 @@
 | A1.2 | Plan-then-Act：执行前先产出 JSON 分阶段计划（侦察→假设→验证→利用），每步含理由与预期观察 | `ai/dispatcher.py` | P0 | `--deep` 日志出现 plan 节点且被逐条消费 |
 | A1.3 | 反思循环：每轮 execute→verify 后强制 LLM 自评（成功/失败/不确定+下一步修正），失败两次自动换策略 | `ai/dispatcher.py` `_observe` | P0 | 单元测试：注入失败结果断言策略切换 |
 | A1.4 | 目标函数驱动：把"下一步选什么"从固定顺序改为按 tool\_success\_rates × 预期信息增益打分（现有成功率统计已具备基础） | `ai/dispatcher.py` | P1 | 同一靶场两次扫描工具顺序有据可查 |
-| A1.5 | 失败原因结构化沉淀：失败参数/类型/响应特征写入短期记忆，下轮 prompt 必带 | `ai/dispatcher.py` | P1 | memory 文件出现 failure\_class 字段 |
+| A1.5 | 失败原因结构化沉淀：失败参数/类型/响应特征写入短期记忆，下轮 prompt 必带 | `ai/dispatcher.py` | P1 | memory 文件出现 failure\_class 字段  （✅ 已实现 2026-09-05：`_failure_classes` 结构化台账 + `_build_failure_class` 提取 param/vuln\_type/response\_features + `_format_failure_lessons` 注入 `_think` 下轮 prompt；`_record_tool_outcome` 条目携带 failure\_class；3 例单测 + 全量 738 绿，commit 97e079b）|
 | A1.6 | Human-in-the-loop：高位动作（利用/内网）暂停等人工确认，确认结果回填继续 | `core/danger_guard.py`+dispatcher | P1 | MCP/CLI 下可交互批准 |
 
 #### A2 多 Agent 协作架构（Graph-of-Agents 对标；全部 A）
