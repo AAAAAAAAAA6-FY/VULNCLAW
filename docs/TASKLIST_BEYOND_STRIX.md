@@ -994,7 +994,7 @@
 
 ### §21.3 TASKLIST 勾选批量校正（2026-09-06，主线程）
 - [x] A2.1 角色化子 Agent（dispatcher AGENT_ROLES 4 角色）；[x] A5.6 阶段动态裁剪（stage_tool_keys+STAGE_TO_ROLE）；[x] C2.2 提权路径规划（deepsec/priv_esc_planner.py）；[x] Z3.1 AI PoC 动态生成（poc_generator._generate_llm 三级）；[x] Z4.4 中间件 0day（middleware_exposure_engines 三引擎）；[x] A3.2 目标画像增量扫描（asset_profile 比对跳过）；[x] C1.4 PoC 输出入报告；
-- 仍待办（保留 [ ]）：A2.4 竞争协作（P2 未实现）、A4.6 断点续扫含 agent 记忆（部分）、SP14/15 历史 B 线项（已有完成记录）。
+- 仍待办（保留 [ ]）：SP14/15 历史 B 线项（已有完成记录，勾选状态未同步）。A2.4 与 A4.6 已分别于 §21.5/§21.6 确认实现。
 
 ### §21.4 收口
 - 两 Agent 新测试合跑 42 例全绿；未触 settings.py 冲突热区（字段由主线程收口补齐）；TASKLIST §21 纯增量记录。
@@ -1005,3 +1005,10 @@
 - coordinate() 接线：race 开启时 exploit 角色走竞争路径，其余角色原样；返回 dict 增 race 观测（enabled/nodes/losers）；
 - 新增 tests/test_sp24_agent_race.py 11 例（开关默认关 / 候选提取与高价值排序 / 上限裁剪 / 双节点派生 / 无参数回退 / 取先确认者取消后到者 / 异常弃权 / coordinate 集成竞速）；test_s1_deep_react 18 例相邻回归全绿；ruff 新增代码 0 错误（既有 baseline 违规不动）；
 - 成本评估（P2 验收项）：race 默认关不产生重复成本；开启时仅 exploit 角色且目标参数 ≤2 参与竞速，损耗以 losers 计数可观测。
+
+
+### §21.6 A4.6 断点续扫（含 agent 记忆）复核确认（2026-09-06，主线程）
+- 复核结论：**已完整实现**（此前未勾选系状态滞后）。
+- 证据：orchestrator.py `_seed_resume_state`（续扫三件套回填）——①已扫 (engine,target,param) 三元组经 SqliteCheckpointStore.load_done_tasks 恢复并置 `_resume_skip_done` 跳过；②历史 findings 经 load_findings 按去重 key 并入本次；③agent 记忆（shared_knowledge.experiences）经 load_agent_memory 恢复；保存侧 1626 行 save_agent_memory + 1618 行 _persist_scan_memory（VectorMemory 跨会话）；
+- 阶段级续扫：resume_info 恢复 stage_index，主循环 idx <= resume_stage_index 整段跳过（1372/1393 行）；
+- 测试覆盖：tests/test_sqlite_resume.py 14 例全绿（含 agent 记忆保存/恢复路径）。
