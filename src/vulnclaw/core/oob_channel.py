@@ -73,6 +73,7 @@ class OOBInteraction:
     from_addr: str = ""     # 来源 IP（HTTP）
     raw_protocol: str = ""  # 原始协议首行
     extra: Dict = None      # 原始 JSON
+    channel: str = ""       # SP14.3-B：解析出的通道 provider（interactsh/dnslog），随证据链传递
 
     def __post_init__(self):
         if self.extra is None:
@@ -82,6 +83,38 @@ class OOBInteraction:
 
     def to_dict(self):
         return asdict(self)
+
+    def evidence_view(self, channel: str = "") -> Dict:
+        """SP14.3-B：结构化证据视图（接口约定，消费方 = A 线 evidence 组装）。
+
+        返回固定四键，A 侧按 evidence.oob_* 直接展开写入 finding/报告：
+          oob_ts      回调时间（ISO 风格字符串）
+          oob_channel 通道标识 "provider:protocol"（provider ∈ interactsh/dnslog，
+                      未解析时退化为 protocol）
+          oob_token   触发回调的唯一 token（串台防护的关键字段）
+          oob_detail  人读证据串（协议/来源/原始首行/extra 摘要，截断防膨胀）
+        """
+        chan = str(channel or "").strip() or self.channel or self.protocol
+        return {
+            "oob_ts": self.time,
+            "oob_channel": f"{chan}:{self.protocol}",
+            "oob_token": self.token,
+            "oob_detail": self._detail_text(),
+        }
+
+    def _detail_text(self, max_chars: int = 200) -> str:
+        parts = [f"{self.protocol} 回调", f"time={self.time}"]
+        if self.from_addr:
+            parts.append(f"from={self.from_addr}")
+        if self.raw_protocol:
+            parts.append(f"raw={self.raw_protocol}")
+        if self.extra:
+            try:
+                parts.append(f"extra={json.dumps(self.extra, ensure_ascii=False)[:80]}")
+            except (TypeError, ValueError):
+                pass
+        text = " | ".join(p for p in parts if p)
+        return text[:max_chars]
 
 
 def _new_token() -> str:
@@ -289,6 +322,9 @@ class OOBChannel:
             items = await self._poll_interactsh(timeout)
         elif self._resolved_provider == "dnslog":
             items = await self._poll_dnslog(timeout)
+        if items:
+            for _it in items:  # SP14.3-B：通道 provider 随证据链传递
+                _it.channel = self._resolved_provider or _it.channel
         self.record_interactions(items)  # A1.4：回调证据链持久化 + 去重
         return items
 
@@ -439,12 +475,14 @@ class OOBChannel:
     # A1.4：回调证据链审计 / 去重 / 复核
     # ----------------------------------------------------------
     def _record_interaction(self, it: "OOBInteraction") -> None:
-        """单条回调去重入库（进程内）。"""
+        """单条回调去重入库（进程内 + JSONL 落盘跨进程审计）。"""
         key = (it.token, it.protocol, it.time, it.from_addr, it.raw_protocol)
         if key in _OOB_AUDIT_SEEN:
             return
         _OOB_AUDIT_SEEN.add(key)
         _OOB_AUDIT.append(it)
+        _append_oob_evidence_jsonl(
+            it.evidence_view(channel=self._resolved_provider or ""))
 
     def record_interactions(self, items: List["OOBInteraction"]) -> None:
         """批量入库（忽略非 OOBInteraction）。"""
@@ -482,6 +520,39 @@ def get_oob_audit(token: Optional[str] = None) -> List["OOBInteraction"]:
     return [it for it in _OOB_AUDIT if it.token and it.token.lower() == t]
 
 
+# ----------------------------------------------------------
+# SP14.3-B：结构化证据落盘（跨进程审计 + A 线 evidence 组装的数据源）
+# 每条回调入库时同步追加一行 evidence_view()（oob_ts/oob_channel/oob_token/
+# oob_detail），写失败静默——落盘是增强项，绝不影响盲打主流程。
+# ----------------------------------------------------------
+_OOB_EVIDENCE_RELPATH = ("_runtime_cache", "metrics", "oob_interactions.jsonl")
+
+
+def _oob_evidence_path() -> str:
+    root = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__)))))
+    return os.path.join(root, *_OOB_EVIDENCE_RELPATH)
+
+
+def _append_oob_evidence_jsonl(view: Dict) -> None:
+    try:
+        path = _oob_evidence_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(view, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        logger.debug(f"OOB 证据落盘失败（忽略）: {exc}")
+
+
+def get_oob_evidence(token: Optional[str] = None) -> List[Dict]:
+    """模块级结构化证据查询（SP14.3-B，A 线一行调用）：返回 evidence_view 列表。
+
+    与 get_oob_audit 同源；A 侧按 evidence.oob_* 直接展开写入 finding/报告。
+    """
+    return [it.evidence_view() for it in get_oob_audit(token)]
+
+
 __all__ = [
     "OOBChannel", "OOBInteraction", "make_oob_probe", "get_oob_audit",
+    "get_oob_evidence",
 ]

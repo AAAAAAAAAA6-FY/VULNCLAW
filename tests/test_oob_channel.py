@@ -212,3 +212,71 @@ async def test_address_building(monkeypatch):
     assert ch.interaction_url(token, "https") == f"https://{token}.abc.dnslog.cn/"
     assert ch.dns_label(token) == f"{token}.abc.dnslog.cn"
     assert ch.require_domain() == "abc.dnslog.cn"
+
+
+# ============================================================
+# SP14.3-B: 结构化证据视图（oob.* 字段约定）+ JSONL 落盘
+# ============================================================
+class TestEvidenceView:
+    def test_four_keys_and_channel_fallback(self):
+        it = OOBInteraction(token="tok123", protocol="dns", from_addr="1.2.3.4")
+        v = it.evidence_view()
+        assert set(v) == {"oob_ts", "oob_channel", "oob_token", "oob_detail"}
+        assert v["oob_channel"] == "dns:dns"  # 未解析 provider 时退化为 protocol
+        assert v["oob_token"] == "tok123"
+        assert "dns" in v["oob_detail"] and "1.2.3.4" in v["oob_detail"]
+
+    def test_channel_precedence(self):
+        it = OOBInteraction(token="tok123", protocol="http")
+        it.channel = "interactsh"
+        assert it.evidence_view()["oob_channel"] == "interactsh:http"
+        assert it.evidence_view(channel="dnslog")["oob_channel"] == "dnslog:http"
+
+    def test_record_persists_jsonl_deduped(self, tmp_path, monkeypatch):
+        import json as _json
+        path = tmp_path / "oob.jsonl"
+        monkeypatch.setattr(oob_mod, "_oob_evidence_path", lambda: str(path))
+        monkeypatch.setattr(oob_mod, "_OOB_AUDIT", [])
+        monkeypatch.setattr(oob_mod, "_OOB_AUDIT_SEEN", set())
+        ch = OOBChannel()
+        ch._resolved_provider = "interactsh"
+        it = OOBInteraction(token="tok123", protocol="dns")
+        ch.record_interactions([it])
+        # 同五元组重复录入 → 审计链与落盘均去重
+        ch.record_interactions([OOBInteraction(token="tok123", protocol="dns")])
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 1
+        rec = _json.loads(lines[0])
+        assert rec["oob_channel"] == "interactsh:dns"
+        assert rec["oob_token"] == "tok123" and rec["oob_ts"]
+        assert ch.audit_size() == 1 and ch.get_audit("tok123")
+
+    def test_get_oob_evidence_filters_by_token(self, monkeypatch):
+        monkeypatch.setattr(oob_mod, "_OOB_AUDIT", [
+            OOBInteraction(token="tk", protocol="http", channel="interactsh"),
+            OOBInteraction(token="other", protocol="dns"),
+        ])
+        monkeypatch.setattr(oob_mod, "_OOB_AUDIT_SEEN", set())
+        views = oob_mod.get_oob_evidence("tk")
+        assert len(views) == 1 and views[0]["oob_channel"] == "interactsh:http"
+        assert oob_mod.get_oob_evidence("nope") == []
+        assert len(oob_mod.get_oob_evidence()) == 2
+
+    def test_poll_injects_channel(self, monkeypatch):
+        """poll 收割后 channel provider 随证据链传递。"""
+        async def fake_poll_interactsh(timeout):
+            return [OOBInteraction(token="tk", protocol="dns")]
+        ch = OOBChannel(provider="interactsh")
+        ch._domain = "abc.oast.pro"
+        ch._resolved_provider = "interactsh"
+        monkeypatch.setattr(ch, "_poll_interactsh", fake_poll_interactsh)
+        monkeypatch.setattr(oob_mod, "_OOB_AUDIT", [])
+        monkeypatch.setattr(oob_mod, "_OOB_AUDIT_SEEN", set())
+        items = asyncio_run(ch.poll(timeout=1))
+        assert items[0].channel == "interactsh"
+        assert items[0].evidence_view()["oob_channel"] == "interactsh:dns"
+
+
+def asyncio_run(coro):
+    import asyncio
+    return asyncio.new_event_loop().run_until_complete(coro)

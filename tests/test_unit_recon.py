@@ -1,5 +1,16 @@
-"""单元测试：_is_internal_domain 内网/回环/伪TLD 分类器。"""
-from vulnclaw.modules.recon import _is_internal_domain
+"""单元测试：_is_internal_domain 内网/回环/伪TLD 分类器 + SP14.1-B 参数挖掘器。"""
+import json as _json
+
+import pytest
+
+import vulnclaw.core.utils as core_utils
+import vulnclaw.modules.recon as recon_mod
+from vulnclaw.modules.recon import (
+    _is_internal_domain,
+    append_param_candidates,
+    mine_params,
+    param_pool_path,
+)
 
 
 class TestLoopbackAndPrivate:
@@ -75,3 +86,125 @@ class TestEdgeCases:
 
     def test_trailing_dot_ip(self):
         assert _is_internal_domain("127.0.0.1.") is True
+
+
+# ============================================================
+# SP14.1-B: D3.5 参数挖掘器（词典 + 差异判定 + 入池）
+# ============================================================
+def _mk_get(responses):
+    """responses: {"<url子串>": (status, text), "_base": (status, text)}；未命中词返回基线。"""
+    async def fake_async_get(url, **kw):
+        for key, val in responses.items():
+            if key != "_base" and key and key in url:
+                return val + ({},)
+        return responses.get("_base", (200, "hello")) + ({},)
+    return fake_async_get
+
+
+class TestParamMiner:
+    @pytest.mark.asyncio
+    async def test_reflected_signal(self, monkeypatch):
+        monkeypatch.setattr(core_utils, "async_get", _mk_get({
+            "_base": (200, "welcome home"),
+            "debug=vulnclaw_p0": (200, "welcome home vulnclaw_p0"),
+        }))
+        out = await mine_params("http://t.example.com/?id=1")
+        hit = [c for c in out if c["param"] == "debug"]
+        assert hit and hit[0]["signal"] == "reflected"
+        assert hit[0]["base_len"] == len("welcome home")
+
+    @pytest.mark.asyncio
+    async def test_diff_len_signal(self, monkeypatch):
+        monkeypatch.setattr(core_utils, "async_get", _mk_get({
+            "_base": (200, "welcome home"),
+            "order=vulnclaw_p0": (200, "welcome home" + "x" * 200),
+        }))
+        out = await mine_params("http://t.example.com/")
+        hit = [c for c in out if c["param"] == "order"]
+        assert hit and hit[0]["signal"] == "diff_len"
+
+    @pytest.mark.asyncio
+    async def test_status_change_signal(self, monkeypatch):
+        monkeypatch.setattr(core_utils, "async_get", _mk_get({
+            "_base": (200, "welcome home"),
+            "file=vulnclaw_p0": (403, "forbidden page" * 10),
+        }))
+        out = await mine_params("http://t.example.com/")
+        hit = [c for c in out if c["param"] == "file"]
+        assert hit and hit[0]["signal"] == "status_change"
+
+    @pytest.mark.asyncio
+    async def test_5xx_and_0_noise_skipped(self, monkeypatch):
+        monkeypatch.setattr(core_utils, "async_get", _mk_get({
+            "_base": (200, "welcome home"),
+            "admin=vulnclaw_p0": (500, "server error" * 50),
+        }))
+        assert await mine_params("http://t.example.com/") == []
+        assert await mine_params("") == []  # 非法 URL 防御
+
+    @pytest.mark.asyncio
+    async def test_baseline_failure_returns_empty(self, monkeypatch):
+        async def fail_get(url, **kw):
+            raise OSError("down")
+        monkeypatch.setattr(core_utils, "async_get", fail_get)
+        assert await mine_params("http://t.example.com/") == []
+
+
+class TestParamPool:
+    def test_append_and_dedupe(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(recon_mod, "param_pool_path",
+                            lambda: str(tmp_path / "pool.jsonl"))
+        recon_mod._PARAM_POOL_SEEN.clear()
+        c = [{"param": "debug", "url": "http://t/", "base_len": 5, "signal": "reflected"}]
+        assert append_param_candidates(c) == 1
+        assert append_param_candidates(c) == 0  # 进程内 (url,param) 去重
+        lines = (tmp_path / "pool.jsonl").read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 1
+        assert _json.loads(lines[0])["param"] == "debug"
+        assert _json.loads(lines[0])["signal"] == "reflected"
+
+    def test_append_malformed_skipped(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(recon_mod, "param_pool_path",
+                            lambda: str(tmp_path / "pool.jsonl"))
+        recon_mod._PARAM_POOL_SEEN.clear()
+        assert append_param_candidates([{"no_url": True}, "junk", None]) == 0
+
+    def test_pool_path_layout(self):
+        p = param_pool_path().replace("\\", "/")
+        assert p.endswith("_runtime_cache/recon/param_candidates.jsonl")
+
+
+class TestMiningHook:
+    @pytest.mark.asyncio
+    async def test_disabled_by_default(self, monkeypatch):
+        monkeypatch.setitem(recon_mod.settings.__dict__, "enable_param_mining", False)
+        from vulnclaw.modules.recon import EndpointCollector
+        c = EndpointCollector()
+        assert await c.mine_hidden_params(["http://t.example.com/"]) == []
+
+    @pytest.mark.asyncio
+    async def test_enabled_mines_and_pools(self, tmp_path, monkeypatch):
+        monkeypatch.setitem(recon_mod.settings.__dict__, "enable_param_mining", True)
+        monkeypatch.setattr(recon_mod, "param_pool_path",
+                            lambda: str(tmp_path / "pool.jsonl"))
+        recon_mod._PARAM_POOL_SEEN.clear()
+
+        async def fake_mine(endpoints, session=None, max_endpoints=10, per_url_words=120):
+            return [{"param": "debug", "url": sorted(endpoints)[0],
+                     "base_len": 5, "signal": "reflected"}]
+        monkeypatch.setattr(recon_mod, "mine_params_for_endpoints", fake_mine)
+        from vulnclaw.modules.recon import EndpointCollector
+        c = EndpointCollector()
+        out = await c.mine_hidden_params({"http://t.example.com/"})
+        assert out and (tmp_path / "pool.jsonl").exists()
+
+    @pytest.mark.asyncio
+    async def test_enabled_but_mine_fails_isolated(self, monkeypatch):
+        monkeypatch.setitem(recon_mod.settings.__dict__, "enable_param_mining", True)
+
+        async def boom(*a, **k):
+            raise RuntimeError("x")
+        monkeypatch.setattr(recon_mod, "mine_params_for_endpoints", boom)
+        from vulnclaw.modules.recon import EndpointCollector
+        c = EndpointCollector()
+        assert await c.mine_hidden_params(["http://t.example.com/"]) == []  # 异常隔离不上抛

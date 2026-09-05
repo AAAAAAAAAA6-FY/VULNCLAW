@@ -1245,6 +1245,9 @@ class EndpointCollector:
         if unfurl_stats:
             logger.info(f"      🧩 unfurl 解析: {len(unfurl_stats)} 个唯一 host, {len(filtered)} 个端点")
 
+        # SP14.1-B：参数挖掘钩子（默认关，开启后结果入池供任务生成消费）
+        await self.mine_hidden_params(filtered)
+
         self._log_tool_stats()
 
         if filtered:
@@ -1639,6 +1642,25 @@ class EndpointCollector:
             logger.debug(f"         anew 失败: {e}")
         return urls
 
+    async def mine_hidden_params(self, endpoints, max_endpoints: int = 10) -> List[Dict]:
+        """SP14.1-B（D3.5 参数挖掘，默认关）：对收集到的端点做隐藏参数挖掘并入池。
+
+        开关 settings.enable_param_mining（getattr 动态读，字段由 A 线在
+        settings.py 定义）；关闭/失败时返回 []，零行为变更。
+        """
+        if not getattr(settings, "enable_param_mining", False):
+            return []
+        try:
+            mined = await mine_params_for_endpoints(
+                endpoints, session=self.session, max_endpoints=max_endpoints)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"参数挖掘异常（忽略）: {exc}")
+            return []
+        if mined:
+            written = append_param_candidates(mined)
+            logger.info(f"      🔎 参数挖掘: {len(mined)} 个候选（入池 {written}）")
+        return mined
+
 
 async def crawl_same_origin(target: str, session=None, max_depth: int = 2, max_urls: int = 80, render: bool = False, crawl_hash_routing: bool = False, crawl_websocket: bool = False, ws_endpoints=None) -> Dict[str, List[str]]:
     from vulnclaw.config.settings import settings as _st
@@ -1757,4 +1779,176 @@ async def crawl_same_origin(target: str, session=None, max_depth: int = 2, max_u
     return {u: sorted(p) for u, p in results.items()}
 
 
-__all__ = ['EndpointCollector']
+# ============================================================
+# SP14.1-B / D3.5: 参数名挖掘器（词典 + 差异判定）
+#
+# 入池格式（SP14 接口约定，消费方 = A 线 request_feed / 参数池 / 任务生成）:
+#   {"param": str, "url": str, "base_len": int, "signal": str}
+#   signal: "reflected"(强，探针回显) / "diff_len"(响应长度差异) / "status_change"(状态码变化)
+# 解耦：B 不 import A 的任何文件；结果写 JSONL 池文件，A 按需读取。
+# 开关：getattr(settings, "enable_param_mining", False) —— 字段由 A 线在
+#       settings.py 定义（热区归 A），未定义时本挖掘器保持关闭，零行为变更。
+# ============================================================
+
+# 高价值候选参数词典（可被调用方 wordlist 覆盖/扩展）
+_PARAM_WORDLIST = (
+    # 调试/运维（历史高危）
+    "debug", "debug_mode", "test", "admin", "verbose", "trace", "trace_id",
+    "log", "log_level", "show_errors", "error", "errors", "dump",
+    # 身份/会话
+    "user", "username", "uname", "userid", "uid", "account", "email",
+    "login", "token", "secret", "key", "apikey", "api_key", "session",
+    # 重定向/回跳（SSRF/开放重定向高发位）
+    "redirect", "redirect_uri", "redirect_url", "return", "return_url",
+    "returnTo", "next", "next_url", "goto", "continue", "callback", "cb",
+    "jsonp", "url", "uri", "link", "dest", "destination", "target",
+    # 文件/路径（LFI/RCE 高发位）
+    "file", "filename", "filepath", "path", "dir", "folder", "doc",
+    "download", "read", "cat", "load", "load_file", "include", "template",
+    "tpl", "view", "render", "page", "page_id", "module", "component",
+    "theme", "layout", "skin", "partial", "block", "action", "func",
+    # 查询/列表
+    "q", "query", "search", "keyword", "filter", "sort", "order", "by",
+    "limit", "offset", "start", "end", "count", "size", "num", "page_size",
+    "id", "name", "type", "category", "tag", "group", "lang", "locale",
+    "format", "mode", "op", "method", "cmd", "exec", "code", "run", "eval",
+    # 网络/代理（SSRF 高发位）
+    "host", "site", "server", "proxy", "gateway", "forward", "referer",
+    "ref", "source", "src", "origin", "remote", "fetch", "feed", "rss",
+    # 业务/其他
+    "api", "version", "v", "out", "output", "output_format", "export",
+    "download_type", "attachment", "media", "image", "img", "photo",
+    "attachment_id", "post", "post_id", "article", "news", "product",
+    "item", "order_id", "invoice", "report", "chart", "data", "json",
+    "xml", "preview", "edit", "update", "delete", "create", "status",
+)
+
+_PARAM_PROBE = "vulnclaw_p0"  # 固定探针值（反射判定基准）
+
+# 池文件相对根的路径（_runtime_cache/recon/param_candidates.jsonl）
+_PARAM_POOL_RELPATH = ("_runtime_cache", "recon", "param_candidates.jsonl")
+
+# 进程内 (url, param) 去重（跨多次调用不重复落池）
+_PARAM_POOL_SEEN: set = set()
+
+
+def param_pool_path() -> str:
+    """参数候选池文件绝对路径（项目根/_runtime_cache/recon/param_candidates.jsonl）。"""
+    root = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__)))))
+    return os.path.join(root, *_PARAM_POOL_RELPATH)
+
+
+def append_param_candidates(candidates) -> int:
+    """按入池格式追加写 JSONL 池（进程内去重；失败静默返回 0，绝不影响主流程）。"""
+    path = param_pool_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        written = 0
+        with open(path, "a", encoding="utf-8") as f:
+            for c in candidates or []:
+                try:
+                    key = (str(c["url"]), str(c["param"]))
+                except (KeyError, TypeError):
+                    continue
+                if key in _PARAM_POOL_SEEN:
+                    continue
+                _PARAM_POOL_SEEN.add(key)
+                f.write(json.dumps(c, ensure_ascii=False) + "\n")
+                written += 1
+        return written
+    except OSError as exc:
+        logger.debug(f"参数候选池写入失败（忽略）: {exc}")
+        return 0
+
+
+async def mine_params(url: str, session=None, wordlist=None,
+                      max_params: int = 120, concurrency: int = 5,
+                      timeout: int = 8) -> List[Dict]:
+    """对单个 URL 做隐藏参数挖掘（词典 + 差异判定），返回入池格式列表。
+
+    判定规则（低误报，逐词一轮探测）：
+      - reflected:      探针值出现在响应体（强信号，参数既存在又回显）
+      - diff_len:       状态码与基线一致但响应长度差 >=64（参数改变了行为）
+      - status_change:  状态码变化且非 404/5xx（404 页与 5xx 多为全参数噪声）
+    """
+    from vulnclaw.core.utils import async_get
+
+    url = str(url or "").strip()
+    if not url or not url.lower().startswith(("http://", "https://")):
+        return []
+    words = list(wordlist or _PARAM_WORDLIST)[:max_params]
+    if not words:
+        return []
+
+    try:
+        base = await async_get(url, session=session, timeout=timeout, no_retry=True)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"参数挖掘基线请求失败（{url}）: {exc}")
+        return []
+    if not isinstance(base, tuple) or len(base) < 2:
+        return []
+    base_status, base_text = base[0], base[1] or ""
+    base_len = len(base_text)
+    if not base_len and base_status in (0, None):
+        return []
+
+    sep = "&" if "?" in url else "?"
+    probe_url_tpl = f"{url}{sep}{{w}}={_PARAM_PROBE}"
+
+    async def _probe(word: str) -> Optional[Dict]:
+        try:
+            resp = await async_get(
+                probe_url_tpl.format(w=word), session=session,
+                timeout=timeout, no_retry=True)
+        except Exception:  # noqa: BLE001
+            return None
+        if not isinstance(resp, tuple) or len(resp) < 2:
+            return None
+        status, text = resp[0], resp[1] or ""
+        if status in (0, 429) or (isinstance(status, int) and status >= 500):
+            return None  # 目标不稳定，不可判
+        if _PARAM_PROBE in text:
+            return {"param": word, "url": url, "base_len": base_len, "signal": "reflected"}
+        if status != base_status and status != 404:
+            return {"param": word, "url": url, "base_len": base_len, "signal": "status_change"}
+        if status == base_status and abs(len(text) - base_len) >= 64:
+            return {"param": word, "url": url, "base_len": base_len, "signal": "diff_len"}
+        return None
+
+    sem = asyncio.Semaphore(max(1, concurrency))
+    out: List[Dict] = []
+
+    async def _guarded(word: str) -> Optional[Dict]:
+        async with sem:
+            return await _probe(word)
+
+    for r in await asyncio.gather(*(_guarded(w) for w in words)):
+        if r:
+            out.append(r)
+    return out
+
+
+async def mine_params_for_endpoints(endpoints, session=None, max_endpoints: int = 10,
+                                    per_url_words: int = 120) -> List[Dict]:
+    """对端点集合批量挖掘（collect 钩子入口）：挑前 max_endpoints 个 URL 逐个挖。"""
+    picked: List[str] = []
+    for ep in endpoints or []:
+        ep = str(ep or "").strip()
+        if not ep.lower().startswith(("http://", "https://")):
+            continue
+        if ep.lower().rsplit("?", 1)[0].rsplit(".", 1)[-1] in (
+                "css", "js", "png", "jpg", "jpeg", "gif", "svg", "ico",
+                "woff", "woff2", "ttf", "pdf", "zip", "mp3", "mp4"):
+            continue
+        picked.append(ep)
+        if len(picked) >= max_endpoints:
+            break
+    out: List[Dict] = []
+    for u in picked:
+        out.extend(await mine_params(u, session=session, max_params=per_url_words))
+    return out
+
+
+__all__ = ['EndpointCollector', 'mine_params', 'mine_params_for_endpoints',
+           'append_param_candidates', 'param_pool_path', '_PARAM_WORDLIST']
