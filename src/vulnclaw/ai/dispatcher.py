@@ -197,6 +197,9 @@ class ReActAgent:
         self._consecutive_failures: int = 0
         self._failed_params: set = set()
         self._param_fail_count: Dict[str, int] = {}
+        # A1.5: 失败原因结构化沉淀——失败参数/类型/响应特征写入台账，下轮 prompt 必带
+        self._failure_classes: List[Dict] = []
+        self._failure_classes_limit = 10
 
         # 场景缓存
         self._scene_cache: Dict[str, Dict] = {}
@@ -239,7 +242,7 @@ class ReActAgent:
         self.context.__dict__[self._shared_knowledge_key] = shared
         return shared
 
-    def _record_tool_outcome(self, tool_name: str, success: bool, payload: str = "", detail: str = ""):
+    def _record_tool_outcome(self, tool_name: str, success: bool, payload: str = "", detail: str = "", failure_class: Optional[Dict] = None):
         if not tool_name:
             return
         entry = {
@@ -250,6 +253,12 @@ class ReActAgent:
             "timestamp": time.time(),
             "target": self.target,
         }
+        # A1.5: 失败条目附带结构化 failure_class（参数/类型/响应特征），沉淀进记忆
+        if failure_class is not None:
+            entry["failure_class"] = failure_class
+            self._failure_classes.append(failure_class)
+            if len(self._failure_classes) > self._failure_classes_limit:
+                self._failure_classes = self._failure_classes[-self._failure_classes_limit:]
         self.short_term_memory.append(entry)
         if len(self.short_term_memory) > self.short_term_memory_limit:
             self.short_term_memory = self.short_term_memory[-self.short_term_memory_limit:]
@@ -272,6 +281,58 @@ class ReActAgent:
             f"🧠 [ToolFeedback] tool={tool_name} success={success} score={self.tool_success_rates.get(tool_name, 0.5):.2f} "
             f"detail={detail[:80] or 'n/a'}"
         )
+
+    def _build_failure_class(self, tool_name, action, result, observation) -> Optional[Dict]:
+        """A1.5: 从失败结果提取结构化失败原因（参数/类型/响应特征）。
+
+        返回 failure_class 字典或 None（成功/无效结果不沉淀）。
+        """
+        if not isinstance(result, dict):
+            return None
+        if not (result.get("error") or not result.get("type")):
+            return None  # 成功发现路径不沉淀失败
+
+        param = ""
+        if isinstance(action, dict):
+            params = action.get("params")
+            if isinstance(params, dict):
+                param = str(params.get("param", ""))
+        # 推断漏洞类型：优先 result.type，否则从工具名启发式
+        vuln_type = result.get("type") or ""
+        if not vuln_type:
+            for kw in ("sqli", "xss", "lfi", "cmdi", "ssti", "ssrf", "xxe",
+                      "idor", "jwt", "deser", "upload", "redirect", "cors", "graphql"):
+                if kw in (tool_name or "").lower():
+                    vuln_type = kw
+                    break
+        if not vuln_type:
+            vuln_type = "unknown"
+        response_features = {
+            "status": result.get("status"),
+            "error": str(result.get("error", ""))[:120],
+            "evidence": str(result.get("evidence", ""))[:120],
+        }
+        return {
+            "param": param,
+            "tool": tool_name,
+            "vuln_type": vuln_type,
+            "response_features": response_features,
+            "timestamp": time.time(),
+        }
+
+    def _format_failure_lessons(self) -> str:
+        """A1.5: 将结构化失败台账渲染为下轮 prompt 必带的"历史失败教训"块。"""
+        if not self._failure_classes:
+            return "无历史失败教训。"
+        lines = []
+        for fc in self._failure_classes[-8:]:
+            rf = fc.get("response_features", {}) or {}
+            feat = ", ".join(f"{k}={v}" for k, v in rf.items() if v not in (None, ""))
+            lines.append(
+                f"- 参数[{fc.get('param', '')}] 工具[{fc.get('tool', '')}] "
+                f"类型[{fc.get('vuln_type', '')}] 响应特征[{feat}]"
+            )
+        return "\n".join(lines)
 
     def _estimate_tool_success(self, tool_name: str) -> float:
         if tool_name in self.tool_success_rates and self.tool_success_rates[tool_name] > 0:
@@ -483,7 +544,8 @@ class ReActAgent:
                 tool_name,
                 bool(await self._verify_action(action, result)),
                 payload=payload,
-                detail=observation.get("message", "")
+                detail=observation.get("message", ""),
+                failure_class=self._build_failure_class(tool_name, action, result, observation),
             )
             self._adjust_plan_after_feedback(action, observation)
             self._share_knowledge()
@@ -630,6 +692,9 @@ class ReActAgent:
 - 中价值参数: {', '.join(medium_priority) if medium_priority else '无'}
 - 已发现漏洞: {len(self.findings)} 个
 - 已失败参数: {', '.join(self._failed_params) if self._failed_params else '无'}
+
+【历史失败教训（A1.5 必带，下轮决策规避同类失败）】
+{self._format_failure_lessons()}
 
 【可用工具（共{len(self.tools)}个）】
 {self._format_tools()}

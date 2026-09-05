@@ -299,3 +299,75 @@ def test_a1_4_objective_scores_success_times_info_gain():
     agent.tool_stats = {"xss": {"success": 0, "failure": 5}}
     agent._tool_recent = ["xss"]
     assert agent._rank_tools(["sqli", "xss"])[0] == "sqli"
+
+
+# ---------------------------------------------------------------------------
+# A1.5 失败原因结构化沉淀：memory 条目带 failure_class + 下轮 prompt 必带
+# ---------------------------------------------------------------------------
+def test_a1_5_build_failure_class_structured():
+    agent = _bare_react_agent()
+    action = {"tool": "sqli", "params": {"url": "http://t", "param": "id"}}
+    result = {"error": "无回显", "evidence": "baseline 200", "status": 500}
+    fc = agent._build_failure_class("sqli", action, result, {"type": "error"})
+    assert fc is not None
+    assert fc["param"] == "id"
+    assert fc["tool"] == "sqli"
+    assert fc["vuln_type"] == "sqli"                 # 从工具名启发式推断
+    assert fc["response_features"]["status"] == 500
+    assert fc["response_features"]["error"] == "无回显"
+    # 成功发现路径不沉淀失败
+    ok = agent._build_failure_class("sqli", action, {"type": "SQL注入"}, {"type": "finding"})
+    assert ok is None
+
+
+def test_a1_5_record_tool_outcome_carries_failure_class():
+    agent = _bare_react_agent()
+    agent.short_term_memory = []
+    agent.short_term_memory_limit = 25
+    agent._failure_classes = []
+    agent._failure_classes_limit = 10
+    agent.target = "http://t.example.com"
+    agent.tool_stats = {"sqli": {"success": 0, "failure": 0}}
+    agent.tool_success_rates = {}
+    agent._ensure_shared_knowledge = lambda: {"tool_stats": {}}
+    agent._record_tool_outcome(
+        "sqli", False, payload="p", detail="d",
+        failure_class={"param": "id", "tool": "sqli", "vuln_type": "sqli", "response_features": {}},
+    )
+    assert "failure_class" in agent.short_term_memory[-1]   # memory 文件出现 failure_class 字段
+    assert agent.short_term_memory[-1]["failure_class"]["param"] == "id"
+    assert len(agent._failure_classes) == 1
+
+
+@pytest.mark.asyncio
+async def test_a1_5_failure_lessons_injected_into_think_prompt():
+    agent = _bare_react_agent()
+    agent.target = "http://t.example.com"
+    agent.role = "general"
+    agent.role_system = ""
+    agent.blackboard = None
+    agent._scene_cache = {}
+    agent.findings = []
+    agent._failed_params = set()
+    agent.tools = {}
+    agent._failure_classes = [{
+        "param": "id", "tool": "sqli", "vuln_type": "sqli",
+        "response_features": {"status": 500, "error": "无回显"},
+    }]
+    # 桩掉重依赖，聚焦 A1.5 注入
+    agent._global_context = lambda: ""
+    agent._target_context = lambda: ""
+    agent._format_tools = lambda: ""
+    agent._skills_context = lambda *a, **k: ""
+
+    captured = {}
+
+    class _FakeLLM:
+        async def ask(self, prompt, **kw):
+            captured["prompt"] = prompt
+            return "继续探索。"
+
+    agent.llm = _FakeLLM()
+    await agent._think({"params": [], "tech_stack": [], "status": "200"})
+    assert "历史失败教训" in captured["prompt"]
+    assert "参数[id]" in captured["prompt"]            # 失败教训必带进下轮 prompt
