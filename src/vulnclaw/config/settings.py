@@ -294,6 +294,9 @@ class Settings(BaseSettings):
     max_found_dirs: int = Field(0, alias="MAX_FOUND_DIRS")                 # 目录爆破结果
     max_nuclei_results: int = Field(0, alias="MAX_NUCLEI_RESULTS")         # 报告/简报保留的 nuclei 条数（0=全部）
     max_crawl_endpoints: int = Field(0, alias="MAX_CRAWL_ENDPOINTS")       # 爬虫端点喂给引擎的数量（替代原 CRAWL_ENDPOINT_CAP）
+    scan_param_mining: bool = Field(True, alias="SCAN_PARAM_MINING")
+    enable_param_mining: bool = Field(False, alias="ENABLE_PARAM_MINING")          # D3.5 挖掘器本体开关（探测侧，默认关控成本；scan_param_mining 为消费侧）             # D3.5 参数挖掘结果入任务生成（消费侧总开关）
+    max_param_mining: int = Field(0, alias="MAX_PARAM_MINING")                   # 参数挖掘条目喂给引擎的上限（0=不限制）
     max_crawl_seed_urls: int = Field(0, alias="MAX_CRAWL_SEED_URLS")       # 迭代爬虫种子 URL
     max_crawl_batch: int = Field(0, alias="MAX_CRAWL_BATCH")               # 每轮爬虫批处理 URL
     max_crawl_rounds: int = Field(8, alias="MAX_CRAWL_ROUNDS")             # 迭代爬虫轮数（原固定 3）
@@ -323,6 +326,7 @@ class Settings(BaseSettings):
             self.max_found_dirs = 50
             self.max_nuclei_results = 50
             self.max_crawl_endpoints = 60
+            self.max_param_mining = 40
             self.max_crawl_seed_urls = 15
             self.max_crawl_batch = 30
             self.max_crawl_rounds = 3

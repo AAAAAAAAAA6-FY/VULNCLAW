@@ -472,6 +472,22 @@ def render_html(enhanced_report):
             poc_link_html = (f'<p style="margin:6px 0;"><strong>PoC 产物 (C1.4):</strong> '
                              f'<a href="{_pf}" download>{_pf}</a> '
                              f'<span style="color:#666;">[{_po}]</span></p>')
+        # SP14.3: OOB 回调证据段（有则渲染，无则留空）
+        oob_html = ""
+        _oob = v.get("oob_evidence")
+        if isinstance(_oob, dict) and (_oob.get("ts") or _oob.get("detail")):
+            oob_html = (f'<p style="margin:6px 0;"><strong>带外回调证据 (OOB):</strong> '
+                        f'通道 {html_escape.escape(str(_oob.get("channel", "dns")))} · '
+                        f'时间 {html_escape.escape(str(_oob.get("ts", "")))}'
+                        f'{(" · token " + html_escape.escape(str(_oob.get("token", "")))) if _oob.get("token") else ""}</p>')
+            if _oob.get("detail"):
+                oob_html += (f'<pre style="background:#f8f9fa; padding:8px; border-radius:4px; overflow-x:auto; '
+                             f'white-space:pre-wrap; word-wrap:break-word; font-size:12px; margin:4px 0;">'
+                             f'{html_escape.escape(str(_oob.get("detail")))}</pre>')
+            if _oob.get("curl"):
+                oob_html += (f'<pre style="background:#263238; color:#cddc39; padding:8px; border-radius:4px; '
+                             f'overflow-x:auto; white-space:pre-wrap; word-wrap:break-word; font-size:12px; '
+                             f'margin:4px 0;">{html_escape.escape(str(_oob.get("curl")))}</pre>')
 
         vuln_items_html.append(f'''
         <div class="vuln-item vuln-{sev_class}" data-severity="{sev_class}" data-type="{html_escape.escape(vuln_type_raw.lower())}">
@@ -491,6 +507,7 @@ def render_html(enhanced_report):
                 <pre style="background:#263238; color:#cddc39; padding:8px; border-radius:4px; overflow-x:auto; white-space:pre-wrap; word-wrap:break-word; font-size:12px; margin:4px 0;">{curl_cmd}</pre>
                 <ol style="margin:6px 0;">{repro_html}</ol>
                 {poc_link_html}
+                {oob_html}
             </details>
             <details style="margin-top:6px;">
                 <summary style="cursor:pointer; color:#007bff;">🛡️ 修复建议（{remediation["cwe"]} / {remediation["owasp"]}）</summary>
@@ -845,6 +862,19 @@ def generate_markdown_report(report_data, output_path):
             lines.append("```")
             lines.append(evidence)
             lines.append("```")
+            _oob = v.get("oob_evidence")
+            if isinstance(_oob, dict) and (_oob.get("ts") or _oob.get("detail")):
+                lines.append("")
+                lines.append("**带外回调证据 (OOB)**:")
+                lines.append(f"- 通道: {_oob.get('channel', 'dns')}")
+                lines.append(f"- 时间: {_oob.get('ts', '')}")
+                if _oob.get("token"):
+                    lines.append(f"- token: {_oob.get('token')}")
+                if _oob.get("detail"):
+                    lines.append("- detail:")
+                    lines.append("```")
+                    lines.append(str(_oob.get("detail"))[:MAX_EVIDENCE_LENGTH])
+                    lines.append("```")
             lines.append("---")
         if len(vulns) > 30:
             lines.append(f"\n... 共 {len(vulns)} 个漏洞，仅显示前 30 个。请查看 JSON 报告获取完整列表。")
@@ -1116,7 +1146,9 @@ def generate_sarif(report_data: Dict, out_path: str = "") -> Dict:
                 }
             }],
             "properties": {"confidence": str(v.get("confidence", "") or ""),
-                           "cvss": v.get("cvss", 0) or 0, "type": vtype},
+                           "cvss": v.get("cvss", 0) or 0, "type": vtype,
+                           # SP14.3: OOB 回调证据（平行字段，未触发 OOB 时为 None）
+                           "oob_evidence": v.get("oob_evidence")},
         })
     sarif = {
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",

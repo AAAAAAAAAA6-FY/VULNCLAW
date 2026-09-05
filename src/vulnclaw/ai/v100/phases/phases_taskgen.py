@@ -450,6 +450,37 @@ async def _generate_tasks(self):
             }
             await self.task_queue.add_task(task_data, task_data["priority"])
             tasks_added += 1
+    # C: param_mining（B 侧 recon.py 写入的 D3.5 参数挖掘结果）-> 参数池补测
+    if getattr(settings, "scan_param_mining", True):
+        _pmined = self._recon_brief.get("param_mining", []) or []
+        for _item in cap(_pmined, getattr(settings, "max_param_mining", 0)):
+            _pu = _item.get("url") if isinstance(_item, dict) else None
+            _pp = _item.get("param") if isinstance(_item, dict) else None
+            if not _pu or not _pp or _is_static_resource_url(_pu):
+                continue
+            _pm_target = _pu.split('?')[0]
+            _pm_param = str(_pp)
+            if _a32_target_unchanged or crawl_asset_unchanged(_a32_assets, _pu, [_pm_param]):
+                self._a32_skipped += 1
+                continue
+            if _is_credential_param(_pm_param):
+                continue
+            _es = sorted(engine_priority.items(), key=lambda x: x[1], reverse=True)
+            _sel = [e for e, _ in cap(_es, settings.max_engines_per_param)]
+            task_data = {
+                "type": "engine_bundle",
+                "engines": _sel,
+                "target": _pm_target,
+                "param": _pm_param,
+                "priority": engine_priority.get(_sel[0], 8),
+                "payload_limit": 10,
+                "created_at": time.time(),
+                "source": "param_mining",
+                "mining_signal": str(_item.get("signal", "") or ""),
+                "mining_base_len": int(_item.get("base_len", 0) or 0),
+            }
+            await self.task_queue.add_task(task_data, task_data["priority"])
+            tasks_added += 1
     if static_skipped:
         logger.info(f"   🗑️ [静态资源过滤] 源头丢弃 {static_skipped} 个静态资源 URL")
     if self._a32_skipped:

@@ -56,6 +56,86 @@ def enrich_finding(finding: Dict, method: str = "GET", headers: Optional[Dict] =
             steps.append(f"2. 在参数 {param} 注入恶意载荷，观察响应是否符合漏洞特征（见上方证据）。")
         steps.append("3. 对比正常/恶意请求的响应差异，确认漏洞可复现。")
         f["reproduction_steps"] = "\n".join(steps)
+    return attach_oob_evidence(f)
+
+
+def _channel_is_http(channel: str) -> bool:
+    """通道串 "provider:protocol"（B 侧 evidence_view）或裸 protocol 均判断 HTTP。"""
+    return str(channel or "").rsplit(":", 1)[-1].strip().lower() == "http"
+
+
+def _query_oob_via_module(finding: Dict) -> Optional[Dict]:
+    """SP15.1 合流适配：OOB 证据查询的双接口统一入口。
+
+    优先级：
+      1) B 侧实供 get_oob_evidence(token) -> List[evidence_view]
+         （evidence_view 固定四键 oob_ts/oob_channel/oob_token/oob_detail，取首条映射平铺）
+      2) 早期约定 query_oob_evidence(token) -> {ts, channel, token, detail}
+    模块未就绪 / 异常 / 无命中一律返回 None——调用方优雅跳过、不写字段（低误报铁律）。
+    """
+    try:
+        from vulnclaw.core import oob_channel as _oc
+    except Exception:  # noqa: BLE001 - B 侧模块未就绪
+        return None
+    token = finding.get("oob_token") or finding.get("url") or ""
+    getter = getattr(_oc, "get_oob_evidence", None)
+    if callable(getter):
+        try:
+            views = getter(token) or []
+        except Exception:  # noqa: BLE001
+            views = []
+        view = views[0] if views else None
+        if isinstance(view, dict):
+            return {
+                "ts": str(view.get("oob_ts", "") or ""),
+                "channel": str(view.get("oob_channel", "") or ""),
+                "token": str(view.get("oob_token", "") or ""),
+                "detail": str(view.get("oob_detail", "") or ""),
+            }
+    query = getattr(_oc, "query_oob_evidence", None)
+    if callable(query):
+        try:
+            legacy = query(token)
+        except Exception:  # noqa: BLE001
+            legacy = None
+        if isinstance(legacy, dict):
+            return legacy
+    return None
+
+def attach_oob_evidence(finding: Dict) -> Dict:
+    """SP14.3 (A线): 尽力附加 OOB 回调证据段（有则写、无则跳过）。
+
+    数据源优先级：finding 自带 oob 上下文（引擎在验证阶段已填）-> 尝试
+    try-import vulnclaw.core.oob_channel 的 query_oob_evidence 查询接口
+    （B 侧提供，未就绪时优雅跳过，不抛错、不写字段、互不阻塞）。
+    写出平行字段 finding["oob_evidence"] = {ts/channel/token/detail/curl}，
+    不改变现有 str evidence 的兼容性；JSON 报告自动随 dict 序列化，
+    HTML/Markdown/SARIF 由报告侧按字段渲染。
+    """
+    f = dict(finding)
+    oob = f.get("oob") or f.get("oob_evidence")
+    if not isinstance(oob, dict):
+        oob = _query_oob_via_module(f)
+    if not isinstance(oob, dict):
+        return f
+    ts = str(oob.get("ts", "") or "")
+    token = str(oob.get("token", "") or "")
+    channel = str(oob.get("channel", "dns") or "dns")
+    detail = str(oob.get("detail", "") or "")
+    curl = ""
+    if _channel_is_http(channel) and detail:
+        curl_url = detail.split()[-1] if " " in detail else detail
+        if curl_url.startswith("http"):
+            curl = f"curl -s '{curl_url}'"
+    if not ts and not token and not detail:
+        return f
+    f["oob_evidence"] = {
+        "ts": ts,
+        "channel": channel,
+        "token": token,
+        "detail": detail,
+        "curl": curl,
+    }
     return f
 
 

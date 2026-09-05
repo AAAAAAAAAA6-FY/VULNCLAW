@@ -659,3 +659,49 @@
 - 参数池：`recon_brief["param_mining"] = [ {"param": str, "url": str, "base_len": int, "signal": str}, ... ]`；A 侧按其生成任务，source=param_mining
 - OOB 证据：B 侧在 `core/oob_channel.py` 提供查询接口（可返回 `{"ts": iso时间戳, "channel": "dns|http", "token": str, "detail": str}` 或 None）；A 侧在 base.py 挂"有则写、无则跳过"的 enrich，并在 JSON/HTML/SARIF 写出 `evidence.oob_*`
 - B 侧接口未就绪期间：A 侧以 try-import + 无回调返回 None 优雅降级，互不阻塞
+
+### A 线收口（2026-09-05 我方完成，待 B 侧合流）
+
+- [x] SP14.1 消费侧已实现：settings.py 新增 scan_param_mining（默认开）+ max_param_mining 上限；phases_taskgen 读取 recon_brief[`param_mining`] 生成 engine_bundle 任务（source=param_mining，剥离 query 由 param 注入，凭据/静态资源/畸形条目过滤，cap 生效）
+- [x] SP14.2 已实现并在 A 侧落地：新建 modules/request_feed.py（RequestRecord 三源归一 + RequestFeed 精确去重 + path_template 模板聚类 + jaccard 相似度工具）；本期仅抽象不接主链路，零行为影响
+- [x] SP14.3 集成侧已实现：engines/base.py 新增 attach_oob_evidence（finding 自带 oob 上下文优先，否则 try-import oob_channel.query_oob_evidence 查询，异常/无回调优雅跳过不写字段）；report_generator 的 HTML/Markdown/SARIF 均已按 oob_evidence 字段渲染
+- 新增单测 38 例（tests/test_request_feed.py + tests/test_oob_evidence.py + tests/test_param_mining_taskgen.py）全绿；全量回归 exit=0（同基线仅 2 例 test_usage_ledger 全量并发下偶发环境抖动，单跑通过，与本批改动无交集）
+- 接口对齐：B 侧参数池字段 {param,url,base_len,signal} 已在消费侧适配；OOB 查询接口 query_oob_evidence(token) -> dict|None 已按约定 try-import
+***
+
+
+## 11. SP15 合流验证 + 实战回灌落地（2026-09-06，双方并行）
+
+> 前提：B 线 SP14 已交付（7157a2b，D3.5 挖掘器 + OOB 结构化证据），A 线 SP14 开发完毕待提交。
+> 已核实合流断点二处，SP15.0 统一处理后再并行：
+>   1) OOB 接口偏离：B 交付 `get_oob_evidence(token)->List[dict]`（四键 oob_ts/oob_channel/oob_token/oob_detail）+ JSONL 落盘，
+>      约定名 `query_oob_evidence->dict`（ts/channel/token/detail）未提供 → A 侧 enrich 适配双接口。
+>   2) 挖掘开关命名分叉：B 读 `getattr(settings,"enable_param_mining",False)`，A 定义为 `scan_param_mining`（消费侧）→
+>      settings 补齐 `enable_param_mining`（探测侧开关）并写文档说明二者关系。
+> 约束不变：无共同文件交集、B 仅定点改既有独占文件（recon.py/oob_channel.py + 其测试）、A 不动 B 文件、
+> 新增测试文件各自放 tests/ 不重名、全部完成后全量回归绿、结束时按 §10.1 收口格式追加增量记录。
+
+### SP15.0 合流基座（A 侧先行，一次性 commit，文件全在 A 权限）
+- [ ] A-SP15.0 提交 A 线 SP14 全部改动（9 文件，见 §10 收口标注）
+- [ ] A-SP15.0b settings.py 补 `enable_param_mining`（探测侧开关，默认 False 控成本；`scan_param_mining` 保持为消费侧）——B 挖掘钩子即读此字段，无需 B 改代码
+
+### A 线（我方，并行 3 项 + 后置 1 项）
+- [ ] **A-SP15.1 OOB 证据合流适配**（`engines/base.py`，A）—— attach_oob_evidence 优先 try-import `get_oob_evidence`
+  （B 实供：List[dict]，键 oob_ts/oob_channel/oob_token/oob_detail，取首条映射为 ts/channel/token/detail；无命中返回空），
+  其次兼容 `query_oob_evidence->dict`；异常/无回调仍优雅跳过不写字段（低误报铁律不变）。单测 +3。
+- [ ] **A-SP15.2 参数挖掘端到端融验**（A 主导真扫）—— local_lab 定向开 enable_param_mining=1：
+  recon 挖参 → param_candidates.jsonl → recon_brief[param_mining] → 消费侧 engine_bundle 任务 → 检出隐蔽参数注入
+  → report 溯源 source=param_mining。新增 tests/test_sp15_param_mining_e2e.py（mock 挖参产物直填 brief，离线）。
+- [ ] **A-SP15.3 D4.2 采集→任务实时生成**（新 `modules/request_feed.py` 续，A）—— 三源写入点接入
+  （crawler_bfs 回调节点 + dispatcher 采集回调），加 acq_score 打分阈值，实时入引擎队列（延迟<10s 目标）；
+  总开关默认关、零行为回归、不做降级删除。实战流量回灌（growth 方向 2）的地基。
+- [ ] A-SP15.5 D4.5 采集质量评分（依赖 SP15.3，P2 后置）—— 响应码/内容新颖度降权（静态/404 不生成任务）。
+
+### B 线（对面，并行 3 项，仅定点既有独占文件）
+- [ ] B-SP15.1 OOB 数据源合流自证—— get_oob_evidence 回查真实轮询记录（DNS/HTTP 两通道结构一致）、JSONL 落盘去重、
+  超时/无回调返回空列表（不抛错）。测试 +3（含双通道 + 空回查）。
+- [ ] B-SP15.2 挖掘器真扫自证—— local_lab 开 enable_param_mining=1：mine_params 命中差异入池
+  （param_candidates.jsonl 字段 param/url/base_len/signal 正确）、目标噪声（5xx/429/0）不收录、
+  同端点去重不重复收录。单测补反例（base_len 阈值 / signal 判定）。
+- [ ] B-SP15.4 recon_brief 回灌补齐—— 真扫路径下挖掘池结果在 recon_brief[`param_mining`] 的出现时机与格式
+  与 A 侧消费字段完全一致（{param,url,base_len,signal}），print/report 侧可无痛读到。
