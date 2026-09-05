@@ -117,11 +117,23 @@ class Settings(BaseSettings):
     ai_timeout: int = Field(300, alias="AI_TIMEOUT")
 
     # ========== A4.4: 任务分层模型路由（便宜粗筛 / 贵验证，复用 AI_MODE 档位 + provider_failover） ==========
-    model_tier_routing: bool = Field(False, alias="MODEL_TIER_ROUTING")  # 默认关=零行为变更；开=粗筛/分类走 cheap 档，验证/计划走 expensive 档
+    model_tier_routing: bool = Field(True, alias="MODEL_TIER_ROUTING")  # 默认关=零行为变更；开=粗筛/分类走 cheap 档，验证/计划走 expensive 档
     tier_cheap_codes: List[str] = Field(default_factory=lambda: ["1", "2"], alias="TIER_CHEAP_CODES")  # 便宜快模型码（粗筛/分类）
     tier_expensive_codes: List[str] = Field(default_factory=lambda: ["4", "5"], alias="TIER_EXPENSIVE_CODES")  # 贵模型码（验证/计划）
     ai_api_base: str = Field("https://open.bigmodel.cn/api/paas/v4/", alias="AI_API_BASE")
     ai_api_key: str = Field("", alias="AI_API_KEY")
+
+    # ========== SP24: 通用硬编码参数 env 化（超时/重试/批大小，原散落各模块的字面量统一收口） ==========
+    request_timeout: int = Field(10, alias="REQUEST_TIMEOUT")                    # 单次 HTTP 请求超时（秒，原 async_get/async_post 硬编码 10/30）
+    ai_call_timeout: int = Field(300, alias="AI_CALL_TIMEOUT")                   # AI 模型调用超时（verify 档原 300）
+    model_call_timeout_long: int = Field(3600, alias="MODEL_CALL_TIMEOUT_LONG")  # 长推理超时（plan/长上下文档原 3600）
+    ai_delegate_timeout: int = Field(25, alias="AI_DELEGATE_TIMEOUT")            # 远程/委派分析单次超时（原 25）
+    ai_router_timeout: int = Field(90, alias="AI_ROUTER_TIMEOUT")                # 分层路由/候选粗筛超时（原 90）
+    ai_batch_size: int = Field(5, alias="AI_BATCH_SIZE")                         # AI 批处理大小（BatchProcessor 原 5）
+    subprocess_timeout: int = Field(30, alias="SUBPROCESS_TIMEOUT")              # 外部工具子进程超时（原 30）
+    chain_flush_timeout: int = Field(900, alias="CHAIN_FLUSH_TIMEOUT")           # 流式落盘最终冲刷超时（原 900）
+    oob_domain_timeout: int = Field(20, alias="OOB_DOMAIN_TIMEOUT")              # OOB 域名申请超时（原 20）
+    oob_poll_timeout: int = Field(10, alias="OOB_POLL_TIMEOUT")                  # OOB 轮询超时（原 10）
 
     # ========== 硬编码参数改为 env 读取（新增通用字段） ==========
     enable_waf_bypass: bool = Field(True, alias="ENABLE_WAF_BYPASS")
@@ -152,10 +164,10 @@ class Settings(BaseSettings):
     # ========== S3: 唤醒闲置资产（VectorMemory/ClueEngine/上下文压缩） ==========
     enable_clue_engine: bool = Field(True, alias="ENABLE_CLUE_ENGINE")  # ReAct 深挖前预生成线索
     # ========== A2: 多 Agent 协作（角色化子 Agent + 共享黑板 + 竞争协作） ==========
-    enable_agent_roles: bool = Field(False, alias="ENABLE_AGENT_ROLES")  # 深挖改用多 Agent 编排
+    enable_agent_roles: bool = Field(True, alias="ENABLE_AGENT_ROLES")  # 深挖改用多 Agent 编排
     multi_agent_max_params: int = Field(1, alias="MULTI_AGENT_MAX_PARAMS")
     multi_agent_max_iterations: int = Field(4, alias="MULTI_AGENT_MAX_ITERATIONS")
-    enable_agent_race: bool = Field(False, alias="ENABLE_AGENT_RACE")  # 竞争协作：取先确认者
+    enable_agent_race: bool = Field(True, alias="ENABLE_AGENT_RACE")  # 竞争协作：取先确认者
     # ========== Z3: AI 生成式 0day（动态 PoC 生成开关） ==========
     enable_llm_poc: bool = Field(True, alias="ENABLE_LLM_POC")  # 无模板漏洞走 LLM 动态生成 PoC
     # ========== A4: 上下文管理（分层/裁剪） ==========
@@ -221,7 +233,7 @@ class Settings(BaseSettings):
     # E3: 单参数一旦确认高危/严重，跳过剩余低优先级引擎（早停），减少无效调用
     engine_early_stop_on_confirmed: bool = Field(True, alias="ENGINE_EARLY_STOP_ON_CONFIRMED")
     # E1: 增量扫描——基于上次状态文件跳过已扫端点/参数
-    incremental_scan: bool = Field(False, alias="INCREMENTAL_SCAN")
+    incremental_scan: bool = Field(True, alias="INCREMENTAL_SCAN")
     incremental_state_file: str = Field("", alias="INCREMENTAL_STATE_FILE")
     # A3.2: 目标画像 TTL（小时）——画像超龄视为过期，全量重扫（防陈旧指纹掩盖真实变化）
     asset_profile_ttl_hours: float = Field(168.0, alias="ASSET_PROFILE_TTL_HOURS")
@@ -300,17 +312,17 @@ class Settings(BaseSettings):
     max_nuclei_results: int = Field(0, alias="MAX_NUCLEI_RESULTS")         # 报告/简报保留的 nuclei 条数（0=全部）
     max_crawl_endpoints: int = Field(0, alias="MAX_CRAWL_ENDPOINTS")       # 爬虫端点喂给引擎的数量（替代原 CRAWL_ENDPOINT_CAP）
     scan_param_mining: bool = Field(True, alias="SCAN_PARAM_MINING")
-    enable_param_mining: bool = Field(False, alias="ENABLE_PARAM_MINING")
+    enable_param_mining: bool = Field(True, alias="ENABLE_PARAM_MINING")
     # ---- D4.2 采集→任务实时生成（SP15.3/SP15.5，A 线；默认关，零行为回归）----
-    live_intake_enabled: bool = Field(False, alias="LIVE_INTAKE_ENABLED")
+    live_intake_enabled: bool = Field(True, alias="LIVE_INTAKE_ENABLED")
     live_intake_min_score: int = Field(8, alias="LIVE_INTAKE_MIN_SCORE")   # >=8 仅带参注入面放行
     live_intake_priority: int = Field(8, alias="LIVE_INTAKE_PRIORITY")          # D3.5 挖掘器本体开关（探测侧，默认关控成本；scan_param_mining 为消费侧）             # D3.5 参数挖掘结果入任务生成（消费侧总开关）
     # ---- SP16.1 RL 决策层：上下文多臂老虎机（A 线；默认关零行为回归）----
-    rl_bandit_enabled: bool = Field(False, alias="RL_BANDIT_ENABLED")
+    rl_bandit_enabled: bool = Field(True, alias="RL_BANDIT_ENABLED")
     rl_bandit_influence: int = Field(2, alias="RL_BANDIT_INFLUENCE")            # 浮/降权幅度上限（试验超参）
     rl_bandit_feed_dir: str = Field("", alias="RL_BANDIT_FEED_DIR")             # 空=不落盘；JSONL 反馈飞轮目录
     # ---- SP16.2 TLS 指纹伪装（A 线；curl_cffi 可选后端，默认关零行为回归）----
-    http_impersonate: bool = Field(False, alias="HTTP_IMPERSONATE")
+    http_impersonate: bool = Field(True, alias="HTTP_IMPERSONATE")
     http_impersonate_browser: str = Field("chrome", alias="HTTP_IMPERSONATE_BROWSER")
     # ---- SP17.3 TLS 指纹链（A 线；基于 SP16.2，把"单指纹"升级为"指纹链"；默认全关/空池零行为回归）----
     # 可用的指纹轮换池（兼容 JSON 数组与逗号串，见 parse_list；默认值即出厂默认）
@@ -319,11 +331,11 @@ class Settings(BaseSettings):
         alias="HTTP_IMPERSONATE_POOL",
     )
     # 轮换开关：开着时请求按池 round-robin 轮换，命中（连续成功 N 次）保持当前指纹
-    http_impersonate_rotate: bool = Field(False, alias="HTTP_IMPERSONATE_ROTATE")
+    http_impersonate_rotate: bool = Field(True, alias="HTTP_IMPERSONATE_ROTATE")
     # HTTP2 SETTINGS 显式编排/声明开关（curl_cffi 已内置浏览器指纹，本开关控制额外显式编排输出层）
     http_impersonate_http2: bool = Field(False, alias="HTTP_IMPERSONATE_HTTP2")
     # ---- SP16.3 调用链上下文（A 线；enrich_findings 入口可达性证据增强）----
-    scan_callgraph: bool = Field(False, alias="SCAN_CALLGRAPH")
+    scan_callgraph: bool = Field(True, alias="SCAN_CALLGRAPH")
     # ---- SH17.1 阶段预算：per-phase wall-clock 上限（带默认值启用；单阶段超时只中断本阶段跳过继续）----
     phase_timeout_recon_s: int = Field(240, alias="PHASE_TIMEOUT_RECON_S")
     phase_timeout_taskgen_s: int = Field(60, alias="PHASE_TIMEOUT_TASKGEN_S")

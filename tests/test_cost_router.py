@@ -11,6 +11,7 @@
 import pytest
 
 from vulnclaw.ai.cost_router import PRESCREEN_SITE, VerifyBudgetGate, pre_screen_candidates
+from vulnclaw.config.settings import settings
 
 
 class _FakeOrch:
@@ -40,7 +41,9 @@ def _candidates(n=4):
 
 
 @pytest.mark.asyncio
-async def test_prescreen_marks_false_positives():
+async def test_prescreen_marks_false_positives(monkeypatch):
+    # 显式关闭档位路由：本用例验证"原路径"粗筛的 FP 标记 + filter 档台账（SP24 默认开档位路由，故需钉死此场景）
+    monkeypatch.setattr(settings, "model_tier_routing", False)
     orch = _FakeOrch(raw='{"false_positives": [0, 2]}')
     cands = _candidates(4)
     fp_ids, calls = await pre_screen_candidates(orch, cands, batch_size=10)
@@ -52,7 +55,8 @@ async def test_prescreen_marks_false_positives():
 
 
 @pytest.mark.asyncio
-async def test_prescreen_parse_fail_releases_all():
+async def test_prescreen_parse_fail_releases_all(monkeypatch):
+    monkeypatch.setattr(settings, "model_tier_routing", False)
     orch = _FakeOrch(raw="不是 JSON 的垃圾输出")
     cands = _candidates(3)
     fp_ids, calls = await pre_screen_candidates(orch, cands)
@@ -61,7 +65,8 @@ async def test_prescreen_parse_fail_releases_all():
 
 
 @pytest.mark.asyncio
-async def test_prescreen_exception_stops():
+async def test_prescreen_exception_stops(monkeypatch):
+    monkeypatch.setattr(settings, "model_tier_routing", False)
     orch = _FakeOrch(exc=RuntimeError("model down"))
     cands = _candidates(5)
     fp_ids, calls = await pre_screen_candidates(orch, cands, batch_size=2)

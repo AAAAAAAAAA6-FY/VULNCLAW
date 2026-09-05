@@ -1012,3 +1012,27 @@
 - 证据：orchestrator.py `_seed_resume_state`（续扫三件套回填）——①已扫 (engine,target,param) 三元组经 SqliteCheckpointStore.load_done_tasks 恢复并置 `_resume_skip_done` 跳过；②历史 findings 经 load_findings 按去重 key 并入本次；③agent 记忆（shared_knowledge.experiences）经 load_agent_memory 恢复；保存侧 1626 行 save_agent_memory + 1618 行 _persist_scan_memory（VectorMemory 跨会话）；
 - 阶段级续扫：resume_info 恢复 stage_index，主循环 idx <= resume_stage_index 整段跳过（1372/1393 行）；
 - 测试覆盖：tests/test_sqlite_resume.py 14 例全绿（含 agent 记忆保存/恢复路径）。
+
+
+## 22. SP24 框架优化批次（2026-09-06，2 Agent 并行 + 主线程收口）
+> 按用户三项要求：①先不检测，专注框架；②硬编码全部改为 env 配置；③能打开的开关全部默认打开，并列出未打开项及原因。
+
+### §22.1 硬编码 env 化（通用参数统一收口到 settings，默认值=原字面量，行为零变化）
+- settings.py 新增 10 个通用字段：request_timeout=10 / ai_call_timeout=300 / model_call_timeout_long=3600 / ai_delegate_timeout=25 / ai_router_timeout=90 / ai_batch_size=5 / subprocess_timeout=30 / chain_flush_timeout=900 / oob_domain_timeout=20 / oob_poll_timeout=10；
+- AI 链路（Agent A）：ai/core.py（model_timeout 3600/300、子进程 30）、cost_router.py（90）、dispatcher.py（10/25）、tools.py（10/30）；
+- V100 执行链（Agent B）：orchestrator.py（10/90/900/批大小 5）、phases_executor.py（30/批大小 5/45→90 线索生成放宽）、burp.py（OOB 20/10、connect 10）；
+- 明确未动（语义不符，记录）：tools.py 工具长执行超时 120×2（浏览器/登录流）、core.py sleep(2)（P5-2 指数退避）、phases_executor 240（阶段预算，归 phase_timeout_* 管理）/60（限流等待）、orchestrator 60（ChromaDB 向量库加载）、burp bridge_retry+sleep(3)（重试编排）、burp read_timeout 保留原值 30（大响应宽松）；
+- 回归：AI 链路 + V100 链 + OOB 相邻测试 93 例合跑全绿；ruff 改动行零新增违规（与基线逐条对比一致）。
+
+### §22.2 默认开关批量打开（10 项，均具降级/预算/门禁保护）
+- model_tier_routing（成本分层，cheap 粗筛）、enable_agent_roles（深挖多 Agent）、enable_agent_race（竞争协作）、incremental_scan（增量扫描，无状态文件自动全量）、enable_param_mining（参数挖掘）、live_intake_enabled（实时任务生成，min_score=8 门禁）、rl_bandit_enabled（RL 决策，冷启动无影响）、http_impersonate + http_impersonate_rotate（TLS 指纹，curl_cffi 缺失自动降级）、scan_callgraph（调用链上下文，tree-sitter 缺失降级）。
+
+### §22.3 测试兼容修正（主线程）
+- test_cost_router.py：3 个 pre_screen 用例显式钉死 model_tier_routing=False（原路径场景，档位路径由 test_sp23_tier_router 覆盖）；
+- test_llm_cache.py：fixture 隔离熔断（_failover=None），消除 test_sp23_tier_router breaker 状态跨文件泄漏。
+
+### §22.4 未打开参数及原因（详见上方对话清单；危险/凭据/基础设施类保持关闭）
+- 危险操作：dangerous_mode(deny)、danger_level_write_allow、danger_level_destructive_allow、remote_deep_enabled——需显式授权（--dangerous/审批），法律合规红线；
+- 凭据依赖：crawl_authed（需用户认证凭据）、scan_diff_baseline（需基线报告路径）；
+- 基础设施：distributed_scan（需 Redis）、sandbox_enabled（需本地沙箱后端）、enable_metrics（metrics_port=0 无监听且无消费方）、http2（aiohttp h2 依赖未验证）；
+- 职责重叠/验证不足：agent_coordinator_enabled（与 enable_agent_roles 重叠）、http_impersonate_http2（HTTP2 显式编排层，基础依赖未验证）。

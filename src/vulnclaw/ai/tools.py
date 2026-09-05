@@ -17,6 +17,7 @@ import re
 import shlex
 
 from vulnclaw.core.logger import logger
+from vulnclaw.core.settings import settings
 from vulnclaw.core.utils import async_get, get_shared_session
 from typing import Dict, List
 
@@ -101,7 +102,7 @@ def create_tool(engine_class, custom_name: str = None, custom_desc: str = None):
             try:
                 if param is not None:
                     try:
-                        normal_resp = await async_get(url, session=session, timeout=10)
+                        normal_resp = await async_get(url, session=session, timeout=settings.request_timeout)
                     except Exception as e:
                         return {"error": f"获取正常响应失败: {e}"}
 
@@ -462,7 +463,7 @@ class BrowserAgentTool(BaseTool):
     description = "AI 驱动的浏览器交互探索：自动点击/填表/翻页，捕获页面与 API 请求。用于 SPA/JS 渲染站点或需交互才能触达的端点。"
     category = "native"
     danger_level = "safe"
-    timeout = 120
+    timeout = 120  # 工具长执行超时（浏览器交互，非子进程），保持原值不接入 subprocess_timeout
     parameters = [
         {"name": "url", "type": "string", "required": True, "description": "起始 URL"},
         {"name": "use_profile_b", "type": "string", "required": False,
@@ -489,7 +490,7 @@ class LoginAgentTool(BaseTool):
     description = "自动登录目标站点并提取 Cookie 回写会话管理（供后续引擎带认证态探测）。需提供账号密码与登录页选择器。"
     category = "native"
     danger_level = "guarded"
-    timeout = 120
+    timeout = 120  # 工具长执行超时（登录流，非子进程），保持原值不接入 subprocess_timeout
     parameters = [
         {"name": "login_url", "type": "string", "required": True, "description": "登录页 URL"},
         {"name": "username", "type": "string", "required": True, "description": "账号"},
@@ -534,7 +535,7 @@ class SandboxTool(BaseTool):
     description = "受控 shell 沙箱：仅允许白名单命令（echo/cat/grep/curl 等），禁止组合/重定向/危险参数，带超时与输出截断。安全辅助命令执行。"
     category = "native"
     danger_level = "guarded"
-    timeout = 30
+    timeout = settings.subprocess_timeout
     parameters = [
         {"name": "command", "type": "string", "required": True, "description": "白名单命令（如 curl）"},
         {"name": "args", "type": "string", "required": False, "description": "命令参数，空格分隔"},

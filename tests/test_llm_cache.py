@@ -38,6 +38,9 @@ def client(monkeypatch):
 
     c = LLMClient(models=[_MODEL], budget=TokenBudget())
     c.api_key = "test-key"
+    # 隔离熔断：fixture 不使用 Provider 熔断检查（避免 test_sp23_tier_router 的
+    # breaker 状态跨测试泄漏到本文件），直接走 _call_model_once 假应答
+    c._failover = None
     monkeypatch.setattr(c, "_call_model_once", _fake_call)
     c._fake_calls = calls
     return c

@@ -644,9 +644,9 @@ class LLMClient:
             }
 
             if self._is_glm_47(model):
-                model_timeout = 3600
+                model_timeout = settings.model_call_timeout_long
             else:
-                model_timeout = 300
+                model_timeout = settings.ai_call_timeout
 
             sock_read_timeout = max(60, model_timeout - 60)
             session = await self._get_session()
@@ -1665,7 +1665,7 @@ def _chromadb_probe() -> bool:
         import sys as _sys
         probe = subprocess.run(
             [_sys.executable, "-c", "import chromadb"],
-            capture_output=True, timeout=30,
+            capture_output=True, timeout=settings.subprocess_timeout,
         )
         ok = probe.returncode == 0
     except Exception:  # noqa: BLE001

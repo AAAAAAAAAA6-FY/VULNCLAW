@@ -269,7 +269,7 @@ class V100Orchestrator:
         score = 0
         try:
             logger.info("   📊 正在探测目标抗压能力...")
-            status, body, headers = await async_get(self.target, session=self.session, timeout=10)
+            status, body, headers = await async_get(self.target, session=self.session, timeout=settings.request_timeout)
 
             cf_ray = headers.get('CF-Ray', '')
             server = headers.get('Server', '')
@@ -536,7 +536,7 @@ class V100Orchestrator:
         try:
             return await asyncio.wait_for(
                 self._ask_ai_impl(prompt, system, temperature, max_tokens, use_cache=use_cache, task_type=task_type, usage_site=usage_site),
-                timeout=90.0,
+                timeout=float(settings.ai_router_timeout),
             )
         except asyncio.TimeoutError as exc:
             # P2-1: 连续 2 次超时 → 自动降级更小模型
@@ -730,7 +730,7 @@ class V100Orchestrator:
         # 先把最后一批刷掉（含 final_flush 兜底），再停后台循环。
         if wait_pending:
             try:
-                await asyncio.wait_for(self._stream_flush_pending(force_all=True, final_flush=True), timeout=900.0)
+                await asyncio.wait_for(self._stream_flush_pending(force_all=True, final_flush=True), timeout=float(settings.chain_flush_timeout))
             except asyncio.TimeoutError:
                 logger.warning("⏰ [StreamVerify] 收尾 flush 超时（900s），强制关闭后台协程")
             except Exception as exc:  # noqa: BLE001
@@ -743,7 +743,7 @@ class V100Orchestrator:
         if task is not None and not task.done():
             task.cancel()
             try:
-                await asyncio.wait_for(task, timeout=10.0)
+                await asyncio.wait_for(task, timeout=settings.request_timeout)
             except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                 logger.debug("suppressed exception (core audit)")
         logger.info(
@@ -1528,7 +1528,7 @@ class V100Orchestrator:
             self.max_tasks = auto_tasks
 
             self.rate_limiter = get_rate_limiter(self.initial_qps)
-            self.batch_processor = BatchProcessor(max_batch_size=5)
+            self.batch_processor = BatchProcessor(max_batch_size=settings.ai_batch_size)
             self.local_filter = get_local_filter()
             self._bandit = None
             if getattr(settings, "rl_bandit_enabled", False):

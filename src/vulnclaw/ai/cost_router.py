@@ -84,7 +84,7 @@ async def _tier_ask_ai(orch, tier, prompt, system, temperature, max_tokens, usag
                 use_cache=False,
                 usage_site=usage_site or None,
             ),
-            timeout=90.0,
+            timeout=float(settings.ai_router_timeout),
         )
     except Exception as exc:  # noqa: BLE001
         logger.debug(f"[A4.4] 档位直调失败，回退 orch._ask_ai: {exc}")

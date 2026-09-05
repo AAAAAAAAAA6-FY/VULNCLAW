@@ -561,7 +561,7 @@ class ReActAgent:
         logger.info("🔍 侦察阶段...")
 
         try:
-            resp = await async_get(self.target, session=self.session, timeout=10)
+            resp = await async_get(self.target, session=self.session, timeout=settings.request_timeout)
             status, text, headers = resp
             self.context.tech_stack = self._detect_tech_stack(headers, text)
         except Exception as e:
@@ -1192,7 +1192,7 @@ ask_expert(question,context,system)：困惑时外询——内部知识盲区/�
         prompt = f"【附加上下文】\n{context}\n\n【问题】\n{question}" if context else question
         try:
             answer = await asyncio.wait_for(
-                delegate_analysis(prompt, system=system, max_tokens=max_tokens), timeout=25
+                delegate_analysis(prompt, system=system, max_tokens=max_tokens), timeout=settings.ai_delegate_timeout
             )
         except asyncio.TimeoutError:
             logger.warning("[外询] 外部专家超时（25s），回退本地逻辑")

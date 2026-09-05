@@ -22,6 +22,7 @@ from urllib.parse import quote, urlparse
 
 import aiohttp
 
+from vulnclaw.config.settings import settings
 from vulnclaw.core.logger import logger
 from vulnclaw.core.utils import get_shared_session
 
@@ -1159,7 +1160,7 @@ class BurpClient:
         try:
             from vulnclaw.core.oob_channel import OOBChannel
             self._oob_channel = OOBChannel(provider="auto")
-            domain = await asyncio.wait_for(self._oob_channel.request_domain(), timeout=20)
+            domain = await asyncio.wait_for(self._oob_channel.request_domain(), timeout=settings.oob_domain_timeout)
         except asyncio.TimeoutError:
             logger.warning("⚠️ OOB 通道申请超时（interactsh + dnslog 均未在 20s 内就绪）")
             domain = None
@@ -1188,7 +1189,7 @@ class BurpClient:
         ch = getattr(self, "_oob_channel", None)
         if ch is not None and getattr(ch, "_domain", None):
             try:
-                interactions = await ch.poll(timeout=10)
+                interactions = await ch.poll(timeout=settings.oob_poll_timeout)
                 results = [i.to_dict() for i in (interactions or [])]
                 return {"results": results, "count": len(results)}
             except Exception as e:  # noqa: BLE001
@@ -1197,7 +1198,7 @@ class BurpClient:
         # legacy 回退：仅 interactsh 域名有效
         try:
             from vulnclaw.modules.vuln_scanner.oob_interactsh import get_interactsh_poll
-            interactions = await get_interactsh_poll(domain, timeout=10)
+            interactions = await get_interactsh_poll(domain, timeout=settings.oob_poll_timeout)
             interactions = interactions or []
             return {"results": interactions, "count": len(interactions)}
         except Exception as e:
@@ -1294,8 +1295,8 @@ def get_burp_client() -> Optional[BurpClient]:
                 base_url=base_url,
                 api_key=api_key,
                 max_retries=3,
-                connect_timeout=10,
-                read_timeout=30
+                connect_timeout=settings.request_timeout,
+                read_timeout=30  # 保留原值：Burp 大响应读取需宽松超时（勿收紧）
             )
         except Exception as e:
             logger.error(f"❌ 创建 BurpClient 失败: {e}")

@@ -372,7 +372,7 @@ async def _run_one_task(self, task: Dict, task_id: str, semaphore: asyncio.Semap
         timeout = 240.0
 
     async def _lifecycle():
-        model = await asyncio.wait_for(self._get_next_model(), timeout=30)
+        model = await asyncio.wait_for(self._get_next_model(), timeout=settings.subprocess_timeout)
         wait_time = await asyncio.wait_for(self.rate_limiter.acquire(model), timeout=60)
         if wait_time > 0:
             await asyncio.sleep(min(wait_time, 30))
@@ -436,7 +436,7 @@ async def _execute_batch(self, task: Dict) -> Optional[List[Dict]]:
     from vulnclaw.ai.v100.batch_processor import BatchProcessor
     bp = self.batch_processor
     if bp is None:
-        bp = BatchProcessor(max_batch_size=5)
+        bp = BatchProcessor(max_batch_size=settings.ai_batch_size)
         self.batch_processor = bp
     subtasks = task.get("tasks", [])
     if not subtasks:
@@ -672,7 +672,7 @@ async def _run_react_deep_dive(self):
         try:
             from vulnclaw.ai.core import ClueEngine
             clue_engine = ClueEngine(self.session, self.target)
-            await asyncio.wait_for(self._generate_clues_for_dive(clue_engine), timeout=45)
+            await asyncio.wait_for(self._generate_clues_for_dive(clue_engine), timeout=float(settings.ai_router_timeout))
         except Exception as _ce:  # noqa: BLE001
             logger.debug(f"[ClueEngine] 预生成线索失败（继续深挖）: {_ce}")
 
