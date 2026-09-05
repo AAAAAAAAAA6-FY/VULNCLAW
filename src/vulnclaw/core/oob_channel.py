@@ -318,10 +318,15 @@ class OOBChannel:
         items: List[OOBInteraction] = []
         if not self._domain:
             return items
-        if self._resolved_provider == "interactsh":
-            items = await self._poll_interactsh(timeout)
-        elif self._resolved_provider == "dnslog":
-            items = await self._poll_dnslog(timeout)
+        try:
+            if self._resolved_provider == "interactsh":
+                items = await self._poll_interactsh(timeout)
+            elif self._resolved_provider == "dnslog":
+                items = await self._poll_dnslog(timeout)
+        except Exception as exc:  # noqa: BLE001
+            # SP15-B 自证口径：任何回查异常（含超时/网络抖动）一律返回空，绝不抛错
+            logger.debug(f"[OOB] poll 异常（忽略，返回空）: {exc}")
+            items = []
         if items:
             for _it in items:  # SP14.3-B：通道 provider 随证据链传递
                 _it.channel = self._resolved_provider or _it.channel

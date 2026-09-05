@@ -1931,8 +1931,12 @@ async def mine_params(url: str, session=None, wordlist=None,
 
 async def mine_params_for_endpoints(endpoints, session=None, max_endpoints: int = 10,
                                     per_url_words: int = 120) -> List[Dict]:
-    """对端点集合批量挖掘（collect 钩子入口）：挑前 max_endpoints 个 URL 逐个挖。"""
+    """对端点集合批量挖掘（collect 钩子入口）：挑前 max_endpoints 个 URL 逐个挖。
+
+    自证（SP15-B）：静态资源后缀跳过、同 URL 去重（重复端点只挖一次）。
+    """
     picked: List[str] = []
+    seen: set = set()
     for ep in endpoints or []:
         ep = str(ep or "").strip()
         if not ep.lower().startswith(("http://", "https://")):
@@ -1941,6 +1945,9 @@ async def mine_params_for_endpoints(endpoints, session=None, max_endpoints: int 
                 "css", "js", "png", "jpg", "jpeg", "gif", "svg", "ico",
                 "woff", "woff2", "ttf", "pdf", "zip", "mp3", "mp4"):
             continue
+        if ep in seen:
+            continue  # 端点去重：同 URL 只挖一次
+        seen.add(ep)
         picked.append(ep)
         if len(picked) >= max_endpoints:
             break
@@ -1950,5 +1957,107 @@ async def mine_params_for_endpoints(endpoints, session=None, max_endpoints: int 
     return out
 
 
+# ============================================================
+# SP15-B / B-SP15.4: recon_brief 回灌（字段与 A 侧消费完全一致）
+#
+# A 侧消费（phases_taskgen）对 brief["param_mining"] 的契约：
+#   _item 为 dict，读 .get("url")/.get("param")/.get("signal")/.get("base_len")；
+#   url 会剥 query 由 param 注入；param 过凭据过滤；条目数过 cap(max_param_mining)。
+# 本模块保证：回灌条目恒为四字段齐全的 dict，signal 在三枚举内，url 为绝对 http(s)。
+# ============================================================
+_PARAM_SIGNALS = ("reflected", "diff_len", "status_change")
+_SIGNAL_RANK = {"reflected": 0, "diff_len": 1, "status_change": 2}
+
+
+def load_param_candidates(path: str = None) -> List[Dict]:
+    """读参数候选池 JSONL → 归一化列表（只留四字段齐全且合法的条目）。
+
+    脏行（缺字段/非法 signal/非法 URL/类型错）剔除——A 侧消费零防御成本。
+    """
+    path = path or param_pool_path()
+    out: List[Dict] = []
+    try:
+        if not os.path.isfile(path):
+            return out
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                url = str(item.get("url") or "").strip()
+                param = str(item.get("param") or "").strip()
+                signal = str(item.get("signal") or "").strip()
+                if not url or not param or signal not in _PARAM_SIGNALS:
+                    continue
+                if not url.lower().startswith(("http://", "https://")):
+                    continue
+                try:
+                    base_len = int(item.get("base_len") or 0)
+                except (TypeError, ValueError):
+                    base_len = 0
+                out.append({"param": param, "url": url,
+                            "base_len": base_len, "signal": signal})
+    except OSError as exc:
+        logger.debug(f"参数候选池读取失败（忽略）: {exc}")
+    return out
+
+
+def brief_param_mining(brief: Dict, items=None, max_items: int = 0) -> List[Dict]:
+    """回灌入口：把挖掘结果写入 brief["param_mining"]（幂等，可重复调用）。
+
+    - items 缺省时自动读池（load_param_candidates）；传入时同样过归一化校验。
+    - 确定性排序：reflected > diff_len > status_change（同信号按 url,param），
+      保证 A 侧 cap(max_param_mining) 截断时优先留强信号。
+    - max_items<=0 时不在此截断（截断权在 A 侧 cap，与"0=不限制"语义一致）。
+    - 幂等：按 (url, param) 合并去重，重复调用以先出现的条目为准。
+    返回写入后的 brief["param_mining"] 列表。
+    """
+    brief = brief if isinstance(brief, dict) else {}
+    candidates = list(items) if items is not None else load_param_candidates()
+    # 归一化校验（与 load_param_candidates 同规则）
+    valid: List[Dict] = []
+    seen: set = set()
+    for it in candidates:
+        if not isinstance(it, dict):
+            continue
+        url = str(it.get("url") or "").strip()
+        param = str(it.get("param") or "").strip()
+        signal = str(it.get("signal") or "").strip()
+        if not url or not param or signal not in _PARAM_SIGNALS:
+            continue
+        if not url.lower().startswith(("http://", "https://")):
+            continue
+        key = (url, param)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            base_len = int(it.get("base_len") or 0)
+        except (TypeError, ValueError):
+            base_len = 0
+        valid.append({"param": param, "url": url,
+                      "base_len": base_len, "signal": signal})
+    valid.sort(key=lambda d: (_SIGNAL_RANK[d["signal"]], d["url"], d["param"]))
+    if max_items and max_items > 0:
+        valid = valid[:max_items]
+    # 幂等合并：与 brief 已有 param_mining 去重合并（已有条目优先）
+    existing = brief.get("param_mining") or []
+    exist_keys = set()
+    for it in existing:
+        if isinstance(it, dict):
+            exist_keys.add((str(it.get("url") or ""), str(it.get("param") or "")))
+    merged = list(existing) + [it for it in valid
+                               if (it["url"], it["param"]) not in exist_keys]
+    brief["param_mining"] = merged
+    return merged
+
+
 __all__ = ['EndpointCollector', 'mine_params', 'mine_params_for_endpoints',
-           'append_param_candidates', 'param_pool_path', '_PARAM_WORDLIST']
+           'append_param_candidates', 'param_pool_path', 'load_param_candidates',
+           'brief_param_mining', '_PARAM_WORDLIST']

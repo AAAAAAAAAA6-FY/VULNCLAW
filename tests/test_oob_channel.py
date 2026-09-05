@@ -280,3 +280,74 @@ class TestEvidenceView:
 def asyncio_run(coro):
     import asyncio
     return asyncio.new_event_loop().run_until_complete(coro)
+
+
+# ============================================================
+# SP15-B: B-SP15.1 OOB 回查自证（双通道结构化 / 落盘去重 / 超时空回查不抛错）
+# ============================================================
+class TestSelfCheck:
+    def _isolated(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(oob_mod, "_oob_evidence_path",
+                            lambda: str(tmp_path / "oob.jsonl"))
+        monkeypatch.setattr(oob_mod, "_OOB_AUDIT", [])
+        monkeypatch.setattr(oob_mod, "_OOB_AUDIT_SEEN", set())
+
+    def test_dual_channel_structured(self, monkeypatch, tmp_path):
+        """双通道（interactsh/dnslog）poll → evidence_view 通道标识各自正确。"""
+        self._isolated(monkeypatch, tmp_path)
+
+        async def fake_itsh(timeout):
+            return [OOBInteraction(token="tk1", protocol="dns")]
+
+        async def fake_dnslog(timeout):
+            return [OOBInteraction(token="tk2", protocol="dns")]
+
+        ch1 = OOBChannel(provider="interactsh")
+        ch1._domain, ch1._resolved_provider = "x.oast.pro", "interactsh"
+        monkeypatch.setattr(ch1, "_poll_interactsh", fake_itsh)
+        ch2 = OOBChannel(provider="dnslog")
+        ch2._domain, ch2._resolved_provider = "abc.dnslog.cn", "dnslog"
+        monkeypatch.setattr(ch2, "_poll_dnslog", fake_dnslog)
+
+        v1 = asyncio_run(ch1.poll(timeout=1))[0].evidence_view()
+        v2 = asyncio_run(ch2.poll(timeout=1))[0].evidence_view()
+        assert v1["oob_channel"] == "interactsh:dns"
+        assert v2["oob_channel"] == "dnslog:dns"
+        assert v1["oob_token"] == "tk1" and v2["oob_token"] == "tk2"
+
+    def test_cross_instance_dedupe_on_disk(self, monkeypatch, tmp_path):
+        """跨 OOBChannel 实例的同一条回调 → 落盘仅 1 行（全局去重）。"""
+        self._isolated(monkeypatch, tmp_path)
+        path = tmp_path / "oob.jsonl"
+        it = OOBInteraction(token="tok1", protocol="dns", time="2026-09-06 00:00:00")
+        ch1 = OOBChannel()
+        ch1._resolved_provider = "interactsh"
+        ch1.record_interactions([it])
+        ch2 = OOBChannel()
+        ch2._resolved_provider = "interactsh"
+        ch2.record_interactions([OOBInteraction(token="tok1", protocol="dns",
+                                                time="2026-09-06 00:00:00")])
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 1
+        assert oob_mod.OOBChannel.audit_size() == 1
+
+    def test_timeout_and_empty_poll_never_raise(self, monkeypatch, tmp_path):
+        """超时/无域名/内部异常 → poll/wait_for_interaction 一律返回空，不抛错。"""
+        self._isolated(monkeypatch, tmp_path)
+        # 无域名 → poll 空
+        ch = OOBChannel(provider="interactsh")
+        assert asyncio_run(ch.poll(timeout=1)) == []
+
+        # interactsh 轮询抛 TimeoutError → poll 吞掉返回 []
+        ch2 = OOBChannel(provider="interactsh")
+        ch2._domain, ch2._resolved_provider = "x.oast.pro", "interactsh"
+
+        async def boom(timeout):
+            raise asyncio.TimeoutError("poll timeout")
+        monkeypatch.setattr(ch2, "_poll_interactsh", boom)
+        assert asyncio_run(ch2.poll(timeout=1)) == []
+        assert asyncio_run(ch2.wait_for_interaction("tk", timeout=1)) == []
+
+        # wait_for_interaction 通道不可用 → 空
+        ch3 = OOBChannel(provider="interactsh")
+        assert asyncio_run(ch3.wait_for_interaction("tk", timeout=0.5)) == []
