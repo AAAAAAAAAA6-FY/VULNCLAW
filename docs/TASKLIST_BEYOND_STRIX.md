@@ -1036,3 +1036,28 @@
 - 凭据依赖：crawl_authed（需用户认证凭据）、scan_diff_baseline（需基线报告路径）；
 - 基础设施：distributed_scan（需 Redis）、sandbox_enabled（需本地沙箱后端）、enable_metrics（metrics_port=0 无监听且无消费方）、http2（aiohttp h2 依赖未验证）；
 - 职责重叠/验证不足：agent_coordinator_enabled（与 enable_agent_roles 重叠）、http_impersonate_http2（HTTP2 显式编排层，基础依赖未验证）。
+
+## 23. SP25 开源部署易用性优化批次（2026-09-06，2 Agent 并行 + 主线程收口，评分 9.4/10 达标 8.5）
+> 按用户要求「开源后别人便于部署」，目标 ≥8.5 分。A/B 双 Agent 并行零重叠，主线程独立复核后提交（26a15d2）。
+
+### §23.1 依赖打包与容器化（AgentA）
+- pyproject.toml 新增 [project.optional-dependencies] full 分组：curl_cffi（TLS 指纹）/ chromadb（向量记忆）/ tree-sitter+tree_sitter_languages（调用链 AST）/ fakeredis（分布式模拟后端）/ uvicorn（Dashboard）——代码内均 try/except 优雅降级，pip install . 不装高级依赖不阻塞；
+- Dockerfile：pip install . → pip install --no-cache-dir .[full]，镜像内置全量高级功能；docker-compose.yaml（已存在）redis+master+2 worker 一键分布式。
+
+### §23.2 配置模板与文档补全（AgentB）
+- .env.example 全量补全 127 个缺失字段（差集核对 alias(settings) − key(.env.example) = 空）：并入既有分组 8 个，文件尾新增 SP 新增字段（v103+）11 个子分组 119 个（含 SP24 通用超时 10、智能体编排 22、扫描覆盖/深度 50 等）；格式沿用 中文注释 + KEY=默认值，布尔小写、列表 JSON；
+- README.md 纯增量 +59 行：5 分钟快速上手（TL;DR）（克隆→安装→配 Key→扫描→看报告 5 步 + 免 Key 纯引擎 AI_MODE=0 提示）、获取 AI 模型 API Key（智谱默认说明 + 智谱/百炼/DeepSeek/硅基 4 家获取渠道表）、FAQ 追加 6 条（无 Key 运行/高级功能 .[full]/第三方工具镜像/分布式 Redis/内网合规/报告位置）。
+
+### §23.3 收口复核（主线程）
+- tools_menu.py 核对：仅经 python-dotenv set_key/unset_key 按行精确修改 AI_MODEL_CONFIGS/AI_MODELS/AI_TASK_ALLOCATION 三键，与新增通用字段零重叠、不破坏其他键；
+- settings.py 全量 alias 键（约 180）均已被 .env.example 覆盖；多余键（DASHBOARD_*/MASTER_*/DEBUG 等 11 个）均被源码实际引用，属合法平台级键；
+- README 引用的 start_vulnclaw.ps1/.sh、scan.py、docker-compose.yaml 均真实存在；settings 加载 .env.example 验证通过（201 字段，MODEL_TIER_ROUTING/ENABLE_REACT_DIVE 默认开）。
+
+## 24. SP25 DualAgent 双智能体并行批次（2026-09-06，主线程，提交 ee063a1）
+> 与部署优化同批发现的未提交完整改动（settings + orchestrator + 测试校正），按独立语义单独提交。
+
+### §24.1 实现
+- settings.py 收口 3 个正式字段：dual_agent_parallel（默认关=零行为变更）、attack_node_budget（原 getattr 130 硬编码 → 500，须小于 phase_timeout_scan_s=600）、attack_dynamic_grace_s（原 45 宽限收口）；
+- orchestrator.py：dual_agent_parallel + agent_coordinator_enabled 同时开启时，scan 主链路与 agent_coordinator 副通道 asyncio.gather 并行（共享 rate_limiter/session/双限流，副 agent 软截止到点收割不拖累主链路，汇合墙钟=max 而非相加）；串行路径阶段仅记账不重复执行，_STAGES 顺序与 P5-1 checkpoint 语义不变；
+- phases_executor.py：attack 预算注释同步（deadline 硬顶语义 + SP21.2 protected 宽限）。
+- 测试：test_sp24_agent_race.py 校正默认值断言 + 新增 disabled flag 用例，专项 12 例全绿。
