@@ -316,12 +316,15 @@ class Settings(BaseSettings):
     max_found_dirs: int = Field(0, alias="MAX_FOUND_DIRS")                 # 目录爆破结果
     max_nuclei_results: int = Field(0, alias="MAX_NUCLEI_RESULTS")         # 报告/简报保留的 nuclei 条数（0=全部）
     max_crawl_endpoints: int = Field(0, alias="MAX_CRAWL_ENDPOINTS")       # 爬虫端点喂给引擎的数量（替代原 CRAWL_ENDPOINT_CAP）
+    # ---- D3.5 参数挖掘（SP14.1，A 线；探测/消费两侧各自独立开关）----
+    # enable_param_mining：挖掘器本体开关（探测侧，默认关控成本）；
+    # scan_param_mining：挖掘结果入任务生成（消费侧总开关，可与探测侧独立控制）。
     scan_param_mining: bool = Field(True, alias="SCAN_PARAM_MINING")
     enable_param_mining: bool = Field(True, alias="ENABLE_PARAM_MINING")
     # ---- D4.2 采集→任务实时生成（SP15.3/SP15.5，A 线；默认关，零行为回归）----
     live_intake_enabled: bool = Field(True, alias="LIVE_INTAKE_ENABLED")
     live_intake_min_score: int = Field(8, alias="LIVE_INTAKE_MIN_SCORE")   # >=8 仅带参注入面放行
-    live_intake_priority: int = Field(8, alias="LIVE_INTAKE_PRIORITY")          # D3.5 挖掘器本体开关（探测侧，默认关控成本；scan_param_mining 为消费侧）             # D3.5 参数挖掘结果入任务生成（消费侧总开关）
+    live_intake_priority: int = Field(8, alias="LIVE_INTAKE_PRIORITY")
     # ---- SP16.1 RL 决策层：上下文多臂老虎机（A 线；默认关零行为回归）----
     rl_bandit_enabled: bool = Field(True, alias="RL_BANDIT_ENABLED")
     rl_bandit_influence: int = Field(2, alias="RL_BANDIT_INFLUENCE")            # 浮/降权幅度上限（试验超参）
