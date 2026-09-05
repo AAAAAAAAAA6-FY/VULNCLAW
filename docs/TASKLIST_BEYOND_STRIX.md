@@ -611,3 +611,32 @@
 - [ ] **A3.2 目标画像增量扫描** —— persistence 断点续扫在，但「二次扫描跳过未变资产」（unchanged/hash 判定）未实现。建议：资产指纹比对 -> 只测变化面。
 - [ ] **A4.4 任务分层模型路由** —— provider_balancer 仅三供应商故障/冷却路由，无「便宜模型分类粗筛 / 贵模型验证计划」分层。建议：接 AI_MODE 档位按任务类型分层。
 - [ ] **C1.4 PoC 输出入报告** —— ✅ 已实现（2026-09-05，commit 966b7e9）：`report_generator.generate_poc_artifacts` 产物落盘 `poc/`（cve_index > 模板（含中文类型映射）> B5 兜底，Critical/High 优先上限 20），finding 标注 poc_file/poc_origin，HTML 漏洞条目附产物链接 + 产物清单段，Markdown 增 PoC 产物段；`test_sarif_attack_graph` +7 用例。 —— poc_generator 4 模板产物在，但 report_generator 无 PoC 附件/链接接入。建议：确认漏洞自动挂接可运行 PoC 产物。
+
+
+***
+
+## 10. SP14 批次增量任务（2026-09-05 分配另一 Agent，纯增量追加）
+
+> 背景：结对交付已闭环（C1.4 PoC 入报告 + target_lab LFI/覆盖分仪表 + 真 Intruder，966b7e9；§9 收口 58/0/0）。
+> 真扫痛点复盘：参数覆盖低（端点常只测 1 个可见参数）、SQLi/盲 SSRF 等依赖参数发现的场景漏检、
+> OOB 盲打缺结构化证据入报告、个人实战流量未回灌扫描（防白嫖壁垒）。以下 3 项据此立项，
+> 全部落在另一 Agent 独占文件（modules/recon.py / 新 modules/request_feed.py / core+engines 层），
+> 与主链路热区（dispatcher/orchestrator/phases_taskgen/settings）零交集，可立即并行。
+> 约束：只改动上述文件；不新增第三方依赖；无 emoji；完成即追加增量记录 + 全量回归绿。
+
+- [ ] **SP14.1 D3.5 参数挖掘落地**（`modules/recon.py`，B 独占）—— 已知端点隐蔽参数猜测（参照 Param Miner 语义：参数名词典 + 值探测），命中响应差异（状态码/长度/内容特征变化，损坏对照判定）即计入端点参数池并标注 source=param_mining。验收：
+  - 参数名词典覆盖常见候选（id/user/page/file/filter/cat/sort/order/... 类），可配置开关
+  - 命中差异即入池：真扫 local_lab 参数覆盖从"仅可见参数"提升到字典命中参数（无差异不收录，严格低误报）
+  - 隐蔽参数发现进报告（report JSON 的 parameter/method 字段可溯源 source=param_mining）
+  - 单测 8+（正：差异命中收录；反：无差异/静态资源不收录 + 词典开关 + 上限保护）
+- [ ] **SP14.2 D4.1 请求级采集抽象 + D4.3 去重**（新 `modules/request_feed.py`，B 独占）—— 浏览器流 / Burp 代理流 / 被动爬取三源归一为 RequestRecord（url/method/param/auth_state/source），入统一队列；URL 归一 + simhash/Jaccard 相似去重（保留参数差异）。验收：
+  - 三源各产 RequestRecord 字段齐全入同一队列（单测 3+ 源）
+  - 同 URL 同参数去重、同 URL 不同参数保留（单测 3+）
+  - 本期仅抽象 + 队列 + 去重，不接主扫描链路（零行为影响，杜绝回归）
+- [ ] **SP14.3 Z2.4 OOB 证据入报告**（`core/oob_channel.py` + `engines/base.py` enrich）—— OOB 回调（DNS/HTTP）结构化写入 finding.evidence：回调时间戳 / 来源通道 / 关联 token / 原始响应摘要，并附 curl 复现命令。验收：
+  - 盲 SSRF/XXE 类 finding 的 evidence 含 OOB 回调证据段（模拟回调回查进单测）
+  - JSON/SARIF 报告可检索 OOB 证据（字段名稳定：evidence.oob_*）
+  - 单测 5+（回调组装 / 无回调不写 / 时间戳格式 / curl 命令生成 / 异常隔离）
+
+> 交接提示：全部完成后按既有收口格式在本节追加"- [x] 已实现（date, commit）"增量记录；
+> 合并前 git pull 最新 main；与本批次无关的文件改动不要混入同一 commit。
