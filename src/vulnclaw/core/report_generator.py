@@ -300,6 +300,12 @@ def _build_attack_graph_block(report_data):
 def generate_html_report(report_data, html_file="report.html"):
     """生成 HTML 报告 - 同步版本"""
     try:
+        # C1.4: 渲染前先落盘 PoC 产物并标注 finding（异常隔离，绝不影响报告主流程）
+        try:
+            _base_dir = os.path.dirname(os.path.abspath(html_file)) or "."
+            generate_poc_artifacts(report_data, _base_dir)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[C1.4] PoC 产物生成失败（忽略）: {exc}")
         html_content = render_html(report_data)
         with open(html_file, 'w', encoding='utf-8') as f:
             f.write(html_content)
@@ -458,6 +464,14 @@ def render_html(enhanced_report):
         curl_cmd = html_escape.escape(_build_curl_command(v))
         repro_steps = _build_reproduction_steps(v)
         repro_html = "".join(f"<li>{html_escape.escape(s)}</li>" for s in repro_steps)
+        # C1.4: 已落盘 PoC 产物 → 该漏洞条目内附产物链接
+        poc_link_html = ""
+        if v.get('poc_file'):
+            _pf = html_escape.escape(str(v.get('poc_file')))
+            _po = html_escape.escape(str(v.get('poc_origin', '') or ''))
+            poc_link_html = (f'<p style="margin:6px 0;"><strong>PoC 产物 (C1.4):</strong> '
+                             f'<a href="{_pf}" download>{_pf}</a> '
+                             f'<span style="color:#666;">[{_po}]</span></p>')
 
         vuln_items_html.append(f'''
         <div class="vuln-item vuln-{sev_class}" data-severity="{sev_class}" data-type="{html_escape.escape(vuln_type_raw.lower())}">
@@ -476,6 +490,7 @@ def render_html(enhanced_report):
                 <p style="margin:6px 0;"><strong>curl 命令:</strong></p>
                 <pre style="background:#263238; color:#cddc39; padding:8px; border-radius:4px; overflow-x:auto; white-space:pre-wrap; word-wrap:break-word; font-size:12px; margin:4px 0;">{curl_cmd}</pre>
                 <ol style="margin:6px 0;">{repro_html}</ol>
+                {poc_link_html}
             </details>
             <details style="margin-top:6px;">
                 <summary style="cursor:pointer; color:#007bff;">🛡️ 修复建议（{remediation["cwe"]} / {remediation["owasp"]}）</summary>
@@ -491,6 +506,8 @@ def render_html(enhanced_report):
         vuln_section += f'<p style="color:#666; font-style:italic;">... 共 {len(vulns)} 个漏洞，仅显示前 50 个。请查看 JSON 报告获取完整列表。</p>'
 
     lifecycle_block = _render_lifecycle_block(enhanced_report)
+    # C1.4: PoC 产物清单段（generate_poc_artifacts 已在 generate_html_report 前置落盘）
+    poc_artifacts_html = _render_poc_artifacts_section(enhanced_report)
 
     html_content = f"""
 <!DOCTYPE html>
@@ -588,6 +605,8 @@ def render_html(enhanced_report):
             <span id="filterCount" style="margin-left:12px; color:#666;"></span>
         </div>
         <div id="vulnList">{vuln_section}</div>
+
+        {poc_artifacts_html}
 
         <h2>🟠 待人工复核漏洞</h2>
         {render_pending_review_section(vulns)}
@@ -843,6 +862,17 @@ def generate_markdown_report(report_data, output_path):
                          f"(参数: {v.get('parameter', '') or '-'}) — "
                          f"{v.get('ai_verdict', v.get('confidence', ''))}")
 
+    # C1.4: PoC 产物清单段
+    arts = report_data.get("poc_artifacts") or []
+    if arts:
+        lines.append("")
+        lines.append(f"## 可运行 PoC 产物（C1.4，共 {len(arts)} 份）")
+        lines.append("")
+        lines.append("产物位于报告同目录 `poc/` 子目录，可直接 `python poc_xx.py` 运行复现：")
+        lines.append("")
+        for a in arts[:30]:
+            lines.append(f"- `{a.get('file', '')}` — {a.get('type', '')} [{a.get('origin', '')}]")
+
     # A8.3：漏报率回归基线段（仅当 REGRESSION_BASELINE 设置）
     reg = _regression_block(report_data)
     if reg:
@@ -909,6 +939,148 @@ def main():
 if __name__ == "__main__":
     main()
 """
+
+
+# ============================================================
+# C1.4: PoC 产物落盘 + 报告挂接
+# 每个确认漏洞自动生成可运行 PoC 产物文件（<报告目录>/poc/），报告内附链接。
+# 内容来源优先级：A8.2 cve_poc.poc_script > POCGenerator 模板渲染 > B5 urllib 骨架。
+# 不主动触发 LLM 生成路径（成本不可控）；全链异常隔离，绝不影响报告主流程。
+# ============================================================
+_POC_GEN = None
+
+
+def _get_poc_generator():
+    """惰性单例 POCGenerator（函数内 import，避免模块加载期依赖）。"""
+    global _POC_GEN
+    if _POC_GEN is None:
+        from vulnclaw.deepsec.poc_generator import POCGenerator
+        _POC_GEN = POCGenerator()
+    return _POC_GEN
+
+
+def _run_poc_coro(coro):
+    """同步报告流程中执行 async PoC 生成；已处于事件循环内时落到独立线程。"""
+    import asyncio
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        return ex.submit(asyncio.run, coro).result()
+
+
+# 中文漏洞类型 → POCGenerator 模板（真实扫描 type 串为中文，TEMPLATE_MAP 英文键覆盖不到）
+_CN_TYPE_TEMPLATE = [
+    ("sql注入", "sqli.py.j2"), ("sql 注入", "sqli.py.j2"), ("sqli", "sqli.py.j2"),
+    ("跨站脚本", "xss.html.j2"), ("xss", "xss.html.j2"),
+    ("文件包含", "lfi.py.j2"), ("路径遍历", "lfi.py.j2"), ("目录遍历", "lfi.py.j2"),
+    ("命令注入", "rce.py.j2"), ("命令执行", "rce.py.j2"),
+    ("代码执行", "rce.py.j2"), ("rce", "rce.py.j2"),
+]
+
+
+def _poc_template_name(vuln: Dict) -> Optional[str]:
+    """漏洞类型命中 POCGenerator 静态模板则返回模板名（不走 LLM 路径）。"""
+    vtype = str(vuln.get("type", "")).lower()
+    try:
+        from vulnclaw.deepsec.poc_generator import TEMPLATE_MAP
+        for key, tpl in TEMPLATE_MAP.items():
+            if key in vtype:
+                return tpl
+    except Exception:  # noqa: BLE001
+        pass
+    for key, tpl in _CN_TYPE_TEMPLATE:
+        if key in vtype:
+            return tpl
+    return None
+
+
+def _safe_poc_stem(idx: int, vuln: Dict) -> str:
+    import re as _re
+    vtype = _re.sub(r"[^0-9A-Za-z]+", "_", str(vuln.get("type", "vuln"))).strip("_")[:40] or "vuln"
+    return "poc_{:02d}_{}".format(idx, vtype)
+
+
+def generate_poc_artifacts(report_data: Dict, base_dir: str, max_artifacts: int = 20) -> List[Dict]:
+    """C1.4: 为漏洞生成可运行 PoC 产物文件，并在 finding 上标注相对路径。
+
+    - 产物写入 <base_dir>/poc/；finding 增 poc_file / poc_origin 字段；
+      report_data["poc_artifacts"] 汇总清单（HTML/Markdown 据此渲染链接）。
+    - 优先 Critical/High，上限 max_artifacts（默认 20）防产物爆炸。
+    - 全链异常隔离：单条失败只跳过该条，绝不上抛。
+    """
+    vulns = normalize_vulns(report_data.get("vulnerabilities", [])) or []
+    if not vulns:
+        return []
+    order = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3, "Info": 4}
+    candidates = sorted(
+        enumerate(vulns),
+        key=lambda kv: (order.get(str(kv[1].get("severity", "Info")), 5), kv[0]),
+    )[:max_artifacts]
+    poc_dir = os.path.join(base_dir, "poc")
+    try:
+        os.makedirs(poc_dir, exist_ok=True)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[C1.4] PoC 产物目录创建失败，跳过: {exc}")
+        return []
+    artifacts: List[Dict] = []
+    used_names = set()
+    for seq, (_idx, v) in enumerate(candidates):
+        try:
+            content, origin, ext = None, "b5_skeleton", "py"
+            cve_poc = v.get("cve_poc")
+            if isinstance(cve_poc, dict) and str(cve_poc.get("poc_script", "") or "").strip():
+                content, origin = str(cve_poc["poc_script"]), "cve_index"
+            if content is None:
+                tpl = _poc_template_name(v)
+                if tpl:
+                    content = _run_poc_coro(_get_poc_generator().generate(dict(v)))
+                    origin = "template:" + tpl
+                    ext = "html" if tpl.endswith(".html.j2") else "py"
+            if not content or not str(content).strip():
+                content = _build_poc_python(v)
+            stem = _safe_poc_stem(seq, v)
+            fname, k = f"{stem}.{ext}", 1
+            while fname in used_names:
+                k += 1
+                fname = f"{stem}_{k}.{ext}"
+            used_names.add(fname)
+            with open(os.path.join(poc_dir, fname), "w", encoding="utf-8") as f:
+                f.write(str(content))
+            rel = f"poc/{fname}"
+            v["poc_file"] = rel
+            v["poc_origin"] = origin
+            artifacts.append({
+                "file": rel, "type": str(v.get("type", "")),
+                "severity": str(v.get("severity", "")), "origin": origin,
+            })
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[C1.4] PoC 产物生成跳过（{v.get('type', '')}）: {exc}")
+    if artifacts:
+        report_data["poc_artifacts"] = artifacts
+        logger.info(f"[C1.4] PoC 产物 {len(artifacts)} 份已落盘 {poc_dir}")
+    return artifacts
+
+
+def _render_poc_artifacts_section(report_data: Dict) -> str:
+    """C1.4: HTML 报告中的 PoC 产物清单段（无产物返回空串）。"""
+    arts = report_data.get("poc_artifacts") or []
+    if not arts:
+        return ""
+    import html as html_escape
+    rows = "".join(
+        "<li><a href=\"%s\" download>%s</a> — %s <span style=\"color:#666;\">[%s]</span></li>" % (
+            html_escape.escape(str(a.get("file", ""))),
+            html_escape.escape(str(a.get("file", ""))),
+            html_escape.escape(str(a.get("type", ""))),
+            html_escape.escape(str(a.get("origin", ""))),
+        ) for a in arts
+    )
+    return ('<div style="background:#f0f7ff;border:1px solid #c8dcf0;border-radius:8px;padding:12px;margin:16px 0;">'
+            '<h3 style="margin:0 0 8px;">PoC 产物（C1.4，可运行脚本随报告交付）</h3>'
+            '<ul style="margin:0;padding-left:18px;line-height:1.9;">%s</ul></div>') % rows
 
 
 # ============================================================
@@ -1143,4 +1315,5 @@ __all__ = [
     "build_fix_snippet",
     "_build_poc_python",
     "_build_curl_command",
+    "generate_poc_artifacts",
 ]

@@ -209,3 +209,153 @@ async def test_mcp_burp_scan_routes_and_normalizes_url(monkeypatch):
     assert seen["url"] == "https://t/"
     payload = json.loads(res["content"][0]["text"])
     assert payload["count"] == 2
+
+
+# ============================================================
+# 砖 3：真 Intruder（扩展桥 1.1.0+/vulnclaw/intruder + 工具 + MCP 接线）
+# ============================================================
+class _FakeResp:
+    def __init__(self, status=200, body=None):
+        self.status = status
+        self._body = body if body is not None else {"status": "ok", "count": 2, "ok": 2,
+                                                    "results": [{"ok": True, "payload": "a",
+                                                                 "status": 200, "length": 10, "ms": 5}]}
+
+    async def json(self, content_type=None):
+        return self._body
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeSession:
+    def __init__(self, resp):
+        self.resp = resp
+        self.posts = []
+
+    def post(self, url, data=None, headers=None, timeout=None):
+        self.posts.append({"url": url, "data": data})
+        return self.resp
+
+
+def _client():
+    from vulnclaw.ai.burp import BurpClient
+
+    return BurpClient()
+
+
+@pytest.mark.asyncio
+async def test_burp_intruder_registered():
+    from vulnclaw.ai.tools import TOOL_REGISTRY
+
+    assert "burp_intruder" in TOOL_REGISTRY
+
+
+@pytest.mark.asyncio
+async def test_run_intruder_posts_to_bridge(monkeypatch):
+    import vulnclaw.ai.burp as burp_mod
+
+    sess = _FakeSession(_FakeResp(200))
+    async def fake_shared():
+        return sess
+    monkeypatch.setattr(burp_mod, "get_shared_session", fake_shared)
+    res = await _client().run_intruder(
+        "http://t/?q=FUZZ", ["a", "b", " ", "c"], marker="FUZZ")
+    assert res is not None and res["count"] == 2
+    assert sess.posts[0]["url"].endswith("/vulnclaw/intruder")
+    body = json.loads(sess.posts[0]["data"].decode("utf-8"))
+    assert body["payloads"] == ["a", "b", "c"]  # 空白 payload 剔除
+    assert body["marker"] == "FUZZ" and body["method"] == "GET"
+
+
+@pytest.mark.asyncio
+async def test_run_intruder_bridge_down_returns_none(monkeypatch):
+    import vulnclaw.ai.burp as burp_mod
+
+    sess = _FakeSession(_FakeResp(404))
+    async def fake_shared():
+        return sess
+    monkeypatch.setattr(burp_mod, "get_shared_session", fake_shared)
+    assert await _client().run_intruder("http://t/?q=FUZZ", ["a"]) is None
+
+
+@pytest.mark.asyncio
+async def test_burp_intruder_tool_executes(monkeypatch):
+    import vulnclaw.ai.burp as burp_mod
+    import vulnclaw.core.danger_guard as dg_mod
+
+    monkeypatch.setattr(
+        dg_mod.guard, "require_tool_approval", lambda *a, **k: True)
+
+    class _C:
+        async def run_intruder(self, url, payloads, **kw):
+            assert url == "http://t/?q=FUZZ"
+            assert payloads == ["a", "b"]
+            return {"status": "ok", "count": 2, "ok": 2,
+                    "results": [{"ok": True, "payload": "a", "status": 200,
+                                 "length": 5, "ms": 3}]}
+    monkeypatch.setattr(burp_mod, "get_burp_client", lambda: _C())
+    from vulnclaw.ai.tools import execute_tool
+
+    res = await execute_tool(
+        "burp_intruder", url="http://t/?q=FUZZ", payloads="a,b")
+    assert res["success"] is True and res["count"] == 2
+    assert res["results"][0]["status"] == 200
+
+
+@pytest.mark.asyncio
+async def test_burp_intruder_tool_guard_denied(monkeypatch):
+    import vulnclaw.core.danger_guard as dg_mod
+
+    monkeypatch.setattr(
+        dg_mod.guard, "require_tool_approval", lambda *a, **k: False)
+    from vulnclaw.ai.tools import execute_tool
+
+    res = await execute_tool("burp_intruder", url="http://t/?q=FUZZ", payloads="a")
+    assert res["success"] is False and res.get("guard_denied") is True
+
+
+@pytest.mark.asyncio
+async def test_burp_intruder_tool_bridge_unavailable(monkeypatch):
+    import vulnclaw.ai.burp as burp_mod
+    import vulnclaw.core.danger_guard as dg_mod
+
+    monkeypatch.setattr(dg_mod.guard, "require_tool_approval", lambda *a, **k: True)
+
+    class _C:
+        async def run_intruder(self, url, payloads, **kw):
+            return None  # 桥未运行
+    monkeypatch.setattr(burp_mod, "get_burp_client", lambda: _C())
+    from vulnclaw.ai.tools import execute_tool
+
+    res = await execute_tool("burp_intruder", url="http://t/?q=FUZZ", payloads="a")
+    assert res["success"] is False and res["burp_available"] is False
+    assert "fallback_hint" in res
+
+
+@pytest.mark.asyncio
+async def test_mcp_burp_intruder_routes(monkeypatch):
+    """MCP burp.intruder → execute_tool('burp_intruder')；URL 自动补协议。"""
+    import vulnclaw.ai.tools as tools_mod
+
+    seen = {}
+
+    async def fake_execute(name, **kw):
+        seen["name"] = name
+        seen["url"] = kw.get("url")
+        seen["payloads"] = kw.get("payloads")
+        return {"tool": name, "success": True, "count": 2, "ok": 2, "results": []}
+
+    monkeypatch.setattr(tools_mod, "execute_tool", fake_execute)
+    from vulnclaw.core.mcp_server import MCPJsonRpcHandler
+
+    res = await MCPJsonRpcHandler._tool_burp_intruder(
+        types.SimpleNamespace(), {"url": "t/?q=FUZZ", "payloads": "a,b"})
+    assert seen["name"] == "burp_intruder"
+    assert seen["url"] == "https://t/?q=FUZZ"
+    assert seen["payloads"] == "a,b"
+    payload = json.loads(res["content"][0]["text"])
+    assert payload["ok"] == 2

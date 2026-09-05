@@ -492,6 +492,40 @@ class MCPJsonRpcHandler:
                     "openWorldHint": True,
                 },
             },
+            "burp.intruder": {
+                "name": "burp.intruder",
+                "description": "Burp Intruder 模糊测试：对 URL 标记位（默认 FUZZ）逐 payload 发送，"
+                               "收集 status/length/耗时差异表（需要 Burp 运行且已加载 "
+                               "vulnclaw-bridge.jar 1.1.0+；不可用时返回可用性说明）。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "目标 URL，含标记位（如 http://x/?q=FUZZ）",
+                        },
+                        "payloads": {
+                            "type": "string",
+                            "description": "逗号分隔的 payload 列表",
+                        },
+                        "marker": {
+                            "type": "string",
+                            "description": "标记占位符（默认 FUZZ）",
+                        },
+                        "concurrency": {
+                            "type": "number",
+                            "description": "并发数（默认 4，上限 16）",
+                        },
+                    },
+                    "required": ["url", "payloads"],
+                },
+                "annotations": {
+                    "readOnlyHint": False,
+                    "destructiveHint": True,
+                    "idempotentHint": False,
+                    "openWorldHint": True,
+                },
+            },
         }
 
     async def handle_request(self, request: dict) -> dict:
@@ -575,6 +609,8 @@ class MCPJsonRpcHandler:
             return await self._tool_engine_run(arguments)
         elif tool_name == "burp.scan":
             return await self._tool_burp_scan(arguments)
+        elif tool_name == "burp.intruder":
+            return await self._tool_burp_intruder(arguments)
         else:
             raise ValueError(f"Tool not implemented: {tool_name}")
 
@@ -1066,6 +1102,41 @@ class MCPJsonRpcHandler:
             logger.info(f"MCP burp.scan: {url} → {result.get('count', 0)} issues")
         else:
             logger.info(f"MCP burp.scan: {url} → {result.get('error', '未获取 issue')}")
+        return {
+            "content": [{
+                "type": "text",
+                "text": json.dumps(result, ensure_ascii=False),
+            }],
+        }
+
+    async def _tool_burp_intruder(self, args: dict) -> dict:
+        """burp.intruder：真 Intruder 模糊测试（扩展桥 1.1.0+）。
+
+        复用 ai.tools 的 burp_intruder 可执行工具（同一实现，双入口：
+        MCP 外部 agent 与内部 agent 都能点）。桥不可用时返回可用性说明。
+        """
+        url = str(args.get("url", "")).strip()
+        payloads = str(args.get("payloads", "")).strip()
+        if not url:
+            raise ValueError("url 参数不能为空")
+        if not payloads:
+            raise ValueError("payloads 参数不能为空（逗号分隔）")
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        try:
+            concurrency = int(args.get("concurrency") or 4)
+        except (TypeError, ValueError):
+            concurrency = 4
+
+        from vulnclaw.ai.tools import execute_tool
+
+        result = await execute_tool(
+            "burp_intruder", url=url, payloads=payloads,
+            marker=str(args.get("marker") or "FUZZ"), concurrency=concurrency)
+        if result.get("success"):
+            logger.info(f"MCP burp.intruder: {url} → {result.get('ok', 0)}/{result.get('count', 0)}")
+        else:
+            logger.info(f"MCP burp.intruder: {url} → {result.get('error', '未完成')}")
         return {
             "content": [{
                 "type": "text",

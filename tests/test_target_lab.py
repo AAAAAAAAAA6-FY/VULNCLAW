@@ -49,18 +49,110 @@ class TestTargetLabLifecycle:
 
 class TestEngineLabMap:
     def test_map_contains_core_engines(self):
-        for name in ("SQLiEngine", "XSSEngine", "OpenRedirectEngine", "SSRFEngine"):
+        for name in ("SQLiEngine", "XSSEngine", "OpenRedirectEngine", "SSRFEngine", "LFIEngine"):
             assert name in tl.ENGINE_LAB_MAP
 
     def test_all_mapped_labs_exist_in_factories(self):
         for lab in tl.ENGINE_LAB_MAP.values():
             assert lab in tl._LAB_FACTORIES
 
+    def test_lab_param_covers_all_labs(self):
+        for lab in tl.ENGINE_LAB_MAP.values():
+            assert lab in tl._LAB_PARAM
+
+
+class TestLfiLab:
+    """LFI 靶机：归一化标记文件，Windows 可确定性复现。"""
+
+    @pytest.mark.asyncio
+    async def test_winini_backslash_payload_hits(self):
+        async with tl.TargetLab("lfi_read") as lab:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    lab.base_url + "/vuln", params={"file": "..\\..\\..\\windows\\win.ini"}
+                ) as r:
+                    body = await r.text()
+                    assert "[extensions]" in body
+
+    @pytest.mark.asyncio
+    async def test_etc_passwd_hits_strong_marker(self):
+        async with tl.TargetLab("lfi_read") as lab:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    lab.base_url + "/vuln", params={"file": "../../../../etc/passwd"}
+                ) as r:
+                    body = await r.text()
+                    assert "root:x:0:0:" in body
+
+    @pytest.mark.asyncio
+    async def test_double_encoded_variant_hits(self):
+        # ..%252f 双重编码 → 解两次后归一化仍应命中 win.ini
+        async with tl.TargetLab("lfi_read") as lab:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    lab.base_url + "/vuln", params={"file": "..%252f..%252fwindows%252fwin.ini"}
+                ) as r:
+                    assert "[extensions]" in await r.text()
+
+    @pytest.mark.asyncio
+    async def test_baseline_and_benign_no_indicator(self):
+        async with tl.TargetLab("lfi_read") as lab:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                async with session.get(lab.base_url + "/vuln") as r:
+                    assert "Target Lab Index Page" in await r.text()
+                async with session.get(
+                    lab.base_url + "/vuln", params={"file": "test.txt"}
+                ) as r:
+                    body = await r.text()
+                    assert "root:x:0:0:" not in body and "[extensions]" not in body
+
+    @pytest.mark.asyncio
+    async def test_real_lfi_engine_hits_lab(self):
+        """真引擎端到端：LFIEngine(check 型) 对 lfi_read 靶机确定性命中。"""
+        from vulnclaw.engines.web_engines import LFIEngine
+        async with tl.TargetLab("lfi_read") as lab:
+            findings = await tl._run_engine_scan(LFIEngine, lab.base_url, param="file")
+        assert findings, "LFIEngine 未命中 lfi_read 靶机（Windows 确定性复现失败）"
+        assert "文件包含" in str(findings[0].get("type", ""))
+
+
+class TestCoverageScore:
+    def test_perfect_score_grade_a(self):
+        s = tl.coverage_score({"total": 5, "hit": 5, "miss": 0, "no_lab": 2})
+        assert s["score"] == 100 and s["grade"] == "A"
+        assert s["gauge"] == "[##########] 100%"
+        assert s["untested_no_lab"] == 2
+
+    def test_zero_score_grade_d(self):
+        s = tl.coverage_score({"total": 4, "hit": 0, "miss": 4})
+        assert s["score"] == 0 and s["grade"] == "D"
+        assert s["gauge"] == "[----------] 0%"
+
+    def test_partial_grades(self):
+        assert tl.coverage_score({"total": 10, "hit": 8})["grade"] == "B"
+        assert tl.coverage_score({"total": 10, "hit": 6})["grade"] == "C"
+
+    def test_empty_report_zero_not_inflated(self):
+        s = tl.coverage_score({})
+        assert s["score"] == 0 and s["tested"] == 0
+
+    @pytest.mark.asyncio
+    async def test_run_coverage_embeds_score(self, monkeypatch):
+        async def _fake_scan(engine_cls, base_url, param=""):
+            return [{"type": "X", "url": base_url}]
+        monkeypatch.setattr(tl, "_run_engine_scan", _fake_scan)
+        report = await tl.run_coverage(engine_names=["SQLiEngine"])
+        assert report["score"]["score"] == 100 and report["score"]["grade"] == "A"
+
 
 class TestRunCoverage:
     @pytest.mark.asyncio
     async def test_report_shape_with_mocked_scan(self, monkeypatch):
-        async def _fake_scan(engine_cls, base_url):
+        async def _fake_scan(engine_cls, base_url, param=""):
             return [{"type": "X", "title": "hit", "url": base_url}]
         monkeypatch.setattr(tl, "_run_engine_scan", _fake_scan)
         report = await tl.run_coverage(engine_names=["SQLiEngine", "XSSEngine"])
@@ -71,7 +163,7 @@ class TestRunCoverage:
 
     @pytest.mark.asyncio
     async def test_expected_hit_respected(self, monkeypatch):
-        async def _fake_scan_empty(engine_cls, base_url):
+        async def _fake_scan_empty(engine_cls, base_url, param=""):
             return []
         monkeypatch.setattr(tl, "_run_engine_scan", _fake_scan_empty)
         report = await tl.run_coverage(engine_names=["SQLiEngine"])

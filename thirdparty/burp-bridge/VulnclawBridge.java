@@ -8,6 +8,7 @@ import burp.api.montoya.extension.ExtensionUnloadingHandler;
 import burp.api.montoya.http.message.HttpHeader;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
+import burp.api.montoya.http.message.responses.HttpResponse;
 import burp.api.montoya.logging.Logging;
 import burp.api.montoya.proxy.http.InterceptedResponse;
 import burp.api.montoya.proxy.http.ProxyResponseHandler;
@@ -44,8 +45,11 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -61,10 +65,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *     → 等待 audit 完成
  *     → 返回 {"status":"ok","issue_count":N,"issues":[{...},...]}
  *     → 同时 AuditIssueHandler 回调自动落盘到 audit_issues.jsonl
+ *   POST /vulnclaw/intruder  body: {"url":"http://x/?q=FUZZ", "payloads":["a","b"],
+ *        "marker":"FUZZ", "method":"GET", "headers":{...}, "body":"", "concurrency":4}
+ *     → 1.1.0 新增真 Intruder：Montoya api.http().sendRequest 逐 payload 发送，
+ *     → 同步返回 [{"payload","status","length","ms"}...] 结果表（上限 200，线程池并发）
  */
 public class VulnclawBridge implements BurpExtension, ExtensionUnloadingHandler {
-
-    static final String VERSION = "1.0.8";
+ 
+    static final String VERSION = "1.1.0";
     static final int BRIDGE_PORT = 18181;
     static final long MAX_FILE_BYTES = 25L * 1024 * 1024;
     private static final Instant STARTED_AT = Instant.now();
@@ -120,6 +128,7 @@ public class VulnclawBridge implements BurpExtension, ExtensionUnloadingHandler 
         try {
             httpServer = new MiniHttpServer("127.0.0.1", BRIDGE_PORT);
             httpServer.addContext("/vulnclaw/scan", this::handleScan);
+            httpServer.addContext("/vulnclaw/intruder", this::handleIntruder);
             httpServer.addContext("/vulnclaw/status", this::handleStatus);
             httpServer.addContext("/vulnclaw/ping", (exc) -> {
                 writeJson(exc, 200, "{\"ok\":true,\"version\":\"" + VERSION + "\",\"audit_written\":" + auditCount + ",\"history_written\":" + historyCount + "}");
@@ -238,6 +247,105 @@ public class VulnclawBridge implements BurpExtension, ExtensionUnloadingHandler 
                     .append("}");
             writeJson(exc, 200, sb.toString());
         } catch (Throwable ignored) {}
+    }
+
+    // ========== Intruder：参数级模糊测试（1.1.0 真 Intruder，替代 ffuf 兜底） ==========
+    // POST /vulnclaw/intruder body:
+    //   {"url":"http://x/?q=FUZZ", "payloads":["a","b"], "marker":"FUZZ",
+    //    "method":"GET", "headers":{"K":"V"}, "body":"...", "concurrency":4}
+    // → marker 替换 url/body 中的标记后经 Montoya api.http().sendRequest 逐 payload 发送
+    //   （线程池并发，上限 200），同步返回结果表 status/length/ms。
+    // 限制：payload 数组用极简解析器（与 urls 同款），元素内含逗号会被拆分——
+    //      含逗号 payload 请改用 marker 多占位或经 body 传递。
+    void handleIntruder(MiniExchange exc) {
+        try {
+            if (!"POST".equalsIgnoreCase(exc.getMethod())) {
+                writeJson(exc, 405, "{\"error\":\"POST only\"}"); return;
+            }
+            String body = new String(exc.getRequestBody(), StandardCharsets.UTF_8).trim();
+            Map<String, String> p = parseJsonBody(body);
+            String url = p.getOrDefault("url", "");
+            List<String> payloads = parseStringArray(p.getOrDefault("payloads", ""));
+            if (url.isBlank() || payloads.isEmpty()) {
+                writeJson(exc, 400, "{\"error\":\"url and payloads[] required\"}"); return;
+            }
+            String marker = p.getOrDefault("marker", "FUZZ");
+            if (marker.isBlank()) marker = "FUZZ";
+            String method = p.getOrDefault("method", "GET").toUpperCase();
+            String bodyStr = p.getOrDefault("body", "");
+            int concurrency = Math.max(1, Math.min(parseInt(p.get("concurrency"), 4), 16));
+            if (payloads.size() > 200) payloads = payloads.subList(0, 200);
+            Map<String, String> headers = new HashMap<>();
+            String headersRaw = p.getOrDefault("headers", "");
+            if (!headersRaw.isBlank()) headers.putAll(parseJsonBody(headersRaw));
+
+            if (apiRef == null) { writeJson(exc, 500, "{\"error\":\"Burp API not ready\"}"); return; }
+            log.logToOutput("[VulnclawBridge] INTRUDER url=" + url + " payloads=" + payloads.size()
+                    + " method=" + method + " concurrency=" + concurrency);
+
+            final String fUrl = url, fMarker = marker, fMethod = method, fBody = bodyStr;
+            final Map<String, String> fHeaders = headers;
+            ExecutorService pool = Executors.newFixedThreadPool(concurrency);
+            try {
+                List<Future<String>> futures = new ArrayList<>();
+                for (String pl : payloads) {
+                    futures.add(pool.submit(
+                            (Callable<String>) () -> intruderOne(fUrl, fMarker, pl, fMethod, fHeaders, fBody)));
+                }
+                StringBuilder rows = new StringBuilder();
+                int okCount = 0;
+                for (int i = 0; i < futures.size(); i++) {
+                    String row;
+                    try { row = futures.get(i).get(120, TimeUnit.SECONDS); }
+                    catch (Throwable t) {
+                        row = "{\"ok\":false,\"error\":\"" + escape(String.valueOf(t)) + "\"}";
+                    }
+                    if (i > 0) rows.append(',');
+                    rows.append(row);
+                    if (row.contains("\"ok\":true")) okCount++;
+                }
+                writeJson(exc, 200, "{\"status\":\"ok\",\"count\":" + payloads.size()
+                        + ",\"ok\":" + okCount + ",\"results\":[" + rows + "]}");
+            } finally {
+                pool.shutdownNow();
+            }
+        } catch (Throwable t) {
+            StringWriter sw = new StringWriter(); t.printStackTrace(new PrintWriter(sw));
+            log.logToError("[VulnclawBridge] handleIntruder 异常: " + t + " -> " + sw);
+            try { writeJson(exc, 500, "{\"error\":\"" + escape(t.toString()) + "\"}"); } catch (IOException ignored) {}
+        }
+    }
+
+    String intruderOne(String url, String marker, String payload, String method,
+                       Map<String, String> headers, String body) {
+        try {
+            String target = url.replace(marker, payload);
+            HttpRequest hr = HttpRequest.httpRequestFromUrl(target);
+            if (!"GET".equals(method)) hr = hr.withMethod(method);
+            for (Map.Entry<String, String> h : headers.entrySet()) {
+                try { hr = hr.withAddedHeader(h.getKey(), h.getValue()); } catch (Throwable ignored) {}
+            }
+            if (body != null && !body.isBlank()) hr = hr.withBody(body.replace(marker, payload));
+            long t0 = System.currentTimeMillis();
+            HttpRequestResponse rr = apiRef.http().sendRequest(hr);
+            long ms = System.currentTimeMillis() - t0;
+            int status = 0, len = 0;
+            try {
+                HttpResponse resp = rr.response();
+                status = resp.statusCode();
+                len = resp.toByteArray().length();
+            } catch (Throwable ignored) {}
+            StringBuilder row = new StringBuilder("{\"ok\":true");
+            put(row, false, "payload", payload);
+            put(row, false, "status", String.valueOf(status));
+            put(row, false, "length", String.valueOf(len));
+            put(row, false, "ms", String.valueOf(ms));
+            row.append('}');
+            return row.toString();
+        } catch (Throwable t) {
+            return "{\"ok\":false,\"payload\":\"" + escape(payload)
+                    + "\",\"error\":\"" + escape(String.valueOf(t)) + "\"}";
+        }
     }
 
     /**
@@ -562,6 +670,22 @@ public class VulnclawBridge implements BurpExtension, ExtensionUnloadingHandler 
             while (i < s.length() && (Character.isWhitespace(s.charAt(i)) || s.charAt(i) == ',')) i++;
         }
         return map;
+    }
+    /** 极简 JSON string 数组解析（与 handleScan 的 urls 解析同款；元素内含逗号会被拆分）。 */
+    static List<String> parseStringArray(String raw) {
+        List<String> out = new ArrayList<>();
+        if (raw == null || raw.isBlank()) return out;
+        if (raw.startsWith("[")) {
+            for (String part : raw.substring(1, raw.length() - 1).split(",")) {
+                String c = part.trim();
+                if (c.startsWith("\"")) c = c.substring(1);
+                if (c.endsWith("\"")) c = c.substring(0, c.length() - 1);
+                if (!c.isBlank()) out.add(c);
+            }
+        } else {
+            out.add(raw);
+        }
+        return out;
     }
     static String unescape(String s) {
         StringBuilder sb = new StringBuilder();

@@ -328,6 +328,58 @@ class BurpClient:
         except Exception:
             return None
 
+    def _bridge_http_url(self) -> str:
+        """扩展桥 mini HTTP server 地址（默认 127.0.0.1:18181，可 VULNCLAW_BRIDGE_URL 覆盖）。"""
+        return (os.environ.get("VULNCLAW_BRIDGE_URL", "").strip().rstrip("/")
+                or "http://127.0.0.1:18181")
+
+    async def run_intruder(
+        self,
+        url: str,
+        payloads: List[str],
+        marker: str = "FUZZ",
+        method: str = "GET",
+        headers: Optional[Dict[str, str]] = None,
+        body: str = "",
+        concurrency: int = 4,
+        timeout_s: int = 120,
+    ) -> Optional[Dict]:
+        """真 Intruder：经扩展桥 /vulnclaw/intruder 逐 payload 发送并收集结果表。
+
+        桥（vulnclaw-bridge.jar 1.1.0+）未运行时返回 None（调用方降级或如实报
+        不可用）。payload 数上限 200；payload 含逗号时请用 marker 多占位规避
+        （桥端为极简数组解析器，与 urls 解析同款）。
+        """
+        payload_list = [str(p) for p in (payloads or []) if str(p).strip()]
+        url = str(url or "").strip()
+        if not url or not payload_list:
+            return None
+        payload = json.dumps({
+            "url": url,
+            "payloads": payload_list[:200],
+            "marker": str(marker or "FUZZ"),
+            "method": str(method or "GET").upper(),
+            "headers": dict(headers or {}),
+            "body": str(body or ""),
+            "concurrency": max(1, min(int(concurrency or 4), 16)),
+        }, ensure_ascii=False).encode("utf-8")
+        try:
+            session = await get_shared_session()
+            async with session.post(
+                self._bridge_http_url() + "/vulnclaw/intruder",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=max(30, int(timeout_s))),
+            ) as resp:
+                if resp.status != 200:
+                    logger.debug(
+                        f"[BurpBridge] intruder HTTP {resp.status}（桥版本过低或未加载）")
+                    return None
+                return await resp.json(content_type=None)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[BurpBridge] intruder 调用失败（桥未运行？）: {exc}")
+            return None
+
     def _read_new_lines(self, name: str) -> List[Dict]:
         """增量读取桥 JSONL（记住 offset；轮转后文件变小则重头读）。"""
         path = self._bridge_file(name)

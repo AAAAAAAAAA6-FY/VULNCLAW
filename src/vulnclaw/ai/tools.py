@@ -355,6 +355,80 @@ class BurpIssuesTool(BaseTool):
             return {"tool": self.name, "success": False, "error": f"Burp 扫描失败: {e}"}
 
 
+class BurpIntruderTool(BaseTool):
+    """真 Intruder：经 Burp 扩展桥（1.1.0+）对标记位逐 payload 模糊测试。
+
+    替代 FALLBACK_MAP 里 burp_intruder→ffuf 的旧兜底语义：走 Burp 自身 HTTP
+    栈（会话/Cookie/上游代理与手工测试一致），收集 status/length/耗时差异表。
+    danger_level=guarded：主动模糊测试，经工具级 DangerGuard 审批。
+    """
+
+    def __init__(self):
+        self.name = "burp_intruder"
+        self.description = (
+            "Burp Intruder 模糊测试：对 URL 中标记位（默认 FUZZ）逐 payload 发送，"
+            "收集 status/length/耗时差异表（需要 Burp 运行且已加载 "
+            "vulnclaw-bridge.jar 1.1.0+；不可用时返回明确说明而非崩溃）"
+        )
+        self.parameters = [
+            {"name": "url", "type": "string", "required": True,
+             "description": "目标 URL，含标记位（如 http://x/?q=FUZZ）"},
+            {"name": "payloads", "type": "string", "required": True,
+             "description": "逗号分隔的 payload 列表（含逗号的 payload 请改用多标记位）"},
+            {"name": "marker", "type": "string", "required": False,
+             "description": "标记占位符（默认 FUZZ）"},
+            {"name": "concurrency", "type": "number", "required": False,
+             "description": "并发数（默认 4，上限 16）"},
+        ]
+        self.category = "burp"
+        self.danger_level = "guarded"
+
+    async def execute(self, url: str = "", payloads: str = "", marker: str = "FUZZ",
+                      concurrency: int = 4, **kwargs) -> Dict:
+        from vulnclaw.ai.burp import get_burp_client
+
+        url = str(url or "").strip()
+        plist = [p.strip() for p in str(payloads or "").split(",") if p.strip()]
+        if not url or not plist:
+            return {"tool": self.name, "success": False,
+                    "error": "url 与 payloads 均不能为空（payloads 逗号分隔）"}
+        # 工具级门禁：主动模糊测试需 DangerGuard 审批
+        try:
+            from vulnclaw.core.danger_guard import guard
+            if not guard.require_tool_approval(
+                    self.name, f"intruder x{len(plist)} payloads", f"{self.name} @ {url}"):
+                logger.warning(f"🚫 [DangerGuard] {self.name} 未获审批（工具级门禁）")
+                return {"tool": self.name, "success": False, "guard_denied": True,
+                        "error": "工具未获审批（DangerGuard 工具级门禁）"}
+        except Exception as _ge:  # noqa: BLE001
+            logger.debug(f"[DangerGuard] 工具级检查失败（放行兜底）: {_ge}")
+
+        client = get_burp_client()
+        if client is None:
+            return {"tool": self.name, "success": False, "burp_available": False,
+                    "error": "Burp 客户端未配置（检查 BURP_API_URL / BURP_API_KEY）"}
+        try:
+            result = await client.run_intruder(
+                url, plist, marker=marker or "FUZZ",
+                concurrency=concurrency if isinstance(concurrency, int) else 4)
+        except Exception as e:  # noqa: BLE001
+            return {"tool": self.name, "success": False, "error": f"Intruder 调用失败: {e}"}
+        if result is None:
+            return {"tool": self.name, "success": False, "burp_available": False,
+                    "error": "扩展桥不可用（Burp 未运行或未加载 vulnclaw-bridge.jar 1.1.0+）",
+                    "fallback_hint": "可改用 ffuf 做目录模糊枚举"}
+        results = result.get("results") or []
+        return {
+            "tool": self.name,
+            "type": "burp_intruder",
+            "success": bool(results),
+            "count": int(result.get("count", 0)),
+            "ok": int(result.get("ok", 0)),
+            "results": results[:100],
+            "summary": (f"Intruder 完成 {result.get('ok', 0)}/{result.get('count', 0)} 个 payload"),
+        }
+
+
 def _register_burp_tools() -> int:
     registered = 0
     try:
@@ -362,6 +436,11 @@ def _register_burp_tools() -> int:
         registered += 1
     except Exception as e:  # noqa: BLE001
         logger.warning(f"⚠️ Burp 工具注册失败: {e}")
+    try:
+        TOOL_REGISTRY["burp_intruder"] = BurpIntruderTool()
+        registered += 1
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"⚠️ Burp Intruder 工具注册失败: {e}")
     return registered
 
 
