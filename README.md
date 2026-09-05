@@ -8,8 +8,26 @@ AI 驱动的自动化渗透测试平台（v103 · 基于 v100 限流感知编排
 
 ---
 
+## 5 分钟快速上手（TL;DR）
+
+1. **克隆仓库**：`git clone <your-repo-url> pentest_platform && cd pentest_platform`（或直接下载源码 zip 解压）。
+2. **安装依赖**（Python ≥ 3.11）：
+   ```bash
+   pip install -e .
+   ```
+3. **配置 API Key**：`cp .env.example .env`，编辑 `.env` 填入 `AI_API_KEY`（默认 Provider 为智谱 zhipu，详见「获取 AI 模型 API Key」）。
+4. **启动第一次扫描**：
+   - Windows PowerShell：`.\start_vulnclaw.ps1 -Target http://testphp.vulnweb.com`
+   - Linux / macOS：`./start_vulnclaw.sh -t http://testphp.vulnweb.com`
+5. **看报告**：扫描结束输出至 `_runtime_cache/reports/`，用浏览器打开 `report_<target>_<时间戳>.html`（JSON + HTML 双格式，另含 SARIF）。
+
+> **只想先跑纯引擎、不配任何 Key**：跳过第 3 步，在 `.env` 中设置 `AI_MODE=0`（纯引擎模式：不调用任何 AI，AI 增强自动降级，扫描照常执行）后直接运行第 4 步命令。
+
+---
+
 ## 目录
 
+- [5 分钟快速上手（TL;DR）](#5-分钟快速上手tldr)
 - [项目简介](#项目简介)
 - [架构总览](#架构总览)
 - [环境要求](#环境要求)
@@ -195,6 +213,29 @@ PROVIDER_PRIORITY=["zhipu","aliyun","siliconflow"]
 > 提示：也可以不手写，直接运行 `python tools_menu.py` 选择「3. 切换 AI 配置」交互式向导。
 
 完整环境变量清单见 [.env.example](.env.example)。
+
+### 获取 AI 模型 API Key
+
+平台默认使用智谱（zhipu）作为 AI Provider（`AI_PROVIDER=zhipu`），在 `.env` 中配置：
+
+```env
+AI_PROVIDER=zhipu
+AI_API_KEY=你的真实Key
+AI_API_BASE=https://open.bigmodel.cn/api/paas/v4/
+```
+
+- 复制模板：`cp .env.example .env`（Windows PowerShell 用 `Copy-Item .env.example .env`）。
+- 多模型时用 `AI_MODEL_CONFIGS`（JSON）：为每个模型配置 `api_key` 与 `base_url`，模型名见 `AI_MODEL_ALIASES`；也可以只用 `AI_PROVIDER` + `AI_API_KEY` 的单模型快捷方式（与 `AI_MODEL_CONFIGS` 二选一）。
+- Key 获取渠道：
+
+| Provider | 一句话说明 | 官网 |
+|---|---|---|
+| 智谱（默认） | 注册账号后在控制台创建 API Key | https://open.bigmodel.cn/ |
+| 阿里云百炼 | 开通百炼服务后获取 DashScope API Key | https://dashscope.aliyun.com/ |
+| DeepSeek | 开放平台创建 API Key | https://platform.deepseek.com/ |
+| 硅基流动 | 注册后创建 API Key | https://siliconflow.cn/ |
+
+> 模板占位 Key（`your_api_key_here`）会导致 401 认证失败并熔断该 Provider，务必替换为真实 Key；不想用 AI 时设 `AI_MODE=0` 走纯引擎模式。
 
 ## 分布式部署
 
@@ -457,6 +498,24 @@ A: 内网/回环/私网目标会自动跳过 OTX/Urlscan 等外部 API，属于�
 
 **Q: 找不到 `subdomains_top5000.txt`？**
 A: 字典在 `src/vulnclaw/core/data/subdomains_top5000.txt`，`_resolve_wordlist_path` 会自动按 根→config→thirdparty 顺序解析。
+
+**Q: 没有 API Key 能跑吗？**
+A: 能。设置 `AI_MODE=0` 走纯引擎模式：不调用任何 AI，AI 增强（验证/过滤/线索）自动降级为规则模式，扫描照常执行。
+
+**Q: 高级功能（TLS 指纹伪装 / 向量记忆 / 调用链分析 / Dashboard）怎么开？**
+A: 这些是可选的依赖，默认 `pip install -e .` 不安装（代码内 try/except 优雅降级）。运行 `pip install -e .[full]` 安装 curl_cffi、chromadb、tree-sitter、fakeredis、uvicorn 等即可启用。
+
+**Q: 第三方工具（nuclei / sqlmap / nmap）没装怎么办？**
+A: 缺失时对应步骤自动降级，不影响主流程；也可以设置 `TOOL_AUTO_INSTALL=true`（默认开启）让平台启动时尽力自动安装，GitHub 直连失败时会按 `TOOL_DOWNLOAD_MIRRORS` 配置的镜像前缀（默认 gh-proxy.com / ghproxy.net）依次重试。
+
+**Q: 分布式扫描怎么开？**
+A: 需要本机或远端可用 Redis，然后 `docker compose up -d --build` 一键启动（Redis + Master + 2 Worker）；也可以手动 `python scan.py --distributed --master` 与 `python scan.py --distributed --worker` 分开启动。
+
+**Q: 内网 / 靶场使用有什么要注意？**
+A: 危险操作默认 `DANGEROUS_MODE=deny`（安全默认，write/destructive 级别被拦截），需显式传 `--dangerous` 或 `DANGEROUS_ALLOW` 放行。请确保已获得目标系统的书面测试授权，仅用于合法授权的渗透测试与安全学习。
+
+**Q: 报告在哪里？**
+A: 扫描报告输出至 `_runtime_cache/reports/`（JSON + HTML 双格式，浏览器打开 HTML 即可查看），同时默认输出 SARIF 文件（`REPORT_SARIF=true`）；全量日志在 `_runtime_cache/logs/`。
 
 ## 参与贡献
 

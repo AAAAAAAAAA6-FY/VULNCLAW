@@ -40,6 +40,20 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["ruff", "mypy", "pre-commit", "pytest", "pytest-cov", "pytest-asyncio"]
+# 高级功能：代码内均为可选导入（try/except ImportError 优雅降级），默认不装、不阻塞 pip install .
+#   curl_cffi            -> SP16.2/SP17.3 TLS 指纹伪装（core/impersonate.py）
+#   chromadb             -> orchestrator 向量记忆（ai/core.py，import chromadb）
+#   tree-sitter / tree_sitter_languages -> SP16.3 调用链 AST 定义表（code/graph.py）
+#   fakeredis            -> E6 分布式分片在无 Redis 环境下的模拟后端（distributed/*）
+#   uvicorn              -> Dashboard 服务（dashboard/server.py）
+full = [
+    "curl_cffi>=0.7.0",
+    "chromadb>=0.4.0",
+    "tree-sitter>=0.21.0",
+    "tree_sitter_languages>=1.10.0",
+    "fakeredis>=2.20.0",
+    "uvicorn>=0.27.0",
+]
 
 [project.scripts]
 vulnclaw = "vulnclaw.cli:main"
