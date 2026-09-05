@@ -923,3 +923,22 @@
 
 ### 18.4 收口
 - SP20 专项 67 例全绿 + 全量回归通过（清理根目录遗留 _tmp_lock_check.py 后）；新增行 emoji 红线复核通过；TASKLIST §18 增量记录。
+
+## 19. SP21 验证批次（2026-09-06，A 线 2 路并行验证 + B 侧合流勾选确认）
+> 前提：SP20 提交 24d30ae 后必做任务清零，剩余仅验证类/合流确认，一次性并行收尾。
+
+### 19.1 PDF/CSV 导出真实验证（SP21-1）
+- 环境：装 reportlab 5.0.1（纯 Python 无系统库依赖）；卸载坏 weasyprint 69.0（Windows 缺 libgobject GTK 系统库，顶层 import 即 OSError，且 export_pdf 用 find_spec 探测造成假阳性——weasyprint 优先导致 reportlab 后端永远走不到，与 test_sp17 的真实 import 探测逻辑不一致，是 PDF 用例长期 skip 的根因）；
+- 验证：export_pdf 真实生成 2347B %PDF magic 文件（reportlab 路径走通）；export_csv UTF-8 BOM 头 EF BB BF + csv.reader 读回表头/中文无损；
+- 新增 tests/test_sp21_export_real.py（PDF skipif reportlab 不可用 + CSV 恒跑）；test_sp17_export 6 例从 skip 变全绿，共 8 passed。
+
+### 19.2 CLI 全子命令冒烟（SP21-2）
+- 11 个子命令实测（scan/setup/code/health/mcp/verify/tools/bandit-report/bandit-train/archive/flywheel）全部 --help 退出码 0；
+- 离线端到端：mcp token 43 字符、bandit-report（8 样本/2 组合/引擎分布）、bandit-train（policy combos 生成，n<5 组合不进策略防过拟合）、flywheel（首跑 ran=true，二次同样本 ran=false 属防抖设计）、archive（ARCHIVE.md + zip 748B 双条目）、health 全绿；无 Traceback；
+- 临时产物已清理。
+
+### 19.3 B 侧合流勾选确认
+- B 线 3 项（B-SP15.1/2/4 OOB 自证 + 挖掘器真扫自证 + recon_brief 回灌）已在 TASKLIST 勾选 [x]，对面交付；合流联调历史上已完成（见 §11.2 记录），本批次同步确认勾选状态。
+
+### 19.4 收口
+- 真扫联调按用户指示跳过（SP15-SP20 全部离线专项 + 全量回归已覆盖链路）；TASKLIST §19 增量记录。
