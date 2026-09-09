@@ -378,7 +378,19 @@ class XSSEngine(BaseEngine):
         if 'confirm' in payload.lower():
             key_indicators.append('confirm')
 
+        # 2026-09-08 修复：不允许"正文出现 alert/onerror 等单词即判反射"。
+        # SPA 大站外壳自带 JS 必含这些词（Audible 基线: alertx3/onerrorx10/onloadx10），
+        # 曾致全站反射型 XSS 误报。改为：整个 payload 的 HTML 骨架（tag+attr）出现才算反射，
+        # 若无骨架标签则退化为"裸事件词出现 且 页面骨架含 <adbl/可注入属性上下文"（均跳过）。
         text_lower = text.lower()
+        has_skeleton = False
+        for tag in ("<script", "<img", "<svg", "<video", "<audio", "<iframe",
+                    "<body", "<a", "<form", "<textarea", "</script>"):
+            if tag in text_lower:
+                has_skeleton = True
+                break
+        if not has_skeleton:
+            return False
         for indicator in key_indicators:
             if indicator in text_lower:
                 return True
@@ -587,6 +599,14 @@ class SQLiEngine(BaseEngine):
     }
 
     COMMON_PAYLOADS = [
+        # 无特征布尔对（WAF 绕过，线2.1）：不含 union/--/*/#/' or '，置于头部以命中 payload 截断
+        ("1'1", "数字自逆布尔"),
+        ("1'2", "数字自逆布尔对比"),
+        ("1'OR 1=1", "无空格OR布尔"),
+        ("1'OR 1=2", "无空格OR布尔对比"),
+        ("1=1", "裸数字布尔"),
+        ("1=2", "裸数字布尔对比"),
+        ("1' AND SLEEP(5)", "时间盲注-无注释"),
         ("' OR '1'='1", "经典布尔绕过"),
         ("' OR 1=1#", "MySQL注释绕过"),
         ("' OR 1=1-- -", "PostgreSQL注释"),
@@ -601,6 +621,7 @@ class SQLiEngine(BaseEngine):
     ]
 
     MYSQL_PAYLOADS = [
+        ("1' AND SLEEP(5)", "时间盲注-无注释"),
         ("1' AND SLEEP(5)--", "MySQL时间盲注(5s)"),
         ("' OR SLEEP(5)#", "MySQL时间盲注变体"),
         ("1' AND extractvalue(1,concat(0x7e,version()))--", "MySQL报错注入"),
@@ -806,8 +827,35 @@ class SQLiEngine(BaseEngine):
                 return line.strip()[:100]
         return "检测到 SQL 错误特征"
 
+    def _digits_only_diff(self, text_a, text_b) -> bool:
+        """线2.1：A/B 仅数字令牌差异检测。
+
+        无特征布尔对在 WAF 过滤下常只差一个数字（"2 rows" vs "0 rows"），
+        字符级 difflib(0.15) 对这类差异不敏感（ratio≈0.82 → diff 0.11 < 0.15）。
+        若两份响应去数字后的骨架完全一致、且数字令牌集合不同 → 判定布尔差异成立。
+        骨架一致约束严格：调用方需先 strip_payload_reflection，否则回显型目标
+        （httpbin 类）攻击/逆命题响应仅差回显的 payload 数字，会误判成立。
+        """
+        if not text_a or not text_b:
+            return False
+        ta, tb = str(text_a), str(text_b)
+        a_digits = set(re.findall(r'\d+', ta))
+        b_digits = set(re.findall(r'\d+', tb))
+        if not a_digits or not b_digits or a_digits == b_digits:
+            return False
+        return re.sub(r'\d+', '#', ta) == re.sub(r'\d+', '#', tb)
+
     def _generate_reverse_payload(self, payload: str) -> Optional[str]:
         for pattern, replacement in [
+            # 线2.1 WAF 绕过无特征布尔对：精确逆。
+            # 必须置于 "1=1"/"1=2" 等泛化 pattern 之前（"1'OR 1=1" 内含 "1=1"）；
+            # 数字兜底会把真命题合成真命题（1'1→2'2），故先精确匹配。
+            ("1'OR 1=1", "1'OR 1=2"),
+            ("1'OR 1=2", "1'OR 1=1"),
+            ("1'1", "1'2"),
+            ("1'2", "1'1"),
+            ("1=1", "1=2"),
+            ("1=2", "1=1"),
             ("OR '1'='1", "OR '1'='2"),
             ("OR 1=1", "OR 1=2"),
             ("AND '1'='1", "AND '1'='2"),
@@ -854,7 +902,7 @@ class SQLiEngine(BaseEngine):
         except BaseException:
             baseline_rtt = 0.5
 
-        threshold = baseline_rtt + 2.0
+        threshold = baseline_rtt + 1.0
 
         url_sleep = build_attack_url(url, param, payload_sleep, parsed_query)
         url_no_sleep = build_attack_url(url, param, payload_no_sleep, parsed_query)
@@ -973,7 +1021,7 @@ class SQLiEngine(BaseEngine):
                     if self._has_sql_error(_p_text):
                         _any_signal = True
                         break
-                    if _is_time_probe and _probe_elapsed >= 4.0:
+                    if _is_time_probe and _probe_elapsed >= 1.5:
                         _any_signal = True  # 疑似时间盲注，继续全量检测
                         break
                     # 短响应差异天然被压缩（如 "1 row: id=1" vs "2 rows returned"
@@ -1092,8 +1140,13 @@ class SQLiEngine(BaseEngine):
                     )
                     continue
 
-                if is_time_based and elapsed > 4.0:
+                if is_time_based and elapsed >= 2.0:
                     reverse_payload = self._generate_reverse_payload(payload)
+                    # 逆命题仍含 sleep 关键字（SLEEP(0) 在部分靶场仍触发延时）→ 合成恒真对照
+                    if reverse_payload and 'sleep' in reverse_payload.lower():
+                        _synth = re.sub(r'SLEEP\(\d+\)', '1=1', reverse_payload, flags=re.I)
+                        if _synth != reverse_payload:
+                            reverse_payload = _synth
                     if reverse_payload and reverse_payload != payload:
                         is_real_time_based, diff = await self._verify_time_based(
                             url, param, payload, reverse_payload, parsed_query, session
@@ -1136,6 +1189,28 @@ class SQLiEngine(BaseEngine):
                             url, param, payload, reverse_payload,
                             parsed_query, session, normal_resp
                         )
+                        if not ab_result.get('verified', False):
+                            # 线2.1：无特征布尔对 A/B 常只差一个数字（"2 rows" vs "0 rows"），
+                            # 字符级 difflib 阈值(0.15)不敏感 → 补充数字骨架检测。
+                            # 用 async_get 绕过 safe_request 缓存取逆命题新鲜响应；
+                            # 对比前剥离双方 payload 反射，防止回显型目标误判。
+                            try:
+                                _rev_url = build_attack_url(url, param, reverse_payload, parsed_query)
+                                _rr = await async_get(_rev_url, session=session, timeout=timeout, no_retry=True)
+                                if (isinstance(_rr, tuple) and len(_rr) >= 2
+                                        and _rr[0] not in (0, 429) and _rr[0] < 500
+                                        and self._digits_only_diff(
+                                            self.strip_payload_reflection(attack_text, payload),
+                                            self.strip_payload_reflection(_rr[1] or "", reverse_payload),
+                                        )):
+                                    ab_result = {'verified': True, 'diff_ratio': 0.3,
+                                                 'evidence': 'A/B 仅数字令牌差异'}
+                                    self.log_debug(
+                                        f"参数 {param} A/B 数字骨架一致且数字令牌不同，"
+                                        f"判定无特征布尔差异成立"
+                                    )
+                            except BaseException:
+                                logger.debug("suppressed exception (engine audit)")
                         if ab_result.get('verified', False):
                             # ⑧ 第二层补充：A/B逆命题通过后，重放攻击请求做稳定性复核，
                             #    防止一次性抖动通过A/B（SPA/CDN随机差异）
@@ -1161,6 +1236,29 @@ class SQLiEngine(BaseEngine):
                                         f"判定为响应抖动，按⑧跳过"
                                     )
                                     continue
+                            # 线2.1 数字骨架 A/B 已实证（骨架一致 + 数字令牌集不同，且已剥离
+                            #    payload 反射对比）：盲注差异由 A/B 本身证明，SPA/回显噪声已被
+                            #    "骨架一致"约束排除，反射验证门在此不再适用（否则 WAF 过滤下
+                            #    不回显的纯布尔盲注靶场被降级→C10 误杀）。直接报确认布尔盲注。
+                            if ab_result.get('evidence') == 'A/B 仅数字令牌差异':
+                                return {
+                                    'url': url,
+                                    'parameter': param,
+                                    'payload': payload,
+                                    'type': 'SQL注入-布尔盲注(数字骨架A/B)',
+                                    'severity': 'High',
+                                    'ai_verdict': '高',
+                                    'confidence': 'high',
+                                    'evidence': 'A/B 数字骨架一致且数字令牌集不同（剥离 payload 反射后有差异），'
+                                                '判定无特征布尔差异成立',
+                                    'diff_ratio': 0.3,
+                                    'elapsed': elapsed,
+                                    'db_type': db_type,
+                                    'method': 'boolean_based',
+                                    'ab_verified': True,
+                                    'reflection_verified': False,
+                                    'digit_skeleton_verified': True,
+                                }
                             # ⑥ 反射证据验证：注入唯一12位token，剥离基线后确认反射，
                             #    有反射才可报 High；无反射一律降级（抗SPA噪声/参数化误报）
                             reflected, reflect_evidence = await self.reflective_validator.validate_reflection(
@@ -2496,7 +2594,11 @@ class SSTIEngine(BaseEngine):
                 resp = await async_get(attack_url, session=session, timeout=settings.timeout, no_retry=True)
                 status, text, _ = await _parse_response(resp)
 
-                if expected in text:
+                # 反射失真防护（2026-09-09）：模板把 payload 原样回显时，响应必然
+                # 含 payload 全文与其中任意外键子串（如 'json'/'uid='），不能当作
+                # 命令执行成功。必须排除"payload 原文被回显"的候选，避免 L3 假实锤
+                # 短路真实的 L1 算术确认（真扫描实证：local_lab /ssti 被误判 RCE）。
+                if expected in text and payload not in text:
                     return {
                         'url': url,
                         'parameter': param,

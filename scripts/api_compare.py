@@ -91,6 +91,9 @@ import requests  # type: ignore
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
+_SRC = os.path.join(PROJECT_ROOT, "src")
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
 
 # ---- user-supplied targets; edit before running ------------------------
 DEFAULT_CASES: list[dict[str, Any]] = [
@@ -449,7 +452,7 @@ def run_compare(cases: list[dict] | None = None) -> int:
           f"{failed_n} FAILED / {mismatches_any} DIFFS")
     # Also write a machine-readable JSON artifact into _runtime_cache
     try:
-        from core.settings import PROJECT_CACHE_DIR  # noqa: F401
+        from vulnclaw.core.settings import PROJECT_CACHE_DIR  # noqa: F401
         report_dir = os.path.join(str(PROJECT_CACHE_DIR), "reports")
     except Exception:
         report_dir = os.path.join(PROJECT_ROOT, "_runtime_cache", "reports")

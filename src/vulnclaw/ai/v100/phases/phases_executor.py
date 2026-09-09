@@ -21,13 +21,59 @@ from vulnclaw.engines.http_engines import CachePoisonEngine
 from vulnclaw.engines.base import annotate_chain_info
 from vulnclaw.deepsec.sqlmap_wrapper import SQLMapWrapper
 from vulnclaw.ai.v100.smart_queue import is_protected_task
+from vulnclaw.core.http_client import url_in_scope, parse_scope
+
+# ============================================================
+# D 方案: 引擎目标域硬约束 + 粘滞剔除簿记（2026-09-08）
+# ============================================================
+def _engine_task_target_allowed(self, task) -> tuple:
+    """D2: 引擎任务目标域硬约束（fail-closed）。
+
+    目标必须满足以下任一条件才放行：
+      - 命中 ALLOWED_SCOPE 白名单（URL 级）；
+      - 属于主扫描目标的域或子域（主域判定即使 ALLOWED_SCOPE 未配置也生效）。
+    其余一律拒绝且不发起任何请求。
+    """
+    try:
+        from urllib.parse import urlparse as _up_d
+        target = str(task.get("target", "") or "")
+        if not target:
+            return True, "无目标"
+        host = (_up_d(target).hostname or "").lower()
+        if not host:
+            return True, "目标无 host（相对路径，交由请求层判定）"
+        main = (_up_d(str(getattr(self, "target", "") or "")).hostname or "").lower()
+        if main and (host == main or host.endswith("." + main)):
+            return True, "主域/子域"
+        entries = parse_scope()
+        if entries and url_in_scope(target, entries):
+            return True, "allowed_scope 白名单"
+        return False, f"host={host} 不在授权域(main={main or '未知'} scope={entries or '未配置'})"
+    except Exception as _e:  # noqa: BLE001
+        return False, f"域校验异常: {_e}"
+
+
+def _sticky_mark_failed(self, task) -> None:
+    """D1.2: 记录 (engine,target,param) 失败次数，达阈值写墓碑黑名单。"""
+    if not hasattr(self, "_sticky_fail_counter"):
+        self._sticky_fail_counter = {}
+        self._sticky_blacklist = set()
+    key = (str(task.get("engine", "")), str(task.get("target", "")), str(task.get("param", "")))
+    n = self._sticky_fail_counter.get(key, 0) + 1
+    self._sticky_fail_counter[key] = n
+    threshold = int(getattr(settings, "sticky_fail_threshold", 2))
+    if n >= threshold:
+        self._sticky_blacklist.add(key)
+        logger.warning(
+            f"   [D1] 粘滞剔除: {key[0]}/{key[2]} 累计失败 {n} 次，后续同键任务跳过"
+        )
 async def _run_business_logic_scan(self):
     try:
         logger.info("🧬 [BusinessLogic] 全局扫描...")
         engine = BusinessLogicEngine()
         results = await engine.scan(self.target, self.session)
         for r in results:
-            if not any(f.get('url') == r.get('url') and f.get('type') == r.get('type') for f in self.findings):
+            if (str(r.get('url', '')), str(r.get('type', ''))) not in self._seen_ut:
                 self._add_finding(r)
                 self._business_findings += 1
                 logger.info(f"   📌 业务逻辑: {r.get('type')}")
@@ -39,7 +85,7 @@ async def _run_api_version_scan(self):
         engine = APIVersionDiffEngine()
         results = await engine.scan(self.target, self.session)
         for r in results:
-            if not any(f.get('url') == r.get('url') and f.get('type') == r.get('type') for f in self.findings):
+            if (str(r.get('url', '')), str(r.get('type', ''))) not in self._seen_ut:
                 self._add_finding(r)
                 self._api_version_findings += 1
                 logger.info(f"   📌 API版本: {r.get('type')}")
@@ -51,7 +97,7 @@ async def _run_smuggling_scan(self):
         engine = RequestSmugglingEngine()
         results = await engine.scan(self.target, self.session)
         for r in results:
-            if not any(f.get('url') == r.get('url') and f.get('type') == r.get('type') for f in self.findings):
+            if (str(r.get('url', '')), str(r.get('type', ''))) not in self._seen_ut:
                 self._add_finding(r)
                 self._smuggling_findings += 1
                 logger.info(f"   🩹 请求走私: {r.get('type')}")
@@ -63,7 +109,7 @@ async def _run_http2_ws_scan(self):
         engine = HTTP2WebSocketEngine()
         results = await engine.scan(self.target, self.session)
         for r in results:
-            if not any(f.get('url') == r.get('url') and f.get('type') == r.get('type') for f in self.findings):
+            if (str(r.get('url', '')), str(r.get('type', ''))) not in self._seen_ut:
                 self._add_finding(r)
                 self._http2_ws_findings += 1
                 logger.info(f"   🔌 HTTP2/WS: {r.get('type')}")
@@ -75,7 +121,7 @@ async def _run_cache_poison_scan(self):
         engine = CachePoisonEngine()
         results = await engine.scan(self.target, self.session)
         for r in results:
-            if not any(f.get('url') == r.get('url') and f.get('type') == r.get('type') for f in self.findings):
+            if (str(r.get('url', '')), str(r.get('type', ''))) not in self._seen_ut:
                 self._add_finding(r)
                 self._cache_poison_findings += 1
                 logger.info(f"   🔗 缓存投毒: {r.get('type')}")
@@ -181,14 +227,35 @@ async def _execute_with_limiting(self):
         self.rate_limiter = get_rate_limiter(getattr(self, 'initial_qps', 3))
         logger.warning("⚠️ [_execute_with_limiting] 自动创建 rate_limiter（兜底）")
     logger.info("⚔️ [攻击执行] 开始执行（多消费者并发模式）...")
-    MAX_CONCURRENT = int(getattr(settings, "orchestrator_max_concurrent", 10))
+    if getattr(settings, "engine_target_scope_enforce", True):
+        from urllib.parse import urlparse as _up_d
+        _mh = str(getattr(self, "target", "") or "")
+        _main_host = (_up_d(_mh).hostname or "?").lower() if _mh else "?"
+        _scope_entries = parse_scope()
+        logger.info(
+            f"   [D2] 引擎目标域硬约束 ON: 主域={_main_host} "
+            f"scope={_scope_entries or '未配置(退化为仅主域)'} "
+            f"粘滞剔除阈值={getattr(settings, 'sticky_fail_threshold', 2)}"
+        )
+    # 消费点3：引擎任务并发优先读目标请求能力探测结果（未探测/失败 → None → 原静态默认值）
+    from vulnclaw.core.target_capacity_probe import get_safe_concurrency
+    MAX_CONCURRENT = int(get_safe_concurrency() or getattr(settings, "orchestrator_max_concurrent", 10))
     # 第3次修复：attack 阶段预算硬顶（settings.attack_node_budget，P0 已收口为正式字段，
     # 默认 500s 且须小于外层 phase_timeout_scan_s=600）。LLM QPS 降级(1.5~2.1)时任务
     # 墙钟时间不可控，用 deadline 保证 attack 节点耗时上限。超预算任务判败出队
     # （SP21.2：动态补测任务 protected 保留宽限窗口），已产出的 finding 已进 StreamVerify 队列。
-    attack_budget = float(getattr(settings, "attack_node_budget", 130.0))
+    # 超时工作量自适应（2026-09-06）：与 scan 外层预算同源(compute_adaptive_budget)，
+    # 保证 内层 < 外层。封顶用外层动态预算-余量（外层已在 orchestrator taskgen 后重算）。
+    from vulnclaw.core.target_capacity_probe import get_capacity, compute_adaptive_budget
+    _worker = MAX_CONCURRENT  # 已取 get_safe_concurrency() or 静态默认值
+    _cap = get_capacity()
+    _avg_rt_ms = (_cap.avg_rt_ms if (_cap and _cap.probed) else 200.0)
+    _pending = self.task_queue.pending_count() if hasattr(self.task_queue, "pending_count") else 0
+    _outer = float((getattr(self, "_phase_budgets", {}) or {}).get(
+        "scan", getattr(settings, "phase_timeout_scan_s", 600)))
+    attack_budget = min(compute_adaptive_budget(_pending, _worker, _avg_rt_ms), _outer - 80)
     self._attack_deadline_ts = time.time() + attack_budget
-    logger.info(f"   [deadline] attack 阶段预算: {attack_budget:.0f}s")
+    logger.info(f"   [deadline] attack 阶段预算(自适应): {attack_budget:.0f}s | 待执行={_pending} worker={_worker} rt={_avg_rt_ms:.0f}ms 外层={_outer:.0f}s")
     # 调度信号量：worker 并发跑 _run_one_task，但真正调用任务体再限流一层。
     # 注：该 semaphore 与 _run_one_task 内部 rate_limiter/并发模型叠加后，
     # 瞬时出请求上限为 MAX_CONCURRENT * 每个引擎平均并发子请求（通常<=2）。
@@ -212,6 +279,11 @@ async def _execute_with_limiting(self):
                 await asyncio.sleep(0.05)
                 continue
             task_id, task = full
+            _pick_ts = getattr(self, "_task_pick_ts", None)
+            if _pick_ts is None:
+                _pick_ts = dict()
+                self._task_pick_ts = _pick_ts
+            _pick_ts.setdefault(task_id, time.time())
             # sentinel：让 worker 收到结束信号
             if isinstance(task, dict) and task.get("__done_sentinel__") is True:
                 logger.info(f"   🏁 [w{worker_id}] 收到 sentinel，退出")
@@ -263,17 +335,40 @@ async def _execute_with_limiting(self):
         目的：
           - 防止"还有任务在执行，执行完会 retry 入队"时过早发 sentinel；
           - 连续 2 次（间隔 200ms）drained → 可安全认为不会再有新任务进来了。
+        调度审计A（自愈）：is_drained 异常有界重试（连续5次失败即放弃等待，
+        直接广播，避免 guard 空转）；finally 兜底广播 sentinel——哪怕中途崩溃，
+        worker 也能收到 sentinel 正常退出，杜绝攻击阶段永久挂起。
         """
-        stable = 0
-        while True:
-            drained = await self.task_queue.is_drained()
-            stable = (stable + 1) if drained else 0
-            if stable >= 2:
-                break
-            await asyncio.sleep(0.2)
-        # 给所有 worker 一人一个 sentinel（priority=0 最高优先级会立刻被弹出）
-        await self.task_queue.mark_production_done(num_consumers=MAX_CONCURRENT)
-        queue_ended.set()
+        try:
+            stable = 0
+            fail = 0
+            _guard_start = time.monotonic()
+            # 审计I3: 封板不再是"连续 2 次≈400ms"就广播——动态补测任务(param_mining
+            # /live:*)延迟入队时 400ms 空窗会被误判为空 → 补测任务入队后无人消费。
+            # 双条件：连续 2 次 drained 且 总观察时长 ≥ 1.0s；仍由 fail>=5 有界兜底。
+            _MinObserve = 1.0
+            while True:
+                try:
+                    drained = await self.task_queue.is_drained()
+                    fail = 0
+                except Exception as _qd:
+                    fail += 1
+                    if fail >= 5:
+                        break
+                    await asyncio.sleep(0.2)
+                    continue
+                stable = (stable + 1) if drained else 0
+                if stable >= 2 and time.monotonic() - _guard_start >= _MinObserve:
+                    break
+                await asyncio.sleep(0.2)
+        finally:
+            if not queue_ended.is_set():
+                try:
+                    # 给所有 worker 一人一个 sentinel（priority=0 最高优先级会立刻被弹出）
+                    await self.task_queue.mark_production_done(num_consumers=MAX_CONCURRENT)
+                except Exception as _mp:
+                    logger.warning(f"⛔ [sentinel] 兑底广播 sentinel 失败: {_mp}")
+                queue_ended.set()
     # ============================================================
     # 正式启动：N 个 worker + 1 个 sentinel 守望者
     # ============================================================
@@ -288,15 +383,84 @@ async def _execute_with_limiting(self):
             try:
                 q = self.task_queue
                 alive = sum(1 for w in workers if not w.done())
-                logger.info(
+                # 调度审计A（兜底）：guard 异常退出且未广播，而队列已 drained →
+                # 强发 sentinel，防止 worker 们永久空转、attack 阶段永不结束。
+                if not queue_ended.is_set() and guard.done() and await q.is_drained():
+                    await self.task_queue.mark_production_done(num_consumers=MAX_CONCURRENT)
+                    queue_ended.set()
+                    logger.warning(
+                        "🚨 [watchdog][A修复] sentinel 守望者异常退出未广播，已兑底强制广播"
+                    )
+                _pick_ts = getattr(self, "_task_pick_ts", {}) or {}
+                _now = time.time()
+                _stale = sorted(
+                    ((_tid, _now - _ts) for _tid, _ts in _pick_ts.items() if _now - _ts > 300),
+                    key=lambda x: -x[1],
+                )
+                info = (
                     f"   👁 [watchdog] queue={len(q._queue)} pending={len(q._pending_tasks)} "
                     f"drained={await q.is_drained()} workers_alive={alive} "
                     f"workers={dict(getattr(self, '_dbg_workers', {}))}"
                 )
+                if _stale:
+                    info += f" stale={_stale[0][1]:.0f}s:{_stale[0][0]}"
+                    if _stale[0][1] > 600:
+                        logger.warning(
+                            f"   🚨 [D1.3] 任务滞留超过 600s: {_stale[0][0]}（回查其 engine/param）"
+                        )
+                    # 调度审计K（自愈）：滞留任务强制判失败并出队。
+                    # 否则 pending 恒非空 → is_drained() 永远 False → sentinel 不广播
+                    # → 所有 worker 永久空转 get_next，attack 阶段挂死（真扫实证：
+                    # task_63 滞留 300s 即导致 queue=0/pending=2/drained=False）。
+                    # 取舍：宁可把卡死任务判失败（后续可补测），也不让整阶段挂起。
+                    _reaped = 0
+                    for _tid, _age in _stale:
+                        if _age <= 300:
+                            continue
+                        try:
+                            await self.task_queue.complete_task(_tid, success=False)
+                            _reaped += 1
+                        except Exception:
+                            logger.debug("suppressed exception (core audit)")
+                        try:
+                            self._task_pick_ts.pop(_tid, None)
+                        except Exception:
+                            logger.debug("suppressed exception (core audit)")
+                    if _reaped:
+                        logger.warning(
+                            f"   🧹 [D1.3] 强制回收 {_reaped} 个滞留任务(>300s)，"
+                            f"解除 drained 阻塞"
+                        )
+                logger.info(info)
             except Exception as e:
                 logger.warning(f"   👁 [watchdog] 异常: {e}")
 
     watchdog = asyncio.create_task(_watchdog())
+
+    async def _orphan_spy():
+        """D1.1: 孤儿协程诊断——运行中且不属于 worker/guard/spy 的任务打 WARNING 定位。"""
+        while True:
+            await asyncio.sleep(15)
+            try:
+                managed = {id(t) for t in workers} | {id(guard), id(enforcer), id(watchdog)}
+                leaks = []
+                for t in asyncio.all_tasks():
+                    if t is asyncio.current_task() or t.done() or id(t) in managed:
+                        continue
+                    try:
+                        f = t.get_coro().cr_frame
+                        loc = f"{f.f_code.co_filename.split(chr(92))[-1]}:{f.f_lineno}" if f else "?"
+                    except Exception:  # noqa: BLE001
+                        loc = "?"
+                    leaks.append(loc)
+                if leaks:
+                    logger.warning(
+                        f"   👁 [D1.1] 孤儿协程泄漏 {len(leaks)} 个（持续存在则需排查）: {leaks[:5]}"
+                    )
+            except Exception as _s:  # noqa: BLE001
+                logger.debug(f"   👁 [D1.1] spy 异常: {_s}")
+
+    spy = asyncio.create_task(_orphan_spy())
 
     async def _deadline_enforcer():
         """预算耗尽时清空未执行任务并通知 worker 收尾。
@@ -314,9 +478,31 @@ async def _execute_with_limiting(self):
             protected = await self.task_queue.protected_pending_count()
             if protected:
                 logger.warning(
-                    f"   [deadline] 保留 {protected} 个动态补测任务, 宽限 {grace:.0f}s"
+                    f"   [deadline] 保留 {protected} 个动态补测任务, 宽限 {grace:.0f}s 内执行"
                 )
-                await asyncio.sleep(grace)
+                # 审计E: 宽限窗口不再是纯等待——主动消费并执行受保护补测任务，
+                # 兑现 SP21.2 宽限意图（原实现：workers 已退出，补测任务无人消费，
+                # 干等 45s 后被 fail_all_pending(protect=False) 直接判败=静默丢弃）
+                _g_until = time.time() + grace
+                while time.time() < _g_until:
+                    _full = await self.task_queue.get_next_full()
+                    if _full is None:
+                        await asyncio.sleep(0.2)
+                        continue
+                    _g_id, _g_task = _full
+                    if isinstance(_g_task, dict) and _g_task.get("__done_sentinel__") is True:
+                        continue
+                    self._dbg_workers[9999] = f"grace:{_g_id}"
+                    try:
+                        await self._run_one_task(_g_task, _g_id, execute_semaphore)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as _ge:
+                        logger.warning(f"   [grace] 补测任务异常 {_g_id}: {_ge}")
+                        try:
+                            await self.task_queue.complete_task(_g_id, success=False)
+                        except Exception:
+                            logger.debug("suppressed exception (core audit)")
                 n += await self.task_queue.fail_all_pending(
                     reason=f"宽限 {grace:.0f}s 结束", protect=False
                 )
@@ -335,15 +521,16 @@ async def _execute_with_limiting(self):
         await guard
         await asyncio.gather(*workers, return_exceptions=True)
     except Exception:
-        # 浠讳綍寮傚父锛氬厛鍏ㄩ噺 cancel锛屽啀鎶?
-        for t in workers + [guard, watchdog]:
+        # 任意异常：先全量 cancel，再上报
+        for t in workers + [guard, watchdog, spy]:
             if not t.done():
                 t.cancel()
-        await asyncio.gather(*workers, guard, watchdog, return_exceptions=True)
+        await asyncio.gather(*workers, guard, watchdog, spy, return_exceptions=True)
         raise
     finally:
         watchdog.cancel()
         enforcer.cancel()
+        spy.cancel()
     logger.info(f"   Execution complete: {processed} tasks")
 async def _run_one_task(self, task: Dict, task_id: str, semaphore: asyncio.Semaphore):
     """单任务完整生命周期（模型选择 → 限流 → 执行），整体受超时约束。
@@ -354,6 +541,28 @@ async def _run_one_task(self, task: Dict, task_id: str, semaphore: asyncio.Semap
     2. 超时上限取 min(240s, attack 剩余预算)，保证 attack 节点墙钟时间可控。
     3. 超时/异常一律判败出队，不再 requeue（240s x 3 重试 = 960s 是耗时失控主因）。
     """
+    # D2: 引擎目标域硬约束（fail-closed）——外域任务在被消费前剔除，不发任何请求。
+    if getattr(settings, "engine_target_scope_enforce", True):
+        allowed, reason = _engine_task_target_allowed(self, task)
+        if not allowed:
+            logger.warning(
+                f"   [D2] 越界目标剔除: {task.get('engine', '?')}/"
+                f"{task.get('param', '')} target={str(task.get('target', ''))[:120]} ({reason})"
+            )
+            if hasattr(self.task_queue, 'complete_task'):
+                await self.task_queue.complete_task(task_id, success=False)
+            return None
+# SP27: 指令消费——排除项过滤 + 重点(target)增强（--instruction 的 Focus/Out of scope）
+    _ins_ctx = getattr(settings, "instruction_context", None)
+    if _ins_ctx:
+        _tgt = str(task.get("target", ""))
+        if _ins_ctx.exclude and any(_k in _tgt for _k in _ins_ctx.exclude):
+            logger.info(f"   ⏭️ [SP27] 指令排除命中，跳过任务: {_tgt}")
+            if hasattr(self.task_queue, 'complete_task'):
+                await self.task_queue.complete_task(task_id, success=True)
+            return None
+        if _ins_ctx.focus and any(_k in _tgt for _k in _ins_ctx.focus):
+            task["payload_limit"] = max(int(task.get("payload_limit", 5)), 12)
     deadline_ts = getattr(self, "_attack_deadline_ts", None)
     _is_dynamic = is_protected_task(task)
     if deadline_ts is not None:
@@ -384,24 +593,30 @@ async def _run_one_task(self, task: Dict, task_id: str, semaphore: asyncio.Semap
         result = await asyncio.wait_for(_lifecycle(), timeout=timeout)
         if hasattr(self.task_queue, 'complete_task'):
             await self.task_queue.complete_task(task_id, success=True)
+        self._task_pick_ts.pop(task_id, None)
         return result
     except asyncio.CancelledError:
         logger.debug(f"   [cancel] 任务被取消: {task_id}")
         if hasattr(self.task_queue, 'complete_task'):
             await self.task_queue.complete_task(task_id, success=False)
+        self._task_pick_ts.pop(task_id, None)
         raise
     except asyncio.TimeoutError:
+        self._sticky_mark_failed(task)
         logger.warning(
             f"   [timeout] 任务执行超时 ({timeout:.0f}s), 判失败出队(不重试): "
             f"{task.get('engine', 'unknown')}/{task.get('param', '')}"
         )
         if hasattr(self.task_queue, 'complete_task'):
             await self.task_queue.complete_task(task_id, success=False)
+        self._task_pick_ts.pop(task_id, None)
         return None
     except Exception as e:
+        self._sticky_mark_failed(task)
         logger.warning(f"   [error] 任务异常: {task.get('engine', 'unknown')}/{task.get('param', '')} - {e}")
         if hasattr(self.task_queue, 'complete_task'):
             await self.task_queue.complete_task(task_id, success=False)
+        self._task_pick_ts.pop(task_id, None)
         return None
 async def _execute_task(self, task: Dict) -> Optional[Dict]:
     task_type = task.get("type", "engine_check")
@@ -480,7 +695,7 @@ async def _execute_batch(self, task: Dict) -> Optional[List[Dict]]:
                 "bundle_engine": sub.get("engine", "batch"),
             })
     for f in confirmed:
-        if not any(x.get('url') == f.get('url') and x.get('type') == f.get('type') for x in self.findings):
+        if (str(f.get('url', '')), str(f.get('type', ''))) not in self._seen_ut:
             self._add_finding(f)
             logger.info(f"   📦 [Batch] 确认: {f.get('type')} @ {f.get('parameter')}")
     return confirmed or None
@@ -980,6 +1195,12 @@ async def _run_multi_agent_dive(self):
                 )
                 for t in pending:
                     t.cancel()
+                # 审计P（孤儿协程根治）：cancel() 只是"发起取消请求"，协程要运行到
+                # 下一个 await 点才真正结束、finally 才会执行。不 await 的话任务会
+                # 停在 cancelling 状态持续堆积——真扫实证 D1.1 报的 217 个孤儿协程
+                # 正来源于此（每个参数的竞争协作都留下一批未回收 task）。
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
                 reports = []
                 for t in done:
                     try:
@@ -1062,7 +1283,7 @@ async def _execute_cve_scan(self, task: Dict) -> Optional[Dict]:
             if item.get("ai_verdict") != "真实漏洞":
                 continue
             ftype = f"CVE: {item.get('template') or item.get('info') or '未知'}"
-            if any(f.get('type') == ftype and f.get('url') == item.get('url', target) for f in self.findings):
+            if (str(item.get('url', target)), str(ftype)) in self._seen_ut:
                 continue
             finding = {
                 "type": ftype,
@@ -1105,7 +1326,9 @@ def _global_scan_endpoints(orch) -> List[str]:
     out: List[str] = []
     for key in ("js_endpoints", "apis", "found_dirs", "crawled_endpoints", "ws_endpoints"):
         for u in brief.get(key, []) or []:
-            if not isinstance(u, str):
+            if isinstance(u, dict):
+                u = u.get("url") or ""
+            if not isinstance(u, str) or not u:
                 continue
             if u.startswith("http") or u.startswith("ws"):
                 out.append(u.split("?")[0].rstrip("/"))
@@ -1143,7 +1366,7 @@ async def _execute_global_scan(self, task: Dict) -> Optional[Dict]:
             results = await engine.scan(target, self.session, endpoints=_global_scan_endpoints(self))
         if results:
             for r in results:
-                if not any(f.get('url') == r.get('url') and f.get('type') == r.get('type') for f in self.findings):
+                if (str(r.get('url', '')), str(r.get('type', ''))) not in self._seen_ut:
                     # S2.1: 全局扫描路径同样标注链信息（端到端实测：多数 finding 来自该路径）
                     if isinstance(r, dict):
                         try:
@@ -1240,11 +1463,23 @@ async def _maybe_sqlmap_confirm(result: Dict, target: str, param: str) -> None:
 async def _execute_engine_check(self, task: Dict) -> Optional[Dict]:
     engine_name = task.get("engine")
     target = task.get("target", self.target)
+    # K.3：签名前置——任务携带 SignerPool 生成的合法签名 URL 时覆盖裸 target
+    # （signer query 由 build_attack_url 合并进每次载荷请求，引擎零改动）
+    if task.get("signed_url"):
+        target = task["signed_url"]
     param = task.get("param")
     payload_limit = task.get("payload_limit", 5)
     if not engine_name or not param:
         return None
     self._processed_params.add(param)
+    # D1.2: 粘滞墓碑——已被剔除的粘滞任务不再占 worker
+    if int(getattr(settings, "sticky_fail_threshold", 2)) > 0:
+        if not hasattr(self, "_sticky_blacklist"):
+            self._sticky_blacklist = set()
+        _skey = (engine_name, target, str(param or ""))
+        if _skey in self._sticky_blacklist:
+            logger.info(f"   ⏭️ [D1] 粘滞剔除命中，跳过: {engine_name}/{param}")
+            return None
     # E4: 早停——该参数已确认同类高危/严重漏洞才跳过（按漏洞大类生效），
     # 避免 XSS 确认后把同参数的 SQLi/SSTI/LFI/CMDi 等正交大类一并误杀（漏报根因）。
     if getattr(settings, "engine_early_stop_on_confirmed", True) and (target, param) in self._confirmed_params:
@@ -1292,6 +1527,9 @@ async def _execute_engine_check(self, task: Dict) -> Optional[Dict]:
         kwargs = {}
         if engine_name in ("cmdi", "ssrf") and self._collaborator_domain:
             kwargs["interactsh_domain"] = self._collaborator_domain
+        if engine_name == "state_chain":
+            # 二次/存储型触发需要已知消费端点列表；recon 未发现端点时引擎自行跳过该分支
+            kwargs["endpoints"] = _global_scan_endpoints(self)
         if getattr(settings, "incremental_scan", False) or getattr(self, "_resume_skip_done", False):
             self._incremental_scanned.add((engine_name, target, param))
             if getattr(self, "_checkpoint", None) is not None:
@@ -1385,4 +1623,4 @@ async def _execute_engine_check(self, task: Dict) -> Optional[Dict]:
         logger.debug(f"   ❌ 执行失败: {e}")
         self._record_engine_metric(engine_name, time.monotonic() - _t0, hit=False, error=True)
         return None
-__all__ = ['_run_business_logic_scan', '_run_api_version_scan', '_run_smuggling_scan', '_run_http2_ws_scan', '_run_cache_poison_scan', '_run_burp_scan', '_execute_with_limiting', '_run_one_task', '_execute_task', '_safe_parse_bundle_json', '_execute_engine_bundle', '_execute_global_scan', '_execute_engine_check', '_run_react_deep_dive', '_collect_react_candidates', '_merge_react_findings', '_run_chain_router', '_chain_ssrf', '_chain_upload', '_generate_clues_for_dive', '_persist_scan_memory', '_run_multi_agent_dive', '_resolve_agent_conflicts']
+__all__ = ['_run_business_logic_scan', '_run_api_version_scan', '_run_smuggling_scan', '_run_http2_ws_scan', '_run_cache_poison_scan', '_run_burp_scan', '_execute_with_limiting', '_run_one_task', '_execute_task', '_safe_parse_bundle_json', '_execute_engine_bundle', '_execute_global_scan', '_execute_engine_check', '_run_react_deep_dive', '_collect_react_candidates', '_merge_react_findings', '_run_chain_router', '_chain_ssrf', '_chain_upload', '_generate_clues_for_dive', '_persist_scan_memory', '_run_multi_agent_dive', '_resolve_agent_conflicts', '_sticky_mark_failed']

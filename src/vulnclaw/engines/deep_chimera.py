@@ -115,6 +115,8 @@ class DeepChimeraEngine(BaseEngine):
         residual_diff_seen = False
         normal_has_marker = False
         evidence_parts: List[str] = []
+        # 可观测性：逐信号溯源（family/命中类型/marker 或差异比率），聚合判定后供审计回溯
+        signal_trace = []
         max_len_delta_ratio = 0.0  # 剥壳后与正常响应的长度相对差（滤纯反射编码残差）
         nlen = max(1, len(normal_text))
 
@@ -152,6 +154,9 @@ class DeepChimeraEngine(BaseEngine):
                 if family not in strong_families:
                     strong_families.append(family)
                     evidence_parts.append(f"强语义回显重构: {marker}")
+                    signal_trace.append(
+                        {"family": family, "kind": "strong_echo", "marker": marker}
+                    )
                 residual_diff_seen = True
             elif ratio >= self.AGG_DIFF_THRESHOLD:
                 residual_diff_seen = True
@@ -173,6 +178,13 @@ class DeepChimeraEngine(BaseEngine):
                     if ok2 and ratio2 >= self.AGG_DIFF_THRESHOLD:
                         if family not in diff_families:
                             diff_families.append(family)
+                            signal_trace.append(
+                                {
+                                    "family": family,
+                                    "kind": "diff",
+                                    "diff_ratio": round(ratio2, 3),
+                                }
+                            )
                 except Exception as exc:  # noqa: BLE001 - 复核异常不影响其他族
                     logger.debug(f"[{self.name}] 二次复核失败: {family}: {exc}")
             # else: 无强回显且弱信号不达标 —— 该族无信号，跳过
@@ -191,6 +203,7 @@ class DeepChimeraEngine(BaseEngine):
             normal_has_marker=normal_has_marker,
             max_len_delta_ratio=max_len_delta_ratio,
             evidence_parts=evidence_parts,
+            signal_trace=signal_trace,
         )
 
         violations = self._sieve_violations(candidate, candidate.get("evidence", ""))
@@ -282,7 +295,9 @@ class DeepChimeraEngine(BaseEngine):
         normal_has_marker: bool,
         max_len_delta_ratio: float,
         evidence_parts: List[str],
+        signal_trace: List[Dict] = None,
     ) -> Dict:
+        signal_trace = signal_trace or []
         strong_count = len(strong_families)
         total_signal = len(set(strong_families) | set(diff_families))
 
@@ -307,6 +322,17 @@ class DeepChimeraEngine(BaseEngine):
         )
         if evidence_parts:
             ev += "; ".join(evidence_parts)
+        # 可观测性：汇聚成可读溯源行，保证下游即使裁剪结构化字段仍可审计
+        if signal_trace:
+            trace_row = "; ".join(
+                (
+                    f"{t['family']}(强回显:{t['marker']})"
+                    if t.get("kind") == "strong_echo"
+                    else f"{t['family']}(差异:{t.get('diff_ratio')})"
+                )
+                for t in signal_trace
+            )
+            ev += f"; 信号溯源: {trace_row}"
 
         finding: Dict = {
             "type": "deep_chimera_encoded_injection",
@@ -336,6 +362,7 @@ class DeepChimeraEngine(BaseEngine):
             "_dc_normal_has_marker": normal_has_marker,
             "_dc_len_delta_ratio": float(max_len_delta_ratio),
             "_dc_severity": severity,
+            "_dc_signal_trace": list(signal_trace),
         }
         return finding
 

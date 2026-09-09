@@ -42,7 +42,13 @@ def build_curl_command(url: str, method: str = "GET", data=None, headers: Option
     return " ".join(parts)
 
 
-def enrich_finding(finding: Dict, method: str = "GET", headers: Optional[Dict] = None) -> Dict:
+def enrich_finding(
+    finding: Dict,
+    method: str = "GET",
+    headers: Optional[Dict] = None,
+    normal_resp: Optional[tuple] = None,  # (status, text, headers) 现响应
+    attack_resp: Optional[tuple] = None,  # (status, text, headers) 载荷响应, 非空才回填证据
+) -> Dict:
     """P2-5: 为 finding 补充 reproduction_steps 与 curl_command（报告 PoC 复现）。"""
     f = dict(finding)
     curl_cmd = f.get("curl_command") or build_curl_command(
@@ -56,6 +62,31 @@ def enrich_finding(finding: Dict, method: str = "GET", headers: Optional[Dict] =
             steps.append(f"2. 在参数 {param} 注入恶意载荷，观察响应是否符合漏洞特征（见上方证据）。")
         steps.append("3. 对比正常/恶意请求的响应差异，确认漏洞可复现。")
         f["reproduction_steps"] = "\n".join(steps)
+    # A 方案: 引擎侧证据回填（可选参数攻击响应非空时）——给 AI 验证大脑喂响应侧客观证据
+    if attack_resp is not None and len(attack_resp) >= 2 and attack_resp[1]:
+        _a_status, _a_text = attack_resp[0], str(attack_resp[1] or "")
+        if _a_text.strip():
+            try:
+                from vulnclaw.ai.v100.evidence_pack import _smart_truncate
+
+                f["response_preview"] = _smart_truncate(
+                    _a_text, budget=2000, markers=("syntax", "root:", "uid=", "<script", "{{", "127.0.0.1")
+                )
+            except Exception:  # noqa: BLE001 - 打包器未就绪不影响旧路径
+                f["response_preview"] = _a_text[:2000]
+            if normal_resp is not None and len(normal_resp) >= 2:
+                _b_status = normal_resp[0]
+                _b_len = max(1, len(str(normal_resp[1] or "")))
+                _a_len = len(_a_text)
+                f["diff_ratio"] = round(abs(_a_len - _b_len) / _b_len, 4)
+                f["status_shift"] = bool(
+                    (_a_status >= 500 and _b_status < 500) or (_a_status != _b_status)
+                )
+            payload = str(f.get("payload", "") or "").strip()
+            if len(payload) >= 4:
+                f["echo_feature"] = (
+                    payload.lower() in _a_text.lower()
+                )
     return attach_oob_evidence(f)
 
 
@@ -640,7 +671,63 @@ class BaseEngine(ABC):
             except Exception as e:
                 logger.debug(f"WAF 绕过测试失败: {e}")
 
-        logger.info("🧠 静态 WAF 绕过失败，尝试 AI 动态生成...")
+        # 第二阶段增强：本地规则自适应变异（零成本，先于 AI 生成）
+        logger.info("🧠 静态绕过未命中，启动本地规则自适应变异...")
+        try:
+            from vulnclaw.core.payload_mutator import PayloadMutator
+            mutator = PayloadMutator()
+            seen_local = set(bypass_payloads)
+            local_variants: List[str] = []
+            for local_attempt in range(3):
+                level = min(5, 1 + local_attempt)
+                for lp in mutator.mutate_combine(original_payload, level=level):
+                    if lp != original_payload and lp not in seen_local:
+                        seen_local.add(lp)
+                        local_variants.append(lp)
+                if len(local_variants) >= 12:
+                    break
+            logger.info(f"🧠 本地规则变异生成 {len(local_variants)} 个变体")
+
+            for local_payload in local_variants:
+                try:
+                    test_url = build_attack_url(url, param, local_payload, parsed_query)
+                    resp = await safe_request(test_url, session, method="GET", timeout=timeout)
+                    if resp is None:
+                        continue
+
+                    attack_status, attack_text = resp[0], resp[1]
+
+                    if not isinstance(attack_text, str):
+                        continue
+
+                    waf_detected = await self.detect_waf(attack_text)
+                    if waf_detected is not None:
+                        continue
+
+                    # 验证本地变异 payload 是否成功绕过
+                    success = await self._verify_waf_bypass_success(
+                        url, param, local_payload, parsed_query, session, normal_resp
+                    )
+
+                    if success:
+                        logger.info(f"✅ 本地规则变异绕过 WAF: {waf_type} -> {local_payload[:30]}...")
+                        return {
+                            'url': url,
+                            'parameter': param,
+                            'payload': local_payload,
+                            'type': f'{self.name.upper()}-WAF绕过({waf_type})',
+                            'ai_verdict': '中（本地规则变异）',
+                            'confidence': 'medium',
+                            'evidence': f'WAF ({waf_type}) 被本地规则变异绕过',
+                            'waf_bypass': True,
+                            'local_mutated': True,
+                        }
+                except Exception as e:
+                    logger.debug(f"本地变异测试失败: {e}")
+        except Exception as exc:
+            logger.debug(f"本地规则变异不可用: {exc}")
+
+        logger.info("🧠 本地规则变异未绕过，尝试 AI 动态生成...")
         error_msg = f"WAF {waf_type} 拦截了 Payload: {original_payload}"
         ai_payloads = await self._ai_mutate_payload(error_msg, original_payload, param, waf_type)
 

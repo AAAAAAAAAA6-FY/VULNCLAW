@@ -63,7 +63,13 @@ async def _run_oob_scan(
         return None
     dedup.add(key)
 
-    from vulnclaw.core.oob_channel import OOBChannel
+    from vulnclaw.core.oob_channel import OOBChannel, is_oob_blocked
+
+    # P0 熔断：外发被封禁（连续零回调达阈值）或通道熔断中 → 整段跳过。
+    # 不透传空等（oob_wait=12s）与注定无回连的注入请求（每个 payload 一个 HTTP）。
+    if is_oob_blocked(_origin_of(url)):
+        logger.debug(f"[{engine_name}] OOB 熔断生效，跳过 {url} 的带外盲打")
+        return None
 
     ch = OOBChannel()
     try:
@@ -104,7 +110,8 @@ async def _run_oob_scan(
                 pass
             await asyncio.sleep(0.2)
 
-    hits = await ch.wait_for_interaction(token, timeout=oob_wait)
+    hits = await ch.wait_for_interaction(token, timeout=oob_wait,
+                                         target=_origin_of(url))
     if not hits:
         return None
     first = hits[0]

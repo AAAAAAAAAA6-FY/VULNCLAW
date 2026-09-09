@@ -382,6 +382,9 @@ def _is_internal_domain(domain: str) -> bool:
 
 def get_otx_with_retry(domain: str, max_retries: int = 5) -> dict:
     """查询 AlienVault OTX API，带指数退避重试。内网目标短路返回 None。"""
+    if getattr(settings, "osint_disable", False):
+        logger.info("  OTX 跳过（OSINT_DISABLE=1）")
+        return None
     if _is_internal_domain(domain):
         logger.info(f"  OTX 跳过（内网目标: {domain}）")
         return None
@@ -411,6 +414,9 @@ def get_otx_with_retry(domain: str, max_retries: int = 5) -> dict:
 
 async def _fetch_ct_subdomains(domain: str) -> list:
     """从 crt.sh 获取历史证书中的子域名。内网目标短路空。"""
+    if getattr(settings, "osint_disable", False):
+        logger.info("  crt.sh 跳过（OSINT_DISABLE=1）")
+        return []
     if _is_internal_domain(domain):
         logger.info(f"  crt.sh 跳过（内网目标: {domain}）")
         return []
@@ -566,6 +572,9 @@ def brute_force_subdomains(domain: str, wordlist: str = "subdomains_top5000.txt"
 
 async def get_subdomains_async(domain: str, compliant: bool = True, skip_subfinder: bool = False) -> list:
     """异步主流程：工具扫描 + DNS爆破 + CT + 公开API"""
+    # 合规告知：公网 OSINT 子域枚举会把目标域名发往第三方服务，可 OSINT_DISABLE=1 关闭
+    if not getattr(settings, "osint_disable", False):
+        logger.warning("🌐 [OSINT 合规告知] 子域枚举会把目标域名发往公网第三方服务 (crt.sh / AlienVault OTX / urlscan.io)；如不接受请设 OSINT_DISABLE=1 关闭。")
     logger.info(f"🔍 开始收集子域名: {domain}")
     final_subs = set()
 
@@ -667,6 +676,9 @@ async def get_subdomains_async(domain: str, compliant: bool = True, skip_subfind
         return api_subs
 
     def _query_urlscan(domain_target: str):
+        if getattr(settings, "osint_disable", False):
+            logger.info("  Urlscan 跳过（OSINT_DISABLE=1）")
+            return None, set()
         if _is_internal_domain(domain_target):
             return None, set()
         try:
@@ -1410,20 +1422,24 @@ class EndpointCollector:
             try:
                 result = await run_tool(
                     "katana",
-                    args=["-u", url],
+                    args=["-u", url, "-d", "2", "-silent", "-timeout", "15",
+                          "-H", f"User-Agent: {settings.user_agent}"],
                 )
                 if result.get("success"):
                     count = 0
                     for line in result.get("stdout", "").splitlines():
-                        if line.strip():
-                            try:
-                                data = json.loads(line)
-                                ep = data.get("url")
-                                if ep and self._is_valid_endpoint(ep, strict=False):
-                                    endpoints.add(ep)
-                                    count += 1
-                            except BaseException:
-                                logger.debug("suppressed exception (core audit)")
+                        line = line.strip()
+                        if not line:
+                            continue
+                        ep = ""
+                        try:
+                            data = json.loads(line)
+                            ep = data.get("url") or ""
+                        except BaseException:
+                            ep = line if line.startswith("http") else ""
+                        if ep and self._is_valid_endpoint(ep, strict=False):
+                            endpoints.add(ep)
+                            count += 1
                     count_total += count
             except FileNotFoundError:
                 self._tool_stats["katana"]["available"] = False
@@ -1748,8 +1764,8 @@ async def crawl_same_origin(target: str, session=None, max_depth: int = 2, max_u
             if h.startswith('?'):
                 for k in parse_qs(urlparse(h).query):
                     params.add(k)
-        if params:
-            results[url] = params
+        # 无条件记录端点（含无参端点），供 jwt/idor/weak_credential 等无参引擎使用
+        results[url] = params
         if depth >= max_depth:
             return
         for h in _re.findall(r'href=["\']([^"\']+)["\']', text, _re.I):
@@ -1777,7 +1793,10 @@ async def crawl_same_origin(target: str, session=None, max_depth: int = 2, max_u
                 return
 
     head = 0
-    sem = asyncio.Semaphore(8)
+    # 消费点1：爬虫并发优先读目标请求能力探测结果（未探测/失败 → None → 原静态默认值）
+    from vulnclaw.core.target_capacity_probe import get_safe_concurrency
+    _cc = get_safe_concurrency() or int(getattr(_st, "max_crawl_concurrency", 0) or 16)
+    sem = asyncio.Semaphore(_cc)
     while head < len(queue):
         if len(results) >= max_urls:
             break

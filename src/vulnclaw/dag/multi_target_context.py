@@ -12,6 +12,7 @@ redis_url 为空时降级为内存模式（与原 DAGContext 行为一致）。
 集成点：dag/scheduler.py __init__ 增加 context_backend 参数。
 """
 import asyncio
+import json
 import pickle
 from typing import Any, Dict, List, Optional
 
@@ -57,12 +58,27 @@ class MultiTargetContext(DAGContext):
         """拼接带前缀的完整 key。"""
         return f"{self._prefix}:{key}" if self._prefix else key
 
+    def _safe_serialize(self, value: Any) -> bytes:
+        """JSON 优先序列化；不可 JSON 化的类型才 pickle 兜底。"""
+        try:
+            return json.dumps(value, ensure_ascii=False).encode("utf-8")
+        except Exception:  # noqa: BLE001
+            return pickle.dumps(value)
+
+    def _safe_deserialize(self, raw: Any) -> Any:
+        """先按 JSON 解析，失败再用安全 pickle 加载（兼容旧数据）。"""
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except Exception:  # noqa: BLE001
+            from vulnclaw.core.safe_pickle import safe_pickle_loads
+            return safe_pickle_loads(raw)
+
     # --- DAGContext 接口实现 ---
 
     async def set(self, key: str, value: Any) -> None:
         full_key = self._full_key(key)
         if self._redis:
-            serialized = pickle.dumps(value)
+            serialized = self._safe_serialize(value)
             await self._redis.set(full_key, serialized)
         else:
             async with self._lock:
@@ -74,7 +90,7 @@ class MultiTargetContext(DAGContext):
             raw = await self._redis.get(full_key)
             if raw is None:
                 return None
-            return pickle.loads(raw)
+            return self._safe_deserialize(raw)
         else:
             async with self._lock:
                 return self._memory.get(full_key)

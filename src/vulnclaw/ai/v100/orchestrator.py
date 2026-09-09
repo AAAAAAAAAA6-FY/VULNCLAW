@@ -16,7 +16,8 @@ from vulnclaw.core.context import get_scan_context
 from vulnclaw.core.settings import settings
 from vulnclaw.core.utils import async_get, vuln_category
 from vulnclaw.core.scanner import _load_engines
-from vulnclaw.core.session_manager import get_session_manager
+from vulnclaw.core.oob_channel import reset_oob_breaker
+from vulnclaw.core.auth.session_manager import get_session_manager
 from vulnclaw.ai.core import get_llm_client, get_memory
 from vulnclaw.ai.burp import get_burp_controller, get_burp_client
 from .rate_limiter import get_rate_limiter
@@ -106,7 +107,11 @@ class V100Orchestrator:
         self._model_failures = {m: 0 for m in self._model_pool}
         self._timeout_streaks: Dict[str, int] = {}  # P2-1: 任务类型连续超时计数
         self.findings: List[Dict] = []
+        self._pending_review: List[Dict] = []  # 终稿收敛：AI/技术均未实锤的存疑发现
         self._finding_keys: Set[tuple] = set()
+        # 修复"越扫越卡"：url+type 级 O(1) 去重索引，替代 executor 各全局扫描线
+        # 对 self.findings 的全量 any(...) 遍历（findings 越多每次判定越慢 = O(n^2)）。
+        self._seen_ut: Set[tuple] = set()
         self._pending_verify: List[Dict] = []
         self._max_pending_verify = 2000  # 限制最大待验证数
         # --- 流水线验证（stream-verify）状态 ------------------------------------------------
@@ -554,6 +559,7 @@ class V100Orchestrator:
         max_tokens: int = 2048,
         use_cache: bool = False,  # P1-2
         task_type: str = "default",  # P2-1
+        usage_site: str = "",  # A4.4/SP8: 成本台账调用点标签
     ) -> str:
         model = await self._get_next_model(task_type)
         fallback_model_name = model
@@ -649,7 +655,7 @@ class V100Orchestrator:
                 if count > 0:
                     logger.info(f"👤 从Burp加载了 {count} 个角色的凭证")
                     return
-            from vulnclaw.core.browser_cookie import get_browser_cookies
+            from vulnclaw.core.auth.browser_cookie import get_browser_cookies
             domain = urlparse(self.target).netloc
             cookies = get_browser_cookies(domain)
             if cookies:
@@ -850,11 +856,18 @@ class V100Orchestrator:
             saved_pending = list(self._pending_verify)
             self._pending_verify = list(batch)
             self._stream_touched_keys -= batch_keys
+        _batch_ok = False
         try:
             await self._verify_all_findings()
+            _batch_ok = True
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            raise
         finally:
             async with self._pending_verify_lock:
-                self._stream_touched_keys |= batch_keys
+                if _batch_ok:
+                    self._stream_touched_keys |= batch_keys
                 # 合并回：保留原始 pending 的顺序（因为我们不会从中删 touched，只是为了未来 debug 完整）。
                 # 注意：_verify_all_findings 内部不会清空 _pending_verify，因此这里简单 restore 即可。
                 # 关键修复（漏检根因）：验证期间 phases_executor 会无锁 append 新 finding 到
@@ -912,6 +925,14 @@ class V100Orchestrator:
             return "suspicious"
         return "likely" if is_real else "suspicious"
     def _add_finding(self, finding: Dict):
+        # 第2点：已知负样本端点拦截（2026-09-06）。命中 negative_endpoints 的 url
+        # 在落库前判误报丢弃，避免 /safe 类已知安全端点污染报告（验证层补拦截）。
+        _neg = [x.strip() for x in (getattr(settings, "negative_endpoints", "") or "").split(",") if x.strip()]
+        if _neg:
+            _url = str(finding.get("url", ""))
+            if any(n in _url for n in _neg):
+                logger.info(f"   [负样本] {finding.get('type')} @ {_url} 命中负样本清单，判误报丢弃")
+                return
         try:
             finding["verdict"] = self._classify_finding_verdict(finding)
         except Exception as exc:  # noqa: BLE001
@@ -930,8 +951,11 @@ class V100Orchestrator:
             except Exception as exc:  # noqa: BLE001
                 logger.debug(f"finding 后处理跳过: {exc}")
             self.findings.append(finding)
+            self._seen_ut.add((str(finding.get("url", "")), str(finding.get("type", ""))))
             # SP16.1 回注：产出 finding → bandit 正样本（默认关，无代价）
-            if self._bandit is not None:
+            # K2: _bandit 在 run() 内第1669行才初始化，此前 _add_finding 可能已被全局
+            # 扫描调用 → getattr 守卫，避免 AttributeError 击穿整条全局扫描线。
+            if getattr(self, "_bandit", None) is not None:
                 try:
                     self._bandit.record(self._bandit.key_from_finding(finding), hit=True)
                 except Exception:  # noqa: BLE001
@@ -1133,6 +1157,16 @@ class V100Orchestrator:
         if self._enable_idor:
             await self._scan_idor()
 
+        # C 方案社区线（2026-09-08）：Nuclei 社区模板通用检测，与 extras 收尾一并执行
+        if (
+            getattr(settings, "nuclei_community_line", True)
+            or True  # _enable_idor 关闭时社区线仍可独立跑（开关单独控制，fail-closed 内部保证）
+        ):
+            try:
+                await self._run_nuclei_community_line()
+            except Exception:  # noqa: BLE001 - 社区线异常不阻断 extras
+                logger.debug("suppressed exception (core audit)")
+
         if self._enable_default_creds:
             await self._check_default_creds()
 
@@ -1167,9 +1201,61 @@ class V100Orchestrator:
                 from vulnclaw.ai.v100.phases.phases_verify import llm_judge_dedup, hallucination_suppress
                 self.findings = await llm_judge_dedup(self, self.findings)
                 self.findings = hallucination_suppress(self, self.findings)
+                # 后处理可能重排/裁剪 findings，重建去重索引保持一致
+                self._seen_ut = {(str(f.get("url", "")), str(f.get("type", ""))) for f in self.findings}
         except Exception as _ce:  # noqa: BLE001
             logger.warning(f"⚠️ C9/C10 后处理异常，保留原始 findings: {_ce}")
         self._phase_timings['verify'] = time.monotonic() - _pt
+
+    def _apply_final_review_gate(self) -> None:
+        """终稿收敛（负向裁决）：verify 层未背书或显式存疑的 finding，若缺任一实锤证据，
+        降为 Info 并列入报告 pending_review 桶（保留 original_severity / type / evidence 可追溯）。
+        规则可解释：doubted = ai_verdict 含存疑标记，或 verdict==suspicious 且 ai_verdict 非"真实漏洞"
+        （即 verify 未背书，包括引擎裸模板/空值/预算跳过）。真漏洞经 verify 背书为"真实漏洞"或
+        带实锤字段（cross_confirmed / burp_verified / exploited / oob_confirmed）一律不动。
+        开关：settings.final_review_gate（默认 True）。幂等。
+        """
+        try:
+            if not getattr(settings, "final_review_gate", True):
+                return
+            _doubt_markers = ("待人工复核", "低优先级", "非漏洞", "预算已满",
+                              "未确认", "无回显/无响应证据", "响应异常", "LLM 降级", "LLM降级")
+            _hard_proof = ("cross_confirmed", "cross_tool_confirmed",
+                           "burp_verified", "burp_confirmed",
+                           "exploited", "oob_confirmed", "oob_callback")
+            downgraded = 0
+            for f in self.findings:
+                if f.get("verdict") == "pending_review":
+                    continue
+                av = str(f.get("ai_verdict", ""))
+                verdict = str(f.get("verdict", ""))
+                doubted = any(m in av for m in _doubt_markers)
+                if f.get("cross_tool_pending"):
+                    doubted = True  # E3: 业务逻辑单点且无差分证据 → 必须复核
+                if not doubted and verdict == "suspicious" and "真实漏洞" not in av:
+                    doubted = True  # verify 未背书（裸模板/空/跳过），宁缺毋滥
+                if not doubted:
+                    continue
+                if any(f.get(k) for k in _hard_proof) or f.get("confirmation_sources"):
+                    continue
+                sev = str(f.get("severity", "Low")).strip().capitalize()
+                f["original_severity"] = sev
+                f["severity"] = "Info"
+                f["verdict"] = "pending_review"
+                f["pending_review_reason"] = av or "验证未背书（engine 模板）"
+                self._pending_review.append({
+                    k: f.get(k) for k in ("url", "type", "parameter", "ai_verdict",
+                                          "original_severity", "payload", "evidence")
+                    if f.get(k) is not None
+                })
+                downgraded += 1
+            if downgraded:
+                logger.warning(
+                    f"⚠️ [终稿收敛] {downgraded} 条 AI/技术均未实锤的存疑发现已降级 Info "
+                    f"并列入报告 pending_review 桶（人工复核后再提升）"
+                )
+        except Exception as _ge:  # noqa: BLE001
+            logger.warning(f"终稿收敛异常（跳过，保留原样）: {_ge}")
 
     def _emit_metrics(self, report: Optional[Dict] = None) -> None:
         """G4 可观测性：扫描结束输出指标（落盘 _runtime_cache/metrics/ + 日志摘要）。"""
@@ -1409,7 +1495,14 @@ class V100Orchestrator:
                     logger.debug("suppressed exception (core audit)")
 
     async def _run_phase_timeboxed(self, name: str, coro):
-        """SH17.1 阶段预算：单阶段 wall-clock 超时只中断本阶段，跳过继续（不整扫报废）。"""
+        """SH17.1 阶段预算：单阶段 wall-clock 超时只中断本阶段，跳过继续（不整扫报废）。
+        预算随阶段工作量自适应（2026-09-06）：findings 驱动阶段∝len(findings)，
+        scan∝pending，recon/taskgen∝目标数；未探出规模时回退静态 floor。
+        动态值写回 self._phase_budgets[name]，供阶段内部(如 attack 内层)读取保证 内层<外层。"""
+        _dyn = self._recompute_phase_budget(name)
+        if _dyn and _dyn > 0:
+            self._phase_budgets[name] = int(_dyn)
+            logger.info(f"   [deadline] {name} 阶段预算(自适应): {self._phase_budgets[name]}s")
         budget = self._phase_budgets.get(name, 0)
         if not budget:
             return await coro
@@ -1419,6 +1512,35 @@ class V100Orchestrator:
             self._phase_timeouts_hit.append(name)
             logger.warning(f"⏱️ [SH17.1] 阶段超时: {name}（预算 {budget}s），跳过继续")
             return None
+
+    def _recompute_phase_budget(self, name: str) -> float:
+        """按阶段工作量动态重算预算，复用公共 compute_adaptive_budget。
+        各阶段工作量信号：scan=待执行任务数(pending)；verify/extras/agent_coordinator/
+        chain_router/react_deep_dive/report/fallback=已产 findings 数；recon/taskgen 因
+        循环依赖(规模由自身发现)无开始前信号，按目标数缩放(单目标=地板)。"""
+        from vulnclaw.core.target_capacity_probe import compute_adaptive_budget
+        _pending = (self.task_queue.pending_count() if hasattr(self, "task_queue")
+                    and hasattr(self.task_queue, "pending_count") else 0)
+        _findings = len(getattr(self, "findings", []) or [])
+        _targets = len(getattr(self, "targets", []) or [getattr(self, "target", "")]) or 1
+        if name == "scan":
+            return compute_adaptive_budget(_pending, cap=float(getattr(settings, "max_scan_time", 3600))) + 80
+        if name == "recon":
+            # recon 自身发现规模，开始前未知；按目标数缩放，单目标维持地板 240
+            # 大站防线（2026-09-07）：爬虫产出常在预算尾部才成批出现（audible 745 端点于
+            # 239s 附近就绪），固定 240s 地板会把刚要入队的爬取掐断。floor 只是 wall-clock
+            # 上限，小站提前返回不受影响，故可安全放大：单目标 240→480，多目标 ×8 封顶。
+            _floor = 480.0 if _targets <= 1 else min(240.0 * _targets, 1920.0)
+            return compute_adaptive_budget(_targets, worker=1, rt_ms=200.0, per_task_s=40.0, floor=_floor)
+        if name == "taskgen":
+            return compute_adaptive_budget(_targets, worker=1, rt_ms=200.0, per_task_s=20.0, floor=60.0)
+        # findings 驱动阶段：预算∝已确认发现数
+        _per = {
+            "verify": 1.5, "extras": 3.0, "agent_coordinator": 4.0,
+            "chain_router": 0.8, "react_deep_dive": 2.0, "report": 0.4, "fallback": 1.0,
+        }.get(name, 1.0)
+        _floor = float(getattr(settings, f"phase_timeout_{name}_s", 120) or 120)
+        return compute_adaptive_budget(_findings, worker=1, per_task_s=_per, floor=_floor)
 
     def _coord_enabled(self, name: str) -> bool:
         """SP18: 协调阶段是否被配置启用（关闭时跳过，不写 0 假值）。"""
@@ -1489,6 +1611,7 @@ class V100Orchestrator:
                 if key not in self._finding_keys:
                     self._finding_keys.add(key)
                     self.findings.append(f)
+                    self._seen_ut.add((str(f.get("url", "")), str(f.get("type", ""))))
             if loaded:
                 logger.info(f"♻️ [P5-1] 已恢复 {len(loaded)} 条历史发现并入 findings")
         except Exception as _e:  # noqa: BLE001
@@ -1506,6 +1629,28 @@ class V100Orchestrator:
             logger.debug(f"[P5-1] 恢复 agent 记忆失败: {_e}")
 
     async def run(self) -> Dict:
+        # P0 修复：每次扫描开场重置 OOB 进程级状态（熔断计数/通道/域名与 session 缓存），
+        # 避免上一扫描的 miss_streak 残留导致本目标带外验证永久跳过。
+        try:
+            reset_oob_breaker()
+        except Exception:  # noqa: BLE001
+            logger.debug("reset_oob_breaker 调用失败（不影响扫描）")
+        # G5/AI 横幅：起扫时明示 AI 验证可用性（模型池为空 = 纯引擎模式，强告警）
+        try:
+            _pool_now = list(getattr(self, "_model_pool", []) or [])
+            if _pool_now:
+                logger.info(
+                    "🔔 [AI 验证] 已启用: %d 个模型 - %s｜verify 将执行 粗筛→多模型投票→技术验证→Burp 双源",
+                    len(_pool_now), ", ".join(_pool_now[:4] + (["..."] if len(_pool_now) > 4 else []))
+                )
+            else:
+                logger.warning(
+                    "🚨 当前无可用 AI 模型（AI_MODELS 为空或未配置）——扫描将进入纯引擎模式，"
+                    "误报率风险偏高，建议配置 AI_MODELS/AI_API_KEY 后再扫"
+                )
+        except Exception:  # noqa: BLE001
+            logger.debug("suppressed exception (core audit)")
+
         # P4-3: 后台更新 Nuclei 模板（不阻塞扫描启动，收尾时回收）
         self._nuclei_update_task = None
         try:
@@ -1656,6 +1801,7 @@ class V100Orchestrator:
                     self._checkpoint.save_agent_memory("shared_knowledge", self._ensure_shared_knowledge())
                 except Exception:  # noqa: BLE001
                     logger.debug("suppressed exception (core audit)")
+            self._apply_final_review_gate()
             async with self._stage("report"):
                 # P5-1: 收尾前把全部 findings 落盘（双保险，_add_finding 增量已覆盖）
                 if self._checkpoint is not None:
@@ -1692,6 +1838,7 @@ class V100Orchestrator:
                 self._emit_metrics()
             except Exception:
                 logger.debug("suppressed exception (core audit)")
+            self._apply_final_review_gate()
             return await self._generate_report()
 
     async def _finalize_nuclei_update(self) -> None:

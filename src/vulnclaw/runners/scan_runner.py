@@ -26,8 +26,10 @@ from urllib.parse import urlparse
 from vulnclaw.ai.core import close_llm_client
 from vulnclaw.ai.v100 import run_v100_scan
 from vulnclaw.config import PROJECT_CACHE_DIR, settings
+from vulnclaw.core.auth.instruction_auth import try_instruction_login
+from vulnclaw.core.instructions import load_instruction
 from vulnclaw.core.logger import logger
-from vulnclaw.core.utils import close_shared_session, ensure_thirdparty_tools, get_shared_session
+from vulnclaw.core.utils import close_shared_session, ensure_thirdparty_tools, get_shared_session, resolve_burp_cookies_path
 from vulnclaw.runners.code_audit_runner import run_code_audit
 from vulnclaw.core.detectors.spa_detector import SpaFingerprintDetector
 
@@ -181,6 +183,54 @@ def _get_cookie_file_path(domain: str) -> Path:
 
 
     return COOKIE_DIR / f"{domain}.json"
+
+def parse_cookie_str(cookie_str: str) -> dict:
+    """解析内联 Cookie 字符串（name=value; name=value，兼容分号/逗号分隔）。"""
+    cookies: dict = {}
+    if not cookie_str:
+        return cookies
+    for part in cookie_str.replace(",", ";").split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        name, _, value = part.partition("=")
+        name, value = name.strip(), value.strip()
+        if not name or name.lower() in {"path", "domain", "expires", "max-age",
+                                        "httponly", "secure", "samesite", "priority"}:
+            continue
+        if value:
+            cookies[name] = value
+    return cookies
+
+def seed_cookie_for_domain(domain: str, cookie_str: str) -> bool:
+    """把 CLI 直传的内联 Cookie 写入目标专属 Cookie 文件（与 Burp 链路同一落点）。
+
+    优先级高于陈旧的 burp_cookies.json：用户显式指定的 Cookie 直接生效，
+    供 get_shared_session / extract_target_cookies 统一读取。
+    """
+    if not domain or not cookie_str:
+        return False
+    cookies = parse_cookie_str(cookie_str)
+    if not cookies:
+        print("⚠️ --cookie 解析无有效键值对，请以 name=value; name=value 格式提供")
+        return False
+    cookie_file = _get_cookie_file_path(domain)
+    existing = {}
+    if cookie_file.exists():
+        try:
+            with open(cookie_file, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+        except BaseException:
+            pass
+    existing.update(cookies)
+    try:
+        with open(cookie_file, "w", encoding="utf-8") as f:
+            json.dump(existing, f, indent=2, ensure_ascii=False)
+        print(f"🍪 --cookie 已按目标域 {domain} 保存 {len(cookies)} 个键（{cookie_file}）")
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ 保存 --cookie 失败: {e}")
+        return False
 
 async def _try_default_login(target_url: str, domain: str) -> bool:
 
@@ -352,7 +402,7 @@ async def _try_browser_cookies(domain: str) -> bool:
 
 
 
-        from vulnclaw.core.browser_cookie import get_browser_cookies
+        from vulnclaw.core.auth.browser_cookie import get_browser_cookies
 
 
 
@@ -450,7 +500,7 @@ async def _try_burp_cookies(domain: str) -> bool:
 
 
 
-    burp_file = os.path.expanduser("~/burp_cookies.json")
+    burp_file = resolve_burp_cookies_path()
 
 
 
@@ -939,7 +989,7 @@ async def extract_target_cookies(target_url: str):
                 break
 
 
-    old_file = os.path.expanduser("~/burp_cookies.json")
+    old_file = resolve_burp_cookies_path()
 
 
 
@@ -1208,6 +1258,25 @@ async def main_async(args):
     if args.target:
 
         await extract_target_cookies(target)
+
+        # ---- SP27 指令凭据登录（第 0 步：优先于既有 cookie 流程；失败自动回退）----
+        _ins = load_instruction(
+            getattr(args, "instruction", None),
+            getattr(args, "instruction_file", None),
+        )
+        if _ins and _ins.has_credentials and not getattr(args, "no_auth", False):
+            _host = urlparse(target).hostname or ""
+            if _host.startswith("www."):
+                _host = _host[4:]
+            try:
+                _logged = await try_instruction_login(target, _host, _ins)
+                if _logged:
+                    settings.instruction_context = _ins
+                    print(f"🔐 指令登录成功：认证会话已就绪（{_ins.masked_summary}）")
+                else:
+                    print("⚠️ 指令登录失败，回退现有 Cookie 流程")
+            except Exception as _exc:
+                logger.warning(f"指令登录异常（回退现有流程）: {_exc}")
 
 
 
@@ -2400,6 +2469,14 @@ async def main_async(args):
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 
+
+    # P0：OOB 熔断状态入报告——排障时可直接看出"本轮为何没有带外实锤"
+    try:
+        from vulnclaw.core.oob_channel import oob_state_snapshot
+        if isinstance(report, dict):
+            report["oob_breaker"] = oob_state_snapshot()
+    except Exception as e:  # noqa: BLE001 - 快照是增强项，绝不影响报告落盘
+        logger.debug(f"OOB 熔断快照写入失败（忽略）: {e}")
 
     json_path = REPORT_DIR / f"report_{safe_target}_{timestamp}.json"
 

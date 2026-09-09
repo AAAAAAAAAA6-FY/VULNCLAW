@@ -22,13 +22,26 @@ _SEVERITY_RANK = {"critical": 6, "high": 5, "medium": 3, "low": 2, "info": 1, ""
 # verdict 排序权重（confirm > likely > suspicious，保留更高判定）
 _VERDICT_RANK = {"confirm": 3, "likely": 2, "suspicious": 1, "": 0}
 # confidence 数值化（用于合并选优）
-_CONFIDENCE_NUM = {"high": 0.95, "medium": 0.7, "low": 0.35, "": 0.5}
+_CONFIDENCE_NUM = {"high": 0.95, "medium": 0.7, "low": 0.35, "": 0.5,
+    "高": 0.95, "中": 0.7, "低": 0.35,
+    "high rule fallback": 0.7, "medium rule fallback": 0.5, "low rule fallback": 0.35,
+}
 
 _FILLER_RE = re.compile(r"[\s_\-.]+")
+_WS_RE = re.compile(r"\s+")
 
 
 def _norm_text(s: Any) -> str:
     return _FILLER_RE.sub(" ", str(s or "")).strip().lower()
+
+
+def _norm_param(s: Any) -> str:
+    """参数名归一化：仅折叠内部空白 + 小写，保留 _ - . 分隔符。
+
+    与 _norm_text 不同：user_id / user.id / user-id 是可能真实不同的参数，
+    统一折叠分隔符会误合并（漏报），因此指纹中的参数一律走本函数。
+    """
+    return _WS_RE.sub(" ", str(s or "")).strip().lower()
 
 
 def _norm_url(url: Any) -> str:
@@ -41,7 +54,10 @@ def _norm_url(url: Any) -> str:
 
 
 def _conf_of(f: Dict[str, Any]) -> float:
+    """confidence 数值化：同时支持 0-100 整数与 0-1 小数两套尺度。"""
     c = f.get("confidence")
+    if isinstance(c, bool):
+        return 0.5 if c else 0.35
     if isinstance(c, (int, float)):
         val = c
         if val >= 100:
@@ -50,15 +66,44 @@ def _conf_of(f: Dict[str, Any]) -> float:
             return 0.9
         if val >= 60:
             return 0.7
+        if val > 1:            # 0-100 尺度低值
+            return 0.35
+        if val >= 0.9:         # 0-1 尺度
+            return 0.95
+        if val >= 0.6:
+            return 0.7
         return 0.35
     return _CONFIDENCE_NUM.get(_norm_text(c), 0.5)
 
 
-def _strength(f: Dict[str, Any]) -> Tuple[int, int, float, int]:
-    """合并优先级：(severity, verdict, confidence, 原序)。"""
+def _strength(f: Dict[str, Any]) -> Tuple[int, int, float]:
+    """合并优先级：(severity, verdict, confidence)。同强度时保留先到者。"""
     sev = _SEVERITY_RANK.get(_norm_text(f.get("severity")), 0)
     ver = _VERDICT_RANK.get(_norm_text(f.get("verdict")), 0)
-    return (sev, ver, _conf_of(f), 0)
+    return (sev, ver, _conf_of(f))
+
+
+# 场外证据/实锤字段——同指纹重复项合并时必须并入保留对象，避免证据链断裂
+# 与 sigma 多源证据计数失真（合并时逐键"覆盖"或"整体丢弃"都会丢证据）。
+_EVIDENCE_KEYS = (
+    "nuclei_result", "burp_evidence", "oob_evidence", "cross_tool_evidence",
+    "sqlmap_extracted", "confirm_evidence", "exploit_payload", "reproduction_steps",
+)
+_BOOST_KEYS = (
+    "burp_verified", "burp_confirmed", "cross_confirmed", "cross_tool_confirmed",
+    "oob", "oob_verified", "oob_confirmed", "oob_callback", "exploited",
+    "exploit_verified", "sqlmap_confirmed", "confirmation_sources",
+)
+
+
+def _merge_weak_evidence(merged: Dict[str, Any], donor: Dict[str, Any]) -> None:
+    """把 donor 的场外证据并入 merged：缺失即补；实锤布尔任一为真即真。"""
+    for k in _EVIDENCE_KEYS:
+        if donor.get(k) and not merged.get(k):
+            merged[k] = donor[k]
+    for k in _BOOST_KEYS:
+        if donor.get(k) and not merged.get(k):
+            merged[k] = donor[k]
 
 
 def findings_fingerprint(f: Dict[str, Any]) -> str:
@@ -70,7 +115,7 @@ def findings_fingerprint(f: Dict[str, Any]) -> str:
     url = _norm_url(f.get("url"))
     method = _norm_text(f.get("method")).lower() or "get"
     vtype = _norm_text(f.get("type"))
-    param = _norm_text(f.get("parameter"))
+    param = _norm_param(f.get("parameter"))
     return "|".join((url, method, vtype, param))
 
 
@@ -94,7 +139,13 @@ def deterministic_dedupe(findings: List[Dict[str, Any]]) -> Tuple[List[Dict[str,
             best_by_key[key] = dict(f)
             kept.append(best_by_key[key])
         elif _strength(f) > _strength(cur):
+            # 更强的后到者接管表征字段；先并入弱者已有证据，update 后再兜底补缺
+            _merge_weak_evidence(f, cur)
             best_by_key[key].update(f)
+            _merge_weak_evidence(best_by_key[key], cur)
+        else:
+            # 同强度：表征保留先到者，但后到者的场外证据/实锤字段不可丢
+            _merge_weak_evidence(cur, f)
 
     # 语义疑似组：同 host+path+type、不同指纹（param 或 method 不同）
     by_loc: Dict[str, List[Dict[str, Any]]] = {}
@@ -141,7 +192,7 @@ def merge_llm_verdict(kept: List[Dict[str, Any]], ambiguous: List[Dict[str, Any]
     for f in kept:
         purl = urlparse(str(f.get("url") or ""))
         loc = (purl.scheme + "://" + purl.netloc.lower() + purl.path.rstrip("/")) if purl.scheme else ""
-        key = f"{loc}|{_norm_text(f.get('parameter'))}"
+        key = f"{loc}|{_norm_text(f.get('type'))}|{_norm_param(f.get('parameter'))}"
         if key not in drop_keys:
             out.append(f)
     return out

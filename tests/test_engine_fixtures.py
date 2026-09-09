@@ -27,7 +27,7 @@ class _FakeChannel:
     async def make_probe(self, scheme):
         return {"token": "t", "url": "https://t.oast/x/", "domain": "oast.x"}
 
-    async def wait_for_interaction(self, token, timeout=None):
+    async def wait_for_interaction(self, token, timeout=None, interval=None, target=""):
         return self.hits
 
 

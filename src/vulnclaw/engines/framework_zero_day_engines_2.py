@@ -16,7 +16,7 @@ from typing import Dict, List, Optional, Tuple
 
 from vulnclaw.core.logger import logger
 from vulnclaw.core.settings import settings
-from vulnclaw.core.utils import async_get
+from vulnclaw.core.utils import async_get, CLOUD_METADATA_ENDPOINTS
 from vulnclaw.engines.base import BaseEngine
 
 
@@ -296,14 +296,8 @@ class CloudAndContainerExposureEngine(BaseEngine):
     KUBELET_RE = re.compile(r'"kubelet"|"kubeVersion"|pods/|/pods|kube-system', re.I)
     # etcd 未授权特征
     ETCD_RE = re.compile('etcdserver|etcd\\s+version|"cluster"\\s*:|"health"', re.I)
-    # 各厂商云元数据地址 -> 类型
-    CLOUD_META = (
-        ("http://169.254.169.254/latest/meta-data/", "AWS EC2 元数据"),
-        ("http://169.254.169.254/computeMetadata/v1/", "GCP 元数据"),
-        ("http://169.254.169.254/metadata/instance?api-version=2021-02-01", "Azure 元数据"),
-        ("http://169.254.169.254/metadata/", "阿里云 ECS 元数据"),
-        ("http://169.254.169.254/metadata/v1/", "腾讯云/通用元数据"),
-    )
+    # 各厂商云元数据地址 -> 类型（统一权威清单，P1-5 收敛三处硬编码）
+    CLOUD_META = tuple(CLOUD_METADATA_ENDPOINTS)
     # kubelet/etcd 端点候选
     CONTAINER_ENDPOINTS = (
         ("/api/v1/namespaces/kube-system/pods", "K8s API(kube-system pods) 未授权"),

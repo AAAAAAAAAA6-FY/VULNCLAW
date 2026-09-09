@@ -12,6 +12,8 @@ import os
 import tempfile
 import time
 
+import re
+
 from vulnclaw.core.logger import logger
 from vulnclaw.core.settings import settings
 from vulnclaw.core_modules.cache import SQLiteCache
@@ -19,6 +21,18 @@ from typing import List
 
 # P1-1: FFUF 结果 SQLite 持久化缓存（Key=ffuf:{target_hash}:{wordlist_mtime}，24h TTL）
 _ffuf_cache = SQLiteCache(name="ffuf", ttl=86400)
+# ffuf `-of json` 写文件在部分 Windows 构建下失效（日志 0B 但 stdout 有表格）。
+# 统一回退解析 stdout 表格行，格式: `<url>  [Status: 200, Size: N, ...]`
+_FFUF_STDOUT_ROW = re.compile(r'^\s*(\S+)\s+\[Status:\s*(\d+),')
+
+
+def _parse_ffuf_stdout_rows(stdout: str) -> List[Tuple[str, int]]:
+    rows: List[Tuple[str, int]] = []
+    for ln in (stdout or "").splitlines():
+        m = _FFUF_STDOUT_ROW.match(ln)
+        if m:
+            rows.append((m.group(1), int(m.group(2))))
+    return rows
 
 async def run_ffuf_async(target: str, concurrency: int = 20, timeout: int = 120) -> List[str]:
     """
@@ -137,6 +151,7 @@ async def run_ffuf_async(target: str, concurrency: int = 20, timeout: int = 120)
             "-w", wordlist_file,
             "-c", str(concurrency),
             "-timeout", str(timeout),
+            "-H", f"User-Agent: {settings.user_agent}",
             "-o", output_file,
             "-of", "json",
         ]
@@ -158,7 +173,16 @@ async def run_ffuf_async(target: str, concurrency: int = 20, timeout: int = 120)
         not_found: List[str] = []
         if os.path.exists(output_file):
             if file_size == 0:
-                logger.warning("📂 [FFUF] 输出文件为空（0B），跳过解析")
+                logger.warning("📂 [FFUF] 输出文件为空（0B），回退解析 stdout 表格")
+                for raw, status in _parse_ffuf_stdout_rows(out):
+                    if status in (200, 301, 302, 307, 401, 403):
+                        path = raw.replace(target, '').split('?')[0]
+                        if path and path != '/' and path not in dirs:
+                            dirs.append(path)
+                    elif status in (404, 429):
+                        path = raw.replace(target, '').split('?')[0]
+                        if path and path not in not_found:
+                            not_found.append(path)
             else:
                 try:
                     with open(output_file, 'r', encoding='utf-8') as f:

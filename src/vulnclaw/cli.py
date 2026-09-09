@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 import vulnclaw.bootstrap  # noqa: F401  环境固化
@@ -306,6 +307,21 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="扫描前强制重新下载所有第三方工具（对齐版本），含 nuclei 模板更新。",
     )
+    # SP27: 指令层（对标 Strix --instruction：凭据直写，自动登录）
+    _ins_group = scan_parser.add_mutually_exclusive_group()
+    _ins_group.add_argument(
+        "--instruction",
+        help="SP27: 内联扫描指令，可直接写账号密码（如: Login with email: admin@x.com, password: Pass123）。"
+             "支持多账号/测试重点/排除项，凭据用于自动登录，不落日志。",
+    )
+    scan_parser.add_argument(
+        "--cookie",
+        help="内联 Cookie 直传（name=value; name=value），按目标域写入并优先于 Burp 文件生效",
+    )
+    _ins_group.add_argument(
+        "--instruction-file",
+        help="SP27: 指令文件路径（UTF-8 文本，含账号密码说明）。与 --instruction 二选一。",
+    )
 
     setup_parser = subparsers.add_parser(
         "setup",
@@ -588,12 +604,22 @@ def main(argv: list[str] | None = None) -> None:
             fwd += ["--resume-scan"]
         if getattr(args, "diff", False):
             fwd += ["--diff"]
+        if getattr(args, "cookie", None):
+            fwd += ["--cookie", args.cookie]
         if args.proxy:
             fwd += ["--proxy", args.proxy]
         if args.metrics_port:
             fwd += ["--metrics-port", str(args.metrics_port)]
         if args.http2:
             fwd += ["--http2"]
+        # SP27: 指令层转发（内联文本或指令文件，二选一）
+        if args.instruction:
+            fwd += ["--instruction", args.instruction]
+        if args.instruction_file:
+            if not os.path.exists(args.instruction_file):
+                print(f"❌ 指令文件不存在: {args.instruction_file}")
+                sys.exit(2)
+            fwd += ["--instruction-file", args.instruction_file]
         # 扫描前自动下载工具（按需 / 强制）
         if getattr(args, "download_thirdparty", False) or getattr(args, "force_download_thirdparty", False):
             from vulnclaw.core.utils import download_thirdparty_tools

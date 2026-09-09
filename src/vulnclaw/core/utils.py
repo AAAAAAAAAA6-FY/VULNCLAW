@@ -225,7 +225,7 @@ async def _load_and_filter_cookies(session: aiohttp.ClientSession, target: Optio
                 break
 
     # 兼容旧文件 ~/burp_cookies.json
-    old_file = os.path.expanduser("~/burp_cookies.json")
+    old_file = resolve_burp_cookies_path()
     if not cookie_file.exists() and os.path.exists(old_file):
         try:
             with open(old_file, 'r', encoding='utf-8') as f:
@@ -348,6 +348,12 @@ class _RateLimiter:
         for _ in range(max(1, int(tokens))):
             await self._impl.acquire()
 
+    async def set_qps(self, qps: float):
+        """运行时动态调整全局 HTTP 限流 QPS（目标容量探测结果应用）。"""
+        self.rate = qps
+        await self._ensure_impl()
+        await self._impl.set_qps(qps)
+
 
 _global_rate_limit = _RateLimiter(settings.rps)
 
@@ -403,6 +409,11 @@ async def _http_request(
         timeout = _timeout_for_url(url, settings.timeout)
 
     await _global_rate_limit.acquire()
+
+    # 合规：任何请求路径都必须带配置的 User-Agent（政策强制，如 HackerOne 的
+    # audibleresearcher_<h1name>），调用方未显式指定时兜底注入。
+    headers = dict(headers or {})
+    headers.setdefault('User-Agent', settings.user_agent)
 
     proxy = kwargs.pop('proxy', None) or settings.proxy or _pool_active_proxy()
     parsed = urllib.parse.urlparse(url)
@@ -1392,6 +1403,18 @@ def get_tool_path(tool_name: str) -> Optional[str]:
         _TOOL_CACHE[tool_name] = path
         return path
 
+    # 工具名别名（2026-09-07）：Windows 下 sqlmap 是 Python 包，无 sqlmapapi 可执行文件，
+    # 真实入口为 thirdparty/sqlmap/sqlmapapi.py；别名命中后 _invoke 会自动前置 python。
+    _tool_aliases = {
+        "sqlmapapi": os.path.join("sqlmap", "sqlmapapi.py"),
+    }
+    _alias_path = _tool_aliases.get(tool_name)
+    if _alias_path:
+        _ap = os.path.join(settings.thirdparty_dir, _alias_path)
+        if os.path.exists(_ap):
+            _TOOL_CACHE[tool_name] = _ap
+            return _ap
+
     third = os.path.join(settings.thirdparty_dir, tool_name)
     if os.path.isdir(third):
         # 目录型分发（如 thirdparty/sqlmap/sqlmap.py）：定位内部可执行/脚本
@@ -1572,27 +1595,32 @@ def build_attack_url(base_url: str, param: str, payload: str, original_query: st
     return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
 
 
+def resolve_burp_cookies_path() -> str:
+    """双路回退：返回 burp_cookies.json 的实际可读路径。
+
+    scan_main.py 为防 nuclei/uncover 往 HOME 写垃圾，会把 HOME/USERPROFILE
+    重定向到 _runtime_cache/tools，导致 expanduser("~/burp_cookies.json")
+    解析到不存在的位置（真实文件仍在用户目录）。这里按存在性双路回退：
+      1) 当前 HOME 解析结果（若被重定向，即 _runtime_cache/tools/）；
+      2) 真实用户目录（以系统盘 + 用户名重建，不受重定向影响）。
+    任一存在即返回，均不存在时返回第 1 个候选（保持调用方报错路径可读）。
+    """
+    candidates = [os.path.expanduser("~/burp_cookies.json")]
+    drive = os.environ.get("SystemDrive") or "C:"
+    username = os.environ.get("USERNAME")
+    if username:
+        candidates.append(os.path.join(drive + os.sep, "Users", username, "burp_cookies.json"))
+    for cand in candidates:
+        try:
+            if os.path.isfile(cand):
+                return cand
+        except OSError:
+            continue
+    return candidates[0]
+
+
 def urlencode_payload(payload: str) -> str:
     return urllib.parse.quote(payload, safe='')
-
-
-def get_random_ua() -> str:
-    if settings.user_agent and settings.user_agent != "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36":
-        return settings.user_agent
-
-    ua_list = [
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/122.0',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0',
-    ]
-    return random.choice(ua_list)
-
-
-def get_delay() -> float:
-    return random.uniform(0.3, 1.0)
 
 
 def limit_response_size(text: str, max_len: int = 2000) -> str:
@@ -1610,6 +1638,39 @@ def cap(seq, limit: int):
     if not limit or limit <= 0:
         return _lst
     return _lst[:limit]
+
+
+# ============================================================
+# P1-5：云厂商实例元数据（IMDS）端点 —— 统一权威清单
+# ============================================================
+# 收敛背景：SSRF 引擎 / 云容器暴露引擎 / 业务逻辑引擎三处各自硬编码了 169.254.169.254
+# 等云元数据端点，且厂商与路径互不一致（有的缺腾讯云/OpenStack，有的多写重复 AWS 路径）。
+# 这里集中维护一份全厂商清单，供三处引用，保证覆盖范围一致、单点维护。
+CLOUD_METADATA_ENDPOINTS = (
+    # AWS EC2 IMDSv1（含常见敏感路径）
+    ("http://169.254.169.254/latest/meta-data/", "AWS EC2 元数据"),
+    ("http://169.254.169.254/latest/meta-data/iam/security-credentials/", "AWS IAM 凭证"),
+    ("http://169.254.169.254/latest/meta-data/identity-credentials/ec2/security-credentials/", "AWS EC2 凭证"),
+    ("http://169.254.169.254/latest/meta-data/user-data/", "AWS 用户数据"),
+    ("http://169.254.169.254/latest/meta-data/local-ipv4", "AWS 本地 IP"),
+    ("http://169.254.169.254/latest/meta-data/public-ipv4", "AWS 公网 IP"),
+    ("http://169.254.169.254/latest/meta-data/hostname", "AWS 主机名"),
+    ("http://169.254.169.254/latest/dynamic/instance-identity/", "AWS 实例身份"),
+    # GCP
+    ("http://metadata.google.internal/computeMetadata/v1/", "GCP 元数据"),
+    ("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/", "GCP 服务账号"),
+    # Azure
+    ("http://169.254.169.254/metadata/instance?api-version=2017-08-01", "Azure 元数据"),
+    ("http://169.254.169.254/metadata/instance?api-version=2021-02-01", "Azure 元数据(v2021)"),
+    # 阿里云
+    ("http://100.100.100.200/latest/meta-data/", "阿里云 ECS 元数据"),
+    ("http://100.100.100.200/latest/meta-data/ram/security-credentials/", "阿里云 RAM 凭证"),
+    # 腾讯云 / 通用（metadata/ 路径厂商区分度低，统一标注）
+    ("http://169.254.169.254/metadata/", "云元数据(通用)"),
+    ("http://169.254.169.254/metadata/v1/", "腾讯云/通用元数据"),
+    # OpenStack
+    ("http://169.254.169.254/openstack/latest/meta_data.json", "OpenStack 元数据"),
+)
 
 
 def compress_http_response(response_text: str, max_len: int = 1500) -> str:
@@ -1828,7 +1889,6 @@ __all__ = [
     'detect_waf',
     'generate_mutated_requests',
     'build_attack_url', 'urlencode_payload',
-    'get_random_ua', 'get_delay',
     'limit_response_size', 'compress_http_response', 'clean_ai_json',
     'obfuscate_payload', 'load_cookie_file',
     'classify_severity',

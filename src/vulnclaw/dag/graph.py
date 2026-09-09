@@ -16,6 +16,7 @@ class NodeStatus(Enum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     SKIPPED = "skipped"
+    RETRYING = "retrying"  # 调度审计C: 指数退避期间挂起态，防止重试节点被重复提交
 
 
 class NodeType(Enum):

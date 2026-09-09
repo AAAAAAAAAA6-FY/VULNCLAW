@@ -2249,16 +2249,34 @@ BUSINESS_KEYWORDS = [
     "/api/v1", "/api/v2", "/api/v3"
 ]
 
-CLOUD_METADATA = {
-    "aws": [
-        "http://169.254.169.254/latest/meta-data/",
-        "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
-        "http://169.254.169.254/latest/user-data/"
-    ],
-    "gcp": ["http://metadata.google.internal/computeMetadata/v1/"],
-    "azure": ["http://169.254.169.254/metadata/instance?api-version=2017-08-01"],
-    "aliyun": ["http://100.100.100.200/latest/meta-data/"]
-}
+def _build_cloud_metadata():
+    """P1-5：云厂商 IMDS 端点从统一权威清单按厂商派生，消除三处硬编码不一致。
+
+    返回 {厂商: [url,...]}，与旧结构（dict[厂商, List[url]]）兼容，business_logic 引擎
+    遍历 .items() 消费时无需改动。
+    """
+    from vulnclaw.core.utils import CLOUD_METADATA_ENDPOINTS
+    buckets = {"aws": [], "gcp": [], "azure": [], "aliyun": [], "tencent": [], "openstack": []}
+    for url, _label in CLOUD_METADATA_ENDPOINTS:
+        u = url.lower()
+        if "metadata.google.internal" in u:
+            buckets["gcp"].append(url)
+        elif "100.100.100.200" in u:
+            buckets["aliyun"].append(url)
+        elif "openstack" in u:
+            buckets["openstack"].append(url)
+        elif "/metadata/instance" in u and "169.254.169.254" in u:
+            buckets["azure"].append(url)
+        elif "metadata/v1/" in u and "169.254.169.254" in u:
+            buckets["tencent"].append(url)
+        elif "169.254.169.254" in u:
+            buckets["aws"].append(url)
+        else:
+            buckets.setdefault("other", []).append(url)
+    return {k: v for k, v in buckets.items() if v}
+
+
+CLOUD_METADATA = _build_cloud_metadata()
 
 RACE_KEYWORDS = ["order", "checkout", "purchase", "buy", "claim", "redeem", "withdraw", "transfer", "apply", "submit", "create", "update", "delete", "cancel", "refund", "lottery", "draw", "raffle", "giveaway", "bonus", "reward", "cashback", "discount"]
 
@@ -3691,6 +3709,11 @@ class HPPEngine(BaseEngine):
 
         reflected = marker in text
         if not reflected:
+            if status == 0:
+                # 2026-09-08: status==0 = 连接失败/请求未完成（反爬断连、抖动），
+                # 不是 HTTP 响应差异。Audible 实测双值 200 内容与基线一致却因一次
+                # 瞬时断连被报"200→0 差异 100%"误报。此类请求直接判无效，不参与判定。
+                return None
             has_diff, diff_ratio = self.has_response_diff(normal_resp, (status, text, {}))
             if not (has_diff and (status != normal_resp[0] or diff_ratio > 0.35)):
                 return None

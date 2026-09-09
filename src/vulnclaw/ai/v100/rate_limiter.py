@@ -46,9 +46,17 @@ class AdaptiveRateLimiter:
 
         logger.info(f"⏱️ 自适应限流器初始化: {initial_qps} QPS")
 
+    def _ensure_model(self, model: str) -> None:
+        """模型桶动态扩展：首次见到的模型名自动建桶（调用方须已持锁）。"""
+        if model not in self._model_qps:
+            self._model_qps[model] = self.initial_qps
+            self._failures[model] = 0
+            self._cooldown_until[model] = 0.0
+
     async def acquire(self, model: str = "glm-4-flash") -> float:
         async with self._lock:
             self._total_requests += 1
+            self._ensure_model(model)
 
             if model in self._cooldown_until:
                 cooldown_end = self._cooldown_until[model]
@@ -70,6 +78,19 @@ class AdaptiveRateLimiter:
             history.append(now)
             return 0
 
+    async def set_qps(self, qps: float, model: str = "glm-4-flash") -> None:
+        """运行时动态调整限流 QPS（目标请求能力探测结果应用）。
+
+        只改指定 model 桶（默认 HTTP 通道），LLM 各模型桶不受影响；
+        封顶在 [_min_qps, _max_qps]，加锁避免与 acquire 竞态。
+        """
+        qps = max(self._min_qps, min(float(qps), self._max_qps))
+        async with self._lock:
+            self._ensure_model(model)
+            self.current_qps = qps
+            self._model_qps[model] = qps
+            self._cooldown_until[model] = 0.0
+
     def available_tokens(self, window: float = 1.0) -> float:
         """P3-1: 当前可用令牌余量（所有模型容量合计 − 近 window 秒已发请求）。
 
@@ -89,6 +110,7 @@ class AdaptiveRateLimiter:
     async def record_success(self, model: str = "glm-4-flash"):
         async with self._lock:
             self._success_requests += 1
+            self._ensure_model(model)
             self._success_window.append(1)
             self._failure_window.append(0)
 
@@ -122,6 +144,7 @@ class AdaptiveRateLimiter:
         async with self._lock:
             self._failure_window.append(1)
             self._success_window.append(0)
+            self._ensure_model(model)
 
             if model in self._failures:
                 self._failures[model] += 1
@@ -145,7 +168,7 @@ class AdaptiveRateLimiter:
                 new_qps = max(self._min_qps, old_qps * 0.4)
                 self._model_qps[model] = new_qps
                 self.current_qps = new_qps
-                self._cooldown_until[model] = time.time() + self._cooldown_base * (1 + self._failures[model] * 0.5)
+                self._cooldown_until[model] = time.time() + self._cooldown_base * (1 + self._failures.get(model, 0) * 0.5)
                 logger.warning(f"⚠️ 模型 {model} 触发限流(429)，QPS: {old_qps:.1f} → {new_qps:.1f}")
                 return
 

@@ -84,7 +84,9 @@ class SmartTaskQueue:
         self._lock = asyncio.Lock()
         self._task_counter = 0
         self._pending_tasks: Dict[str, PrioritizedTask] = {}
-        self._completed_tasks: set = set()
+        # 审计I2: 保序 dict（插入序=c完成序）——set 无序切片裁剪会裁掉任意元素，
+        # 导致"刚完成的任务 id 被裁、重试漏拦重复执行"；dict 成员测试仍 O(1)。
+        self._completed_tasks: Dict[str, float] = {}
         self._failed_tasks: Dict[str, int] = {}
         self._drained = False
         self._reopened = False
@@ -97,11 +99,51 @@ class SmartTaskQueue:
             "total_failed": 0,
             "total_retried": 0
         }
+        # 审计G: 长驻复用的审计集合/映射有界上限，超限裁剪防无限膨胀
+        self._completed_cap = 200_000
+        self._completed_keep = 100_000
 
         # 参数-任务关联（用于提升相关任务优先级）
         self._param_task_map: Dict[str, List[str]] = {}
 
         logger.info("📋 智能任务队列已创建")
+
+    @staticmethod
+    def _heap_wrap(queue, pos: int) -> None:
+        """就地修复堆上被覆盖的 pos 位置（删除处留下空位再放入新元素后调用）。
+
+        heapq 是"最小元素在堆顶"（__lt__ 反转后即最高优先级），
+        覆盖后按父节点/子节点比较做上下浮，维持堆不变量，O(log n)。
+        """
+        item = queue[pos]
+        n = len(queue)
+        if pos > 0:
+            parent_pos = (pos - 1) >> 1
+            if item < queue[parent_pos]:
+                while pos > 0:
+                    parent_pos = (pos - 1) >> 1
+                    parent = queue[parent_pos]
+                    if item < parent:
+                        queue[pos] = parent
+                        pos = parent_pos
+                    else:
+                        break
+                queue[pos] = item
+                return
+        while True:
+            child_pos = 2 * pos + 1
+            if child_pos >= n:
+                queue[pos] = item
+                return
+            right_pos = child_pos + 1
+            if right_pos < n and queue[right_pos] < queue[child_pos]:
+                child_pos = right_pos
+            if queue[child_pos] < item:
+                queue[pos] = queue[child_pos]
+                pos = child_pos
+            else:
+                queue[pos] = item
+                return
 
     async def add_task(self, task_data: Dict, priority: int = 5) -> str:
         """
@@ -113,24 +155,66 @@ class SmartTaskQueue:
         task_id = f"task_{self._task_counter}_{int(time.time())}"
 
         async with self._lock:
+            _final_priority = priority
+            # 审计J1: bandit 是可选 RL 挂件，采样/调权异常绝不可阻断任务入队
+            #（否则 taskgen 批量 add_task 一处抛异常 → 当期全部任务丢失=部分漏检）
+            if self._bandit is not None:
+                try:
+                    _bk = key_from_task(task_data)
+                    if _bk and self._bandit.has_sample(_bk):
+                        _final_priority = self._bandit.adjust(priority, _bk)
+                except Exception as _be:  # noqa: BLE001
+                    logger.debug(f"[bandit] 调权失败，按原始优先级入队: {_be}")
+
             # 检查队列大小
             if len(self._queue) >= self._max_size:
                 # 移除最低优先级的任务（priority 数值最小者）
-                lowest = min(self._queue, key=lambda t: t.priority)
-                if priority <= lowest.priority:
-                    # 新任务优先级更低，不添加
+                lowest_pos, lowest = min(
+                    enumerate(self._queue), key=lambda it: it[1].priority
+                )
+                if _final_priority <= lowest.priority:
+                    # 调度审计D: 队列满且新任务优先级不占优 → 拒绝添加，
+                    # 必须打警告，避免静默丢弃导致漏检误判为已入队
+                    logger.warning(
+                        "⚠️ [queue] 队列已满(%s)，新任务优先级 %s <= 最低 %s，丢弃: %s",
+                        len(self._queue), _final_priority, lowest.priority,
+                        task_data.get("param") or task_data.get("engine") or task_data.get("type"),
+                    )
                     return task_id
-                # 移除最低优先级任务并插入新任务
-                self._queue.remove(lowest)
-                heapq.heapify(self._queue)
+                # 审计F: 覆盖最低优先级槽位 + 局部堆修复（O(log n)），
+                # 替代原 remove+heapify 的 O(n) 淘汰，队列满时显著降 CPU
                 self._pending_tasks.pop(lowest.task_id, None)
+                # 审计I1: 覆盖入队统计守恒——被淘汰任务扣回(-1)，新任务入账(+1)，
+                # 口径与常规入队一致（净入队数 = processed + 在队 + 待执行）
                 self._stats["total_added"] -= 1
+                self._stats["total_added"] += 1
+                # 审计I5: 被淘汰任务的参数关联索引同步清理
+                try:
+                    _p0 = str(lowest.task_data.get("param", ""))
+                    if _p0 and lowest.task_id in self._param_task_map.get(_p0, []):
+                        self._param_task_map[_p0] = [
+                            t for t in self._param_task_map[_p0] if t != lowest.task_id
+                        ]
+                        if not self._param_task_map[_p0]:
+                            self._param_task_map.pop(_p0, None)
+                except Exception:  # noqa: BLE001
+                    logger.debug("suppressed exception (core audit)")
+                task = PrioritizedTask(
+                    _final_priority, time.time(), task_id, task_data, 0, 3
+                )
+                self._queue[lowest_pos] = task
+                self._heap_wrap(self._queue, lowest_pos)
+                self._pending_tasks[task_id] = task
 
-            _final_priority = priority
-            if self._bandit is not None:
-                _bk = key_from_task(task_data)
-                if _bk and self._bandit.has_sample(_bk):
-                    _final_priority = self._bandit.adjust(priority, _bk)
+                # 记录参数关联
+                param = task_data.get("param", "")
+                if param:
+                    if param not in self._param_task_map:
+                        self._param_task_map[param] = []
+                    self._param_task_map[param].append(task_id)
+
+                return task_id
+
             task = PrioritizedTask(_final_priority, time.time(), task_id, task_data, 0, 3)
             heapq.heappush(self._queue, task)
             self._pending_tasks[task_id] = task
@@ -157,6 +241,10 @@ class SmartTaskQueue:
             return None
         _, task_data = full
         return task_data
+
+    def pending_count(self) -> int:
+        """待执行任务数（队列中尚未被消费者取走的任务）。用于 attack 阶段预算自适应。"""
+        return len(self._queue)
 
     async def get_next_full(self) -> Optional[Tuple[str, Dict]]:
         """获取下一个 (task_id, task_data)。瓶颈3多消费者需要真实 task_id：
@@ -229,18 +317,42 @@ class SmartTaskQueue:
         """标记任务完成"""
         async with self._lock:
             task = self._pending_tasks.get(task_id)
-            self._completed_tasks.add(task_id)
+            self._completed_tasks[task_id] = time.time()
+            # 审计I2: 保序裁剪——逐出最早完成者（插入序=完成序），保留最近 keep 个；
+            # set 无序切片会误裁"刚完成的任务"，重试漏拦导致重复执行。
+            if len(self._completed_tasks) > self._completed_cap:
+                _n_drop = len(self._completed_tasks) - self._completed_keep
+                for _ in range(_n_drop):
+                    self._completed_tasks.pop(next(iter(self._completed_tasks)), None)
+            if len(self._failed_tasks) > self._completed_cap:
+                self._failed_tasks = dict(tuple(self._failed_tasks.items())[-self._completed_keep:])
             self._pending_tasks.pop(task_id, None)
+            # 审计I5: 同步清理该任务的参数关联索引，防长驻复用下映射膨胀
+            if task is not None:
+                try:
+                    _p = str(task.task_data.get("param", ""))
+                    if _p and task_id in self._param_task_map.get(_p, []):
+                        self._param_task_map[_p] = [
+                            t for t in self._param_task_map[_p] if t != task_id
+                        ]
+                        if not self._param_task_map[_p]:
+                            self._param_task_map.pop(_p, None)
+                except Exception:  # noqa: BLE001
+                    logger.debug("suppressed exception (core audit)")
             if success:
                 self._stats["total_success"] += 1
             else:
                 self._stats["total_failed"] += 1
             # SP16.1 回注：执行失败 → bandit 负样本
             # 保守策略：成功但无产出不降权（避免误伤慢热组合），仅失败落地
+            # 审计J1: 回注失败不得阻塞 complete_task（否则 worker 收尾路径中断）
             if self._bandit is not None and not success and task is not None:
-                _bk = key_from_task(task.task_data)
-                if _bk:
-                    self._bandit.record(_bk, hit=False)
+                try:
+                    _bk = key_from_task(task.task_data)
+                    if _bk:
+                        self._bandit.record(_bk, hit=False)
+                except Exception as _br:  # noqa: BLE001
+                    logger.debug(f"[bandit] 负样本回注失败（忽略）: {_br}")
 
     async def fail_all_pending(self, reason: str = "deadline", protect: bool = False) -> int:
         """attack 预算截止：把所有未完成任务直接判失败并清空队列。

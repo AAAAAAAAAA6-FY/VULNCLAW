@@ -31,6 +31,11 @@ if sys.platform.startswith("win"):
             except Exception: pass
     os.environ.setdefault("TQDM_DISABLE", "1")
 
+# 4. 屏蔽上次扫描残留的 .env 配置（ALLOWED_SCOPE/PROXY）对测试的影响：
+#    本地靶场请求不被 E5 越界守卫拦截、不走代理；.env 文件内容原样保留。
+os.environ["ALLOWED_SCOPE"] = ""
+os.environ["PROXY"] = ""
+
 import pytest
 
 if PROJECT_ROOT not in sys.path:

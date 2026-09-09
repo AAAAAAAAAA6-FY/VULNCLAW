@@ -10,7 +10,7 @@ import time
 
 from vulnclaw.ai.v100.batch_processor import BatchProcessor
 from vulnclaw.core.logger import logger
-from vulnclaw.core.session_manager import get_session_manager
+from vulnclaw.core.auth.session_manager import get_session_manager
 from vulnclaw.core.settings import settings
 from vulnclaw.core.utils import cap
 
@@ -49,6 +49,15 @@ CREDENTIAL_PARAM_HINTS = (
 )
 
 
+def _signer_augment(url: str):
+    """K.3：SignerPool 命中则返回带合法签名的 URL，否则 None（绝不抛错）。"""
+    try:
+        from vulnclaw.ai.js_retriever.signer_pool import signer_pool
+        return signer_pool.augment_url(url)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _is_credential_param(param: str) -> bool:
     """判断参数名是否属于凭据/密钥类，应跳过通用注入模糊。"""
     if not param:
@@ -58,6 +67,8 @@ def _is_credential_param(param: str) -> bool:
 
 
 async def _scan_idor(self):
+    # ---- B 方案差分线（2026-09-08）：双会话差分水平越权，单身份也自动配对匿名身份 ----
+    await self._run_idor_dual_session_line()
     try:
         from vulnclaw.modules.vuln_scanner import scan_idor
         session_mgr = get_session_manager()
@@ -87,6 +98,122 @@ async def _scan_idor(self):
         logger.info(f"   ✅发现 {len(idor_findings)} 个IDOR漏洞")
     except Exception as e:
         logger.warning(f"⚠️ IDOR扫描失败: {e}")
+def _collect_idor_candidates(brief, target: str = ""):
+    """收集带 ID 类参数的候选端点 (url, param, value)。只使用真实观测端点（证据优先，宁缺毋滥）。"""
+    from vulnclaw.engines.auth_engines import IDOREngine
+
+    _id = IDOREngine()
+    seen = set()
+    out = []
+    cands = [u for u in (brief or {}).get("crawled_endpoints", []) or []
+             if isinstance(u, str) and u]
+    if target and str(target).startswith(("http://", "https://")):
+        cands.insert(0, str(target))
+    for u in cands:
+        for param, value in _id._extract_id_params(u):
+            key = (u, param)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((u, param, value))
+    return out
+
+
+async def _run_idor_dual_session_line(self) -> int:
+    """B 方案差分线：双会话差分水平越权，单身份也自动配对匿名身份。返回产出 finding 数。"""
+    if not getattr(settings, "idor_dual_session", True):
+        return 0
+    try:
+        from urllib.parse import urlparse as _up
+
+        from vulnclaw.core.auth.session_manager import get_session_manager as _gsm
+        from vulnclaw.core.biz_oracle import IdentityMatrix
+        from vulnclaw.engines.biz_oracle_engines import DualSessionOracleEngine
+    except Exception as e:  # noqa: BLE001 - 模块缺失时不阻断 extras
+        logger.warning(f"⚠️ [IDOR-双会话] 差分线初始化失败: {e}")
+        return 0
+    try:
+        session_mgr = _gsm()
+        im = IdentityMatrix(session_mgr)
+        domain = _up(self.target or "").netloc or ""
+        if await im.ensure_second_identity(domain) is None:
+            logger.info("ℹ️ [IDOR-双会话] 无可用第二身份，跳过差分线（fail-closed，不降级猜测）")
+            return 0
+        oracle = DualSessionOracleEngine()
+        cands = _collect_idor_candidates(self._recon_brief or {}, self.target or "")
+        if not cands:
+            logger.info("ℹ️ [IDOR-双会话] 无带 ID 参数的候选端点，跳过")
+            return 0
+        budget = int(getattr(settings, "idor_max_probes", 40) or 40)
+        made = 0
+        for ep, param, val in cands[:budget]:
+            try:
+                f = await oracle.diagnose(ep, param, val, im, session_mgr)
+            except Exception:  # noqa: BLE001 - 单候选失败不阻断
+                logger.debug("suppressed exception (core audit)")
+                continue
+            if f:
+                self._add_finding(f)
+                self._idor_findings = getattr(self, "_idor_findings", 0) + 1
+                made += 1
+            if made >= budget:
+                break
+        logger.info(f"🔑 [IDOR-双会话] 差分线完成：{len(cands)} 候选 → {made} 发现")
+        return made
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"⚠️ [IDOR-双会话] 差分线异常: {e}")
+        return 0
+
+
+async def _run_nuclei_community_line(self) -> int:
+    """C 方案社区线：Nuclei 社区模板通用检测（主域根 + 端点预算）。返回产出 finding 数。"""
+    if not getattr(settings, "nuclei_community_line", True):
+        logger.info("ℹ️ [Nuclei社区线] 已关闭（NUCLEI_COMMUNITY_LINE=false）")
+        return 0
+    try:
+        from vulnclaw.modules.vuln_scanner import run_nuclei_community_line, verify_nuclei_with_ai_async
+        severity = str(getattr(settings, "nuclei_line_severity", "critical,high") or "critical,high")
+        timeout = int(getattr(settings, "nuclei_line_timeout", 180) or 180)
+        budget = int(getattr(settings, "nuclei_line_endpoint_budget", 10) or 0)
+        min_tpl = int(getattr(settings, "nuclei_line_min_templates", 300) or 300)
+        logger.info("🧬 [Nuclei社区线] 通用检测外置：模板扫描启动（社区检测线）")
+        results = await run_nuclei_community_line(
+            self.target, self._recon_brief or {},
+            severity=severity, timeout=timeout, budget=budget, min_templates=min_tpl,
+        )
+        if not results:
+            logger.info("ℹ️ [Nuclei社区线] 无候选产出（模板健康失败或零命中，fail-closed）")
+            return 0
+        verified = await verify_nuclei_with_ai_async(results, self.target)
+        made = 0
+        for item in verified:
+            if item.get("ai_verdict") != "真实漏洞":
+                continue
+            ftype = f"Nuclei社区: {item.get('template') or item.get('info') or '未知'}"
+            if any(f.get('type') == ftype and f.get('url') == item.get('url', self.target)
+                   for f in getattr(self, "findings", [])):
+                continue
+            self._add_finding({
+                "type": ftype,
+                "severity": item.get("severity", "High"),
+                "evidence": str(item.get("matched") or "")[:300],
+                "url": item.get("url", self.target),
+                "parameter": "",
+                "source": "nuclei_community",
+                "template_id": item.get("template", ""),
+                "line_target": item.get("line_target", self.target),
+                "confidence": item.get("confidence", "中"),
+                "ai_reason": item.get("ai_reason", ""),
+            })
+            self._nuclei_findings = getattr(self, "_nuclei_findings", 0) + 1
+            made += 1
+        logger.info(f"🧬 [Nuclei社区线] 完成：{len(verified)} 候选 → {made} 条真实漏洞入报告")
+        return made
+    except Exception as e:  # noqa: BLE001 - 社区线异常不阻断 extras
+        logger.warning(f"⚠️ [Nuclei社区线] 异常（fail-closed 跳过）: {e}")
+        return 0
+
+
 async def _check_default_creds(self):
     try:
         from vulnclaw.modules.vuln_scanner import check_default_credentials
@@ -106,6 +233,19 @@ async def _check_default_creds(self):
         logger.warning(f"⚠️ 默认凭证检查失败: {e}")
 async def _generate_tasks(self):
     logger.info("🔎 [总指挥] 生成任务...")
+    # 任务膨胀控制（2026-09-06 第1点）：生成侧总上限，超出截断端点级/参数挖掘尾部，
+    # 保留参数级/api/js/global 核心与 B 段前部高价值端点。0=不限制（兼容旧行为）。
+    _total_cap = int(getattr(settings, "max_total_tasks", 0) or 0)
+    # 分段预算（2026-09-07 大站修复）：端点级(B)独立额度，不被参数级/参数挖掘挤爆。
+    # 大站爬出的真实端点必须获得检测机会：B 额度 = max(全局上限, 端点量×单端点引擎数×2)，
+    # 防爆上限 2000（仍受 max_scan_time 与任务消费自然收敛）。参数级/参数挖掘保持全局口径。
+    _crawled_n = len(self._recon_brief.get("crawled_endpoints", []) or [])
+    # 端点级每端点≈1 个 bundle 任务：额度跟随端点量×2 余量，封顶 5000（极端大站）。
+    # 防爆由队列水位与 scan 阶段预算自然收敛兜底，不再虚高按 12 倍估算。
+    _cap_b = (max(_total_cap, min(5000, max(200, _crawled_n * 2)))
+              if (_total_cap and _crawled_n) else 0)
+    if _total_cap:
+        logger.info(f"   [任务上限] max_total_tasks={_total_cap}（端点级独立额度={_cap_b or '不限'}，端点候选={_crawled_n}）")
     burp_params = self._recon_brief.get("burp_params", [])
     all_params = list(set(
         self._recon_brief.get("url_params", [])
@@ -208,8 +348,34 @@ async def _generate_tasks(self):
         # 合并去重: graphql_introspection 为 graphql 引擎端点级内省探测的子集, 由 graphql 统一承接(见 net_engines.py GraphQLEngine.scan)
         "prometheus_metrics": 6 if ("spring" in tech_lower or "go" in tech_lower) else 4,
         "rate_limit": 5,
-        "verb_tampering": 5
+        "verb_tampering": 5,
+        # 深藏/复杂/解析分歧三引擎（参数级）
+        "deep_chimera": 7,
+        "state_chain": 6,
+        "parsing_shadow": 6,
     }
+    # SP27: 指令重点(focus)提升对应引擎优先级（--instruction 直写账号密码时可顺带指定重点）
+    _ins_ctx = getattr(settings, "instruction_context", None)
+    if _ins_ctx:
+        if _ins_ctx.focus:
+            _fc = " ".join(str(x).lower() for x in _ins_ctx.focus)
+            _focus_map = {
+                "sql": "sqli", "注入": "sqli", "xss": "xss", "跨站": "xss",
+                "越权": "idor", "bolt": "idor", "auth": "auth_enumeration",
+                "登录": "auth_enumeration", "session": "session", "会话": "session",
+                "csrf": "csrf", "上传": "file_upload", "upload": "file_upload",
+                "ssti": "ssti", "ssrf": "ssrf", "文件": "lfi", "lfi": "lfi",
+                "xml": "xxe", "api": "api_security", "graphql": "graphql",
+                "cors": "cors", "重定向": "open_redirect", "redirect": "open_redirect",
+            }
+            for _kw, _eng in _focus_map.items():
+                if _kw in _fc and _eng in engine_priority:
+                    engine_priority[_eng] = min(10, engine_priority[_eng] + 4)
+                    logger.info(f"   [SP27] 指令重点命中「{_kw}」→ {_eng} 优先级提高至 {engine_priority[_eng]}")
+        if _ins_ctx.exclude:
+            logger.info(f"   [SP27] 指令排除项（消费端过滤）: {_ins_ctx.exclude}")
+        if _ins_ctx.has_credentials and len(_ins_ctx.accounts) > 1:
+            logger.info(f"   [SP27] 多角色凭据就绪（IDOR/越权引擎将使用多角色会话）: {_ins_ctx.masked_summary}")
     # P4-1: 情报驱动 —— 按 Shodan/Censys 标记的服务类型与开放端口提升对应引擎优先级
     intel = self._recon_brief.get("intel") or {}
     intel_hints = [str(h).lower() for h in (intel.get("service_hints") or [])]
@@ -257,8 +423,9 @@ async def _generate_tasks(self):
     parameter_tasks = 0
     batch_pending = []  # P1-4: BatchProcessor 收集同参数多引擎任务
     # 覆盖率优化：原先每参数固定取静态优先级 top-3，第 4 名之后的引擎永远不执行。
-    # 现改为 top-3 核心引擎 + 按参数序号轮换 1 个次优引擎（rotation），
-    # 30 个参数即可让全部 32 类参数级引擎都获得至少一次执行机会。
+    # 现改为 top-3 核心引擎 + 按参数序号轮换 N 个次优引擎（rotation），
+    # N 由「剩余引擎数 / 参数数」动态推导（见下方轮换逻辑），
+    # 使参数量少的站点也能在本次扫描内覆盖到尾部引擎。
     rotation_offset = 0
     self._rotation_offset = 0
     # B: 业务流建模/竞争条件总开关——关闭时从引擎池移除 business_logic/race_condition
@@ -292,14 +459,22 @@ async def _generate_tasks(self):
             engine_scores.append((engine_name, priority))
         engine_scores.sort(key=lambda x: x[1], reverse=True)
         top_engines = engine_scores[:3]
-        # 轮换引擎：top-3 之外的引擎按参数序号轮流获得执行机会（覆盖率优化）
+        # P0：轮换步长动态化——每参数额外带 k 个次优引擎，
+        # k = ceil(剩余引擎数 / 参数数)，上限 max_extra_engines_per_param（默认 3）。
+        # 旧实现固定 +1：参数级引擎池已达 59 个，需要 56 个参数才轮得完，
+        # 参数量少的站点尾部引擎永远拿不到执行机会。
         remaining_engines = engine_scores[3:]
         selected_engines = [engine_name for engine_name, _ in top_engines]
         if remaining_engines:
-            rotating_engine = remaining_engines[rotation_offset % len(remaining_engines)][0]
-            if rotating_engine not in selected_engines:
-                selected_engines.append(rotating_engine)
-            rotation_offset += 1
+            _remain_n = len(remaining_engines)
+            _params_n = max(1, len(all_params))
+            _max_extra = int(getattr(settings, "max_extra_engines_per_param", 3) or 3)
+            _k = max(1, min(_max_extra, -(-_remain_n // _params_n)))  # ceil 除法
+            for _i in range(_k):
+                _eng = remaining_engines[(rotation_offset + _i) % _remain_n][0]
+                if _eng not in selected_engines:
+                    selected_engines.append(_eng)
+            rotation_offset += _k
         task_data = {
                 "type": "engine_bundle",
                 "engines": selected_engines,
@@ -360,6 +535,9 @@ async def _generate_tasks(self):
                 "payload_limit": 10,
                 "created_at": time.time()
             }
+            _signed = _signer_augment(full_api)
+            if _signed:
+                task_data["signed_url"] = _signed
             await self.task_queue.add_task(task_data, 8)
             tasks_added += 1
     for js_api in cap(self._recon_brief.get("js_endpoints", []), settings.max_js_endpoints):
@@ -399,10 +577,35 @@ async def _generate_tasks(self):
                 "payload_limit": 8,
                 "created_at": time.time()
             }
+            _signed = _signer_augment(full_api.split('?')[0])
+            if _signed:
+                task_data["signed_url"] = _signed
             await self.task_queue.add_task(task_data, 7)
             tasks_added += 1
     # B: 同源链接爬虫发现的端点 → 喂进引擎循环（target=端点URL，param=端点自带参数）
     _crawled = self._recon_brief.get("crawled_endpoints", []) or []
+    if not _crawled:
+        # 检出率排查（2026-09-06）：recon 同源爬虫在真扫环境曾静默返回空（共享会话状态
+        # 干扰，独立会话正常），导致端点级 bundle 整段缺失（/nosql /deser 漏检）。
+        # 防御：此处用独立裸会话补爬一次，绕开 recon 侧会话状态；失败不阻断任务生成。
+        logger.warning("   [TaskGen] crawled_endpoints 为空——使用独立裸会话补爬一次")
+        try:
+            from urllib.parse import urlparse as _up, parse_qs as _pq
+            from vulnclaw.modules.recon import crawl_same_origin as _cso
+            import aiohttp as _aio
+            async with _aio.ClientSession() as _bare:
+                _c2 = await _cso(
+                    self.target, session=_bare, max_depth=2, max_urls=80, render=False,
+                    crawl_hash_routing=settings.crawl_hash_routing,
+                    crawl_websocket=settings.crawl_websocket,
+                    ws_endpoints=set(),
+                )
+            if _c2:
+                _crawled = [{"url": u, "params": sorted(p)} for u, p in _c2.items()]
+                self._recon_brief["crawled_endpoints"] = _crawled  # 回填 brief 供 extras 等消费
+                logger.info(f"   [TaskGen] 裸会话补爬成功: {len(_crawled)} 个端点已入端点级任务流")
+        except Exception as _ce:  # noqa: BLE001
+            logger.warning(f"   [TaskGen] 裸会话补爬失败（继续无端点级任务）: {_ce}")
     for _item in cap(_crawled, settings.max_crawl_endpoints):
         _ep_url = _item.get("url") if isinstance(_item, dict) else _item
         _ep_params = _item.get("params") if isinstance(_item, dict) else None
@@ -412,6 +615,42 @@ async def _generate_tasks(self):
         _ep_params = [p for p in (_ep_params or []) if p and isinstance(p, str)]
         if _a32_target_unchanged or crawl_asset_unchanged(_a32_assets, _ep_url, _ep_params):
             self._a32_skipped += 1
+            continue
+        if not _ep_params:
+            # 无参端点覆盖（线1.3）：不造默认 "id" 参数，按路径特征映射目标级引擎任务
+            _el0 = _etarget.lower()
+            _mapped_engine = None
+            if re.search(r'/jwt', _el0):
+                _mapped_engine = "jwt"
+            elif re.search(r'/idor|/profile|/user|/account', _el0):
+                _mapped_engine = "idor"
+            elif re.search(r'/admin|/manage|/console', _el0):
+                _mapped_engine = "weak_credential"
+            elif re.search(r'/ssrf|/fetch|/proxy', _el0):
+                # SSRF 型无参端点覆盖：侦察未抓到 url 参数时，补发 url 参数探测任务，
+                # 由 SSRF 引擎 _is_ssrf_param 对 url 放行（防 /ssrf 整轮零任务）
+                await self.task_queue.add_task({
+                    "type": "engine_bundle",
+                    "engines": ["ssrf"],
+                    "target": _etarget,
+                    "param": "url",
+                    "priority": engine_priority.get("ssrf", 7),
+                    "payload_limit": 10,
+                    "created_at": time.time(),
+                    "source": "crawl_noparam_ssrf",
+                }, engine_priority.get("ssrf", 7))
+                tasks_added += 1
+            if _mapped_engine:
+                await self.task_queue.add_task({
+                    "type": "global_scan",
+                    "engine": _mapped_engine,
+                    "target": _etarget,
+                    "priority": engine_priority.get(_mapped_engine, 8),
+                    "payload_limit": 10,
+                    "created_at": time.time(),
+                    "source": "crawl_noparam",
+                }, engine_priority.get(_mapped_engine, 8))
+                tasks_added += 1
             continue
         _test_params = cap(_ep_params, settings.max_test_params_per_endpoint) or ["id"]
         _el = _etarget.lower()
@@ -424,6 +663,12 @@ async def _generate_tasks(self):
             _hint.append("file_upload")
         if re.search(r'/lfi|/include|/path', _el):
             _hint.append("lfi")
+        if re.search(r'/nosql|/mongo', _el):
+            _hint.append("nosql")
+        if re.search(r'/deser|/unserial', _el):
+            _hint.append("deserialization")
+        if re.search(r'/ssrf|/fetch|/proxy|/redirect|/download|/load|/callback', _el):
+            _hint.append("ssrf")
         for _p in _test_params:
             _skip, _reason = self.local_filter.should_skip(_etarget, _p, "", 0)
             if _skip:
@@ -451,6 +696,9 @@ async def _generate_tasks(self):
             }
             await self.task_queue.add_task(task_data, task_data["priority"])
             tasks_added += 1
+            if _cap_b and tasks_added >= _cap_b:
+                logger.warning(f"   [任务上限] 端点级任务截断（额度 {_cap_b}，保留前序端点）")
+                break
     # C: param_mining（B 侧 recon.py 写入的 D3.5 参数挖掘结果）-> 参数池补测
     if getattr(settings, "scan_param_mining", True):
         _pmined = self._recon_brief.get("param_mining", []) or []
@@ -487,6 +735,9 @@ async def _generate_tasks(self):
             }
             await self.task_queue.add_task(task_data, task_data["priority"])
             tasks_added += 1
+            if _total_cap and tasks_added >= _total_cap:
+                logger.warning(f"   [任务上限] 已达 max_total_tasks={_total_cap}，参数挖掘任务截断")
+                break
     if static_skipped:
         logger.info(f"   🗑️ [静态资源过滤] 源头丢弃 {static_skipped} 个静态资源 URL")
     if self._a32_skipped:
@@ -501,10 +752,34 @@ async def _generate_tasks(self):
         "tls_security", "dns_security", "js_library_cve",
         "mass_assignment", "weak_credential",
         "password_reset", "cloud_container_exposure", "backend_component_cve",
-        "open_redirect", "cors", "idor", "jwt", "oauth", "deserialization",
+        "open_redirect", "cors", "idor", "jwt", "oauth",  # deserialization 改由端点级 B 段 hint 承接（避免 global 空 param 噪音任务）
         "file_upload",
         "nacos_exposure", "solr_exposure", "confluence_exposure",
+        "deep_chimera", "parsing_shadow", "state_chain", "llm_injection",
     ]
+    # P0-3：可达性自检——以 scanner 实际加载的引擎集（_ENGINE_MAP，按 name 索引）为权威，
+    # 未进入任一调度池（engine_priority 参数级 / global_engines 目标级）者自动兜底入
+    # 目标级池，杜绝"注册但不跑"。两个调度池 key 均为引擎 name，语义一致。
+    try:
+        from vulnclaw.core.scanner import get_all_engines
+        _loaded = get_all_engines()  # 实际加载的引擎实例列表
+        _loaded_names = {getattr(e, "name", None) or type(e).__name__ for e in _loaded}
+        _param_set = set(engine_priority.keys())
+        _global_set = set(global_engines)
+        # 已知"有意不独立调度"的引擎（由其它引擎内部承接能力），不算漏调度，
+        # 排除在兜底之外，避免重复执行。例：graphql_introspection 由 graphql 引擎端点级内省承接。
+        _known_unscheduled = {"graphql_introspection"}
+        _unreached = [n for n in _loaded_names
+                      if n not in _param_set and n not in _global_set
+                      and n not in _known_unscheduled]
+        if _unreached:
+            logger.warning(
+                f"[engines] {len(_unreached)} 个引擎已注册但未入任何调度池，"
+                f"自动兜底入目标级池以保证可达: {sorted(_unreached)}"
+            )
+            global_engines = list(global_engines) + _unreached
+    except Exception as _re_exc:  # noqa: BLE001 - 引擎集不可用时跳过自检，不影响调度
+        logger.debug(f"[engines] 可达性自检跳过（引擎集不可用）: {_re_exc}")
     for engine_name in global_engines:
         # 修复：info_leak 扫描路径数提升至 150
         if engine_name == "info_leak":
@@ -513,7 +788,7 @@ async def _generate_tasks(self):
                 "engine": engine_name,
                 "target": self.target,
                 "priority": 6,
-                "max_paths": 150  # 淇锛氬鍔犺矾寰勬暟
+                "max_paths": 150  # 修复：增加路径数
             }, priority=6)
         else:
             await self.task_queue.add_task({
@@ -524,6 +799,83 @@ async def _generate_tasks(self):
             }, priority=6)
         tasks_added += 1
     logger.info(f"   📋 总任务数: {tasks_added}")
+    # 子域资产级任务（2026-09-07）：recon 发现的子域进入引擎任务池，弥合大站"子域零消费"漏洞。
+    # 每个子域派发轻量全局引擎子集（scan 型、根路径探测）；数量按 max_subdomain_targets 分摊预算，
+    # 并遵守 max_total_tasks 总上限截断（与端点级/参数挖掘段口径一致）。
+    if getattr(settings, "enable_subdomain_taskgen", True):
+        # 优先消费存活资产（recon 存活探测结果），空则回退全量子域，避免打死域发探测
+        _subdomains = (
+            self._recon_brief.get("alive_assets")
+            or self._recon_brief.get("subdomains")
+            or []
+        )
+        if _subdomains:
+            try:
+                from urllib.parse import urlparse as _sup
+                _main_host = (_sup(self.target).netloc or "").lower()
+            except Exception:  # noqa: BLE001
+                _main_host = ""
+            _sub_engines = [
+                "security_headers", "tls_security", "dns_security",
+                "cors", "open_redirect", "api_version", "info_leak",
+                "source_code_leak", "backup_file_leak", "admin_console_exposure",
+                "swagger_api_doc", "cloud_container_exposure",
+            ]
+            _sub_targets = []
+            for _sd in _subdomains:
+                # 2026-09-08: alive_assets 是 dict 列表（{url,status,...}），
+                # 子域收集是字符串列表；统一提取 url/host 再归一，避免 str(dict) 畸形 URL
+                if isinstance(_sd, dict):
+                    _h = str(_sd.get("url") or _sd.get("host") or "").strip()
+                else:
+                    _h = str(_sd).strip()
+                _h = _h.rstrip('/')
+                if '://' in _h:
+                    _h = _sup(_h).netloc or _h
+                if not _h:
+                    continue
+                _hl = _h.lower()
+                # 跳过主目标自身（www 归一比较），避免对主域重复全扫
+                if _main_host and (
+                    _hl == _main_host
+                    or _hl == (_main_host[4:] if _main_host.startswith("www.") else _main_host)
+                    or _main_host == (_hl[4:] if _hl.startswith("www.") else _hl)
+                ):
+                    continue
+                _sub_targets.append(_h)
+            _sub_targets = list(dict.fromkeys(_sub_targets))  # 保序去重
+            _cap_subs = int(getattr(settings, "max_subdomain_targets", 10) or 0)
+            if _cap_subs and len(_sub_targets) > _cap_subs:
+                logger.info(
+                    f"   [子域任务] 发现 {len(_sub_targets)} 个子域，按 max_subdomain_targets={_cap_subs} "
+                    "取前部分（其余留待增量轮/后续补齐）"
+                )
+                _sub_targets = _sub_targets[:_cap_subs]
+            _scheme = "https" if str(self.target).lower().startswith("https") else "http"
+            for _st in _sub_targets:
+                _sub_url = f"{_scheme}://{_st}/"
+                for _eng in _sub_engines:
+                    if _total_cap and tasks_added >= _total_cap:
+                        logger.warning(f"   [任务上限] 已达 max_total_tasks={_total_cap}，子域任务截断")
+                        break
+                    _sd_task = {
+                        "type": "global_scan",
+                        "engine": _eng,
+                        "target": _sub_url,
+                        "priority": 5,
+                        "source": "subdomain",
+                    }
+                    if _eng == "info_leak":
+                        _sd_task["max_paths"] = 40  # 子域目录爆破预算收敛（主目标 150）
+                    await self.task_queue.add_task(_sd_task, priority=5)
+                    tasks_added += 1
+                if _total_cap and tasks_added >= _total_cap:
+                    break
+            if _sub_targets:
+                logger.info(
+                    f"   🌐 [子域任务] {len(_sub_targets)} 个子域 × {len(_sub_engines)} 个全局引擎"
+                    f" → {len(_sub_targets) * len(_sub_engines)} 个任务入队"
+                )
     # S3.1c: 召回 VectorMemory 历史经验，命中高价值组合时给任务追加 memory_hint/memory_boost
     _mem_injector = getattr(self, "_inject_task_memory_hints", None)
     if _mem_injector is not None:
@@ -797,5 +1149,5 @@ async def _inject_task_memory_hints(self):
         logger.debug(f"[TaskMem] 记忆召回/注入失败（不影响任务生成）: {exc}")
 
 
-__all__ = ['_check_default_creds', '_gen_cve_task', '_generate_tasks', '_inject_task_memory_hints', '_scan_idor']
+__all__ = ['_check_default_creds', '_gen_cve_task', '_generate_tasks', '_collect_idor_candidates', '_inject_task_memory_hints', '_run_idor_dual_session_line', '_run_nuclei_community_line', '_scan_idor']
 

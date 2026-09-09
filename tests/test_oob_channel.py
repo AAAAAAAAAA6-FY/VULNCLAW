@@ -16,9 +16,55 @@ import vulnclaw.core.oob_channel as oob_mod
 from vulnclaw.core.oob_channel import OOBChannel, OOBInteraction
 
 
+@pytest.fixture(autouse=True)
+def _isolate_oob_breaker():
+    """OOB 熔断器是进程级全局状态，用例之间必须隔离。
+
+    否则某个用例触发通道熔断（TTL 300s）后，后续所有用例的 request_domain
+    都会直接返回 None，造成"看起来像功能坏了"的假失败。
+    """
+    # interactsh 短期熔断（_ITSH_DOWN_UNTIL）是独立全局状态，reset_oob_breaker
+    # 不复位；真实注册失败≥2 次后会让后序用例全部短路成 None —— 一并复位
+    oob_mod._ITSH_DOWN_UNTIL = 0.0
+    oob_mod._ITSH_FAIL_STREAK = 0
+    oob_mod.reset_oob_breaker()
+    yield
+    oob_mod._ITSH_DOWN_UNTIL = 0.0
+    oob_mod._ITSH_FAIL_STREAK = 0
+    oob_mod.reset_oob_breaker()
+
+
 # ============================================================
 # mock 工具：假 aiohttp session / 假 run_tool
 # ============================================================
+class _FakeStdout:
+    """异步可迭代 stdout（StreamReader 协议），逐行产出已经拆好的 bytes。"""
+
+    def __init__(self, lines):
+        self._it = iter(lines)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._it)
+        except StopIteration as exc:
+            raise StopAsyncIteration from exc
+
+
+class _FakeProc:
+    """fake create_subprocess_exec 返回体：携带可迭代 stdout。"""
+
+    def __init__(self, lines):
+        self.stdout = _FakeStdout(lines)
+        self.stderr = None
+        self.returncode = None
+
+    def terminate(self):
+        self.returncode = 0
+
+
 class _FakeResp:
     def __init__(self, text: str):
         self._text = text
@@ -102,6 +148,8 @@ async def test_all_channels_unavailable_returns_none(monkeypatch):
 async def test_interactsh_domain_from_stdout(monkeypatch):
     """interactsh-client 输出含 oast 域名时能被揪出并缓存。"""
     monkeypatch.setattr(oob_mod, "load_tool_config", lambda *a, **k: True)
+    monkeypatch.setattr(oob_mod, "resolve_tool_path",
+                        lambda *a, **k: "fake-itsh-bin")
     monkeypatch.setattr(oob_mod, "run_tool",
                         _fake_run_tool("1a2b3c4d5e6f7a.oast.pro", returncode=0))
     ch = OOBChannel(provider="interactsh")
@@ -129,6 +177,41 @@ async def test_interactsh_domain_from_payload_file(monkeypatch, tmp_path):
 async def test_interactsh_poll_parses_json_lines(monkeypatch):
     """interactsh 轮询输出 JSON 行 → 解析成回传，按 token 过滤。"""
     monkeypatch.setattr(oob_mod, "load_tool_config", lambda *a, **k: True)
+    monkeypatch.setattr(oob_mod, "resolve_tool_path",
+                        lambda *a, **k: "fake-itsh-bin")
+    async def _fake_spawn(*a, **k):
+        return _FakeProc([
+            ('{"protocol":"dns","type":"dns","fullId":"tok9.xyz.oast.pro",'
+             '"remote_address":"8.8.8.8","timestamp":"2026-09-01T00:00:00Z",'
+             '"raw_request":"61.2.3.4"}').encode("utf-8"),
+            b"",
+        ])
+
+    monkeypatch.setattr(
+        oob_mod.asyncio, "create_subprocess_exec", _fake_spawn
+    )
+    async def _fake_spawn(*a, **k):
+        return _FakeProc([
+            ('{"protocol":"dns","type":"dns","fullId":"tok9.xyz.oast.pro",'
+             '"remote_address":"8.8.8.8","timestamp":"2026-09-01T00:00:00Z",'
+             '"raw_request":"61.2.3.4"}').encode("utf-8"),
+            b"",
+        ])
+
+    monkeypatch.setattr(
+        oob_mod.asyncio, "create_subprocess_exec", _fake_spawn
+    )
+    async def _fake_spawn(*a, **k):
+        return _FakeProc([
+            ('{"protocol":"dns","type":"dns","fullId":"tok9.xyz.oast.pro",'
+             '"remote_address":"8.8.8.8","timestamp":"2026-09-01T00:00:00Z",'
+             '"raw_request":"61.2.3.4"}').encode("utf-8"),
+            b"",
+        ])
+
+    monkeypatch.setattr(
+        oob_mod.asyncio, "create_subprocess_exec", _fake_spawn
+    )
     line = ('{"protocol":"dns","type":"dns","fullId":"tok9.xyz.oast.pro",'
             '"remote_address":"8.8.8.8","timestamp":"2026-09-01T00:00:00Z",'
             '"raw_request":"61.2.3.4"}')
@@ -351,3 +434,76 @@ class TestSelfCheck:
         # wait_for_interaction 通道不可用 → 空
         ch3 = OOBChannel(provider="interactsh")
         assert asyncio_run(ch3.wait_for_interaction("tk", timeout=0.5)) == []
+
+
+class TestOOBBreaker:
+    """P0：OOB 熔断器（通道级 + 目标级）。
+
+    背景：目标无出网能力 / 外发域被封禁时，引擎仍逐个等待带外回调，空等占满
+    worker（实测 attack 阶段 545s 仅产出 2 个 finding）。熔断后这些等待被跳过，
+    时间还给确定性检测；只影响"等待"，不产生 finding，不影响误报率。
+    """
+
+    def setup_method(self):
+        oob_mod.reset_oob_breaker()
+
+    def teardown_method(self):
+        oob_mod.reset_oob_breaker()
+
+    def test_target_key_from_url(self):
+        assert oob_mod.target_key_from_url("https://Example.COM:8443/a/b?x=1") == "example.com:8443"
+        assert oob_mod.target_key_from_url("not-a-url") == "not-a-url"
+
+    def test_miss_streak_trips_breaker(self):
+        tgt = "example.com"
+        # 未达阈值前不熔断
+        for _ in range(oob_mod._OOB_MISS_THRESHOLD - 1):
+            oob_mod.record_oob_result(tgt, False)
+            assert not oob_mod.is_oob_blocked(tgt)
+        # 达阈值 → 熔断
+        oob_mod.record_oob_result(tgt, False)
+        assert oob_mod.is_oob_blocked(tgt)
+
+    def test_hit_resets_streak(self):
+        tgt = "a.com"
+        for _ in range(oob_mod._OOB_MISS_THRESHOLD):
+            oob_mod.record_oob_result(tgt, False)
+        assert oob_mod.is_oob_blocked(tgt)
+        oob_mod.record_oob_result(tgt, True)   # 收到回调 → 判定有误，立即解除
+        assert not oob_mod.is_oob_blocked(tgt)
+
+    def test_blocked_target_skips_wait(self):
+        """熔断后 wait_for_interaction 立即返回空，不再空等 timeout 秒。"""
+        import time as _t
+        ch = OOBChannel(provider="interactsh")
+        ch._domain, ch._resolved_provider = "x.oast.pro", "interactsh"
+        tgt = "blocked.example"
+        for _ in range(oob_mod._OOB_MISS_THRESHOLD):
+            oob_mod.record_oob_result(tgt, False)
+        assert oob_mod.is_oob_blocked(tgt)
+
+        _t0 = _t.monotonic()
+        assert asyncio_run(ch.wait_for_interaction("tk", timeout=5, target=tgt)) == []
+        assert _t.monotonic() - _t0 < 1.0, "熔断后应立即返回，不应空等 timeout"
+
+    def test_channel_down_skips_domain_request(self, monkeypatch):
+        """通道熔断期内不再重复走 8s 的域名注册流程。"""
+        oob_mod.mark_channel_down("test")
+        assert oob_mod.is_channel_down()
+        assert oob_mod.channel_down_remaining() > 0
+
+        async def _should_not_run(*a, **k):
+            raise AssertionError("通道熔断期间不应再申请域名")
+
+        ch = OOBChannel(provider="interactsh")
+        monkeypatch.setattr(ch, "_request_interactsh_domain", _should_not_run)
+        monkeypatch.setattr(ch, "_request_dnslog_domain", _should_not_run)
+        assert asyncio_run(ch.request_domain()) is None
+
+    def test_snapshot_and_reset(self):
+        oob_mod.record_oob_result("s.com", False)
+        snap = oob_mod.oob_state_snapshot()
+        assert snap["miss_streak"]["s.com"] == 1
+        assert snap["miss_threshold"] == oob_mod._OOB_MISS_THRESHOLD
+        oob_mod.reset_oob_breaker()
+        assert oob_mod.oob_state_snapshot()["miss_streak"] == {}

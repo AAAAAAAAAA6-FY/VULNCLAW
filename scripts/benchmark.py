@@ -1,143 +1,202 @@
-# SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (c) 2026 VULNCLAW Authors (see README & LICENSE)
-# This file is part of VULNCLAW / pentest_platform.
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""G.1 引擎 benchmark：用 fixture（正反例 + mock 响应）测引擎，输出检出率/误报率基线。
 
-"""VULNCLAW 检出率基准（D7.2）：剧本化靶场评估 + 吞吐基准。
+设计要点：
+  - **不依赖真实靶场**：每个 case 自带 responses，benchmark 把它注入引擎模块的
+    async_get，从而可离线、可重复地评估引擎（含合并后的规则驱动引擎）。
+    这正好补上"local_lab 只覆盖十余类漏洞、其余引擎无法评估"的缺口。
+  - **正反例成对**：positive = 应检出（漏了就是 FN）；negative = 不应检出
+    （报了就是 FP）。这样"零误报的零发现"骗不了人。
+  - 判定口径：
+      expect=positive 且有 finding → TP ；无 finding → FN
+      expect=negative 且有 finding → FP ；无 finding → TN
+      检出率 = TP / (TP+FN)   误报率 = FP / (FP+TN)
 
-两种模式：
-  --mode throughput   原 asyncio 并发吞吐基准（默认）
-  --mode eval         给定剧本(expected) + 扫描报告(report)，计算检出率(recall/precision)并对照红线
-
-用法示例：
-  python scripts/benchmark.py --mode eval \
-      --scenarios-dir scripts/benchmarks \
-      --report scripts/benchmarks/baseline_report.json \
-      --min-recall 0.8
+用法：
+    python scripts/benchmark.py                # 跑全部 fixture 并打印
+    python scripts/benchmark.py --save         # 额外写入基线文件
+输出：
+    控制台表格 + tests/fixtures/benchmark_baseline.json
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib
 import json
-import os
 import sys
-import time
-from dataclasses import dataclass, field
-from statistics import mean
-from typing import Any
+from pathlib import Path
+from typing import Dict, List
 
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+# 复刻 scan.py：在任何 vulnclaw 导入前先装 numpy 兼容桩（Python 3.13+/Windows 防段错误）
 try:
-    import yaml
-except ImportError:  # pragma: no cover
-    yaml = None
+    from vulnclaw.core.numpy_compat import install_numpy_compat_stub_if_needed
+
+    install_numpy_compat_stub_if_needed()
+except Exception:  # noqa: BLE001 - 桩不可用时继续，多数场景本就不需要
+    pass
+
+FIXTURE_DIR = ROOT / "tests" / "fixtures" / "engines"
+BASELINE = ROOT / "tests" / "fixtures" / "benchmark_baseline.json"
 
 
-# ---------------- throughput 基准（保留原有能力） ----------------
-async def simulate_request(request_id: int, delay: float = 0.05) -> dict:
-    await asyncio.sleep(delay)
-    return {"id": request_id, "status": "ok"}
+def _load_yaml(path: Path) -> Dict:
+    import yaml  # 局部导入：脚本可独立运行
+
+    return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
 
 
-async def run_benchmark(total_requests: int = 200, concurrency: int = 20) -> float:
-    sem = asyncio.Semaphore(concurrency)
+def _make_fake_async_get(responses: Dict):
+    """按 URL 子串匹配返回预设响应（模拟 async_get 的 (status, text, headers)）。"""
 
-    async def worker(rid: int) -> dict:
-        async with sem:
-            return await simulate_request(rid)
+    async def _get(url, *args, **kwargs):
+        s = str(url)
+        for suffix, resp in (responses or {}).items():
+            if str(suffix) in s:
+                print(f"      [mock] HIT  {s} -> {resp.get('status', 200)}")
+                return int(resp.get("status", 200)), str(resp.get("body", "")), {}
+        print(f"      [mock] MISS {s} -> 404")
+        return 404, "", {}
 
-    start = time.perf_counter()
-    results = await asyncio.gather(*(worker(i) for i in range(total_requests)))
-    elapsed = time.perf_counter() - start
-    return elapsed if results else 0.0
-
-
-async def _throughput(scenarios) -> None:
-    timings = []
-    for total, conc in scenarios:
-        elapsed = await run_benchmark(total, conc)
-        timings.append((total, conc, elapsed))
-        rps = total / elapsed if elapsed else 0.0
-        print(f"requests={total:>3} concurrency={conc:>2} elapsed={elapsed:.3f}s rps={rps:.2f}")
-    print(f"average_elapsed={mean(d for _, _, d in timings):.3f}s")
+    return _get
 
 
-# ---------------- 剧本化评估 ----------------
-@dataclass
-class TargetScenario:
-    name: str
-    target: str
-    expected_vulns: list[str] = field(default_factory=list)
-    auth: dict | None = None
-
-    @classmethod
-    def from_dict(cls, d: dict) -> TargetScenario:
-        return cls(
-            name=d.get("name", d.get("target", "unnamed")),
-            target=d["target"],
-            expected_vulns=d.get("expected_vulns", []),
-            auth=d.get("auth"),
+def _run_case(spec: Dict, engine, loop) -> List[Dict]:
+    """注入 mock 响应后跑一次引擎 scan。"""
+    module_name = spec.get("module") or ""
+    fake = _make_fake_async_get(spec.get("responses") or {})
+    orig = None
+    mod = None
+    if module_name:
+        mod = importlib.import_module(module_name)
+        orig = getattr(mod, "async_get", None)
+        mod.async_get = fake
+    try:
+        findings = loop.run_until_complete(
+            engine.scan(spec.get("target", "http://127.0.0.1:8080"), None)
         )
-
-
-def load_scenarios(path: str) -> list[TargetScenario]:
-    if not os.path.exists(path):
-        raise FileNotFoundError(path)
-    if os.path.isdir(path):
-        out: list[TargetScenario] = []
-        for fn in sorted(os.listdir(path)):
-            if fn.endswith((".yaml", ".yml")):
-                out.extend(load_scenarios(os.path.join(path, fn)))
-        return out
-    if yaml is None:
-        raise RuntimeError("PyYAML 未安装，无法解析剧本")
-    with open(path, "r", encoding="utf-8") as fh:
-        data = yaml.safe_load(fh) or []
-    return [TargetScenario.from_dict(d) for d in data]
-
-
-def _report_findings(report: dict) -> list[dict]:
-    """从扫描报告中提取 finding 列表。
-
-    支持三种真实产物形态：
-    - 平台 JSON 报告：{"vulnerabilities": [{...}]}（scan_runner 真实产物）
-    - 平台 finding JSON：{"findings": [{...}]} / {"results": [...]}
-    - 验证网关 SARIF 2.1：{"runs": [{"results": [{"ruleId": .., "properties": {..}}]}]}
-    归一为统一 dict 列表（type 取 ruleId/properties.type，参数与证据取 properties）。
-    """
-    if not isinstance(report, dict):
+        return findings or []
+    except Exception as exc:  # noqa: BLE001 - 单 case 异常记为未检出
+        print(f"  [!] case {spec.get('id')} 执行异常: {exc}")
         return []
-    findings = (report.get("vulnerabilities")
-                or report.get("findings")
-                or report.get("results")
-                or [])
-    if not findings:
-        # 平台分桶形态兜底：direct/burp/nuclei/idor/cred/..._findings 合并归一
-        for k, v in report.items():
-            if k.endswith('_findings') and isinstance(v, list):
-                findings = findings or []
-                findings.extend(v)
-
-    if findings:
-        return list(findings)
-    out: list[dict] = []
-    for run in report.get("runs") or []:
-        for res in run.get("results") or []:
-            props = res.get("properties") or {}
-            f: dict = {
-                "type": res.get("ruleId") or props.get("type") or "unknown",
-                "url": props.get("url") or "",
-                "parameter": props.get("parameter") or "",
-                "payload": props.get("payload") or "",
-                "evidence": props.get("evidence") or "",
-            }
-            if props.get("severity"):
-                f["severity"] = props.get("severity")
-            out.append(f)
-    return out
+    finally:
+        if mod is not None and orig is not None:
+            mod.async_get = orig
 
 
-# D7.2 补丁：剧本期望名（自然语言）与引擎报告 type（规范类名）的命名空间归一。
-# 不做归一化时 "XSS"/"SQL Injection" 与 "xss"/"sqli" 集合交集恒为空，召回率恒为 0。
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--save", action="store_true", help="写入基线文件")
+    args = ap.parse_args()
+
+    if not FIXTURE_DIR.is_dir():
+        print(f"NO_FIXTURE_DIR {FIXTURE_DIR}")
+        return 2
+
+    loop = asyncio.new_event_loop()
+    try:
+        rows: List[Dict] = []
+        stats: Dict[str, Dict[str, int]] = {}
+
+        for f in sorted(FIXTURE_DIR.glob("*.yaml")):
+            data = _load_yaml(f)
+            module_name = data.get("module") or ""
+            class_name = data.get("class") or ""
+            engine_name = data.get("engine") or class_name
+            try:
+                mod = importlib.import_module(module_name) if module_name else None
+                cls = getattr(mod, class_name) if (mod and class_name) else None
+                engine = cls() if cls else None
+            except Exception as exc:  # noqa: BLE001
+                print(f"[!] 引擎 {engine_name} 加载失败: {exc}")
+                continue
+
+            for case in data.get("cases") or []:
+                if not isinstance(case, dict):
+                    continue
+                case = dict(case)
+                # 修复：module/class 定义在 fixture 顶层，必须带进 case，
+                # 否则 _run_case 拿不到模块名 → mock 不注入 → 引擎走真实 HTTP。
+                case.setdefault("module", module_name)
+                expect = str(case.get("expect") or "positive")
+                findings = _run_case(case, engine, loop) if engine else []
+                found = len(findings) > 0
+                if expect == "positive":
+                    verdict = "TP" if found else "FN"
+                else:
+                    verdict = "FP" if found else "TN"
+                top = (findings[0].get("title") or findings[0].get("type") or "") if findings else ""
+                rows.append({
+                    "file": f.name, "engine": engine_name, "case": case.get("id"),
+                    "expect": expect, "found": found, "verdict": verdict,
+                    "severity": (findings[0].get("severity") if findings else ""),
+                    "top": top[:48],
+                })
+                st = stats.setdefault(engine_name, {"TP": 0, "FN": 0, "FP": 0, "TN": 0})
+                st[verdict] += 1
+
+        # ---- 输出 ----
+        print("=" * 96)
+        print(" 引擎 benchmark（fixture 驱动，离线可重复）")
+        print("=" * 96)
+        print(f"{'引擎':<24}{'用例':<34}{'期望':<10}{'检出':<8}{'判定':<8}严重级/标题")
+        print("-" * 96)
+        for r in rows:
+            print(
+                f"{r['engine'][:23]:<24}{str(r['case'])[:33]:<34}{r['expect']:<10}"
+                f"{('是' if r['found'] else '否'):<8}{r['verdict']:<8}{r['severity']} {r['top']}"
+            )
+        print("-" * 96)
+        print(f"{'引擎':<24}{'TP':>6}{'FN':>6}{'FP':>6}{'TN':>6}{'检出率':>10}{'误报率':>10}")
+        summary = []
+        for name, st in stats.items():
+            pos = st["TP"] + st["FN"]
+            neg = st["FP"] + st["TN"]
+            dr = (st["TP"] / pos * 100) if pos else 0.0
+            fr = (st["FP"] / neg * 100) if neg else 0.0
+            print(
+                f"{name[:23]:<24}{st['TP']:>6}{st['FN']:>6}{st['FP']:>6}{st['TN']:>6}"
+                f"{dr:>9.1f}%{fr:>9.1f}%"
+            )
+            summary.append({"engine": name, **st, "detect_rate": round(dr, 1),
+                            "false_rate": round(fr, 1)})
+        tot = {k: sum(s[k] for s in stats.values()) for k in ("TP", "FN", "FP", "TN")}
+        pos = tot["TP"] + tot["FN"]
+        neg = tot["FP"] + tot["TN"]
+        print("-" * 96)
+        print(
+            f"{'合计':<24}{tot['TP']:>6}{tot['FN']:>6}{tot['FP']:>6}{tot['TN']:>6}"
+            f"{(tot['TP'] / pos * 100) if pos else 0:>9.1f}%"
+            f"{(tot['FP'] / neg * 100) if neg else 0:>9.1f}%"
+        )
+        print("=" * 96)
+
+        if args.save:
+            BASELINE.parent.mkdir(parents=True, exist_ok=True)
+            BASELINE.write_text(
+                json.dumps({"summary": summary, "total": tot, "cases": rows},
+                           ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            print(f"BASELINE_SAVED={BASELINE}")
+        return 0
+    finally:
+        loop.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+import os as _os
+
+
+# ---------------------------------------------------------------------------
+# 兼容层（2026-09-09）：G.1 重写为 fixture 驱动基准后，保留旧评测 API，
+# 供 tests/test_benchmark_eval.py（D7.2 剧本评测）继续收集运行 —— 纯增量，不参与新 main 逻辑。
+# ---------------------------------------------------------------------------
 _VULN_TYPE_ALIASES = {
     "xss": "xss", "cross-site scripting": "xss", "cross site scripting": "xss",
     "反射型xss": "xss", "存储型xss": "xss", "dom xss": "xss",
@@ -162,14 +221,13 @@ _VULN_TYPE_ALIASES = {
 }
 
 
-def normalize_vuln_type(raw: Any) -> str:
+def normalize_vuln_type(raw) -> str:
     """剧本期望名 / 引擎报告 type → 规范漏洞类名（未识别原样小写返回，宁保守）。"""
     if raw is None:
         return ""
     s = str(raw).strip().lower()
     if not s:
         return ""
-    # 精确命中优先；再按最长后缀模糊匹配（如 "SQL Injection at login" → sqli）
     key = _VULN_TYPE_ALIASES.get(s)
     if key:
         return key
@@ -182,8 +240,40 @@ def normalize_vuln_type(raw: Any) -> str:
     return best or s
 
 
-def evaluate_report(report: dict, scenarios: list[TargetScenario]) -> dict:
-    """计算所有剧本期望漏洞的召回率/精确率。"""
+def _report_findings(report: dict) -> list:
+    """从扫描报告中提取 finding 列表（平台 JSON / finding JSON / SARIF 2.1 三形态）。"""
+    if not isinstance(report, dict):
+        return []
+    findings = (report.get("vulnerabilities")
+                or report.get("findings")
+                or report.get("results")
+                or [])
+    if not findings:
+        for k, v in report.items():
+            if k.endswith('_findings') and isinstance(v, list):
+                findings = findings or []
+                findings.extend(v)
+    if findings:
+        return list(findings)
+    out: list = []
+    for run in report.get("runs") or []:
+        for res in run.get("results") or []:
+            props = res.get("properties") or {}
+            f: dict = {
+                "type": res.get("ruleId") or props.get("type") or "unknown",
+                "url": props.get("url") or "",
+                "parameter": props.get("parameter") or "",
+                "payload": props.get("payload") or "",
+                "evidence": props.get("evidence") or "",
+            }
+            if props.get("severity"):
+                f["severity"] = props.get("severity")
+            out.append(f)
+    return out
+
+
+def evaluate_report(report: dict, scenarios: list) -> dict:
+    """计算所有剧本期望漏洞的召回率/精确率（旧评测脚本依赖的稳定 API）。"""
     found_types = set()
     for f in _report_findings(report):
         vt = f.get("type") or f.get("vuln_type") or f.get("name")
@@ -193,7 +283,7 @@ def evaluate_report(report: dict, scenarios: list[TargetScenario]) -> dict:
                 found_types.add(canon)
     expected = set()
     for s in scenarios:
-        for ev in s.expected_vulns:
+        for ev in getattr(s, "expected_vulns", []) or []:
             canon = normalize_vuln_type(ev)
             if canon:
                 expected.add(canon)
@@ -212,41 +302,39 @@ def evaluate_report(report: dict, scenarios: list[TargetScenario]) -> dict:
     }
 
 
-def _load_report_json(path: str) -> dict:
+class TargetScenario:
+    """剧本场景：期望发现的漏洞清单（旧评测脚本兼容定义）。"""
+    def __init__(self, name: str, target: str, expected_vulns=None, auth=None):
+        self.name = name
+        self.target = target
+        self.expected_vulns = list(expected_vulns or [])
+        self.auth = auth
+
+    @classmethod
+    def from_dict(cls, d: dict):
+        return cls(
+            name=d.get("name", d.get("target", "unnamed")),
+            target=d["target"],
+            expected_vulns=d.get("expected_vulns", []),
+            auth=d.get("auth"),
+        )
+
+    def __repr__(self):
+        return f"TargetScenario(name={self.name!r}, target={self.target!r})"
+
+
+def load_scenarios(path: str) -> list:
+    """从 YAML 文件/目录加载剧本场景（旧评测脚本依赖的稳定 API）。"""
+    import yaml as _yaml  # 局部导入
+
+    if not _os.path.exists(path):
+        raise FileNotFoundError(path)
+    if _os.path.isdir(path):
+        out: list = []
+        for fn in sorted(_os.listdir(path)):
+            if fn.endswith((".yaml", ".yml")):
+                out.extend(load_scenarios(_os.path.join(path, fn)))
+        return out
     with open(path, "r", encoding="utf-8") as fh:
-        return json.load(fh)
-
-
-async def _eval_mode(scenarios_dir: str, report_path: str, min_recall: float) -> None:
-    scenarios = load_scenarios(scenarios_dir)
-    report = await asyncio.to_thread(_load_report_json, report_path)
-    res = evaluate_report(report, scenarios)
-    print("=" * 60)
-    print(f"剧本数={len(scenarios)} 期望漏洞={len(res['expected'])} 检出={len(res['found'])}")
-    print(f"recall={res['recall']:.2%}  precision={res['precision']:.2%}")
-    if res["missed"]:
-        print(f"未检出(missed): {res['missed']}")
-    if res["extra"]:
-        print(f"额外检出(extra): {res['extra']}")
-    print("=" * 60)
-    if min_recall is not None and res["recall"] < min_recall:
-        print(f"[FAIL] 检出率 {res['recall']:.2%} 低于红线 {min_recall:.2%}")
-        sys.exit(1)
-    print("[OK] 检出率达标")
-
-
-def main() -> None:
-    ap = argparse.ArgumentParser(description="VULNCLAW 检出率基准")
-    ap.add_argument("--mode", choices=["throughput", "eval"], default="throughput")
-    ap.add_argument("--scenarios-dir", default="scripts/benchmarks")
-    ap.add_argument("--report", default="artifacts/report.json")
-    ap.add_argument("--min-recall", type=float, default=0.8)
-    args = ap.parse_args()
-    if args.mode == "eval":
-        asyncio.run(_eval_mode(args.scenarios_dir, args.report, args.min_recall))
-    else:
-        asyncio.run(_throughput([(100, 10), (200, 20), (400, 40)]))
-
-
-if __name__ == "__main__":
-    main()
+        data = _yaml.safe_load(fh) or []
+    return [TargetScenario.from_dict(d) for d in data]

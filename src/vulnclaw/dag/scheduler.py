@@ -100,6 +100,8 @@ class DAGScheduler:
                 break
 
             for node_id in ready_nodes:
+                if node_id in pending:  # 调度审计C: 已在跑/退避中的节点不再重复提交
+                    continue
                 task = asyncio.create_task(
                     self._agent_pool.submit(self.execute_node(node_id))
                 )
@@ -187,9 +189,46 @@ class DAGScheduler:
             logger.info(f"[DAG Dashboard]   RUNNING: {', '.join(running)}")
 
     def get_ready_nodes(self) -> List[str]:
+        """就绪节点集合。
+
+        调度审计B: 依赖 FAILED 的下游不再无限滞留 PENDING——显式转 SKIPPED
+        并写死信/告警，避免主循环在 `not ready and not pending` 时直接 break
+        造成整段扫描阶段静默漏执行（如 recon 挂则 attack/verify 无声无息不跑）。
+        """
         ready = []
         for node_id, node in self.dag.nodes.items():
             if node.status != NodeStatus.PENDING:
+                continue
+            blocked = [
+                dep_id for dep_id in node.depends_on
+                if dep_id in self.dag.nodes
+                and self.dag.nodes[dep_id].status == NodeStatus.FAILED
+            ]
+            if blocked:
+                node.status = NodeStatus.SKIPPED
+                node.completed_at = time.time()
+                node.error = ("依赖 %s 失败，本节点跳过") % ",".join(blocked)
+                self._results[node_id] = None
+                logger.error(
+                    "⏭ [Agent-%s] 依赖失败被跳过: %s -> %s (%s)",
+                    node_id, ",".join(blocked), node.name, node.node_type.value,
+                )
+                try:
+                    from .executor import write_dead_letter
+                    write_dead_letter(self.scan_id, {
+                        "scan_id": self.scan_id,
+                        "node_id": node_id,
+                        "node_type": node.node_type.value,
+                        "name": node.name,
+                        "target": node.target,
+                        "params": node.params,
+                        "error": node.error,
+                        "retries": 0,
+                        "skipped_by": "dep_failed",
+                        "ts": time.time(),
+                    })
+                except Exception as _sk_err:
+                    logger.warning("💀 [DLQ] 跳过记录写入死信失败: %s", _sk_err)
                 continue
             deps_completed = all(
                 self.dag.nodes.get(dep_id, None) is not None and
@@ -234,7 +273,7 @@ class DAGScheduler:
             async with self._status_lock:
                 if node.retry_count < node.max_retries:
                     node.retry_count += 1
-                    node.status = NodeStatus.PENDING
+                    node.status = NodeStatus.RETRYING  # 调度审计C: 退避期间挂起，杜绝被重复提交
                     node.error = str(e)
                     logger.warning(f"⚠️ [Agent-{node_id}] 重试 ({node.retry_count}/{node.max_retries}): {e}")
                     retry_delay = 2 ** (node.retry_count - 1)  # P1-3: 指数退避 2s、4s
@@ -244,9 +283,11 @@ class DAGScheduler:
                     node.completed_at = time.time()
                     logger.error(f"❌ [Agent-{node_id}] 失败: {e}")
 
-            if node.status == NodeStatus.PENDING:
-                # P1-3: 指数退避后重新入队，并记录重试计数
+            if node.status == NodeStatus.RETRYING:
+                # 调度审计C: 指数退避后回到 PENDING 重新可调度（期间不占 pending 额外槽位）
                 await asyncio.sleep(retry_delay)
+                async with self._status_lock:
+                    node.status = NodeStatus.PENDING
                 if self._context is not None:
                     try:
                         await self._context.record_node_retry(node_id)

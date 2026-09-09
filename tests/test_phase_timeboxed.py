@@ -42,6 +42,12 @@ def _fake_orch(budgets):
     f = types.SimpleNamespace()
     f._phase_budgets = dict(budgets)
     f._phase_timeouts_hit = []
+
+    def _recompute(self, name):
+        # 测试聚焦 timebox 行为本身：预算由调用方给定，不做动态重算
+        return self._phase_budgets.get(name, 0)
+
+    f._recompute_phase_budget = _recompute.__get__(f)
     return f
 
 

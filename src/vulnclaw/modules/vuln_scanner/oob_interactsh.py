@@ -37,17 +37,32 @@ async def get_interactsh_domain_async() -> Optional[str]:
 # ============================================================
 # 其他辅助工具
 # ============================================================
-async def get_interactsh_poll(domain: str, timeout: int = 15) -> List[Dict]:
+async def get_interactsh_poll(domain: str, timeout: int = 15,
+                              target: str = "") -> List[Dict]:
     """轮询 Interactsh 回调（A1.1：委托 OOBChannel，返回原始回调字典）。
 
     返回每个回调的原始 interactsh JSON 字典，并兼容 net_engines / verify 的
     kebab-case 键（raw-request / q-type），与旧实现形状一致，避免回归。
+
+    P0 熔断：``target`` 传入扫描目标（URL 或 host）。该目标若已被判定外发被封禁，
+    直接返回空列表，不再空等 ``timeout`` 秒——这是 attack 阶段被 OOB 拖死的主因之一。
     """
     try:
-        from vulnclaw.core.oob_channel import OOBChannel
+        from vulnclaw.core.oob_channel import (
+            OOBChannel,
+            is_oob_blocked,
+            record_oob_result,
+            target_key_from_url,
+        )
+        _tgt = target or target_key_from_url(domain or "")
+        if is_oob_blocked(_tgt):
+            logger.debug("📡 [Interactsh poll] OOB 熔断生效，跳过轮询")
+            return []
         ch = OOBChannel(provider="interactsh")
         await ch.request_domain()  # 从缓存恢复已注册域名与会话文件
         items = await ch.poll(timeout=timeout)
+        # 驱动目标级熔断：命中清零、零回调累加
+        record_oob_result(_tgt, bool(items))
         out: List[Dict] = []
         for it in (items or []):
             extra = getattr(it, "extra", None) or {}

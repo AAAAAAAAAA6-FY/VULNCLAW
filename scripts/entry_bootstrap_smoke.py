@@ -8,7 +8,7 @@ Purpose:
     correctly applied and inherited when this file runs through the BAT
     launcher.
   * Exercize the PROJECT_ROOT heuristic from scripts/ -> one-up.
-  * Confirm project package imports (core.settings) resolve correctly via the
+  * Confirm project package imports (vulnclaw.core.settings) resolve correctly via the
     project-local thirdparty venv.
 """
 
@@ -80,6 +80,9 @@ from pathlib import Path  # noqa: E402
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
+_SRC = os.path.join(PROJECT_ROOT, "src")
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
 
 
 def run_checks() -> int:
@@ -124,11 +127,11 @@ def run_checks() -> int:
 
     # Project module import (catches missing pydantic etc in thirdparty\venv)
     try:
-        from core.settings import PROJECT_CACHE_DIR  # noqa: F401
-        results.append(("from core.settings import PROJECT_CACHE_DIR",
+        from vulnclaw.core.settings import PROJECT_CACHE_DIR  # noqa: F401
+        results.append(("from vulnclaw.core.settings import PROJECT_CACHE_DIR",
                         True, str(PROJECT_CACHE_DIR)))
     except Exception as exc:
-        results.append(("from core.settings import PROJECT_CACHE_DIR",
+        results.append(("from vulnclaw.core.settings import PROJECT_CACHE_DIR",
                         False, repr(exc)))
 
     # Print report

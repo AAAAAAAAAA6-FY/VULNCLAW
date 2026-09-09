@@ -8,6 +8,7 @@
 import time
 from typing import Dict, List, Tuple
 from vulnclaw.core.logger import logger
+from vulnclaw.core.settings import settings
 
 # ============================================================
 # 轨道2 2.3: 漏洞类型 → CWE / OWASP Top 10 2021 / 修复建议 静态映射表
@@ -228,6 +229,76 @@ def _confidence_rank(vuln: Dict) -> int:
     return 0
 
 
+def _sigma_score(vuln: Dict) -> 'tuple[int, str]':
+    """D3: 证据运营——置信度量化 + 分档。
+
+    权重：实锤类证据 +3/+2，AI 背书 +2，多源证据 +1；降级（pending_review/Info）减分。
+    分档：>=5 实锤高优先复核 / 3-4 中（需人工确认）/ <3 低（批量复核）。
+    """
+    s = 0
+    if vuln.get('exploited') or vuln.get('exploit_verified'):
+        s += 3
+    for _k in ("burp_verified", "cross_confirmed", "cross_tool_confirmed",
+               "oob", "oob_verified", "sqlmap_confirmed"):
+        if vuln.get(_k):
+            s += 2
+    _verdict = str(vuln.get("ai_verdict", "")).lower()
+    # 审计K1: 评分口径——"真实漏洞（本地规则确认）"是 LLM 降级/失败后的本地规则
+    # 兜底，无 AI 实调背书；若按 AI 背书 +2，零调用降级场景会把规则单源证据批量
+    # 抬成"高优先复核（实锤）"，淹没人工。规则兜底降为 +1，AI 多模型投票背书维持 +2。
+    if "真实" in _verdict and "本地规则确认" in _verdict:
+        s += 1
+    elif "真实" in _verdict or "高置信" in _verdict or _verdict == "real":
+        s += 2
+    _sources = [k for k in ("evidence", "nuclei_result", "sqlmap_extracted", "burp_evidence", "oob_evidence")
+                 if vuln.get(k)]
+    if len(_sources) >= 2:
+        s += 1
+    if vuln.get('pending_review'):
+        s -= 2
+    if str(vuln.get("severity", "")).strip().capitalize() == "Info":
+        s -= 3
+    if s >= 5:
+        return s, "★ 高优先复核（实锤）"
+    if s >= 3:
+        return s, "★ 中（需人工确认）"
+    return s, "低（批量复核）"
+
+
+def _build_evidence_chain(vuln: Dict, cap_len: int = 4000) -> List[str]:
+    """D3: 多源证据合并为单一证据链（按来源前缀分段，总长截断）。"""
+    parts: List[str] = []
+    order = (
+        ("evidence", "引擎证据"),
+        ("nuclei_result", "Nuclei 原始输出"),
+        ("cross_tool_evidence", "开源对照"),
+        ("sqlmap_extracted", "sqlmap"),
+        ("ai_verdict", "AI 裁决"),
+        ("burp_evidence", "Burp"),
+        ("oob_evidence", "OOB 回调"),
+    )
+    for key, label in order:
+        raw = vuln.get(key)
+        if not raw:
+            continue
+        text = str(raw).strip()
+        if not text or text in ("无", "N/A", "n/a"):
+            continue
+        parts.append(f"[{label}] {text}"[:cap_len])
+        if sum(len(p) for p in parts) >= cap_len:
+            break
+    total = 0
+    out: List[str] = []
+    for p in parts:
+        total += len(p)
+        if total > cap_len:
+            p = p[: max(0, cap_len - (total - len(p)))]
+            out.append(p)
+            break
+        out.append(p)
+    return out
+
+
 async def _generate_report(self) -> Dict:
     elapsed = int(time.time() - self._start_time)
     severity_count = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0, "Info": 0}
@@ -258,16 +329,28 @@ async def _generate_report(self) -> Dict:
             entry["vuln_types"].append(vtype)
 
     # 轨道2 2.2: 双引擎交叉确认优先展示（严重度 → 交叉确认 → 置信度 → 原始顺序）
+    # 轨道2 2.2 + D3: 实锤证据最高优先 → 严重度 → 交叉确认 → sigma → 置信度 → 原始顺序
     ordered = sorted(
         enumerate(self.findings),
         key=lambda pair: (
+            0 if (pair[1].get("exploited") or pair[1].get("exploit_verified")) else 1,
             -_SEVERITY_RANK.get(str(pair[1].get("severity", "Low")).strip().capitalize(), 0),
             0 if pair[1].get("cross_confirmed") else 1,
+            -int(pair[1].get("sigma_score") or 0),
             -_confidence_rank(pair[1]),
             pair[0],
         ),
     )
     findings_ordered = [v for _i, v in ordered]
+    # D3: 证据链合并 + sigma 分档注入（可控开关，默认开）
+    sigma_stats: Dict = {}
+    if getattr(settings, "report_sigma_enable", True):
+        for _v in findings_ordered:
+            _sc, _bucket = _sigma_score(_v)
+            _v["sigma_score"] = _sc
+            _v["sigma_bucket"] = _bucket
+            _v.setdefault("evidence_chain", _build_evidence_chain(_v))
+            sigma_stats[_bucket] = sigma_stats.get(_bucket, 0) + 1
     cross_confirmed_count = sum(1 for v in self.findings if v.get("cross_confirmed"))
 
     rate_stats = await self.get_rate_stats_cached()
@@ -296,6 +379,7 @@ async def _generate_report(self) -> Dict:
         "verified_findings": len(self.findings),
         "vulnerabilities": findings_ordered,
         "severity_stats": severity_count,
+        "pending_review": list(getattr(self, "_pending_review", []) or []),
         # 轨道2 2.2: 双引擎交叉确认统计
         "cross_confirmed_count": cross_confirmed_count,
         # 轨道2 2.3: 按 CWE 去重的修复建议（报告 Remediation 段）
@@ -312,6 +396,7 @@ async def _generate_report(self) -> Dict:
         "burp_tokens": bool(self._recon_brief.get("burp_tokens")),
         "collaborator_domain": self._collaborator_domain,
         "ai_model_usage": model_stats,
+        "sigma_stats": sigma_stats,
         "performance": {
             "rate_limiter": rate_stats,
             "local_filter": filter_stats,
@@ -348,7 +433,7 @@ async def _generate_report(self) -> Dict:
     logger.info("   🤖 AI模型调用统计:")
     for model, count in model_stats.get('per_model', {}).items():
         failures = model_stats.get('failures', {}).get(model, 0)
-        logger.info(f"      {model}: {count} 娆?(澶辫触: {failures})")
+        logger.info(f"      {model}: {count} 次（失败: {failures}）")
     logger.info(f"   Critical: {severity_count.get('Critical', 0)}")
     logger.info(f"   High: {severity_count.get('High', 0)}")
     # 轨道2 2.2/2.3 交付物概览
@@ -374,6 +459,28 @@ async def _generate_report(self) -> Dict:
         logger.info(f"   E1 攻击图: {len(report['attack_paths'])} 条 TOP 攻击路径")
     except Exception as exc:  # noqa: BLE001
         logger.debug(f"E1 攻击图构建失败，报告降级跳过: {exc}")
+    # P1-6：去重收口——报告生成统一先经 deterministic_dedupe 合并同指纹 findings
+    # （每指纹保留强度最高者），消除跨引擎/多路径产生的重复 finding；歧义簇单独留存
+    # 供 LLM 裁决，不污染主 findings。这是去重的唯一权威入口，避免 phases_verify /
+    # verification_gateway 各自去重导致口径不一致。
+    try:
+        from vulnclaw.core.dedupe import deterministic_dedupe
+        _raw = list(report.get("vulnerabilities") or [])
+        _kept, _ambiguous = deterministic_dedupe(_raw)
+        report["vulnerabilities"] = _kept
+        if _ambiguous:
+            report["dedupe_ambiguous"] = _ambiguous
+            for _ag in _ambiguous:
+                for _c in _ag.get("candidates", []):
+                    _c["llm_pending"] = True  # 歧义簇未接入运行时 LLM 裁决，标记留待人工
+            logger.warning(
+                f"   [去重] 合并 {len(_raw) - len(_kept)} 条重复；{len(_ambiguous)} 簇语义疑似"
+                f"（暂未接入 LLM 裁决，全部保留备查，报告命中 dedupe_ambiguous 字段）"
+            )
+        else:
+            logger.info(f"   [去重] 合并 {len(_raw) - len(_kept)} 条重复 finding")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[去重] 失败，跳过（保留原始 findings）: {exc}")
     # SP10: finding 生命周期台账 + 对比分组（失败不阻塞主报告）
     from vulnclaw.core.finding_lifecycle import apply_lifecycle
 

@@ -73,6 +73,9 @@ def test_oob_skips_itsh_when_binary_missing(monkeypatch):
         return None
 
     monkeypatch.setattr(oob_channel, "is_channel_down", lambda: False)
+    # 复位 interactsh 短期熔断，避免前序用例真实注册失败后短路本用例
+    monkeypatch.setattr(oob_channel, "_ITSH_DOWN_UNTIL", 0.0)
+    monkeypatch.setattr(oob_channel, "_ITSH_FAIL_STREAK", 0)
     monkeypatch.setattr(oob_channel, "resolve_tool_path", fake_resolve)
     monkeypatch.setattr(oob_channel, "run_tool", never_run)
     monkeypatch.setattr(OOBChannel, "_request_dnslog_domain", fake_dnslog)

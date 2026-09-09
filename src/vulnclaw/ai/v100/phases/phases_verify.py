@@ -12,6 +12,8 @@ from vulnclaw.core.settings import settings
 from vulnclaw.ai.core import get_llm_client
 from vulnclaw.modules.vuln_scanner import get_interactsh_poll
 from vulnclaw.core.exploit_verify import SafeExploit, safe_verify_vulnerability
+from vulnclaw.ai.v100.evidence_pack import build_evidence_pack, _probe_summary
+import time as _time
 def _severity_verify_plan(severity: str) -> Dict[str, Any]:
     plans = {
         "Critical": {"n_models": 3, "do_http_verify": True, "do_exploit": True, "do_oob_poll": True},
@@ -58,11 +60,33 @@ def _local_rule_verify(self, vuln: Dict) -> str:
     # 1) 引擎结构化标志：响应内容已在引擎侧被规则确认
     if vuln.get("dir_listing") or vuln.get("file_read") or vuln.get("base64_encoded"):
         return "engine_structured_flag"
+    # 1b) 引擎实锤标志：CMD 回显 / 时间盲注 A/B 复核 / 反序列化 gadget 确认
+    if vuln.get("cmd_exec") or vuln.get("time_verified") or vuln.get("deser_confirmed"):
+        return "engine_hard_flag"
     vuln_type = str(vuln.get("type", ""))
     vuln_type_l = vuln_type.lower()
     evidence = str(vuln.get("evidence", ""))
     ev = evidence.lower()
     # 2) evidence 关键词分类匹配
+    if "ldap" in vuln_type_l:
+        if any(k in ev for k in (
+            "ldap", "ldapexception", "invalid search filter", "active directory",
+            "directory service", "opendldap", "result code", "error code",
+            "edirectory", "novell", "unexpected token",
+        )):
+            return "ldap_error_marker"
+    if "反序列化" in vuln_type or "deser" in vuln_type_l:
+        if any(k in ev for k in (
+            "反序列化错误", "实锤", "gadget", "ysoserial", "readobject",
+            "deserialize", "failed to deserialize", "unsupported pickle",
+            "no module named", "not implemented for this type",
+        )):
+            return "deser_error_marker"
+    _nosql_local = ("nosql" in vuln_type_l) or ("mongodb" in vuln_type_l) or ("非关系" in vuln_type)
+    if _nosql_local:
+        if any(k in ev for k in ("mongo", "bson", "objectid", "mongodb", "redis", "neo4j",
+                                 "couchdb", "invalid", "exception", "unexpected")):
+            return "nosql_error_marker"
     if "sql" in vuln_type_l or "注入" in vuln_type:
         if any(k in ev for k in ("sql", "syntax", "mysql", "postgres", "oracle", "odbc")):
             return "sql_error_marker"
@@ -72,11 +96,16 @@ def _local_rule_verify(self, vuln: Dict) -> str:
         if "目录项" in evidence or "目录列表" in evidence or "index of" in ev:
             return "dir_listing_marker"
     if any(k in vuln_type for k in ("rce", "cmdi", "command", "命令")):
-        if "uid=" in ev or "whoami" in ev:
+        if any(k in ev for k in ("uid=", "whoami", "命令输出", "延时 payload", "sleep 0 对照", "a/b 复核通过", "复核通过")):
             return "cmdi_output_marker"
     if "xss" in vuln_type_l:
         if "<script" in ev or "onerror" in ev:
             return "xss_echo_marker"
+    # SSTI：A4 二次复核（1337*2→2674）是强甄别特征；仅单次算式时用
+    # "计算结果" 语境词兜底（避免裸 "49" 数字误伤页面天然含 49 的端点）。
+    if "ssti" in vuln_type_l or "模板注入" in vuln_type:
+        if "2674" in ev or "1337*2" in ev or "计算结果" in ev:
+            return "ssti_calc_marker"
     return ""
 def _technical_signal_present(vuln: Dict) -> bool:
     """判断 finding 是否携带引擎侧技术证据，避免被 LLM 一票否决后静默丢弃。
@@ -90,8 +119,35 @@ def _technical_signal_present(vuln: Dict) -> bool:
         return True
     if vuln.get("technical_confirmed") or vuln.get("oob_confirmed"):
         return True
+    # 引擎侧实锤标志：CMD 回显、时间盲注 A/B 复核通过、反序列化无害 gadget/OOB 确认
+    if vuln.get("cmd_exec") or vuln.get("time_verified") or vuln.get("deser_confirmed"):
+        return True
     vuln_type = str(vuln.get("type", "")).lower()
     evl = str(vuln.get("evidence", "")).lower()
+    # LDAP 注入：引擎报错回显（LDAPException / invalid search filter 等）即强证据，
+    # 必须是 LDAP 专用判定，避免误落入下方通用"注入"分支的 SQL 关键词失配。
+    if "ldap" in vuln_type:
+        if any(k in evl for k in (
+            "ldap", "ldapexception", "invalid search filter", "active directory",
+            "directory service", "opendldap", "ldap error", "result code",
+            "error code", "edirectory", "novell", "unexpected token",
+        )):
+            return True
+    if "反序列化" in str(vuln.get("type", "")) or "deser" in vuln_type:
+        if any(k in evl for k in (
+            "反序列化错误", "实锤", "gadget", "ysoserial", "readobject",
+            "deserialize", "failed to deserialize", "invalid object character",
+            "unsupported pickle", "no module named", "not implemented for this type",
+        )):
+            return True
+    _nosql_type = "nosql" in vuln_type or "mongodb" in vuln_type or "非关系" in vuln_type
+    if _nosql_type:
+        # 注意：'NoSQL' 含子串 'sql'，必须优先于下方 sql 分支判定，避免落回 SQL 关键词失配
+        if any(k in evl for k in (
+            "mongo", "bson", "objectid", "mongodb", "redis", "neo4j", "couchdb",
+            "invalid", "exception", "unexpected", "command failed",
+        )):
+            return True
     if "sql" in vuln_type or "注入" in vuln_type:
         if any(k in evl for k in ("sql", "syntax", "mysql", "postgres", "sqlite",
                                   "odbc", "ora-", "near \"", "sqlstate", "unclosed", "error")):
@@ -103,7 +159,10 @@ def _technical_signal_present(vuln: Dict) -> bool:
         if any(k in evl for k in ("root:", "etc/passwd", "index of", "directory listing", "/bin/")):
             return True
     if any(k in vuln_type for k in ("cmdi", "command", "rce", "命令")):
-        if any(k in evl for k in ("uid=", "whoami", "root:", "id=", "bin/bash")):
+        if any(k in evl for k in (
+            "uid=", "whoami", "root:", "id=", "bin/bash",
+            "延时 payload", "sleep 0 对照", "a/b 复核通过", "复核通过", "命令输出",
+        )):
             return True
     if "ssti" in vuln_type:
         if any(k in evl for k in ("49", "777", "jinja", "{{", "freemarker", "gotcha")):
@@ -112,6 +171,61 @@ def _technical_signal_present(vuln: Dict) -> bool:
         if any(k in evl for k in ("127.0.0.1", "localhost", "169.254", "metadata", "internal")):
             return True
     return False
+
+
+async def _probe_before_ai(self, vuln: Dict) -> Dict:
+    """A 方案步骤3: AI 投票前的断言前置探测（基线 vs 载荷），客观信号喂 AI。
+
+    任何异常/参数不足 → {"ok": False}（fail-closed：绝不提升 confidence）。
+    复用 verification_gateway._probe_one 的判定语义（reflect/status_shift），
+    额外补充 len_diff（长度差比率）与 duration_diff（耗时差）。
+    结果落回 vuln["probe"]，供 _verify_cross / _verify_cross_batch 消费。
+    """
+    import time as _probe_time
+
+    result: Dict = {"ok": False}
+    try:
+        url = str(vuln.get("url", "") or "").strip()
+        param = str(vuln.get("parameter") or vuln.get("param") or "").strip()
+        payload = str(vuln.get("payload", "") or "").strip()
+        if not (url and param and payload):
+            result["reason"] = "insufficient"
+            vuln["probe"] = result
+            return vuln
+        if not url.startswith(("http://", "https://")):
+            result["reason"] = "bad_scheme"
+            vuln["probe"] = result
+            return vuln
+
+        from vulnclaw.core.utils import async_get, build_attack_url
+
+        _t0 = _probe_time.monotonic()
+        b_status, b_text, _bh = await async_get(
+            url, session=self.session, timeout=12, no_retry=True)
+        _t1 = _probe_time.monotonic()
+        a_url = build_attack_url(url, param, payload)
+        a_status, a_text, _ah = await async_get(
+            a_url, session=self.session, timeout=12, no_retry=True)
+        _t2 = _probe_time.monotonic()
+
+        low_p = payload.lower()
+        low_b = str(b_text or "").lower()
+        low_a = str(a_text or "").lower()
+        result.update({
+            "ok": True,
+            "base_status": b_status,
+            "attack_status": a_status,
+            "reflect": bool(len(payload) >= 4 and low_p in low_a and low_p not in low_b),
+            "status_shift": bool(
+                (a_status and a_status >= 500 and b_status < 500) or (a_status != b_status)
+            ),
+            "len_diff": round(abs(len(low_a) - len(low_b)) / max(1, len(low_b)), 4),
+            "duration_diff": round(_t2 - _t1 - (_t1 - _t0), 3),
+        })
+    except Exception as _pe:  # noqa: BLE001 - fail-closed：探测失败不升 confidence
+        result["error"] = str(_pe)[:200]
+    vuln["probe"] = result
+    return vuln
 
 
 async def _verify_cross_batch(self, group: list) -> Optional[Dict[int, Dict]]:
@@ -130,18 +244,30 @@ async def _verify_cross_batch(self, group: list) -> Optional[Dict[int, Dict]]:
 
     lines = []
     for i, vuln in enumerate(group):
+        _pk = vuln.get("evidence_pack") or (
+            f"type={vuln.get('type', '?')} | url={vuln.get('url', '')} | "
+            f"evidence={str(vuln.get('evidence', ''))[:300]}"
+        )
+        _pr = _probe_summary(vuln.get("probe"))
         lines.append(
             f"[{i}] type={vuln.get('type', '?')} | severity={vuln.get('severity', '?')} | "
             f"url={vuln.get('url', '')} | param={vuln.get('parameter') or vuln.get('param', '')} | "
-            f"payload={str(vuln.get('payload', ''))[:120]} | "
-            f"evidence={str(vuln.get('evidence', ''))[:300]}"
+            f"payload={str(vuln.get('payload', ''))[:120]}\n"
+            f"    证据包: {str(_pk)[:900]}\n"
+            f"    观测: {_pr}"
         )
     prompt = (
-        "你是 Web 漏洞验证专家。以下是同一 URL 与参数上多个检测引擎给出的漏洞候选，"
-        "请逐条独立判断其是否真实可利用（不要因同组其他条目而影响判断）。\n\n"
+        "你是 Web 漏洞证据型验证官。以下是同一 URL 与参数上多个检测引擎给出的漏洞候选，"
+        "每候选附【证据包】与【probe 观测结果】。请逐条独立裁决，不受同组其他条目影响。\n"
+        "\n"
+        "【裁决规则】\n"
+        "1. 反射/回显类漏洞：只有载荷回显（reflect=true）或明确响应差分才可 confirm；\n"
+        "2. 无客观证据或 probe 缺失/失败（ok=false）：必须判 confirmed=false 且 confidence=low"
+        "（证据不足）；\n"
+        "3. 绝不猜测，宁可证据不足。\n\n"
         + "\n".join(lines)
         + "\n\n只输出 JSON 数组，不要任何解释性文字，格式：\n"
-        '[{"index": 0, "confirmed": true, "confidence": "high", "reason": "..."}]\n'
+        '[{"index": 0, "confirmed": true, "confidence": "high", "reason": "证据式理由"}]\n'
         "confidence 只能是 high / medium / low。"
     )
     try:
@@ -319,6 +445,15 @@ async def _verify_all_findings(self):
                 )
         except Exception as _a44_exc:  # noqa: BLE001
             logger.debug(f"[A4.4] 粗筛不可用，候选全量进 verify: {_a44_exc}")
+    # ===== E 方案: 交叉验证层（开源工具对照）=====
+    if getattr(settings, "cross_check_enabled", True) and verify_items:
+        try:
+            from vulnclaw.modules.vuln_scanner.cross_verify import cross_check_findings
+            _checked = await cross_check_findings([v for _, v in verify_items])
+            if _checked:
+                logger.info(f"🧬[交叉验证层] 完成 {_checked} 条开源工具对照")
+        except BaseException as _cross_exc:  # 对照失败绝不影响主流程
+            logger.debug(f"[E 交叉验证层] 异常（忽略）: {_cross_exc}")
     verification_semaphore = self._concurrency_semaphore
     async def verify_one(vuln, preset_ai_result=None):
         async with verification_semaphore:
@@ -407,6 +542,22 @@ async def _verify_all_findings(self):
                 burp_result = await self._verify_with_burp_repeater(vuln)
                 burp_verified = burp_result.get("confirmed", False)
             return ai_result, burp_verified
+    # A 方案步骤2/3: 断言前置——组装证据包、并发 probe，客观信号落回 finding。
+    # 必须在 batch 分组（下方 _verify_cross_batch 调用）之前执行，否则 batch prompt 吃不到。
+    if getattr(settings, "verify_evidence_pack", True) or getattr(settings, "verify_probe_before_ai", True):
+        for _pv in verify_items:
+            _pv[1]["evidence_pack"] = build_evidence_pack(_pv[1], None)
+        if getattr(settings, "verify_probe_before_ai", True) and not self._llm_degraded():
+            await asyncio.gather(
+                # 调度审计L：显式以模块函数形态调用并传入 self/vuln。
+                # 经 bind_phase_methods 绑定后 self._probe_before_ai(v) 偶发把 v 当作
+                # self（vuln 缺失）→ "missing 1 required positional argument: 'vuln'"
+                # → 整批验证丢失（真扫实证：StreamVerify 批次 #19）。
+                *(_probe_before_ai(self, v) for _, v in verify_items),
+                return_exceptions=True,
+            )
+            for _pv in verify_items:
+                _pv[1]["evidence_pack"] = build_evidence_pack(_pv[1], _pv[1].get("probe"))
     for idx, vuln in verify_items:
         vuln_type = vuln.get('type', '未知')
         vuln_param = vuln.get('parameter', '')
@@ -483,6 +634,12 @@ async def _verify_all_findings(self):
             self._add_finding(_downgrade_unconfirmed_verdict(vuln))
             logger.info(f"   ⏭️ 跳过验证（预算已满）： {vuln_type} (参数： {vuln_param})")
             continue
+        # 修复（批次失败: 0 / SQLi 漏检根因）：A4.4 粗筛拦截后 verify_items 被删减，
+        # 此循环基于完整 verification_plan 遍历，被拦截 idx 在 result_by_index 中缺失
+        # -> KeyError(0) 击穿整批验证（日志: "批次 #N 失败: 0"），该批 finding 全部丢失。
+        # 被拦截条目已在下方 prescreen_local 循环复核，这里跳过即可。
+        if idx not in result_by_index:
+            continue
         outcome = result_by_index[idx]
         try:
             if isinstance(outcome, BaseException):
@@ -549,20 +706,38 @@ async def _verify_all_findings(self):
                 logger.warning(f"   ⚠️ AI验证失败，但置信度高，保留： {vuln_type}")
     # A4.4: 粗筛否决候选 → 本地规则复核（与 LLM 降级路径同语义：命中即确认，未命中保守保留）
     for vuln in prescreen_local:
-        rule_hit = self._local_rule_verify(vuln)
-        if rule_hit:
-            vuln["ai_verdict"] = "真实漏洞（本地规则确认）"
-            vuln["confidence"] = "medium"
-            vuln["verification_method"] = f"local_rule:{rule_hit}"
-            self._add_finding(_downgrade_unconfirmed_verdict(vuln))
-            verified_count += 1
-            logger.info(
-                f"   ✅ [A4.4] 粗筛候选本地规则命中 ({rule_hit}): {vuln.get('type', '未知')}"
+        try:
+            rule_hit = self._local_rule_verify(vuln)
+            if rule_hit:
+                vuln["ai_verdict"] = "真实漏洞（本地规则确认）"
+                vuln["confidence"] = "medium"
+                # 审计K1: 规则兜底 = 本地规则单源证据（无 LLM 实调背书），标记供报告
+                # 人工复核排序（AI 背书项优先），评分侧已按文本区分不重复计权。
+                vuln["llm_backed"] = False
+                vuln["verification_method"] = f"local_rule:{rule_hit}"
+                self._add_finding(_downgrade_unconfirmed_verdict(vuln))
+                verified_count += 1
+                logger.info(
+                    f"   ✅ [A4.4] 粗筛候选本地规则命中 ({rule_hit}): {vuln.get('type', '未知')}"
+                )
+            else:
+                vuln["ai_verdict"] = "待人工复核（粗筛判误报，本地规则未命中）"
+                vuln["confidence"] = "低（粗筛误报候选）"
+                self._add_finding(_downgrade_unconfirmed_verdict(vuln))
+        except Exception as _ps_exc:  # noqa: BLE001
+            # 单项处理异常不得中断其余候选；失败候选取回 _pending_verify，
+            # 交收尾/后续批次重试，避免静默丢失（SSTI-L1 / SSRF-OOB 教训）。
+            logger.warning(
+                f"   [A4.4] 候选处理异常，取回待验证队列: {vuln.get('type', '?')}: {_ps_exc}",
+                exc_info=True,
             )
-        else:
-            vuln["ai_verdict"] = "待人工复核（粗筛判误报，本地规则未命中）"
-            vuln["confidence"] = "低（粗筛误报候选）"
-            self._add_finding(_downgrade_unconfirmed_verdict(vuln))
+            try:
+                _k = self._finding_verify_key(vuln)
+                _existing = {self._finding_verify_key(x) for x in self._pending_verify}
+                if _k not in _existing:
+                    self._pending_verify.append(vuln)
+            except Exception:  # noqa: BLE001
+                logger.debug("suppressed (verify requeue audit)")
     # A4.4: 成本量化——UsageLedger site 维度对比（粗筛 vs 大模型投票），验收要求可量化
     if gate is not None or prescreen_local:
         try:
@@ -592,15 +767,31 @@ async def _verify_cross(
     preferred_model: Optional[str] = None,
 ) -> Dict:
     try:
-        prompt = f"""
-你是一位漏洞验证专家。请验证以下疑似漏洞是否真实存在。
-漏洞信息:
-- 类型： {vuln.get('type', '未知')}
-- URL: {vuln.get('url', '')}
-- 参数: {vuln.get('parameter', '')}
-- 证据: {vuln.get('evidence', '')[:200]}
-请只回答“是”或“否”，并给出简要理由。
-"""
+        # A 方案: 证据型验证官——让模型基于【证据包】与【probe 观测】裁决，而非猜测。
+        evidence_pack = str(vuln.get("evidence_pack") or "").strip()
+        probe = vuln.get("probe")
+        if not evidence_pack:
+            evidence_pack = (
+                f"type={vuln.get('type', '?')} | url={vuln.get('url', '')} | "
+                f"parameter={vuln.get('parameter', '')} | evidence={str(vuln.get('evidence', ''))[:200]}"
+            )
+        # probe 缺失时保持 None：_probe_summary(None) 诚实输出「缺失/失败」（fail-closed），
+        # 避免伪造 ok=True 让 AI 误以为「已探测且无信号」。
+        prompt = (
+            "你是 Web 漏洞证据型验证官。你的唯一职责：基于下方【证据包】与【probe 观测结果】做客观裁决。\n"
+            "\n"
+            "【裁决规则】\n"
+            "1. 反射/XSS 回显类漏洞：只有观测到载荷回显（reflect=true）或明确的"
+            "状态/长度/内容差分才允许 confirm；\n"
+            "2. 无任何客观证据，或 probe 观测缺失/失败（ok=false）：一律判\"证据不足\"，不得 confirm；\n"
+            "3. 绝不猜测、绝不脑补；宁可\"证据不足\"也不误判。\n"
+            "\n"
+            f"【证据包】\n{evidence_pack}\n"
+            "\n"
+            f"【probe 观测结果】\n{_probe_summary(probe)}\n"
+            "\n"
+            "请只回答\"是 / 否 / 证据不足\"，并给出一条最有力的证据行作为理由。"
+        )
         # P2-1: verify 复杂推理优先使用大模型（glm-4.7），提高判定质量
         available_models = []
         try:
@@ -666,7 +857,7 @@ async def _verify_cross(
                     timeout=_VERIFY_CROSS_TIMEOUT,
                 )
             except asyncio.TimeoutError as te:
-                # gather 閲岀敤 return_exceptions=True锛岄€忎紶渚夸簬投票渚ф寜异常鍒?False
+                # gather 调用 return_exceptions=True，跨实例投票遇异常按 False
                 return te
         # Keep provider order stable so votes and reports remain deterministic,
         # while allowing the three independent model calls to overlap.
@@ -707,7 +898,7 @@ async def _verify_cross(
                 "confirmed": False,
                 "severity": "Medium",
                 "confidence": "medium",
-                "reason": "鍗曟ā鍨嬬‘璁わ紝寤鸿浜哄伐澶嶆牳",
+                "reason": "单模型确认，建议人工复核",
                 "votes": [{"provider": selected_models[i][0], "is_vuln": v} for i, v in enumerate(votes)]
             }
         else:
@@ -900,7 +1091,8 @@ def hallucination_suppress(orch, findings: list) -> list:
     for f in findings:
         sev = f.get("severity", "Low")
         verdict = str(f.get("ai_verdict", ""))
-        is_nonvuln = ("非漏洞" in verdict) or ("误报" in verdict) or ("幻觉" in verdict)
+        # 仅精确命中模型裁决词才视为明确否定；复合 verdict（含上下文说明）绝不丢弃（C10 子串匹配误杀 8091 布尔盲注 fix）
+        is_nonvuln = verdict in ("非漏洞", "误报", "幻觉")
         if is_nonvuln and sev not in ("Critical", "High"):
             dropped += 1
             continue

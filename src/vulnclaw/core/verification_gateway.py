@@ -417,8 +417,10 @@ async def _blind_repro_one(
         if not guard.require_approval("blind_repro", f"type={f.get('type')} url={view['url']}"):
             f.setdefault("signals", []).append("blind_skip:danger_denied")
             return f
-    except Exception:  # noqa: BLE001 - 门卫不可用视为放行（网关层另有审计）
-        logger.debug("[BlindRepro] 权限门卫不可用（按放行处理）")
+    except Exception as exc:  # noqa: BLE001 - 门卫异常按 fail-closed 处理：宁可不复现，不可放行
+        f.setdefault("signals", []).append("blind_skip:danger_unavailable")
+        logger.debug(f"[BlindRepro] 权限门卫不可用（按拒绝处理）: {exc}")
+        return f
 
     tried: list[str] = []
     async with semaphore:

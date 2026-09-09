@@ -1094,3 +1094,41 @@
 ### §26.2 section 注释过期同步（e9b89b2/6bebacb）
 - D3.5 参数挖掘双开关注释块补齐（探测侧 enable_param_mining / 消费侧 scan_param_mining，消除与 live_intake_priority 行尾撞车）；
 - D4.2/SP16.1/SP16.2/SP17.3 四处"默认关零回归"注释更正为当前默认开状态。
+
+
+***
+
+## 27. SP27 指令解析层批次（2026-09-06，指令直写账号密码，对标 Strix --instruction）
+
+> 需求来源：用户问到 "Strix 对登录凭据怎么处理的？能不能不用登录网站就拿到"，结论是实现 Strix 同款 `--instruction`：凭据直写指令，平台自动登录并托管认证会话。分两条线：解析层（新 `core/instructions.py`）+ 消费层（新 `core/auth/instruction_auth.py`），纯增量，零新依赖。
+
+### §27.1 解析层（新文件 `src/vulnclaw/core/instructions.py`）
+- 数据结构：`Acct(role, username, password)`、`Instruction(accounts, login_url, focus, exclude)`，`has_credentials` / `masked_summary`（密码一律 `***` 脱敏）。
+- 正则匹配器按优先级覆盖：Strix 长句（`Login with email: u, password: p`）、中文键值对（`账号: u 密码: p`）、`email:pass` / `user:pass`、列表项（`- 角色: u / p`、`1. u / p`）、中文连写（`邮箱 u 密码 p`）、英文键值对同行（`Email: u Password: p`）、登录页（`login_url` / `登录页`）、重点（`focus on` / `重点`）、排除（`out of scope` / `排除` 前瞻截断防污染）。
+- 去重：按 (u.lower(), password.lower()) 吞重复项；focus 段前瞻截断避免被 exclude 字段污染。
+- 公开 API：`parse_instruction_text(text)` 任何文本（含空串）不抛异常；`load_instruction(inline, file)` 内联优先，文件 UTF-8 读取。
+- 纯 Python + 正则，零新依赖；密码明文只存在于返回的 Instruction 对象内。
+
+### §27.2 消费层（新文件 `src/vulnclaw/core/auth/instruction_auth.py`）
+- `try_instruction_login(target_url, domain, ins)`：作为扫描第 0 步（优先于既有 4 步 Cookie 流程），失败自动回退。
+- 登录降级链：Playwright 渲染登录（`playwright_login_default`）→ HTTP 表单登录（`http_form_login`，提取表单 action/method/字段自动 POST）→ 失败回退。
+- Cookie 收集修复：HTTP 降级时用 `client.cookies` 收集整个会话（含重定向中设置的 Cookie），而不是 resp.cookies 只取最终响应。
+- 多账号：第 1 个为主账号落盘 `_runtime_cache/cookies/<domain>.json`（主键），其余按角色后缀落盘（`<domain>.roleX.json`）；`>1` 个角色时 `_register_role_sessions` 注册多角色会话供 IDOR / 越权引擎消费。
+- 日志全程脱敏：`username:***`，不落明文密码。
+
+### §27.3 CLI 接入（`cli.py` / `scan_main.py`）
+- `--instruction` 与 `--instruction-file` 互斥组（下设于 scan 子命令），帮助文本注明可直写账号密码、不落日志。
+
+### §27.4 消费接线（scan_runner / phases_taskgen / phases_executor）
+- `scan_runner.main_async`：`load_instruction` → 有凭据且未 `--no-auth` 时 `try_instruction_login`；登录成功把 `settings.instruction_context = _ins` 并打印脱敏摘要，失败打 warning 回退既有流程，异常也回退。
+- `phases_taskgen`：instruction_context.focus 命中关键词（sql/xss/越权/auth/session/csrf/上传/ssti/ssrf/文件/xml/api/graphql/cors/重定向…）→ 对应引擎优先级 +4（cap 10）；多角色凭据就绪时提示 IDOR/越权引擎。
+- `phases_executor`：exclude 命中目标关键词 → 跳过任务（complete_task success=True）；focus 命中 → 该任务 `payload_limit` 5 → 12 增强。
+
+### §27.5 测试（新增 `tests/test_instructions.py` + `tests/test_instruction_auth.py`）
+- 解析层：Strix 长句、中文键值对、列表多账号（角色集合断言）、email:pass、登录页提取、重点/排除、重复账号去重、focus 不被 exclude 污染。
+- 消费层：无凭据回退 False、主账号落盘 JSON 断言、多角色注册、HTTP 表单降级路径。
+- 回归：核心回归套件通过，无新 FAILED；ruff 新增文件全绿。
+
+### §27.6 文档与安全
+- README「方式三：指令直写账号密码」：用法示例（长句/中文全参数/多账号文件）+ 指令要素表 + 行为安全说明（降级链、失败回退、脱敏、凭据不进 git）。
+- 安全红线：指令文件含真实密码 → 建议 .gitignore；指令内联配合 shell 历史保护；日志侧全程脱敏。

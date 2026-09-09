@@ -242,7 +242,7 @@ async def execute_attack_node(node: DAGNode, context: DAGContext) -> Dict:
     if not orchestrator:
         from vulnclaw.ai.v100.orchestrator import V100Orchestrator
         from vulnclaw.core.utils import get_shared_session
-        from vulnclaw.core.session_manager import get_session_manager
+        from vulnclaw.core.auth.session_manager import get_session_manager
         from urllib.parse import urlparse as _urlparse
 
         session = await context.get(_ctx_key(prefix, 'session'))

@@ -1,0 +1,8 @@
+{
+  "url": "http://127.0.0.1:8765/sign/get_info?user=admin",
+  "signed": {
+    "sign": "U0FMVHwxNzg4OTcxNTk1",
+    "ts": 1788971595,
+    "mode": "manual"
+  }
+}

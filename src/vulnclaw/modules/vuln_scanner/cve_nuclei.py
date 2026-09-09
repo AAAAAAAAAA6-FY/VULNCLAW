@@ -22,6 +22,7 @@ import shutil
 import tempfile
 import os
 import json
+import time
 
 from vulnclaw.core.logger import logger
 
@@ -108,6 +109,167 @@ _TECH_TAG_MAP: Dict[str, List[str]] = {
     "flask": ["flask"],
     "swagger": ["swagger", "api"],
 }
+
+
+def nuclei_template_health(min_count: int = 300) -> tuple:
+    """统计 ~/nuclei-templates 下 yaml 模板数。返回 (count, 是否健康)。
+
+    模板库缺失/0 模板/计数低于阈值 → (count, False)：调用方必须 fail-closed
+    并打醒目 WARNING（不产出、绝不向报告写无模板支撑的扫描结论）。
+    """
+    try:
+        base = os.path.expanduser(settings.nuclei_template_dir or "~/nuclei-templates")
+        if not os.path.isdir(base):
+            return 0, False
+        count = 0
+        for _root, _dirs, files in os.walk(base):
+            count += sum(1 for f in files if f.endswith(('.yaml', '.yml')))
+        ok = count >= int(min_count or 0)
+        return count, ok
+    except Exception:  # noqa: BLE001 - 健康检查失败按不健康 fail-closed
+        return 0, False
+
+
+async def collect_line_targets(brief: dict, budget: int = 0) -> list:
+    """从 recon brief 收集社区线目标：存活资产优先，其次 js/apis/found_dirs。
+
+    返回归一化 http(s) URL 列表（去重、按预算截断）。budget<=0 → []（仅主域根）。
+    """
+    if int(budget or 0) <= 0:
+        return []
+    from urllib.parse import urlparse as _up
+    seen: set = set()
+    out: list = []
+    brief = brief or {}
+    sources = [
+        brief.get("alive_assets", []) or [],
+        brief.get("js_endpoints", []) or [],
+        brief.get("apis", []) or [],
+        brief.get("found_dirs", []) or [],
+        brief.get("crawled_endpoints", []) or [],
+    ]
+    for lst in sources:
+        for u in lst:
+            if isinstance(u, dict):
+                # alive_assets 可能是 dict 列表（{url,status,...}），必须取 url 字段
+                u = u.get("url", "")
+            if not isinstance(u, str) or not u:
+                continue
+            u = u.strip()
+            # 相对路径/非 http(s) scheme 交由调用方/上游处理（此处不拼接，避免双归一）
+            if not u.startswith(("http://", "https://")):
+                continue
+            try:
+                p = _up(u)
+                # 端点级扫描目标：剥离 query/fragment，同一路径不同 query 视为同一端点
+                nu = p._replace(fragment="", query="").geturl().rstrip("/")
+            except Exception:  # noqa: BLE001 - 畸形 URL 直接丢弃
+                continue
+            key = nu.encode("utf-8", "replace")
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(nu)
+            if len(out) >= int(budget or 0):
+                return out
+    return out
+
+
+async def run_nuclei_community_line(
+    target: str,
+    brief: dict,
+    severity: str = "critical,high",
+    timeout: int = 300,
+    budget: int = 0,
+    min_templates: int = 300,
+) -> list:
+    """C 方案社区线核心：模板健康检查 + 主域根 + 端点预算扫描。
+
+    健康失败/扫描异常 → []（fail-closed，绝不产出）。结果带 line_target 字段
+    供证据链定位。复用 run_nuclei_async 的 -o json 解析，零 TLS/代理改造。
+    """
+    try:
+        count, ok = nuclei_template_health(min_templates)
+        if not ok:
+            logger.warning(
+                f"🚨 [Nuclei社区线] 模板健康检查未通过（{count} 个 < 阈值 {min_templates}），"
+                f"整线 fail-closed 跳过（不产出、不误报）"
+            )
+            return []
+    except Exception as e:  # noqa: BLE001 - 健康检查异常按 fail-closed
+        logger.warning(f"🚨 [Nuclei社区线] 模板健康检查异常: {e}（fail-closed）")
+        return []
+    targets = [str(target or "").rstrip("/")]
+    try:
+        extra = await collect_line_targets(brief or {}, budget)
+        targets += [t for t in extra if t and t.rstrip("/") != (target or "").rstrip("/")]
+    except Exception:  # noqa: BLE001 - 目标收集失败不影响主域根
+        logger.debug("suppressed exception (core audit)")
+    logger.info(f"🧬 [Nuclei社区线] 模板健康 OK({count}), 准备扫描 {len(targets)} 个目标(severity={severity}, timeout={timeout}s)")
+    # 审计M：nuclei 在本机/小站点常整体超时（真扫实证：每端点 300s、exit=-1、
+    # 输出 0B、0 结果），逐端点重试会把整轮预算烧光（extras 曾自适应给到 1704s，
+    # 而 nuclei 一条结果都没产出）。对策：
+    #   ① 单端点超时封顶（默认 120s）；
+    #   ② 连续"疑似超时"达阈值即熔断本轮剩余目标，不再逐个白等。
+    _cap = int(getattr(settings, "nuclei_community_timeout_cap", 120) or 120)
+    if timeout > _cap:
+        logger.info(f"🧬 [Nuclei社区线] 单端点超时封顶: {timeout}s → {_cap}s")
+        timeout = _cap
+    _fail = {"n": 0, "aborted": False}
+    _max_fail = max(1, int(getattr(settings, "nuclei_community_max_fail", 3) or 3))
+
+    out: list = []
+    seen_key: set = set()
+    sem = asyncio.Semaphore(4)
+
+    async def _scan_one(url: str) -> None:
+        if _fail["aborted"]:
+            return
+        async with sem:
+            if _fail["aborted"]:
+                return
+            _t0 = time.monotonic()
+            try:
+                rs = await run_nuclei_async(url, severity=severity, timeout=timeout)
+            except Exception:  # noqa: BLE001 - 单端点失败单独跳过，不阻断整线
+                logger.debug(f"[Nuclei社区线] 目标异常跳过: {url}")
+                _fail["n"] += 1
+                if _fail["n"] >= _max_fail:
+                    _fail["aborted"] = True
+                    logger.warning(
+                        f"🧬 [Nuclei社区线] 连续失败 {_fail['n']} 次，熔断本轮剩余目标"
+                    )
+                return
+            _elapsed = time.monotonic() - _t0
+            # 无结果且耗时逼近超时上限 → 判为"疑似超时"，而非"目标确实干净"
+            if not rs and _elapsed >= timeout * 0.9:
+                _fail["n"] += 1
+                if _fail["n"] >= _max_fail:
+                    _fail["aborted"] = True
+                    logger.warning(
+                        f"🧬 [Nuclei社区线] 连续疑似超时 {_fail['n']} 次"
+                        f"({_elapsed:.0f}s/个)，熔断本轮剩余目标"
+                        f"（nuclei 对该目标大概率不可用）"
+                    )
+                return
+            if rs:
+                _fail["n"] = 0
+            for r in rs or []:
+                k = (r.get("template") or "", r.get("matched") or "", r.get("url") or "")
+                kk = (k[0].encode("utf-8", "replace"), k[1].encode("utf-8", "replace"), k[2].encode("utf-8", "replace"))
+                if kk in seen_key:
+                    continue
+                seen_key.add(kk)
+                r = dict(r)
+                r["line_target"] = url
+                out.append(r)
+
+    await asyncio.gather(*(_scan_one(u) for u in targets), return_exceptions=True)
+    logger.info(f"🧬 [Nuclei社区线] 完成：{len(targets)} 目标 → {len(out)} 条候选")
+    return out
+
+
+# ============================================================
 
 
 def build_tags_from_tech(tech_stack: Optional[List[str]], limit: int = 6) -> List[str]:
@@ -294,4 +456,7 @@ __all__ = [
     'run_nuclei_async',
     'update_nuclei_templates',
     'build_tags_from_tech',
+    'nuclei_template_health',
+    'collect_line_targets',
+    'run_nuclei_community_line',
 ]

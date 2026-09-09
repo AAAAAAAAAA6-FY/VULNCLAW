@@ -139,13 +139,20 @@ class ToolGovernance:
         st = self._health_state.setdefault(name, {"consecutive_failures": 0,
                                                   "degraded_until": 0, "last_error": ""})
         if success:
+            _recovered = int(st.get("degraded_until") or 0) > time.time()
             st["consecutive_failures"] = 0
             st["degraded_until"] = 0
             st["last_error"] = ""
+            if _recovered:
+                logger.info(f"✅ [ToolGov] {name} 恢复健康（降级解除）")
         else:
             st["consecutive_failures"] = int(st.get("consecutive_failures") or 0) + 1
             st["last_error"] = str(error or "")[:200]
-            if st["consecutive_failures"] >= max_fail:
+            _still_degraded = int(st.get("degraded_until") or 0) > time.time()
+            if _still_degraded:
+                # 降级期内的失败只记数不重复刷屏（失败计数跨进程持久化，重打无意义）
+                logger.debug(f"[ToolGov] {name} 仍在降级期（累计失败 {st['consecutive_failures']} 次）")
+            elif st["consecutive_failures"] >= max_fail:
                 st["degraded_until"] = time.time() + ttl
                 logger.warning(
                     f"⚠️ [ToolGov] {name} 连续失败 {st['consecutive_failures']} 次，"

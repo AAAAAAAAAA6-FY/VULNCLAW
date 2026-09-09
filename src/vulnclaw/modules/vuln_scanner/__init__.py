@@ -20,7 +20,13 @@ from .verify_ai import (
     get_pending_retry_count,
     clear_pending_retry,
 )
-from .cve_nuclei import run_arjun, run_nuclei_async
+from .cve_nuclei import (
+    run_arjun,
+    run_nuclei_async,
+    nuclei_template_health,
+    collect_line_targets,
+    run_nuclei_community_line,
+)
 from .directory_ffuf import run_ffuf_async
 from .oob_interactsh import get_interactsh_domain_async, get_interactsh_poll
 from .auth_privilege import IDORScanner, scan_idor, scan_vertical_privilege, check_default_credentials
@@ -51,6 +57,9 @@ __all__ = [
     "clear_pending_retry",
     "run_arjun",
     "run_nuclei_async",
+    "nuclei_template_health",
+    "collect_line_targets",
+    "run_nuclei_community_line",
     "run_ffuf_async",
     "get_interactsh_domain_async",
     "get_interactsh_poll",

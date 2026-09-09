@@ -24,7 +24,7 @@ import aiohttp
 
 from vulnclaw.config.settings import settings
 from vulnclaw.core.logger import logger
-from vulnclaw.core.utils import get_shared_session
+from vulnclaw.core.utils import get_shared_session, resolve_burp_cookies_path
 
 
 # Set-Cookie 属性名（出现在分号后，非 cookie 键值对）
@@ -672,9 +672,12 @@ class BurpClient:
     async def scan_and_collect(
         self,
         urls: Optional[List[str]] = None,
-        wait_timeout: int = 240,
+        wait_timeout: int = 60,
         poll_interval: int = 10,
     ) -> List[Dict]:
+        # 2026-09-08: 轮询默认 240s->60s。Audible 实测 10 个并发扫描全部 240s
+        # 超时（SPA 大响应拖慢 Burp 主动扫描），全局引擎被拖死 4 分钟+，
+        # 超时后再依赖扩展桥收割兜底，不再干等。
         """一站式：提交扫描 → 轮询到终态 → 拉取 issues（步骤3）。
 
         会顺带收集此前提交（如 recon 阶段 import_to_burp）已记录的 scan_id，
@@ -880,7 +883,7 @@ class BurpClient:
         return filtered
 
     def _load_cookie_file(self) -> Dict[str, Dict[str, str]]:
-        cookie_file = os.path.expanduser("~/burp_cookies.json")
+        cookie_file = resolve_burp_cookies_path()
         if not os.path.exists(cookie_file):
             return {}
         try:

@@ -7,7 +7,7 @@
   1. 打印 sys.dont_write_bytecode（应为 True）
   2. 打印所有 3 层保护的环境变量
   3. 打印项目路径解析（PROJECT_ROOT 启发式是否正确识别 scripts/ -> 上级）
-  4. 尝试 import 一个项目模块（core.settings）证明 sys.path 插入成功
+  4. 尝试 import 一个项目模块（vulnclaw.core.settings）证明 sys.path 插入成功
   5. 打印 "入口脚本自动触发测试 PASS" 表示业务部分也跑了
 """
 
@@ -80,6 +80,9 @@ from pathlib import Path
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
+_SRC = os.path.join(PROJECT_ROOT, "src")
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
 
 
 def run_checks() -> int:
@@ -119,10 +122,10 @@ def run_checks() -> int:
 
     # Project module import
     try:
-        from core.settings import PROJECT_CACHE_DIR  # noqa: F401
-        results.append(("from core.settings import PROJECT_CACHE_DIR", True, PROJECT_CACHE_DIR))
+        from vulnclaw.core.settings import PROJECT_CACHE_DIR  # noqa: F401
+        results.append(("from vulnclaw.core.settings import PROJECT_CACHE_DIR", True, PROJECT_CACHE_DIR))
     except Exception as exc:  # pragma: no cover
-        results.append(("from core.settings import PROJECT_CACHE_DIR", False, repr(exc)))
+        results.append(("from vulnclaw.core.settings import PROJECT_CACHE_DIR", False, repr(exc)))
 
     # Print report
     all_pass = True

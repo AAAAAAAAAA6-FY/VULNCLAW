@@ -152,11 +152,15 @@ class TestMCPJsonRpcHandler:
             "scan.start",
             "scan.status",
             "scan.findings",
+            "scan.stop",
+            "report.get",
             "scan.api_audit",
             "scan.danger_guard_status",
             "scan.deep_remote",
             "browser.explore",
             "exploit.verify",
+            "verify.gateway",
+            "finding.review",
             "code.audit",
             "intel.lookup",
             "scan.deep",
@@ -171,6 +175,86 @@ class TestMCPJsonRpcHandler:
         # 只读工具须标注 readOnlyHint
         status_tool = next(t for t in tools if t["name"] == "scan.status")
         assert status_tool.get("annotations", {}).get("readOnlyHint") is True
+        # 新工具须带危险/停止语义标注
+        stop_tool = next(t for t in tools if t["name"] == "scan.stop")
+        assert stop_tool.get("annotations", {}).get("destructiveHint") is True
+        gw_tool = next(t for t in tools if t["name"] == "verify.gateway")
+        assert gw_tool.get("annotations", {}).get("destructiveHint") is True
+
+    # --- scan.stop ---
+
+    @pytest.mark.asyncio
+    async def test_scan_stop_queued_job(self, handler, bus):
+        """排队中未启动的任务被 stop 后直接作废为 cancelled。"""
+        await bus.register_job(ScanJob(scan_id="q1", target="https://example.com"))
+        req = self._make_request("tools/call", {"name": "scan.stop", "arguments": {"scan_id": "q1"}})
+        resp = await handler.handle_request(req)
+        data = json.loads(resp["result"]["content"][0]["text"])
+        assert data["status"] == "cancelling"
+        job = await bus.get_job("q1")
+        assert job.status == ScanStatus.CANCELLED
+
+    @pytest.mark.asyncio
+    async def test_scan_stop_unknown_job(self, handler):
+        req = self._make_request("tools/call", {"name": "scan.stop", "arguments": {"scan_id": "no_such"}})
+        resp = await handler.handle_request(req)
+        assert resp.get("error") is not None
+
+    @pytest.mark.asyncio
+    async def test_scan_stop_already_completed(self, handler, bus):
+        await bus.register_job(
+            ScanJob(scan_id="done", target="https://example.com", status=ScanStatus.COMPLETED)
+        )
+        req = self._make_request("tools/call", {"name": "scan.stop", "arguments": {"scan_id": "done"}})
+        resp = await handler.handle_request(req)
+        data = json.loads(resp["result"]["content"][0]["text"])
+        assert data["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_scan_stop_running_cancels_task(self, handler, bus):
+        """运行中任务：cancel 底层 Task 且不报错。"""
+        import vulnclaw.core.mcp_server as m
+
+        scenario = {"cancelled": False}
+        started = asyncio.Event()
+
+        async def _fake_run():
+            started.set()
+            try:
+                while True:
+                    await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                scenario["cancelled"] = True
+                raise
+
+        fake_task = asyncio.create_task(_fake_run())
+        await started.wait()  # 确保协程已启动，否则 cancel 可能发生在协程体运行前
+        await bus.register_job(ScanJob(scan_id="run1", target="https://example.com",
+                                       status=ScanStatus.RUNNING, _task=fake_task))
+        req = self._make_request("tools/call", {"name": "scan.stop", "arguments": {"scan_id": "run1"}})
+        resp = await handler.handle_request(req)
+        data = json.loads(resp["result"]["content"][0]["text"])
+        assert data["status"] == "cancelling"
+        await asyncio.sleep(0.05)
+        assert scenario["cancelled"] is True
+
+    # --- verify.gateway ---
+
+    @pytest.mark.asyncio
+    async def test_verify_gateway_missing_input(self, handler):
+        req = self._make_request("tools/call", {"name": "verify.gateway", "arguments": {"input_path": "_no_such_file_.json"}})
+        resp = await handler.handle_request(req)
+        data = json.loads(resp["result"]["content"][0]["text"])
+        assert data.get("ok") is False
+        assert "error" in data
+
+    @pytest.mark.asyncio
+    async def test_verify_gateway_missing_input_verify_mode(self, handler):
+        req = self._make_request("tools/call", {"name": "verify.gateway", "arguments": {"input_path": "_no_such_file_.json", "mode": "verify"}})
+        resp = await handler.handle_request(req)
+        data = json.loads(resp["result"]["content"][0]["text"])
+        assert data.get("ok") is False
+        assert "error" in data
 
     @pytest.mark.asyncio
     async def test_tool_intel_lookup_no_credentials(self, handler, monkeypatch):

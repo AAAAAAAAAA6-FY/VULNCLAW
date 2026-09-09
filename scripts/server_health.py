@@ -91,6 +91,9 @@ import requests  # type: ignore
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
+_SRC = os.path.join(PROJECT_ROOT, "src")
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
 
 # ---- Defaults; users can override via CLI or editing -------------------
 DEFAULT_HOST = "127.0.0.1"
@@ -333,7 +336,7 @@ def run(argv: list[str] | None = None) -> int:
 
     # 6) Write JSON report under _runtime_cache/reports.
     try:
-        from core.settings import PROJECT_CACHE_DIR  # noqa: F401
+        from vulnclaw.core.settings import PROJECT_CACHE_DIR  # noqa: F401
         report_dir = os.path.join(str(PROJECT_CACHE_DIR), "reports")
     except Exception:
         report_dir = os.path.join(PROJECT_ROOT, "_runtime_cache", "reports")

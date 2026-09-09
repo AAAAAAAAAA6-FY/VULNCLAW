@@ -8,11 +8,12 @@ import json
 import os
 import re
 import time
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from vulnclaw.core.logger import logger
-from vulnclaw.core.session_manager import get_session_manager
+from vulnclaw.core.auth.session_manager import get_session_manager
 from vulnclaw.core.settings import settings
+from vulnclaw.core.target_capacity_probe import get_safe_concurrency
 from vulnclaw.core.utils import async_get, cap, limit_response_size
 from vulnclaw.modules.vuln_scanner import run_arjun
 
@@ -54,7 +55,7 @@ def _host_is_ip(target: str) -> bool:
     """判断目标 host 是否为 IP 地址（IP 靶机无需做子域枚举等外部侦察）。"""
     try:
         import ipaddress
-        from urllib.parse import urlparse
+        from urllib.parse import urljoin, urlparse
         netloc = urlparse(target).netloc
         if netloc.startswith('['):  # IPv6 字面量 [addr]:port
             end = netloc.find(']')
@@ -79,6 +80,9 @@ async def _recon(self):
         "alive_assets": [], "nuclei_results": [], "js_endpoints": [],
         "crawled_endpoints": [], "open_ports": [], "found_dirs": [],
     }
+    # 2026-09-08: brief 提前挂载——recon 阶段超时（_run_phase_timeboxed 取消协程）时，
+    # 已收集的子域/存活资产/端口等仍被 taskgen 读取，避免大站"只扫主域自己"。
+    self._recon_brief = brief
     try:
         resp = await async_get(self.target, session=self.session, timeout=15)
         status, text, headers = resp
@@ -104,6 +108,64 @@ async def _recon(self):
         logger.info(f"   API endpoints: {len(brief['apis'])}")
     except Exception as e:
         logger.warning(f"侦察失败: {e}")
+    if brief["status"] <= 0:
+        # 首次探测失败（超时/被拒，如走 Burp 代理卡住）→ 直连重试一次（30s）
+        try:
+            resp2 = await async_get(self.target, timeout=30, proxy=None, no_retry=True)
+            status2, text2, headers2 = resp2
+            if status2 > 0:
+                brief["status"] = status2
+                brief["tech_stack"] = self._detect_tech(headers2, text2)
+                self._normal_responses[self.target] = {"status": status2, "text": text2, "headers": headers2}
+                logger.info(f"   🔎 直连重试成功 状态码: {status2}, 技术栈: {brief['tech_stack']}")
+        except Exception as e2:
+            logger.warning(f"侦察直连重试失败: {e2}")
+    # 挂载点：目标请求能力探测（首次存活探测成功之后、deep_recon 之前）。
+    # 结果经模块注册表全局可读，下游消费点（爬虫/全局RPS/引擎并发）无需传参；
+    # 探测失败/超时仅告警，绝对不影响主流程（probed=False → 消费点回退默认值）。
+    self._capacity_probe = None
+    if getattr(settings, "enable_target_probe", True):
+        try:
+            from vulnclaw.core.target_capacity_probe import run_capacity_probe
+            _cap = await asyncio.wait_for(run_capacity_probe(self.target), timeout=settings.target_probe_timeout_s)
+            if _cap and _cap.probed:
+                from vulnclaw.core.utils import _global_rate_limit
+                try:
+                    await _global_rate_limit.set_qps(_cap.safe_qps)
+                except Exception as _rl_e:  # noqa: BLE001
+                    logger.warning(f"🛡️ 应用探测 QPS 失败（沿用当前限流）: {_rl_e}")
+                logger.info(f"🛡️ [容量探测] safe_qps={_cap.safe_qps:.1f}, safe_cc={_cap.safe_concurrency} ({_cap.signal}/{_cap.burst_ok})")
+            self._capacity_probe = _cap
+        except Exception as e:
+            logger.warning(f"🛡️ 目标容量探测失败（沿用默认限流）: {e}")
+
+    # 挂载点：目标反检测基线学习（容量探测之后、deep_recon 之前）。
+    # 采样目标"正常页面"动态特征 → 自动推导蜜罐/假404 判定阈值，
+    # 让 Audible 类 SPA 大站免于被固定阈值误判为蜜罐而停摆（零手动）。
+    self._anti_scan_baseline = None
+    if getattr(settings, "enable_anti_scan_baseline", True):
+        try:
+            from vulnclaw.core.target_anti_scan_baseline import detect_anti_scan_baseline
+            _bs = await asyncio.wait_for(
+                detect_anti_scan_baseline(
+                    self.target,
+                    # 2026-09-08: 复用运行时会话（带 auth cookie 的共享 session），
+                    # 采样内容与运行时一致，避免"登录态 426 UUID vs 未登录采样 2"失配。
+                    session=getattr(self, "session", None),
+                    concurrency=2,  # 采样受限并发，避免对目标造成扫描耦合压力
+                    samples=getattr(settings, "anti_scan_baseline_samples", 6),
+                ),
+                timeout=int(getattr(settings, "target_probe_timeout_s", 45) or 45),
+            )
+            if _bs and _bs.probed:
+                logger.info(
+                    f"🛡️ [反制基线] 目标动态特征峰值 uuid={_bs.sample_max_uuid} "
+                    f"len={_bs.sample_max_len} → 阈值 uuid>{_bs.uuid_threshold} "
+                    f"len>{_bs.min_text} ({_bs.fingerprint})"
+                )
+            self._anti_scan_baseline = _bs
+        except Exception as e:
+            logger.warning(f"🛡️ 反检测基线学习失败（沿用全局阈值）: {e}")
     if self._enable_deep_recon:
         await self._deep_recon(brief)
     if self.burp_available and self.burp_client:
@@ -124,12 +186,30 @@ async def _recon(self):
         if settings.crawl_authed:
             logger.info("   🔐 认证后爬取: 已启用（使用认证会话爬取）")
         _ws = set()
+        logger.info("   🕷️ [同源爬虫] 启动（depth=2, max_urls=80）...")
         _crawled = await crawl_same_origin(
             self.target, session=_crawl_session, max_depth=2, max_urls=80, render=_render,
             crawl_hash_routing=settings.crawl_hash_routing,
             crawl_websocket=settings.crawl_websocket,
             ws_endpoints=_ws,
         )
+        logger.info(f"   🕷️ [同源爬虫] 返回端点数: {len(_crawled or {})}")
+        if not _crawled:
+            # 防御：真扫环境下曾出现"共享会话返回空但独立会话正常"的场景
+            # （检出率排查 2026-09-06）。空结果时用裸会话重试一次，绕过共享会话的状态干扰。
+            logger.warning("   🕷️ [同源爬虫] 首次返回空——使用独立裸会话重试一次")
+            try:
+                import aiohttp as _aio
+                async with _aio.ClientSession() as _bare:
+                    _crawled = await crawl_same_origin(
+                        self.target, session=_bare, max_depth=2, max_urls=80, render=False,
+                        crawl_hash_routing=settings.crawl_hash_routing,
+                        crawl_websocket=settings.crawl_websocket,
+                        ws_endpoints=_ws,
+                    )
+                logger.info(f"   🕷️ [同源爬虫] 裸会话重试返回端点数: {len(_crawled or {})}")
+            except Exception as _re:  # noqa: BLE001
+                logger.warning(f"   🕷️ [同源爬虫] 裸会话重试失败: {_re}")
         if _crawled:
             # D5: URL 价值排序——带参数/API/敏感路径的端点优先进入扫描队列
             def _rank(u: str) -> int:
@@ -149,7 +229,9 @@ async def _recon(self):
             brief["ws_endpoints"] = sorted(_ws)
             logger.info(f"   🔌 发现 {len(_ws)} 个 WebSocket 端点（已纳入全局 WS 安全扫描）")
     except Exception as e:
-        logger.debug(f"同源链接爬虫失败（不影响主流程）: {e}")
+        # 检出率排查发现：此失败曾静默吞掉（debug 级），导致端点级 bundle 整段缺失。
+        # 升级为 warning + 堆栈，让真扫环境下的爬虫异常直接可见。
+        logger.warning(f"同源链接爬虫失败（不影响主流程，但端点覆盖受损）: {e}", exc_info=True)
         brief["crawled_endpoints"] = []
     session_mgr = get_session_manager()
     if session_mgr:
@@ -268,8 +350,8 @@ async def _deep_recon_internal(self, brief: dict, domain: str):
             from vulnclaw.modules.vuln_scanner import run_nuclei_async, verify_nuclei_with_ai_async
             logger.info(f"      🔬 [3/10] Nuclei CVE 扫描... start_ts={time.time():.3f}")
             results = await asyncio.wait_for(run_nuclei_async(
-                self.target, severity="critical,high,medium,low", timeout=120,
-                tech_stack=brief.get("tech_stack", [])), timeout=150)
+                self.target, severity="critical,high,medium,low", timeout=settings.nuclei_run_timeout,
+                tech_stack=brief.get("tech_stack", [])), timeout=settings.nuclei_run_timeout + 30)
             brief["nuclei_results"] = cap(results, settings.max_nuclei_results)
             if results:
                 logger.info(f"      🔬 AI正在过滤 {len(results)} 条nuclei结果...")
@@ -302,7 +384,11 @@ async def _deep_recon_internal(self, brief: dict, domain: str):
             async def analyze_one(js_url):
                 async with semaphore:
                     try:
-                        full_url = js_url if js_url.startswith("http") else urlparse(self.target)._replace(path=js_url).geturl()
+                        # 2026-09-08: scheme 白名单——仅 http(s):// 或 / 开头才允许；
+                        # htttps://、tps://、data: 等畸形 scheme 直接跳过，不再进入 E5/请求层
+                        if not js_url.startswith(("http://", "https://", "/")):
+                            return {}
+                        full_url = js_url if js_url.startswith(("http://", "https://")) else urljoin(self.target, js_url)
                         js_resp = await async_get(full_url, session=self.session, timeout=10)
                         content = js_resp[1] if isinstance(js_resp, tuple) else await js_resp.text()
                         content = limit_response_size(content, 50000) if len(content) > 50000 else content
@@ -397,6 +483,21 @@ async def _deep_recon_internal(self, brief: dict, domain: str):
                 existing = brief.get("js_endpoints", [])
                 brief["js_endpoints"] = cap(list(set(existing + unique_endpoints)), settings.max_js_endpoints)
                 logger.info(f"      📤 导入 {len(unique_endpoints[:1000])} 个静态端点注入迭代子池")
+                # 合流（2026-09-07 大站修复）：静态收割的多源端点（历史/备用/备选/gospider/robots/JS）
+                # 过去只入迭代子池、从不进引擎任务池——大站爬出的数百端点被丢。现并入 crawled_endpoints，
+                # TaskGen 端点级任务直接消费；总量护栏防任务爆炸。
+                _MAX_CRAWLED = 2000
+                _M = brief.get("crawled_endpoints") or []
+                _seen = {e.get("url") for e in _M if isinstance(e, dict) and e.get("url")}
+                _new = []
+                for _u in unique_endpoints:
+                    if _u in _seen or len(_new) >= _MAX_CRAWLED:
+                        continue
+                    _new.append({"url": _u, "params": []})
+                    _seen.add(_u)
+                if _new:
+                    brief["crawled_endpoints"] = _M + _new
+                    logger.info(f"      🔗 合流 {len(_new)} 个静态端点 → crawled_endpoints（累计 {len(_M)} + {len(_new)}）")
             auto_import = os.getenv("ENABLE_BURP_IMPORT", "false").lower() == "true"
             if self.burp_available and self.burp_client and auto_import:
                 try:
@@ -432,6 +533,17 @@ async def _deep_recon_internal(self, brief: dict, domain: str):
             if iterative_urls:
                 brief["js_endpoints"] = cap(list(set(brief.get("js_endpoints", []) + iterative_urls)), settings.max_iterative_urls)
                 logger.info(f"         ✅迭代发现 {len(iterative_urls)} 个新端点")
+                _M2 = brief.get("crawled_endpoints") or []
+                _seen2 = {e.get("url") for e in _M2 if isinstance(e, dict) and e.get("url")}
+                _new2 = []
+                for _u2 in iterative_urls:
+                    if _u2 in _seen2 or len(_new2) >= 2000:
+                        continue
+                    _new2.append({"url": _u2, "params": []})
+                    _seen2.add(_u2)
+                if _new2:
+                    brief["crawled_endpoints"] = _M2 + _new2
+                    logger.info(f"      🔗 合流 {len(_new2)} 个迭代端点 → crawled_endpoints")
             else:
                 logger.info("         ⛔ 迭代未发现新端点")
         except Exception as e:
@@ -455,51 +567,56 @@ async def _iterative_api_explorer(self, seed_urls: list[str], max_rounds: int = 
         next_queue = []
         batch = cap(queue, settings.max_crawl_batch)
         logger.info(f"      💚 第{round_num} 轮：处理 {len(batch)} 个URL")
-        for url in batch:
-            if url in visited:
-                continue
-            visited.add(url)
-            if url.startswith('/'):
-                url = urlparse(self.target)._replace(path=url).geturl()
-            try:
-                resp = await async_get(url, session=self.session, timeout=10)
-                status, text = resp[0], resp[1]
-                if status != 200:
-                    continue
-                discovered.add(url)
-                if '<html' in text.lower() or '<a ' in text.lower():
-                    hrefs = re.findall(r'href=["\']([^"\']+)["\']', text, re.IGNORECASE)
-                    for h in hrefs:
-                        if h.startswith('/') and not h.endswith(('.css', '.js', '.png', '.jpg', '.svg', '.ico', '.woff', '.woff2', '.ttf')):
-                            full = urlparse(self.target)._replace(path=h).geturl()
-                            if full not in visited:
-                                next_queue.append(full)
+        _cc = get_safe_concurrency() or int(getattr(settings, "max_crawl_concurrency", 0) or 16)
+        _sem = asyncio.Semaphore(_cc)
+
+        async def _explore_one(u: str):
+            async with _sem:
+                if u in visited:
+                    return
+                visited.add(u)
+                _url = urlparse(self.target)._replace(path=u).geturl() if u.startswith('/') else u
                 try:
-                    data = json.loads(text)
-                    strings = self._extract_strings_from_json(data)
-                    for s in strings:
-                        if isinstance(s, str) and s.startswith('/') and len(s) > 3:
-                            if not s.endswith(('.css', '.js', '.png', '.jpg', '.svg', '.ico')):
-                                full = urlparse(self.target)._replace(path=s).geturl()
+                    resp = await async_get(_url, session=self.session, timeout=10)
+                    status, text = resp[0], resp[1]
+                    if status != 200:
+                        return
+                    discovered.add(_url)
+                    if '<html' in text.lower() or '<a ' in text.lower():
+                        hrefs = re.findall(r'href=["\']([^"\']+)["\']', text, re.IGNORECASE)
+                        for h in hrefs:
+                            if h.startswith('/') and not h.endswith(('.css', '.js', '.png', '.jpg', '.svg', '.ico', '.woff', '.woff2', '.ttf')):
+                                full = urlparse(self.target)._replace(path=h).geturl()
                                 if full not in visited:
                                     next_queue.append(full)
-                        if isinstance(s, str) and self._is_likely_id(s):
-                            base_path = urlparse(url).path.rstrip('/')
-                            if base_path and not base_path.endswith(('.css', '.js')):
-                                if not any(part in base_path for part in ['detail', 'view', 'get']):
-                                    detail_url = urlparse(self.target)._replace(path=f"{base_path}/{s}").geturl()
-                                    if detail_url not in visited:
-                                        next_queue.append(detail_url)
-                except BaseException:
-                    logger.debug("suppressed exception (core audit)")
-                if isinstance(resp, tuple) and len(resp) > 2:
-                    location = resp[2].get('Location', '')
-                    if location and location.startswith('/'):
-                        full = urlparse(self.target)._replace(path=location).geturl()
-                        if full not in visited:
-                            next_queue.append(full)
-            except Exception as e:
-                logger.debug(f"         ⚠️ 探索 {url} 失败: {e}")
+                    try:
+                        data = json.loads(text)
+                        strings = self._extract_strings_from_json(data)
+                        for s in strings:
+                            if isinstance(s, str) and s.startswith('/') and len(s) > 3:
+                                if not s.endswith(('.css', '.js', '.png', '.jpg', '.svg', '.ico')):
+                                    full = urlparse(self.target)._replace(path=s).geturl()
+                                    if full not in visited:
+                                        next_queue.append(full)
+                            if isinstance(s, str) and self._is_likely_id(s):
+                                base_path = urlparse(_url).path.rstrip('/')
+                                if base_path and not base_path.endswith(('.css', '.js')):
+                                    if not any(part in base_path for part in ['detail', 'view', 'get']):
+                                        detail_url = urlparse(self.target)._replace(path=f"{base_path}/{s}").geturl()
+                                        if detail_url not in visited:
+                                            next_queue.append(detail_url)
+                    except BaseException:
+                        logger.debug("suppressed exception (core audit)")
+                    if isinstance(resp, tuple) and len(resp) > 2:
+                        location = resp[2].get('Location', '')
+                        if location and location.startswith('/'):
+                            full = urlparse(self.target)._replace(path=location).geturl()
+                            if full not in visited:
+                                next_queue.append(full)
+                except Exception as e:
+                    logger.debug(f"         ⚠️ 探索 {_url} 失败: {e}")
+
+        await asyncio.gather(*[_explore_one(u) for u in batch], return_exceptions=True)
         queue = cap(list(set(next_queue)), settings.max_crawl_batch)
         logger.info(f"      ✅第{round_num} 轮完成！发现 {len(queue)} 个新URL")
     logger.info(f"   ✅ [多轮迭代] 完成，共发现 {len(discovered)} 个唯一URL")
@@ -545,9 +662,10 @@ async def _fetch_from_burp(self, brief: dict):
     except Exception as e:
         logger.debug(f"Burp历史获取失败: {e}")
     try:
-        cookies = await self.burp_client.get_cookies_from_history(limit=100)
+        _burp_domain = urlparse(self.target).netloc
+        cookies = await self.burp_client.get_cookies_from_history(limit=100, target_domain=_burp_domain)
         if cookies:
-            target_domain = urlparse(self.target).netloc
+            target_domain = _burp_domain
             for domain, cookie_dict in cookies.items():
                 if target_domain in domain or domain in target_domain:
                     brief["burp_cookies"] = cookie_dict

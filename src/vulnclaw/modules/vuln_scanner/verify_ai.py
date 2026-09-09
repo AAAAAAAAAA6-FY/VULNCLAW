@@ -472,9 +472,22 @@ async def batch_verify_with_ai(suspects: List[Dict]) -> List[Dict]:
 # ============================================================
 # verify_nuclei_with_ai_async
 # ============================================================
-async def verify_nuclei_with_ai_async(nuclei_results: List[Dict], target_url: str) -> List[Dict]:
+async def verify_nuclei_with_ai_async(
+    nuclei_results: List[Dict], target_url: str, evidence: Optional[bool] = None
+) -> List[Dict]:
+    """C 方案：nuclei 结果 AI 验证（证据增强可选）。
+
+    evidence=True 时每条发现附加 matched-at 原文与模板描述（对齐 A 方案
+    证据型裁决）；None 时读 settings.nuclei_ai_evidence 回退。
+    输出契约不变：仍返回带 ai_verdict/confidence/ai_reason 的结果列表。
+    """
     if not nuclei_results:
         return []
+    if evidence is None:
+        try:
+            evidence = bool(getattr(settings, "nuclei_ai_evidence", True))
+        except Exception:  # noqa: BLE001 - settings 不可用时默认开启
+            evidence = True
 
     global _AI_VERIFY_FAILED, _last_fail_time
 
@@ -500,7 +513,19 @@ async def verify_nuclei_with_ai_async(nuclei_results: List[Dict], target_url: st
         batch = nuclei_results[i:i + batch_size]
         findings_str = []
         for idx, item in enumerate(batch):
-            findings_str.append(f"""
+            matched_raw = (item.get('matched') or item.get('url') or '')
+            desc = (item.get('info') or '')
+            if evidence:
+                # C 方案证据增强：附上匹配原文与描述（裁剪），对齐 A 方案证据型裁决
+                findings_str.append(f"""
+【发现 {idx + 1}】
+- 模板: {item.get('template', '未知')}
+- 严重性: {item.get('severity', '未知')}
+- 描述: {str(desc)[:300]}
+- 匹配位置: {str(matched_raw)[:300]}
+""")
+            else:
+                findings_str.append(f"""
 【发现 {idx + 1}】
 - 模板: {item.get('template', '未知')}
 - 严重性: {item.get('severity', '未知')}
@@ -521,6 +546,7 @@ async def verify_nuclei_with_ai_async(nuclei_results: List[Dict], target_url: st
 2. 如果发现只是扫描到文件存在但无实际利用价值 → 误报（置信度低）
 3. 如果发现是通用规则匹配但缺乏上下文 → 可能是误报（置信度中）
 4. 如果证据中有明确的敏感信息泄露（密码、密钥）→ 真实漏洞
+5. 附带的匹配原文（matched 字段）是判断的关键证据：若命中位置是明显攻击存在/敏感信息/错误配置指纹，应判真实；若仅泛化文本命中而无利用价值，应判误报
 
 请为每个发现输出 JSON 数组：
 [

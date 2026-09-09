@@ -8,6 +8,23 @@ AI 驱动的自动化渗透测试平台（v103 · 基于 v100 限流感知编排
 
 ---
 
+## 定位（先读这一节）
+
+一句话：**VULNCLAW = 任意模型可插的「验证 · 利用 · 审计」底座。**
+
+1. **核心是可商用的授权渗透扫描引擎**——价值来自确定性引擎广度、工具集成、验证去伪与可审计合规，不来自"AI 有多聪明"。
+2. **AI 是增强层，不是主体**——模型无关（BYOK）、Agent 可插（MCP）；模型越强，验证层越值钱。
+3. **合规是不可协商的底座**——危险操作默认 deny、scope 校验、人工审批、防篡改审计凭证链。
+
+- 完整架构图与分层职责：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- 编号（SP\*/A\*/C\*/D\*/E\*）索引：[docs/CODE_INDEX.md](docs/CODE_INDEX.md)
+- 引擎去留盘点：[docs/engine_disposition_report.md](docs/engine_disposition_report.md)
+- 异步热路径体检：[docs/async_hotpath_report.md](docs/async_hotpath_report.md)
+
+> **仅限对你拥有书面授权的目标进行测试**；使用者自担全部责任，与作者无关。
+
+---
+
 ## 5 分钟快速上手（TL;DR）
 
 1. **克隆仓库**：`git clone <your-repo-url> pentest_platform && cd pentest_platform`（或直接下载源码 zip 解压）。
@@ -188,6 +205,47 @@ python scan.py --distributed --master --redis-url redis://localhost:6379/0
 # 代码安全扫描（CodeQL + Semgrep，本地目录/远程仓库）
 python scan.py --code --repo /path/to/repo --lang python
 ```
+
+### 方式三：指令直写账号密码（--instruction，对标 Strix）
+
+不需要预先准备 Cookie——直接在指令里写账号密码，平台会自动登录目标并托管认证会话：
+
+```bash
+# Strix 风格：长句直写
+python scan.py -t http://target.com --instruction "Login with email: admin@target.com, password: Pass#123"
+
+# 中文键值对 + 登录页 + 测试重点 + 排除项（一条指令全搞定）
+python scan.py -t http://target.com --instruction "账号: admin@target.com 密码: Pass#123；登录页: https://target.com/auth/login；重点: sql, xss，排除: /logout, /static"
+
+# 多账号 / 多角色（列表形式，供 IDOR / 越权引擎以多角色会话交叉验证）
+python scan.py -t http://target.com --instruction-file instruction.txt
+```
+
+`instruction.txt` 内容示例：
+
+```
+- 管理员: admin@target.com / Admin#1
+- 普通用户: user@target.com / User#1
+登录页: https://target.com/auth/login
+重点: 越权, 会话
+排除: /logout
+```
+
+**指令支持的内容**：
+
+| 要素 | 写法（中英文均可） | 作用 |
+|---|---|---|
+| 账号密码 | `Login with email: ... , password: ...` / `账号: ... 密码: ...` / `- 角色: 用户 / 密码` | 自动登录目标并落盘 Cookie（第 0 步，优先于既有 Cookie 流程） |
+| 登录页 | `login_url: https://...` / `登录页: https://...` | 指定登录端点（缺省尝试 `/login`） |
+| 测试重点 | `focus on: ...` / `重点: sql, xss` | 提升对应引擎优先级 + 增强 payload 上限 |
+| 排除项 | `out of scope: ...` / `排除: /logout` | 命中目标即跳过该任务 |
+
+**行为与安全**：
+
+- 多账号时：第 1 个为主账号，其余注册为角色会话，供 IDOR / 越权引擎交叉验证（两者权限应当不同）。
+- 登录方式自动降级：优先 Playwright 渲染登录，缺失时走 HTTP 表单登录；全部失败自动回退既有 Cookie 流程，不影响扫描。
+- 登录失败不影响扫描继续（默认凭据缺失/错误时按未认证状态扫描）。
+- 密码明文只存在于内存中的指令对象：日志一律输出 `username:***` 脱敏摘要；**不要把含真实密码的指令文件提交进 git**（建议加入 `.gitignore`，或使用 `--instruction` 内联配合 shell 历史保护）。
 
 扫描结束后报告输出至 `_runtime_cache/reports/`（JSON + HTML）。
 
@@ -421,6 +479,44 @@ pentest_platform/
 | sqlmap | SQL 注入深度验证 | thirdparty/sqlmap/ |
 
 > 🚨 **Burp Suite 用户自备声明**：VULNCLAW 的 `burp-bridge` 扩展（`thirdparty/burp-bridge/vulnclaw-bridge-1.0.8.jar`，源代码 `thirdparty/burp-bridge/VulnclawBridge.java`）为 VULNCLAW 项目自身原创代码，采用与 VULNCLAW 主项目一致的 AGPL-3.0 许可证分发。**Burp Suite Professional 本身是 PortSwigger 公司的商业专有软件，用户需自行安装合法 License 的 Burp Suite ≥ 2026.7 后才可使用 burp-bridge 功能**；本仓库不包含任何 Burp Suite 二进制、注册机或破解补丁。
+
+#### Burp 桥扩展加载说明（拿不到代理历史的 99% 原因）
+
+扫描器与 Burp 的「代理历史」通道依赖 `vulnclaw-bridge.jar` 扩展写入
+`proxy_history.jsonl`（桥目录下的增量事件文件）。**只有把 jar 加载进 Burp
+Extender，代理历史才会被扫描器读取**；若仅开启 Burp REST API，则只能使用
+Intruder / Replay / 协作器，历史数据仍为空。
+
+```text
+加载步骤（Burp Suite ≥ 2026.7 Professional）：
+1. 打开 Burp → Extender / Extensions 标签页
+2. 点击 Add → Extension Type 选 Java
+3. Location 选择本仓库 thirdparty/burp-bridge/vulnclaw-bridge-1.0.8.jar
+4. 确认扩展列表出现 VulnclawBridge，Status 为 Loaded
+5. 重新启动扫描，Burp 代理拦截流量即写入 proxy_history.jsonl
+```
+
+**验证是否生效**：扫描日志出现 `✅ Burp REST API 连接成功` 且后续
+`历史数据新增 N 个` 非空，即说明桥扩展加载成功。若日志出现
+`Burp 插件文件不存在: burp_cookies.json`，那只是可选的手动 Cookie 导入文件
+缺失（`CRAWL_AUTHED` 未配置时无影响），不影响桥功能。
+
+**爬虫预算配置说明（为什么爬取次数少 / 如何加大）**：同源链接爬虫
+（`crawl_same_origin`）默认 `max_depth=2、max_urls=80`，备用爬虫默认
+`max_depth=2、max_urls=30`——这是防爆炸上限，本地小型站点两次即可爬完，
+属正常现象；对真实站点会自动启用 katana / gau / waybackurls 扩大覆盖。
+如需放宽预算，可在 `.env` 中调整：
+
+| 环境变量 | 默认 | 作用 |
+|---|---|---|
+| `MAX_CRAWL_ENDPOINTS` | 60 | 爬虫端点喂给引擎的数量上限 |
+| `MAX_CRAWL_SEED_URLS` | 15 | 迭代爬虫的种子 URL 数量 |
+| `MAX_CRAWL_BATCH` | 30 | 每轮爬虫批处理 URL 数 |
+| `MAX_CRAWL_ROUNDS` | 3 | 迭代爬虫轮数（默认 8，启动时兜底为 3） |
+
+> 注意：`max_depth` 与 `max_urls` 为代码内预算常量（见
+> `src/vulnclaw/modules/recon.py` 的 `crawl_same_origin`），如有特殊需求
+> 可直接修改后重新安装；常规场景建议优先调上面的 env 参数即可。
 
 ## 商业授权与定价
 

@@ -214,6 +214,26 @@ class MCPJsonRpcHandler:
                     "openWorldHint": False,
                 },
             },
+            "scan.stop": {
+                "name": "scan.stop",
+                "description": "停止/取消一个正在运行的扫描任务。已结束的扫描任务将被忽略",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "scan_id": {
+                            "type": "string",
+                            "description": "要停止的扫描任务 ID",
+                        },
+                    },
+                    "required": ["scan_id"],
+                },
+                "annotations": {
+                    "readOnlyHint": False,
+                    "destructiveHint": True,
+                    "idempotentHint": True,
+                    "openWorldHint": False,
+                },
+            },
             "scan.api_audit": {
                 "name": "scan.api_audit",
                 "description": "执行 API 深度安全审计（GraphQL DoS、速率限制绕过、JWT 重放）",
@@ -278,6 +298,63 @@ class MCPJsonRpcHandler:
                     "destructiveHint": True,
                     "idempotentHint": False,
                     "openWorldHint": True,
+                },
+            },
+            "verify.gateway": {
+                "name": "verify.gateway",
+                "description": "验证网关：对扫描报告（JSON/SARIF）做规则校验/互证/盲复现，并生成审计回执签名",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "input_path": {
+                            "type": "string",
+                            "description": "输入报告文件路径（JSON/SARIF，必填）",
+                        },
+                        "mode": {
+                            "type": "string",
+                            "enum": ["run", "verify"],
+                            "description": "run=完整验证网关（默认）；verify=只校验已有审计回执",
+                        },
+                        "output_path": {
+                            "type": "string",
+                            "description": "输出校验后报告路径（可选）",
+                        },
+                        "receipt_path": {
+                            "type": "string",
+                            "description": "审计回执路径（可选，默认与报告同目录）",
+                        },
+                        "receipt_key": {
+                            "type": "string",
+                            "description": "审计回执签名密钥（可选）",
+                        },
+                        "use_llm": {
+                            "type": "boolean",
+                            "description": "是否启用 LLM 预筛（默认 false）",
+                        },
+                        "probe": {
+                            "type": "boolean",
+                            "description": "是否做存活探测（默认 false）",
+                        },
+                        "blind_repro": {
+                            "type": "boolean",
+                            "description": "盲复现：主动请求验证漏洞（危险操作，默认 false）",
+                        },
+                        "blind_sandbox": {
+                            "type": "boolean",
+                            "description": "盲复现在隔离沙箱内执行（默认 false）",
+                        },
+                        "blind_max": {
+                            "type": "integer",
+                            "description": "单轮盲复现目标上限（默认 40）",
+                        },
+                    },
+                    "required": ["input_path"],
+                },
+                "annotations": {
+                    "readOnlyHint": False,
+                    "destructiveHint": True,
+                    "idempotentHint": False,
+                    "openWorldHint": False,
                 },
             },
             "exploit.verify": {
@@ -467,6 +544,52 @@ class MCPJsonRpcHandler:
                     "openWorldHint": False,
                 },
             },
+            "report.get": {
+                "name": "report.get",
+                "description": "获取扫描报告原文（JSON）。可按 scan_id 精确匹配，缺省返回最近一次扫描的报告。"
+                               "外部 Agent 据此消费结构化漏洞结论，无需再轮询 findings 列表。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "scan_id": {
+                            "type": "string",
+                            "description": "扫描任务 ID（可选，缺省返回最新报告）",
+                        },
+                    },
+                    "required": [],
+                },
+                "annotations": {
+                    "readOnlyHint": True,
+                    "destructiveHint": False,
+                    "idempotentHint": True,
+                    "openWorldHint": False,
+                },
+            },
+            "finding.review": {
+                "name": "finding.review",
+                "description": "对某个漏洞发现（finding）做人工复核回写，形成机检→人判→回流闭环。"
+                               "verdict 为 confirmed / false_positive / pending；结果追加写入 {scan_id}_reviews.jsonl。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "scan_id": {"type": "string", "description": "扫描任务 ID"},
+                        "finding_id": {"type": "string", "description": "finding 标识（来自报告的 id / title / type）"},
+                        "verdict": {
+                            "type": "string",
+                            "enum": ["confirmed", "false_positive", "pending"],
+                            "description": "复核结论",
+                        },
+                        "note": {"type": "string", "description": "复核备注（可选）"},
+                    },
+                    "required": ["scan_id", "finding_id", "verdict"],
+                },
+                "annotations": {
+                    "readOnlyHint": False,
+                    "destructiveHint": False,
+                    "idempotentHint": False,
+                    "openWorldHint": False,
+                },
+            },
             "burp.scan": {
                 "name": "burp.scan",
                 "description": "把 URL 提交给本机 Burp Pro Scanner 深度扫描并收割 issues"
@@ -587,6 +710,8 @@ class MCPJsonRpcHandler:
             return await self._tool_scan_status(arguments)
         elif tool_name == "scan.findings":
             return await self._tool_scan_findings(arguments)
+        elif tool_name == "scan.stop":
+            return await self._tool_scan_stop(arguments)
         elif tool_name == "scan.api_audit":
             return await self._tool_scan_api_audit(arguments)
         elif tool_name == "scan.danger_guard_status":
@@ -595,6 +720,8 @@ class MCPJsonRpcHandler:
             return await self._tool_browser_explore(arguments)
         elif tool_name == "exploit.verify":
             return await self._tool_exploit_verify(arguments)
+        elif tool_name == "verify.gateway":
+            return await self._tool_verify_gateway(arguments)
         elif tool_name == "code.audit":
             return await self._tool_code_audit(arguments)
         elif tool_name == "scan.deep":
@@ -611,6 +738,10 @@ class MCPJsonRpcHandler:
             return await self._tool_burp_scan(arguments)
         elif tool_name == "burp.intruder":
             return await self._tool_burp_intruder(arguments)
+        elif tool_name == "report.get":
+            return await self._tool_report_get(arguments)
+        elif tool_name == "finding.review":
+            return await self._tool_finding_review(arguments)
         else:
             raise ValueError(f"Tool not implemented: {tool_name}")
 
@@ -684,6 +815,53 @@ class MCPJsonRpcHandler:
             "content": [{
                 "type": "text",
                 "text": json.dumps(status_info, ensure_ascii=False),
+            }],
+        }
+
+    async def _tool_scan_stop(self, args: dict) -> dict:
+        scan_id = (args.get("scan_id") or "").strip()
+        if not scan_id:
+            raise ValueError("scan_id 参数不能为空")
+
+        job = await self._event_bus.get_job(scan_id)
+        if job is None:
+            raise ValueError(f"扫描任务不存在: {scan_id}")
+
+        if job.status in (ScanStatus.COMPLETED, ScanStatus.FAILED, ScanStatus.CANCELLED):
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps({
+                        "scan_id": scan_id,
+                        "status": job.status.value,
+                        "message": f"扫描已处于 {job.status.value} 状态，无需停止",
+                    }, ensure_ascii=False),
+                }],
+            }
+
+        if job._task is not None:
+            job._task.cancel()
+        else:
+            # 任务仍在队列排队未真正启动：直接作废，避免 Worker 启动它
+            await self._event_bus.update_job(
+                scan_id,
+                status=ScanStatus.CANCELLED,
+                completed_at=time.time(),
+            )
+        await self._event_bus.publish({
+            "type": "scan.stop",
+            "scan_id": scan_id,
+        })
+
+        logger.info(f"MCP 已请求停止扫描: {scan_id}")
+        return {
+            "content": [{
+                "type": "text",
+                "text": json.dumps({
+                    "scan_id": scan_id,
+                    "status": "cancelling",
+                    "message": f"已请求停止扫描 {scan_id}。使用 scan.status 确认最终状态。",
+                }, ensure_ascii=False),
             }],
         }
 
@@ -963,6 +1141,45 @@ class MCPJsonRpcHandler:
             }],
         }
 
+    async def _tool_verify_gateway(self, args: dict) -> dict:
+        from vulnclaw.core.verification_gateway import run_gateway, verify_gateway_output
+
+        input_path = (args.get("input_path") or "").strip()
+        if not input_path:
+            raise ValueError("input_path 参数不能为空")
+
+        try:
+            if args.get("mode") == "verify":
+                result = verify_gateway_output(
+                    output_path=input_path,
+                    receipt_path=(args.get("receipt_path") or ""),
+                    secret=(args.get("receipt_key") or ""),
+                )
+            else:
+                result = await run_gateway(
+                    input_path=input_path,
+                    output_path=(args.get("output_path") or ""),
+                    receipt_path=(args.get("receipt_path") or ""),
+                    probe=bool(args.get("probe", False)),
+                    use_llm=bool(args.get("use_llm", False)),
+                    source=(args.get("source") or ""),
+                    receipt_key=(args.get("receipt_key") or ""),
+                    blind_repro=bool(args.get("blind_repro", False)),
+                    blind_sandbox=bool(args.get("blind_sandbox", False)),
+                    blind_max=int(args.get("blind_max", 40) or 40),
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"MCP verify.gateway 失败: {exc}\n{traceback.format_exc()}")
+            raise ValueError(f"验证网关执行失败: {exc}")
+
+        logger.info(f"MCP verify.gateway 完成: input={input_path} ok={result.get('ok')}")
+        return {
+            "content": [{
+                "type": "text",
+                "text": json.dumps(result, ensure_ascii=False, indent=2, default=str),
+            }],
+        }
+
     async def _tool_code_audit(self, args: dict) -> dict:
         """代码安全审计（Semgrep + CodeQL + 依赖 CVE + AI 复核）。"""
         from argparse import Namespace
@@ -1143,6 +1360,72 @@ class MCPJsonRpcHandler:
                 "text": json.dumps(result, ensure_ascii=False),
             }],
         }
+
+    def _report_dir(self):
+        """扫描报告目录（延迟导入，避免与 scan_runner 循环依赖）。"""
+        from vulnclaw.runners.scan_runner import REPORT_DIR
+        return REPORT_DIR
+
+    async def _tool_report_get(self, args: dict) -> dict:
+        """report.get：读取扫描报告原文。按 scan_id 精确匹配，缺省返回最新报告。"""
+        import glob as _glob
+        import os as _os
+        scan_id = (args.get("scan_id") or "").strip()
+        report_dir = self._report_dir()
+        try:
+            files = sorted(_glob.glob(str(report_dir / "report_*.json")),
+                           key=_os.path.getmtime, reverse=True)
+        except OSError as e:
+            raise ValueError(f"报告目录不可访问: {e}")
+        if scan_id:
+            matched = [f for f in files if scan_id in _os.path.basename(f)]
+            if matched:
+                files = matched
+        if not files:
+            raise ValueError("未找到任何扫描报告")
+        latest = files[0]
+        try:
+            with open(latest, encoding="utf-8") as fh:
+                report = json.load(fh)
+        except Exception as e:  # noqa: BLE001
+            raise ValueError(f"报告读取失败: {e}")
+        payload = {
+            "report_file": _os.path.basename(latest),
+            "scan_id_hint": scan_id or None,
+            "report": report,
+        }
+        return {"content": [{"type": "text",
+                             "text": json.dumps(payload, ensure_ascii=False, default=str)}]}
+
+    async def _tool_finding_review(self, args: dict) -> dict:
+        """finding.review：人工复核回写，形成机检→人判→回流闭环。"""
+        import os as _os
+        scan_id = (args.get("scan_id") or "").strip()
+        finding_id = (args.get("finding_id") or "").strip()
+        verdict = (args.get("verdict") or "").strip()
+        if not scan_id or not finding_id:
+            raise ValueError("scan_id 与 finding_id 必填")
+        if verdict not in ("confirmed", "false_positive", "pending"):
+            raise ValueError("verdict 必须为 confirmed / false_positive / pending 之一")
+        note = (args.get("note") or "").strip()
+        review = {
+            "scan_id": scan_id,
+            "finding_id": finding_id,
+            "verdict": verdict,
+            "note": note,
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        review_path = self._report_dir() / f"{scan_id}_reviews.jsonl"
+        try:
+            review_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(review_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(review, ensure_ascii=False) + "\n")
+        except OSError as e:
+            raise ValueError(f"复核回写失败: {e}")
+        logger.info(f"MCP finding.review: {scan_id}/{finding_id} → {verdict}")
+        return {"content": [{"type": "text",
+                             "text": json.dumps({"ok": True, "saved": str(review_path),
+                                                  "review": review}, ensure_ascii=False)}]}
 
     async def _tool_engine_run(self, args: dict) -> dict:
         """运行指定确定性检测引擎（scan / check 由引擎能力自动选择）。"""
@@ -1849,24 +2132,31 @@ async def scan_worker(event_bus: Optional[ScanEventBus] = None) -> None:
 
         logger.info(f"Scan Worker 开始执行扫描: {scan_id} → {target}")
 
-        try:
-            await bus.update_job(
-                scan_id,
-                status=ScanStatus.RUNNING,
-                started_at=time.time(),
-            )
+        # 排队期间被 scan.stop 取消的任务直接跳过，不再启动
+        pre = await bus.get_job(scan_id)
+        if pre is not None and pre.status == ScanStatus.CANCELLED:
+            logger.info(f"Scan Worker 跳过已取消任务: {scan_id}")
+            continue
 
+        try:
             from vulnclaw.core.utils import get_shared_session, close_shared_session
             session = await get_shared_session(target=target)
 
             try:
                 from vulnclaw.ai.v100 import run_v100_scan
-                report = await run_v100_scan(
+                scan_task = asyncio.create_task(run_v100_scan(
                     target=target,
                     session=session,
                     max_tasks=max_tasks,
                     initial_qps=initial_qps,
+                ))
+                await bus.update_job(
+                    scan_id,
+                    status=ScanStatus.RUNNING,
+                    started_at=time.time(),
+                    _task=scan_task,
                 )
+                report = await scan_task
             finally:
                 await close_shared_session()
 
@@ -1880,6 +2170,14 @@ async def scan_worker(event_bus: Optional[ScanEventBus] = None) -> None:
                 completed_at=time.time(),
             )
             logger.info(f"Scan Worker 扫描完成: {scan_id}，发现 {len(findings)} 个漏洞")
+
+        except asyncio.CancelledError:
+            logger.info(f"Scan Worker 扫描已取消: {scan_id}")
+            await bus.update_job(
+                scan_id,
+                status=ScanStatus.CANCELLED,
+                completed_at=time.time(),
+            )
 
         except Exception as exc:
             logger.error(f"Scan Worker 扫描失败: {scan_id} - {exc}\n{traceback.format_exc()}")

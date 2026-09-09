@@ -52,7 +52,7 @@ class _FakeOOBChannel:
                     "domain": self.domain}
         return self._probe
 
-    async def wait_for_interaction(self, token, timeout=None):
+    async def wait_for_interaction(self, token, timeout=None, interval=None, target=""):
         return self.hits
 
 

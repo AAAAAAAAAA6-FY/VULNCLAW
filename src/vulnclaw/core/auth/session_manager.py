@@ -29,6 +29,57 @@ from yarl import URL  # 🔧 修复：aiohttp.CookieJar.update_cookies 的 respo
 
 from vulnclaw.core.logger import logger
 from vulnclaw.core.settings import settings
+from vulnclaw.core.utils import resolve_burp_cookies_path
+
+
+
+# ============================================================
+# 桥代理历史 → 认证 Cookie 自动保鲜
+# ============================================================
+# 认证类 Cookie 白名单：只把这些键（而非全量分析 cookie）从 Burp 桥的
+# proxy_history.jsonl 增量同步到 burp_cookies.json，实现
+# "Burp 新抓登录态 → 扫描器 60s 重载自动带上"的闭环（无需 py 插件）。
+AUTH_COOKIE_KEYS = (
+    # —— 亚马逊系（历史兼容，audible/amazon 扫描继续生效）——
+    "session-id", "ubid-main", "at-main", "sess-at-main",
+    "session-token", "x-main", "csm-hit", "i18n-prefs", "lc-main",
+    # —— 通用认证键（跨目标）——
+    "session", "sessionid", "session_id", "sid", "sess", "token",
+    "access_token", "refresh_token", "auth", "auth_token", "authtoken",
+    "jwt", "id_token", "cas_session", "usid", "stable-id", "device",
+    "__Secure-claims", "__Secure-urs",
+)
+
+
+def _is_auth_cookie_key(key: str) -> bool:
+    """判定 cookie 键是否为认证类（白名单精确匹配 + 安全前缀/令牌后缀通配）。
+
+    精确命中白名单→ True；再按安全前缀（__Secure-/__Host- 必为认证类）与
+    常见令牌后缀（token/auth/session/jwt/credential/assertion）兜底，避免
+    目标站点登录态全被滤掉。广告/分析类（__cf_bm/_ga/…）由前缀规则天然排除。
+    """
+    if key in AUTH_COOKIE_KEYS:
+        return True
+    low = key.lower()
+    if low.startswith(("__secure-", "__host-")):
+        return low not in ("__cf_bm", "__cfduid", "_cfuvid")
+    for suf in ("token", "auth", "session", "sess", "jwt", "credential", "assertion", "login", "logged"):
+        if suf in low:
+            return True
+    return False
+
+
+_BRIDGE_DIR_ENV = os.environ.get("VULNCLAW_BRIDGE_DIR", "")
+
+
+def _bridge_proxy_history_path() -> str:
+    """定位 Burp 扩展桥的代理历史文件（与 vulnclaw/ai/burp.py 同源规则）。"""
+    if _BRIDGE_DIR_ENV:
+        return os.path.join(_BRIDGE_DIR_ENV, "proxy_history.jsonl")
+    # session_manager.py 位于 <root>/src/vulnclaw/core/auth/ → 项目根为上四级
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))))))
+    return os.path.join(root, "_runtime_cache", "burp_bridge", "proxy_history.jsonl")
 
 
 # ============================================================
@@ -187,7 +238,11 @@ class SessionManager:
         self.auto_refresh: bool = True
         self.refresh_handlers: Dict[str, callable] = {}
 
-        self._cookie_reload_interval = 60
+        # 2026-09-08: 60s -> settings.CONN_COOKIE_RELOAD_INTERVAL（默认 15s），
+        # 登录态自动保鲜更快生效（Burp 桥同步 -> 文件 -> 会话加载）。
+        self._cookie_reload_interval = int(
+            getattr(settings, "cookie_reload_interval", 15) or 15
+        )
         self._last_reload_time = 0
         self._cookie_file_mtime = 0
         self._reload_task: Optional[asyncio.Task] = None
@@ -331,6 +386,103 @@ class SessionManager:
 
         logger.info(f"👤 添加用户会话: {role}")
 
+    def _sync_bridge_auth_cookies_to_file(self) -> bool:
+        """增量扫描桥 proxy_history.jsonl → 合并认证 Cookie 回 burp_cookies.json。
+
+        用字节偏移记录已消费位置，只处理 AUTH_COOKIE_KEYS 白名单键，
+        避免把广告/分析类 Cookie 堆进文件。有新增才写盘（防止每 60s 空写）。
+        """
+        hist = _bridge_proxy_history_path()
+        if not os.path.exists(hist):
+            return False
+        try:
+            fsize = os.path.getsize(hist)
+        except BaseException:
+            return False
+
+        pos = getattr(self, "_bridge_stream_pos", 0)
+        if pos >= fsize:
+            return False  # 无新增行
+
+        found: Dict[str, Dict[str, str]] = {}
+        try:
+            with open(hist, "r", encoding="utf-8", errors="replace") as f:
+                f.seek(pos)
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    host = (ev.get("host") or "").split(":")[0].strip().lower()
+                    if not host or not _is_valid_cookie_domain(host):
+                        continue
+                    ch = ev.get("request_headers") or {}
+                    ck = ch.get("Cookie") or ch.get("cookie")
+                    if not ck:
+                        continue
+                    for kv in ck.split(";"):
+                        kv = kv.strip()
+                        if not kv or "=" not in kv:
+                            continue
+                        k, _, v = kv.partition("=")
+                        k, v = k.strip(), v.strip()
+                        if _is_auth_cookie_key(k) and v:
+                            found.setdefault(host, {})[k] = v  # 后行覆盖 = 取最近值
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"桥历史读取异常: {e}")
+            return False
+
+        # 推进偏移（无论有无变更，已读行不重复消费）
+        self._bridge_stream_pos = fsize
+        if not found:
+            return False
+
+        cookie_file = resolve_burp_cookies_path()
+        # 只做合并增强：文件缺失或损坏时跳过（不播种、不覆盖损坏文件），
+        # 保持 _reload_cookies_from_file 既有"缺失/损坏 → False + 备份恢复"语义。
+        if not os.path.exists(cookie_file):
+            return False
+        try:
+            with open(cookie_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return False
+        except Exception:  # noqa: BLE001
+            logger.debug("Cookie 文件损坏，桥同步跳过（交给主流程备份恢复）")
+            return False
+
+        changed = False
+        for domain, creds in found.items():
+            if domain in ("_meta",):
+                continue
+            cur = data.get(domain) or {}
+            # 仅当确有变更才写，避免 60s 空写盘
+            if any(cur.get(k) != v for k, v in creds.items()):
+                cur.update(creds)
+                data[domain] = cur
+                changed = True
+
+        if not changed:
+            return False
+
+        data["_meta"] = {
+            "last_update": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "source": "session_manager bridge 增量同步",
+        }
+        try:
+            tmp = cookie_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, cookie_file)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"桥认证 Cookie 写盘失败: {e}")
+            return False
+        logger.info(f"🔄 桥增量同步: {len(found)} 个域新增/更新认证 Cookie")
+        return True
+
     # ============================================================
     # 后台 Cookie 重载
     # ============================================================
@@ -338,7 +490,14 @@ class SessionManager:
         if not self._enabled_reload:
             return False
 
-        cookie_file = os.path.expanduser("~/burp_cookies.json")
+        # 🔧 自动保鲜：先把桥代理历史里新增的认证 Cookie 合并回 Cookie 文件，
+        # 使下方 mtime diff 自然触发更新（无需 Burp py 插件）。
+        try:
+            self._sync_bridge_auth_cookies_to_file()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"桥认证 Cookie 同步异常（不阻断）: {e}")
+
+        cookie_file = resolve_burp_cookies_path()
         if not os.path.exists(cookie_file):
             return False
 
@@ -673,7 +832,7 @@ class SessionManager:
     # ============================================================
     def load_from_burp_plugin(self, file_path: str = None, target_domain: str = None) -> int:
         if file_path is None:
-            file_path = os.path.expanduser("~/burp_cookies.json")
+            file_path = resolve_burp_cookies_path()
 
         if not os.path.exists(file_path):
             logger.warning(f"⚠️ Burp 插件文件不存在: {file_path}")
@@ -704,8 +863,10 @@ class SessionManager:
                 return raw.lstrip('.').lower() or None
 
             if target_domain:
-                clean_target_raw = _normalize_host(target_domain) or target_domain.lower().lstrip('www.').lstrip('.')
-                clean_target = clean_target_raw.lstrip('www.')
+                clean_target_raw = _normalize_host(target_domain) or target_domain.lower().lstrip('.')
+                if clean_target_raw.startswith('www.'):
+                    clean_target_raw = clean_target_raw[4:]
+                clean_target = clean_target_raw
 
                 if '.' not in clean_target:
                     logger.warning(f"⚠️ 目标域名 '{clean_target}' 不包含点，跳过过滤以防止误匹配")
@@ -715,7 +876,7 @@ class SessionManager:
                         host = _normalize_host(domain)
                         if not host:
                             continue
-                        clean_domain = host.lstrip('www.')
+                        clean_domain = host[4:] if host.startswith('www.') else host
                         # 保留原有的两层匹配逻辑：先域名/子域名命中，再防祖先级域越权匹配
                         if clean_domain == clean_target or clean_domain.endswith('.' + clean_target):
                             if clean_domain == clean_target or (

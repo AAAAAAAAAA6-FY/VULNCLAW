@@ -50,6 +50,32 @@ class Settings(BaseSettings):
     # E5.1 scope 硬约束白名单（逗号分隔：example.com 匹配自身及子域；*.*.example.com 通配；10.0.0.0/8 CIDR；精确 IP）
     allowed_scope: str = Field("", alias="ALLOWED_SCOPE")
 
+    # ========== OSINT 外发合规（2026-09-08） ==========
+    # 默认开启：recon 会把目标域名发往公网 OSINT 源（crt.sh / AlienVault OTX / urlscan.io）。
+    # 对敏感目标可设 OSINT_DISABLE=1 关闭全部公网子域枚举，仅保留本地工具。
+    osint_disable: bool = Field(False, alias="OSINT_DISABLE")
+
+    # ========== Dashboard 安全（2026-09-08） ==========
+    # 非空时 Dashboard 所有 API/WebSocket 需携带 X-Dashboard-Token / ?token= 才能访问。
+    dashboard_token: str = Field("", alias="DASHBOARD_TOKEN")
+
+    # ========== 目标请求能力探测（Target Capacity Probe） ==========
+    # 扫描早期测出目标安全 QPS/并发，动态应用到爬虫/全局 HTTP/引擎全链路；
+    # 探测失败自动回退静态默认值（probed=False，零风险开关）。
+    enable_target_probe: bool = Field(True, alias="ENABLE_TARGET_PROBE")
+    target_probe_timeout_s: int = Field(45, alias="TARGET_PROBE_TIMEOUT_S")
+    target_probe_levels: Annotated[List[float], NoDecode] = Field(
+        default_factory=lambda: [2, 4, 8, 16], alias="TARGET_PROBE_LEVELS"
+    )
+    target_probe_duration_s: float = Field(1.0, alias="TARGET_PROBE_DURATION_S")
+    target_probe_burst_multiplier: float = Field(2.5, alias="TARGET_PROBE_BURST_MULTIPLIER")
+    target_probe_burst_duration_s: float = Field(0.5, alias="TARGET_PROBE_BURST_DURATION_S")
+    target_probe_safety_factor: float = Field(0.7, alias="TARGET_PROBE_SAFETY_FACTOR")
+    target_probe_qps_cap: float = Field(50, alias="TARGET_PROBE_QPS_CAP")
+    target_probe_concurrency_cap: int = Field(64, alias="TARGET_PROBE_CONCURRENCY_CAP")
+    target_probe_ok_ratio: float = Field(0.95, alias="TARGET_PROBE_OK_RATIO")
+    target_probe_max_body: int = Field(65536, alias="TARGET_PROBE_MAX_BODY")
+
     # ========== B 堆新增引擎开关（可选，默认启用） ==========
     password_reset: bool = Field(True, alias="PASSWORD_RESET")
     cloud_container_exposure: bool = Field(True, alias="CLOUD_CONTAINER_EXPOSURE")
@@ -61,6 +87,45 @@ class Settings(BaseSettings):
         alias="USER_AGENT"
     )
     extra_headers: Dict[str, str] = Field(default_factory=dict, alias="EXTRA_HEADERS")
+    # 单目标 Nuclei 运行超时（秒）：SPA 大站 120s 跑不完 CVE 模板，默认放宽到 240s
+    nuclei_run_timeout: int = Field(240, alias="NUCLEI_RUN_TIMEOUT")
+
+    # ===== C 方案: 通用检测外置到 Nuclei/社区（2026-09-08）=====
+    # 总开关。关闭则 _run_nuclei_community_line 不挂载，recon 保持旧行为（仅主域根单发）。
+    nuclei_community_line: bool = Field(True, alias="NUCLEI_COMMUNITY_LINE")
+    # 模板健康阈值：模板 yaml 计数 < 此值 → 醒目 WARNING + 整线 fail-closed（不产出、不误报）。
+    nuclei_line_min_templates: int = Field(300, alias="NUCLEI_LINE_MIN_TEMPLATES")
+    # 端点级覆盖预算：每轮最多对多少个存活资产/端点发 nuclei（0=仅主域根，兼容旧行为）。
+    nuclei_line_endpoint_budget: int = Field(10, alias="NUCLEI_LINE_ENDPOINT_BUDGET")
+    # 社区线 severity 档（默认高优两级，可控时耗；需要覆盖低危再显式放开）。
+    nuclei_line_severity: str = Field("critical,high", alias="NUCLEI_LINE_SEVERITY")
+    # 单端点 nuclei 超时（秒）。
+    nuclei_line_timeout: int = Field(300, alias="NUCLEI_LINE_TIMEOUT")
+    # 结果是否走证据增强 AI 验证（升级 prompt）。false 回退旧 4 行文本 prompt。
+    nuclei_ai_evidence: bool = Field(True, alias="NUCLEI_AI_EVIDENCE")
+
+    # ===== E 方案: 交叉验证层（开源工具对照，2026-09-08）=====
+    # 总开关：对引擎候选用 Commix/Nuclei 定向模板做独立二次判定（双杀），
+    # 并把结论写入 cross_tool_confirmed / cross_tool_pending 供审核门消费。
+    cross_check_enabled: bool = Field(True, alias="CROSS_CHECK_ENABLED")
+    # 单条 Nuclei 对照总超时（秒）；定向 tags+单 URL，通常远小于社区线全量
+    cross_check_timeout: int = Field(120, alias="CROSS_CHECK_TIMEOUT")
+    # 对照并发上限（Semaphore），避免验证阶段打爆 QPS
+    cross_check_batch: int = Field(3, alias="CROSS_CHECK_BATCH")
+    # E3 业务逻辑规则化：IDOR/竞态等无开源对照时，强制差分/双源证据，否则标记 pending
+    cross_check_biz_rule: bool = Field(True, alias="CROSS_CHECK_BIZ_RULE")
+
+    # ===== D 方案: 调度弹性护栏 + 引擎目标域硬约束 + 报告证据运营（2026-09-08）=====
+    # D2: 引擎任务目标域硬约束（fail-closed）。true 时所有引擎任务 target 必须落在
+    # 主扫描目标域/子域内（或命中 ALLOWED_SCOPE），外域任务在被消费前剔除，不发请求。
+    engine_target_scope_enforce: bool = Field(True, alias="ENGINE_TARGET_SCOPE_ENFORCE")
+    # D1: 粘滞剔除阈值——同一 (engine,target,param) 累计超时/失败达到此值即入墓碑黑名单，
+    # 后续新生成的同键任务直接跳过，阻止 taskgen 每轮重复生成造成的占位死循环。
+    sticky_fail_threshold: int = Field(2, alias="STICKY_FAIL_THRESHOLD")
+    # D1: 孤儿协程运行时长阈值（秒）——诊断用，超过即打 WARNING 定位泄漏源。
+    orphan_task_age_s: int = Field(180, alias="ORPHAN_TASK_AGE_S")
+    # D3: 报告证据运营——每条 finding 附加 evidence_chain + sigma 置信度分档并参与排序。
+    report_sigma_enable: bool = Field(True, alias="REPORT_SIGMA_ENABLE")
 
     # ========== AI 配置 ==========
     # 默认模型池（AI_MODELS 未配置时使用；模型名支持 1/2/4/5 别名或全名，任意数量）
@@ -238,7 +303,8 @@ class Settings(BaseSettings):
     # E3: 单参数一旦确认高危/严重，跳过剩余低优先级引擎（早停），减少无效调用
     engine_early_stop_on_confirmed: bool = Field(True, alias="ENGINE_EARLY_STOP_ON_CONFIRMED")
     # E1: 增量扫描——基于上次状态文件跳过已扫端点/参数
-    incremental_scan: bool = Field(True, alias="INCREMENTAL_SCAN")
+    # 默认关：同目标重复扫描默认全量（防静默漏扫参数级任务）；--diff 显式开启时才走增量
+    incremental_scan: bool = Field(False, alias="INCREMENTAL_SCAN")
     incremental_state_file: str = Field("", alias="INCREMENTAL_STATE_FILE")
     # A3.2: 目标画像 TTL（小时）——画像超龄视为过期，全量重扫（防陈旧指纹掩盖真实变化）
     asset_profile_ttl_hours: float = Field(168.0, alias="ASSET_PROFILE_TTL_HOURS")
@@ -254,6 +320,10 @@ class Settings(BaseSettings):
     # A4.4: 任务分层成本路由——filter 档便宜模型先粗筛，verify 档贵模型只做真验证
     filter_first_verify: bool = Field(True, alias="FILTER_FIRST_VERIFY")
     verify_llm_call_budget: int = Field(120, alias="VERIFY_LLM_CALL_BUDGET")
+    # ===== A 方案: AI 层认知升级——证据包 + 探测前置 =====
+    # 关闭则回退旧行为（evidence[:200] + 无 probe 观测），零行为变化
+    verify_evidence_pack: bool = Field(True, alias="VERIFY_EVIDENCE_PACK")
+    verify_probe_before_ai: bool = Field(True, alias="VERIFY_PROBE_BEFORE_AI")
     # C9: LLM-as-Judge 去重（对疑似重复 finding 用模型二次判定）
     llm_as_judge_dedup: bool = Field(True, alias="LLM_AS_JUDGE_DEDUP")
     # C10: 幻觉抑制（强制 evidence 非空且可复现，否则降级为低置信）
@@ -294,6 +364,8 @@ class Settings(BaseSettings):
     enable_metrics: bool = Field(True, alias="ENABLE_METRICS")
     metrics_port: int = Field(9090, alias="METRICS_PORT")
     http2: bool = Field(True, alias="HTTP2")
+    # ---- SP27 指令上下文（运行时注入，非 env；--instruction 解析结果，taskgen 消费）----
+    instruction_context: object = None
     max_response_size_mb: int = Field(50, alias="MAX_RESPONSE_SIZE_MB")
     cache_ttl: int = Field(7200, alias="CACHE_TTL")
     cache_backend: str = Field("memory", alias="CACHE_BACKEND")
@@ -310,6 +382,19 @@ class Settings(BaseSettings):
     # 以下上限 0 = 不限制（最强模式）；如需保守可设具体数字（safe 档）。
     max_url_params: int = Field(0, alias="MAX_URL_PARAMS")                 # 参数级引擎测试的总参数数
     max_idor_params: int = Field(0, alias="MAX_IDOR_PARAMS")               # IDOR 测试参数数
+    # ===== B 方案: 双会话差分业务逻辑 oracle（2026-09-08）=====
+    # 总开关。关闭则 _scan_idor 回退旧行为（>= 2 角色才跑，无匿名兜底）。
+    idor_dual_session: bool = Field(True, alias="IDOR_DUAL_SESSION")
+    # 单身份时自动配对"匿名身份"（剥离 Cookie/Authorization）做差分；无真实第二账号也能验证无鉴权越权。
+    idor_anon_pair: bool = Field(True, alias="IDOR_ANON_PAIR")
+    # 第二账号 Cookie 文件（可选，覆盖匿名兜底）：{"target_domain": {"identity_a": {...}, "identity_b": {...}}}
+    idor_role_cookies_file: str = Field("", alias="IDOR_ROLE_COOKIES_FILE")
+    # victim ID 池规模（相邻/随机突变数量），直接喂给 IDOREngine._generate_id_mutations
+    idor_victim_mutations: int = Field(6, alias="IDOR_VICTIM_MUTATIONS")
+    # 公开资源/SPA 壳排除阈值：A/B 均为 200 且 body_sim>=阈值 且无私有标记 → 丢弃
+    idor_shell_sim_threshold: float = Field(0.85, alias="IDOR_SHELL_SIM_THRESHOLD")
+    # 本阶段探测预算（每个候选端点的最大请求对数量）
+    idor_max_probes: int = Field(40, alias="IDOR_MAX_PROBES")
     max_forms: int = Field(0, alias="MAX_FORMS")                           # 表单数
     max_js_endpoints: int = Field(0, alias="MAX_JS_ENDPOINTS")             # JS/API 端点数（含静态收割、迭代）
     max_api_endpoints: int = Field(0, alias="MAX_API_ENDPOINTS")           # API 端点任务数
@@ -352,10 +437,12 @@ class Settings(BaseSettings):
     # attack_node_budget 必须小于 phase_timeout_scan_s（外层 wait_for 兜底），
     # 默认 500s：给 10 worker×多任务留足执行窗口，同时保留 100s 余量给宽限/收尾。
     attack_node_budget: float = Field(500.0, alias="ATTACK_NODE_BUDGET")
+    # 超时工作量自适应：无容量探测时的单任务经验耗时(秒，含引擎执行+AI验证)，有探测RT时按真实RT缩放
+    attack_per_task_s: float = Field(4.0, alias="ATTACK_PER_TASK_S")
     # SP21.2 动态补测任务（param_mining / live:*）宽限窗口（原 getattr 兜底 45s 收口为正式字段）
     attack_dynamic_grace_s: float = Field(45.0, alias="ATTACK_DYNAMIC_GRACE_S")
     phase_timeout_agent_coordinator_s: int = Field(120, alias="PHASE_TIMEOUT_AGENT_COORDINATOR_S")
-    phase_timeout_extras_s: int = Field(240, alias="PHASE_TIMEOUT_EXTRAS_S")
+    phase_timeout_extras_s: int = Field(480, alias="PHASE_TIMEOUT_EXTRAS_S")
     phase_timeout_verify_s: int = Field(120, alias="PHASE_TIMEOUT_VERIFY_S")
     phase_timeout_report_s: int = Field(60, alias="PHASE_TIMEOUT_REPORT_S")
     phase_timeout_fallback_s: int = Field(180, alias="PHASE_TIMEOUT_FALLBACK_S")
@@ -364,15 +451,43 @@ class Settings(BaseSettings):
     max_crawl_seed_urls: int = Field(0, alias="MAX_CRAWL_SEED_URLS")       # 迭代爬虫种子 URL
     max_crawl_batch: int = Field(0, alias="MAX_CRAWL_BATCH")               # 每轮爬虫批处理 URL
     max_crawl_rounds: int = Field(8, alias="MAX_CRAWL_ROUNDS")             # 迭代爬虫轮数（原固定 3）
+    max_crawl_concurrency: int = Field(16, alias="MAX_CRAWL_CONCURRENCY")  # 爬虫并发数（同源爬虫+迭代探索器共用，默认16）
     max_iterative_urls: int = Field(0, alias="MAX_ITERATIVE_URLS")         # 迭代发现 URL 上限
     max_js_files: int = Field(0, alias="MAX_JS_FILES")                     # 深度分析的 JS 文件数
     max_intranet_addrs: int = Field(0, alias="MAX_INTRANET_ADDRS")         # SSRF 内网探测地址数
     max_upload_urls: int = Field(0, alias="MAX_UPLOAD_URLS")               # 上传产物验证 URL 数
     max_url_pool: int = Field(0, alias="MAX_URL_POOL")                     # 深挖线索 URL 池
     max_engines_per_param: int = Field(0, alias="MAX_ENGINES_PER_PARAM")   # 单参数选用的引擎数
+    max_total_tasks: int = Field(300, alias="MAX_TOTAL_TASKS")              # 任务生成总上限（控制膨胀：关增量后端点级bundle爆炸；0=不限制）
+    negative_endpoints: str = Field("", alias="NEGATIVE_ENDPOINTS")          # 已知负样本端点（逗号分隔，如 /safe）；命中则落库前判误报丢弃
     max_test_params_per_endpoint: int = Field(0, alias="MAX_TEST_PARAMS_PER_ENDPOINT")  # 单端点测试参数数
     max_burp_history: int = Field(0, alias="MAX_BURP_HISTORY")             # Burp 历史解析条数
     max_subdomains: int = Field(0, alias="MAX_SUBDOMAINS")                  # 子域收集上限（0=不限制）
+    # 子域资产级任务（2026-09-07）：让 recon 发现的子域进入引擎任务池，弥合大站"子域零消费"漏洞
+    enable_subdomain_taskgen: bool = Field(True, alias="ENABLE_SUBDOMAIN_TASKGEN")
+    max_subdomain_targets: int = Field(10, alias="MAX_SUBDOMAIN_TARGETS")   # 每轮最多测多少个子域（预算分摊；0=不限制）
+    # ---- AntiScan 反制判定阈值（2026-09-07 配置化；默认值=原硬编码值，行为不变）----
+    anti_scan_uuid_threshold: int = Field(15, alias="ANTI_SCAN_UUID_THRESHOLD")              # 蜜罐：动态UUID数量阈值
+    anti_scan_honeypot_min_text: int = Field(8000, alias="ANTI_SCAN_HONEYPOT_MIN_TEXT")      # 蜜罐：配合UUID的正文长度阈值
+    anti_scan_placeholder_threshold: int = Field(10, alias="ANTI_SCAN_PLACEHOLDER_THRESHOLD")  # 蜜罐：随机占位符数量阈值
+    anti_scan_fake404_min_text: int = Field(5000, alias="ANTI_SCAN_FAKE404_MIN_TEXT")        # 假404：正文长度阈值
+    anti_scan_rate_limit_keywords: Annotated[List[str], NoDecode] = Field(
+        default_factory=lambda: ["rate limit", "too many requests", "429", "slow down", "try again later"],
+        alias="ANTI_SCAN_RATE_LIMIT_KEYWORDS",
+    )  # 限流：响应体命中词（基线量级过滤在 AntiScanDetector.is_rate_limited 内实现）
+    anti_scan_blocked_keywords: Annotated[List[str], NoDecode] = Field(
+        default_factory=lambda: ["blocked", "banned", "blacklisted", "denied", "forbidden", "unauthorized"],
+        alias="ANTI_SCAN_BLOCKED_KEYWORDS",
+    )  # 封禁：响应体命中词
+    anti_scan_backoff_base: float = Field(3.0, alias="ANTI_SCAN_BACKOFF_BASE")                # 退避：wait=min(base*2^retry, max)
+    anti_scan_backoff_max: float = Field(30.0, alias="ANTI_SCAN_BACKOFF_MAX")
+    anti_scan_honeypot_consecutive: int = Field(3, alias="ANTI_SCAN_HONEYPOT_CONSECUTIVE")      # 蜜罐消极区：同主机连续 N 条蜜罐/假404 后放弃其请求（大站防拖死）
+    # ---- 目标反检测基线（2026-09-07 自动校准蜜罐/假404 阈值；Audible 类 SPA 大站免误判）----
+    enable_anti_scan_baseline: bool = Field(True, alias="ENABLE_ANTI_SCAN_BASELINE")
+    anti_scan_baseline_samples: int = Field(6, alias="ANTI_SCAN_BASELINE_SAMPLES")        # 采样页面数（含随机路径）
+    anti_scan_baseline_factor: float = Field(1.5, alias="ANTI_SCAN_BASELINE_FACTOR")      # 阈值 = 峰值 x 系数（宁钝勿误）
+
+
     # Nuclei 扫描参数（原硬编码）改为可调
     nuclei_rate_limit: int = Field(5, alias="NUCLEI_RATE_LIMIT")                       # -rl
     nuclei_retries: int = Field(1, alias="NUCLEI_RETRIES")                             # -retries
@@ -394,6 +509,7 @@ class Settings(BaseSettings):
             self.max_crawl_seed_urls = 15
             self.max_crawl_batch = 30
             self.max_crawl_rounds = 3
+            self.max_crawl_concurrency = 16
             self.max_iterative_urls = 100
             self.max_js_files = 5
             self.max_intranet_addrs = 3
@@ -402,7 +518,9 @@ class Settings(BaseSettings):
             self.max_engines_per_param = 3
             self.max_test_params_per_endpoint = 5
             self.max_burp_history = 50
+            self.max_total_tasks = 200  # safe 模式更保守（控制任务膨胀）
             self.max_subdomains = 50
+            self.enable_target_probe = True  # safe 档保留探测——动态测容量反而降低压力
         return self
 
     # 目录爆破字典（200+ 条，按 OWASP 常见路径分类）

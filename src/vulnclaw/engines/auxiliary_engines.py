@@ -31,6 +31,36 @@ from typing import Dict, List, Tuple
 # 1. AntiScanDetector（修复版 - 页面相似度检测蜜罐）
 # ============================================================
 
+def _afn(name, default):
+    """读 anti_scan 配置项，失败/缺失回退默认值（保持向后兼容）。"""
+    try:
+        from vulnclaw.config.settings import settings
+        return getattr(settings, name, default)
+    except Exception:  # noqa: BLE001
+        return default
+
+def _resolve_anti(name, default, bidx):
+    """反制判定阈值解析：用户显式配置 > 目标基线 > 出厂默认。
+
+    用户显式修改过全局配置（现值 != 出厂默认）→ 用户优先；
+    否则若存在目标反检测基线 → 用基线推导阈值（量体定制，SPA 大站免误判）；
+    都不满足 → 出厂默认。
+    """
+    cur = _afn(name, default)
+    if cur != default:
+        return cur
+    try:
+        from vulnclaw.core.target_anti_scan_baseline import get_anti_scan_baseline
+        bl = get_anti_scan_baseline()
+        if bl is not None and getattr(bl, "probed", False):
+            v = getattr(bl, bidx, 0) or 0
+            if v > 0:
+                return v
+    except Exception:  # noqa: BLE001
+        pass
+    return default
+
+
 class AntiScanDetector:
     """反制扫描检测器 - 修复版"""
 
@@ -43,12 +73,23 @@ class AntiScanDetector:
         检测是否为蜜罐 - 修复版
         使用页面相似度检测：多次请求返回几乎相同的随机占位符 => 疑似蜜罐
         """
-        # 方法1：检测大量动态UUID（蜜罐常见特征）
         import re
+        # 2026-09-08: 超大响应（>= 大页门槛）视为完整 SPA 外壳：登录页/首页
+        # 1.6MB 含 35+ UUID 是真实页面而非蜜罐。蜜罐通常是小体量动态页。
+        # 大响应跳过所有正文类判定（UUID/占位符/关键词），仅保留响应头强信号。
+        if len(text) >= _afn("anti_scan_honeypot_big_page", 512000):
+            for h in (["X-Honeypot", "Honeypot", "X-Decoy", "X-Canary"]):
+                if h in headers:
+                    return True, f"响应头包含蜜罐标识: {h}"
+            return False, ""
+
+        # 方法1：检测大量动态UUID（蜜罐常见特征）
         uuid_pattern = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
         uuid_count = len(re.findall(uuid_pattern, text, re.I))
 
-        if uuid_count > 15 and len(text) > 8000:
+        _uuid_th = _resolve_anti("anti_scan_uuid_threshold", 15, "uuid_threshold")
+        _min_len = _resolve_anti("anti_scan_honeypot_min_text", 8000, "min_text")
+        if uuid_count > _uuid_th and len(text) > _min_len:
             return True, f"检测到大量动态UUID ({uuid_count}个)，疑似蜜罐动态生成页面"
 
         # 方法2：检测随机数占位符（如 {{random}} 或 {{uuid}} 残留）
@@ -60,7 +101,7 @@ class AntiScanDetector:
         ]
         for pattern in random_patterns:
             matches = re.findall(pattern, text)
-            if len(matches) > 10:
+            if len(matches) > _resolve_anti("anti_scan_placeholder_threshold", 10, "placeholder_threshold"):
                 return True, f"检测到大量随机占位符 ({len(matches)}个)，疑似蜜罐"
 
         # 方法3：检测是否有明显的蜜罐指纹
@@ -82,11 +123,36 @@ class AntiScanDetector:
 
     @staticmethod
     def is_fake_404(text: str, status: int) -> Tuple[bool, str]:
-        """检测是否为假 404"""
+        """检测是否为假 404
+
+        2026-09-08 修复（SPA 大站免误判）：
+        - 若目标基线已学：响应与正常页同量级（>= 基线 min_text x 0.7）视为
+          SPA 软404 外壳（正常现象），不再判假404。此前 Audible 软404 外壳
+          必含 login/home 词 → 全站误判"假404包含正常内容" → 消极区/退避。
+        - content_indicators 收窄为强登录信号词，去掉 home/index/dashboard/admin
+          这类任意 SPA 外壳都含的宽泛词。
+        """
         if status != 404:
             return False, ""
-        if len(text) > 5000:
-            return True, f"响应体过大 ({len(text)} 字节)，可能为假404"
+        n = len(text)
+        # 2026-09-08: 基线量级门限（与限流判定同口径：采样峰值 x 0.8）。
+        # SPA 软404 外壳 = 完整 UI 外壳，与正常页同量级 => 视为正常现象，不判假404。
+        # 此前 Audible 软404 外壳必含 home/login 词 -> 全站误判 -> 消极区/退避。
+        try:
+            from vulnclaw.core.target_anti_scan_baseline import get_anti_scan_baseline
+            _bl = get_anti_scan_baseline()
+            if _bl is not None and getattr(_bl, "probed", False):
+                _peak = int(getattr(_bl, "sample_max_len", 0) or 0)
+                if _peak > 0 and n >= int(_peak * 0.8):
+                    return False, ""
+        except Exception:  # noqa: BLE001
+            pass
+        # 2026-09-08: 无基线时超大体量 404 同样视为 SPA 软404 外壳（真 404 站点页面小），
+        # 不再按体量判假404。基线存在时上方量级门限已覆盖。
+        if n >= _resolve_anti("anti_scan_honeypot_big_page", 512000, "min_text"):
+            return False, ""
+        if n > _resolve_anti("anti_scan_fake404_min_text", 5000, "min_text"):
+            return True, f"响应体过大 ({n} 字节)，可能为假404"
         content_indicators = ["login", "home", "index", "dashboard", "admin"]
         if any(ind in text.lower() for ind in content_indicators):
             return True, "假404包含正常内容"
@@ -103,9 +169,36 @@ class AntiScanDetector:
             if h in headers:
                 return True, f"限流响应头: {h}"
 
-        rate_limit_text = ["rate limit", "too many requests", "429", "slow down", "try again later"]
-        if any(ind in text.lower() for ind in rate_limit_text):
-            return True, "限流提示"
+        rate_limit_text = _afn("anti_scan_rate_limit_keywords", ["rate limit", "too many requests", "429", "slow down", "try again later"])
+
+        # 2026-09-08: 基线量级门限。响应与正常页同量级（>= 采样峰值 x 0.8）
+        # => 完整页面（SPA 外壳/JS 里的裸 "429"、错误文案），正文关键词一律不判
+        # 限流。此前 Audible 全站误判限流 -> 每请求退避 3s/6s/12s -> 任务 240s 超时。
+        full_page = False
+        try:
+            from vulnclaw.core.target_anti_scan_baseline import get_anti_scan_baseline
+            _bl = get_anti_scan_baseline()
+            if _bl is not None and getattr(_bl, "probed", False):
+                _peak = int(getattr(_bl, "sample_max_len", 0) or 0)
+                if _peak > 0 and len(text or "") >= int(_peak * 0.8):
+                    full_page = True
+        except Exception:  # noqa: BLE001
+            pass
+        if full_page:
+            return False, ""
+        # 2026-09-08: 基线未建时兜底——超大响应视为完整页面（SPA 外壳含有
+        # 限流关键词是 JS 文案，非真限流）。与蜜罐 big_page 同口径。
+        if len(text or "") >= _resolve_anti("anti_scan_honeypot_big_page", 512000, "min_text"):
+            return False, ""
+
+        text_lower = text.lower()
+        for ind in rate_limit_text:
+            if ind == "429":
+                # 裸状态码降级为辅助信号：仅由限流响应头/真实 429 响应兜底，
+                # 正文里的 "429" 大概率是 JS 常量，不再单独判定。
+                continue
+            if ind in text_lower:
+                return True, "限流提示"
 
         return False, ""
 
@@ -113,7 +206,7 @@ class AntiScanDetector:
     def is_ip_blocked(text: str, status: int) -> Tuple[bool, str]:
         """检测 IP 是否被封禁"""
         if status in [403, 401]:
-            block_indicators = ["blocked", "banned", "blacklisted", "denied", "forbidden", "unauthorized"]
+            block_indicators = _afn("anti_scan_blocked_keywords", ["blocked", "banned", "blacklisted", "denied", "forbidden", "unauthorized"])
             if any(ind in text.lower() for ind in block_indicators):
                 return True, f"IP被封禁: {text[:100]}"
         return False, ""

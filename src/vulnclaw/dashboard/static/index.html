@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <title>VULNCLAW Dashboard</title>
-    <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+    <script src="/static/vendor/vue.global.prod.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: 'Segoe UI', monospace; background: #0d1117; color: #c9d1d9; }
@@ -145,6 +145,12 @@
 </div>
 
 <script>
+const DASH_TOKEN = new URLSearchParams(location.search).get('token') || localStorage.getItem('dashboard_token') || '';
+const apiFetch = (url, opts) => {
+    const headers = Object.assign({}, (opts && opts.headers) || {});
+    if (DASH_TOKEN) headers['X-Dashboard-Token'] = DASH_TOKEN;
+    return fetch(url, Object.assign({}, opts, { headers }));
+};
 const { createApp, ref, onMounted, onUnmounted } = Vue;
 
 createApp({
@@ -187,7 +193,7 @@ createApp({
 
         const loadScans = async () => {
             try {
-                const resp = await fetch('/api/scans');
+                const resp = await apiFetch('/api/scans');
                 const data = await resp.json();
                 scans.value = data || [];
             } catch (e) { scans.value = []; }
@@ -195,7 +201,7 @@ createApp({
 
         const loadFindings = async () => {
             try {
-                const resp = await fetch('/api/findings');
+                const resp = await apiFetch('/api/findings');
                 const data = await resp.json();
                 findings.value = data || [];
             } catch (e) { findings.value = []; }
@@ -205,7 +211,7 @@ createApp({
             if (!dagScanId.value) return;
             dagLoading.value = true;
             try {
-                const resp = await fetch(`/api/dag/${encodeURIComponent(dagScanId.value)}`);
+                const resp = await apiFetch(`/api/dag/${encodeURIComponent(dagScanId.value)}`);
                 const data = await resp.json();
                 dagNodes.value = (data && data.nodes) || [];
             } catch (e) {
@@ -231,7 +237,7 @@ createApp({
             scanStarting.value = true;
             scanMessage.value = '';
             try {
-                const resp = await fetch('/api/scans', {
+                const resp = await apiFetch('/api/scans', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ target }),
@@ -253,7 +259,7 @@ createApp({
 
         const connectWS = () => {
             const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-            ws = new WebSocket(`${protocol}//${location.host}/ws`);
+            ws = new WebSocket(`${protocol}//${location.host}/ws?token=${encodeURIComponent(DASH_TOKEN)}`);
 
             ws.onopen = () => {
                 wsConnected.value = true;
@@ -266,7 +272,7 @@ createApp({
                     clusterStatus.value = msg.data;
                     if (msg.data.workers) {
                         // Fetch worker details
-                        fetch('/api/workers').then(r => r.json()).then(data => {
+                        apiFetch('/api/workers').then(r => r.json()).then(data => {
                             workers.value = data;
                         });
                     }

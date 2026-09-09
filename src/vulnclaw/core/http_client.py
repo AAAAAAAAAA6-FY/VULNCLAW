@@ -127,7 +127,7 @@ class _SessionManager:
                     headers=headers,
                     limits=limits,
                     timeout=timeout,
-                    event_hooks=({"request": [_scope_guard]},),
+                    event_hooks={"request": [_scope_guard]},
                 )
                 self._last_target = target
                 logger.info("🚀 HTTP/2 客户端已初始化（httpx + 连接池）")

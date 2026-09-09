@@ -95,6 +95,11 @@ class RedisContext:
         elif isinstance(value, (dict, list)):
             return f"j:{json.dumps(value, ensure_ascii=False)}".encode("utf-8")
         else:
+            try:
+                # JSON 优先：绝大多数上下文值可 JSON 化，避免产生 pickle
+                return f"j:{json.dumps(value, ensure_ascii=False)}".encode("utf-8")
+            except Exception:  # noqa: BLE001 - 不可 JSON 化的类型才走 pickle
+                pass
             pickled = pickle.dumps(value)
             b64 = base64.b64encode(pickled)
             return b"p:" + b64
@@ -115,7 +120,8 @@ class RedisContext:
         elif prefix == b"j:":
             return json.loads(payload.decode("utf-8"))
         elif prefix == b"p:":
-            return pickle.loads(base64.b64decode(payload))
+            from vulnclaw.core.safe_pickle import safe_pickle_loads
+            return safe_pickle_loads(base64.b64decode(payload))
         else:
             # 兼容无前缀的旧数据
             try:

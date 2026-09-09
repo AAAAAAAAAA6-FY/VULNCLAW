@@ -278,21 +278,24 @@ class TestRedisPath:
         asyncio.run(scenario())
 
     def test_set_complex_object_pickle_base64(self):
+        from collections import deque
         fake = _FakeRedis()
         ctx = _make_ctx()
-        obj = _ComplexValue("svc", ["t1", "t2"])
+        obj = deque(["svc", "t1", "t2"])  # 非 JSON 类型 -> p: pickle 分支
 
         async def scenario():
             with patch("redis.asyncio.from_url", return_value=fake):
                 await ctx.set("c", obj)
                 stored = fake.store["vulnclaw:ctx:c"]
                 assert stored.startswith(b"p:")
-                restored = pickle.loads(base64.b64decode(stored[2:]))
-                assert restored == obj
+                from vulnclaw.core.safe_pickle import safe_pickle_loads
+                restored = safe_pickle_loads(base64.b64decode(stored[2:]))
+                assert restored == deque(["svc", "t1", "t2"])
 
         asyncio.run(scenario())
 
     def test_get_roundtrip(self):
+        from collections import deque
         fake = _FakeRedis()
         ctx = _make_ctx()
 
@@ -300,10 +303,10 @@ class TestRedisPath:
             with patch("redis.asyncio.from_url", return_value=fake):
                 await ctx.set("d", {"a": 1, "b": [1, 2]})
                 await ctx.set("s", "text")
-                await ctx.set("c", _ComplexValue("x", ["y"]))
+                await ctx.set("c", deque(["x", "y"]))
                 assert await ctx.get("d") == {"a": 1, "b": [1, 2]}
                 assert await ctx.get("s") == "text"
-                assert await ctx.get("c") == _ComplexValue("x", ["y"])
+                assert await ctx.get("c") == deque(["x", "y"])
 
         asyncio.run(scenario())
 
@@ -509,10 +512,19 @@ class TestSerializationRoundtrip:
         assert ctx._deserialize(data) == value
 
     def test_complex_object(self):
+        from collections import deque
+        ctx = _make_ctx()
+        value = deque(["db", "prod", "backup"])
+        data = ctx._serialize(value)
+        assert ctx._deserialize(data) == value
+
+    def test_unknown_class_rejected(self):
+        # 信任边界收窄：白名单外的自定义类反序列化必须拒绝（防 RCE）
         ctx = _make_ctx()
         value = _ComplexValue("db", ["prod", "backup"])
         data = ctx._serialize(value)
-        assert ctx._deserialize(data) == value
+        assert data.startswith(b"p:")
+        assert ctx._deserialize(data) is None
 
     def test_redis_path_none_and_bool_roundtrip(self):
         fake = _FakeRedis()

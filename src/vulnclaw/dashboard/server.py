@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 from vulnclaw.core.logger import logger
-from vulnclaw.core.settings import PROJECT_CACHE_DIR
+from vulnclaw.core.settings import PROJECT_CACHE_DIR, settings
 
 
 class DashboardServer:
@@ -31,7 +31,7 @@ class DashboardServer:
 
     def __init__(
         self,
-        host: str = "0.0.0.0",
+        host: str = "127.0.0.1",
         port: int = 8080,
         redis_url: str = "redis://localhost:6379/0",
         prefix: str = "vulnclaw",
@@ -52,6 +52,12 @@ class DashboardServer:
         self._ws_clients: Set[Any] = set()  # WebSocket 客户端集合
         self._broadcast_task = None
         self._redis = None
+        self._token = getattr(settings, "dashboard_token", "") or ""
+        # 合规收口：非回环绑定且未配置 token 时醒目告警
+        _loopback = host in ("127.0.0.1", "localhost", "::1")
+        if not _loopback and not self._token:
+            logger.warning("🚨 [Dashboard] 绑定非回环地址且未配置 DASHBOARD_TOKEN，局域网内任何主机"
+                           "都可查看扫描结果并远程发起扫描；建议仅本地使用或配置 token（.env DASHBOARD_TOKEN=xxx）")
         # Avoid re-attempting a broken Redis connection on every single
         # broadcast tick; the event loop gets blocked when each attempt
         # spends 1s on TCP RST. Backoff is reset as soon as any attempt
@@ -61,11 +67,17 @@ class DashboardServer:
 
         logger.info(f"📊 [Dashboard] 初始化: {host}:{port}")
 
+    def _auth_ok(self, request) -> bool:
+        """Token 鉴权：未配置 DASHBOARD_TOKEN 时全部放行（默认回环绑定）；配置后校验 header。"""
+        if not self._token:
+            return True
+        return request.headers.get("X-Dashboard-Token", "") == self._token
+
     def create_app(self):
         """创建 FastAPI 应用。"""
-        from fastapi import Body, FastAPI, WebSocket, WebSocketDisconnect
+        from fastapi import Body, FastAPI, Request, WebSocket, WebSocketDisconnect
         from fastapi.staticfiles import StaticFiles
-        from fastapi.responses import HTMLResponse
+        from fastapi.responses import HTMLResponse, JSONResponse
 
         app = FastAPI(title="VULNCLAW Dashboard", version="1.0.0")
         self._app = app
@@ -86,38 +98,52 @@ class DashboardServer:
             return "<h1>VULNCLAW Dashboard</h1><p>static/index.html not found</p>"
 
         @app.get("/api/status")
-        async def api_status():
+        async def api_status(request: Request):
             """获取集群状态。"""
+            if not self._auth_ok(request):
+                return JSONResponse({"error": "unauthorized"}, status_code=401)
             return await self._get_cluster_status()
 
         @app.get("/api/scans")
-        async def api_scans():
+        async def api_scans(request: Request):
             """获取扫描列表。"""
+            if not self._auth_ok(request):
+                return JSONResponse({"error": "unauthorized"}, status_code=401)
             return await self._get_scans()
 
         @app.post("/api/scans")
-        async def api_scans_create(payload: Dict = Body(default={})):
+        async def api_scans_create(request: Request, payload: Dict = Body(default={})):
             """发起新的扫描任务。"""
+            if not self._auth_ok(request):
+                return JSONResponse({"error": "unauthorized"}, status_code=401)
             return await self._start_scan(payload)
 
         @app.get("/api/scans/{scan_id}")
-        async def api_scan_detail(scan_id: str):
+        async def api_scan_detail(request: Request, scan_id: str):
             """获取扫描详情。"""
+            if not self._auth_ok(request):
+                return JSONResponse({"error": "unauthorized"}, status_code=401)
             return await self._get_scan_detail(scan_id)
 
         @app.get("/api/findings")
-        async def api_findings(scan_id: str = None):
+        async def api_findings(request: Request, scan_id: str = None):
             """获取漏洞列表。"""
+            if not self._auth_ok(request):
+                return JSONResponse({"error": "unauthorized"}, status_code=401)
             return await self._get_findings(scan_id)
 
         @app.get("/api/dag/{scan_id}")
-        async def api_dag(scan_id: str):
+        async def api_dag(request: Request, scan_id: str):
             """获取 DAG 节点状态。"""
+            if not self._auth_ok(request):
+                return JSONResponse({"error": "unauthorized"}, status_code=401)
             return await self._get_dag_status(scan_id)
 
         @app.get("/api/workers")
-        async def api_workers():
+        async def api_workers(request: Request):
             """获取 Worker 状态。"""
+            if not self._auth_ok(request):
+                return JSONResponse({"error": "unauthorized"}, status_code=401)
             return await self._get_workers()
 
         @app.get("/health")
@@ -174,6 +200,9 @@ class DashboardServer:
         @app.websocket("/ws")
         async def websocket_endpoint(websocket: WebSocket):
             """WebSocket 实时推送端点。"""
+            if self._token and websocket.query_params.get("token") != self._token:
+                await websocket.close(code=4401)
+                return
             await websocket.accept()
             self._ws_clients.add(websocket)
             logger.info(f"🔌 [Dashboard] WebSocket 客户端连接 (total={len(self._ws_clients)})")
@@ -521,7 +550,7 @@ class DashboardServer:
         logger.info("🛑 [Dashboard] 已停止")
 
 
-def run_dashboard(host: str = "0.0.0.0", port: int = 8080):
+def run_dashboard(host: str = "127.0.0.1", port: int = 8080):
     """CLI 入口：启动 Dashboard。"""
     server = DashboardServer(host=host, port=port)
     asyncio.run(server.start())
@@ -531,7 +560,7 @@ if __name__ == "__main__":
     import argparse
 
     _parser = argparse.ArgumentParser(description="VULNCLAW Dashboard server")
-    _parser.add_argument("--host", default="0.0.0.0", help="Bind host (default 0.0.0.0)")
+    _parser.add_argument("--host", default="127.0.0.1", help="Bind host (default 127.0.0.1)")
     _parser.add_argument("--port", type=int, default=8080, help="Bind port (default 8080)")
     _args = _parser.parse_args()
     run_dashboard(host=_args.host, port=_args.port)

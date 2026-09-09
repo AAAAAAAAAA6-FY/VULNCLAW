@@ -23,6 +23,7 @@ fastjson/struts2 等）此前只做带内回显判定，目标不回显就漏检
   - 纯本地驱动，interactsh-client 缺失时静默降级，不抛异常。
 """
 import asyncio
+import atexit
 import json
 import os
 import re
@@ -61,6 +62,129 @@ _OOB_PROTOCOLS = ("ldap", "rmi", "smb", "smtp", "dns", "http", "https")
 # 供引擎/verify/报告侧事后审计，避免重复计数与串台误读。进程级单例，无需新建文件。
 _OOB_AUDIT: List["OOBInteraction"] = []
 _OOB_AUDIT_SEEN: set = set()
+
+
+# ----------------------------------------------------------
+# P0：OOB 熔断器（通道级 + 目标级两层）
+# ----------------------------------------------------------
+# 问题：目标无出网能力 / 外发域被封禁（403）时，引擎仍逐个等待带外回调
+# （framework 引擎 oob_wait=12s、wait_for_interaction 默认 15s，且每次
+# poll 内部再挂 6s），大量任务空等占满 worker——实测一次 attack 阶段
+# 545s 仅产出 2 个 finding，355 个任务被超时清空。
+# 策略：
+#   通道级：域名申请失败后短期熔断，避免每个引擎重复走 8s 注册流程；
+#   目标级：连续 N 次「已注入 payload 但零回调」→ 判定外发被封禁，
+#           后续跳过等待（返回空），把时间还给确定性检测。
+# 熔断只影响"等待"，不写 finding、不断言漏洞——低误报铁律不变。
+_OOB_CHANNEL_DOWN_UNTIL: float = 0.0      # 通道熔断截止（monotonic 秒）
+_OOB_CHANNEL_DOWN_TTL: float = 300.0      # 通道熔断时长（秒）
+_OOB_MISS_STREAK: Dict[str, int] = {}     # target -> 连续零回调次数
+_OOB_HIT_COUNT: Dict[str, int] = {}       # target -> 历史回调命中次数
+_OOB_MISS_THRESHOLD: int = 6              # 连续零回调触发阈值
+_OOB_GLOBAL_TARGET = "*"                  # 无目标上下文时的兜底键
+
+# 审计Q：interactsh 通道独立熔断。
+# 国内网络常常连不上 oast 公共服务器，注册必然超时；而 request_domain 每次都
+# 先试 interactsh 再降级 dnslog，等于每次白等 8s——真扫实证单次扫描累计失败
+# 394 次 ≈ 空耗 3152s，比 nuclei 超时还狠。故连续失败达阈值即短期熔断。
+_ITSH_DOWN_UNTIL: float = 0.0
+_ITSH_FAIL_STREAK: int = 0
+_ITSH_FAIL_THRESHOLD: int = 2
+_ITSH_DOWN_TTL: float = 300.0
+
+
+def _mark_itsh_failure() -> None:
+    """审计Q：interactsh 注册失败累计 → 短期熔断，期间直接走 dnslog。"""
+    global _ITSH_FAIL_STREAK, _ITSH_DOWN_UNTIL
+    _ITSH_FAIL_STREAK += 1
+    if _ITSH_FAIL_STREAK >= _ITSH_FAIL_THRESHOLD and time.monotonic() >= _ITSH_DOWN_UNTIL:
+        _ITSH_DOWN_UNTIL = time.monotonic() + _ITSH_DOWN_TTL
+        logger.info(
+            f"[OOB] interactsh 连续失败 {_ITSH_FAIL_STREAK} 次 → 熔断 "
+            f"{_ITSH_DOWN_TTL:.0f}s，期间直接走 dnslog（不再每次白等 8s）"
+        )
+
+
+def mark_channel_down(reason: str = "") -> None:
+    """通道级熔断：带外通道不可用，TTL 内不再尝试申请域名。"""
+    global _OOB_CHANNEL_DOWN_UNTIL
+    _OOB_CHANNEL_DOWN_UNTIL = time.monotonic() + _OOB_CHANNEL_DOWN_TTL
+    logger.info(f"[OOB] 通道熔断 {_OOB_CHANNEL_DOWN_TTL:.0f}s（{reason or '通道不可用'}）")
+
+
+def is_channel_down() -> bool:
+    """通道是否处于熔断期（熔断期间 request_domain 直接返回 None）。"""
+    return time.monotonic() < _OOB_CHANNEL_DOWN_UNTIL
+
+
+def channel_down_remaining() -> float:
+    """通道熔断剩余秒数（0 = 未熔断）。"""
+    return max(0.0, _OOB_CHANNEL_DOWN_UNTIL - time.monotonic())
+
+
+def record_oob_result(target: str, hit: bool) -> None:
+    """记录一次带外探测结果（hit=是否收到回调），驱动目标级熔断。"""
+    key = (target or _OOB_GLOBAL_TARGET).strip().lower() or _OOB_GLOBAL_TARGET
+    if hit:
+        _OOB_HIT_COUNT[key] = _OOB_HIT_COUNT.get(key, 0) + 1
+        _OOB_MISS_STREAK[key] = 0
+        return
+    _OOB_MISS_STREAK[key] = _OOB_MISS_STREAK.get(key, 0) + 1
+    if _OOB_MISS_STREAK[key] == _OOB_MISS_THRESHOLD:
+        logger.info(
+            f"[OOB] 目标 {key} 连续 {_OOB_MISS_THRESHOLD} 次零回调 → 判定外发被封禁，"
+            f"后续跳过带外等待（不影响确定性检测）"
+        )
+
+
+def is_oob_blocked(target: str) -> bool:
+    """目标级熔断：该目标的外发回连是否已被判定为不可达。"""
+    if is_channel_down():
+        return True
+    key = (target or _OOB_GLOBAL_TARGET).strip().lower() or _OOB_GLOBAL_TARGET
+    if _OOB_MISS_STREAK.get(key, 0) >= _OOB_MISS_THRESHOLD:
+        return True
+    # 无目标上下文时以全局键兜底，避免漏判
+    return _OOB_MISS_STREAK.get(_OOB_GLOBAL_TARGET, 0) >= _OOB_MISS_THRESHOLD
+
+
+def oob_state_snapshot() -> Dict:
+    """熔断器状态快照（供报告 / 覆盖账本 / 排障使用）。"""
+    return {
+        "channel_down": is_channel_down(),
+        "channel_down_remaining_s": round(channel_down_remaining(), 1),
+        "miss_threshold": _OOB_MISS_THRESHOLD,
+        "miss_streak": dict(_OOB_MISS_STREAK),
+        "hit_count": dict(_OOB_HIT_COUNT),
+    }
+
+
+def target_key_from_url(url: str) -> str:
+    """从 URL 提取熔断用的目标键（netloc 小写；解析失败退化为整串小写）。
+
+    粒度取 origin 级别：同一主机的不同路径共享熔断状态，否则每个 URL
+    独立计数会导致熔断器永远达不到阈值。
+    """
+    try:
+        from urllib.parse import urlparse
+        return (urlparse(str(url or "")).netloc or str(url or "")).strip().lower()
+    except Exception:  # noqa: BLE001 - URL 形态异常时按整串兜底
+        return str(url or "").strip().lower()
+
+
+def reset_oob_breaker() -> None:
+    """重置 OOB 全部进程级状态（每次扫描开场调用）。
+
+    清除目标级熔断计数、通道熔断、域名/会话缓存，避免跨扫描复用
+    失效的 interactsh session 或残留 miss_streak 导致带外验证永久跳过。
+    证据链 _OOB_AUDIT 保留（审计不可变原则），仅靠 token 去重防串台。
+    """
+    _OOB_MISS_STREAK.clear()
+    _OOB_HIT_COUNT.clear()
+    _DOMAIN_CACHE.clear()
+    _INTERACTSH_SESSION.clear()
+    global _OOB_CHANNEL_DOWN_UNTIL
+    _OOB_CHANNEL_DOWN_UNTIL = 0.0
 
 
 @dataclass
@@ -145,6 +269,17 @@ class OOBChannel:
           dnslog     = 强制 dnslog.cn
         """
         self.provider = provider
+        # 审计N：记录上次轮询是否故障（超时/异常/通道错）。用于区分
+        # "我们没问到（轮询失败）"与"目标确实没回连"——前者绝不能累加目标级
+        # miss，否则通道故障会被误判成"目标外发被封禁"，在真实目标上会错误地
+        # 永久关闭 OOB 检测（真扫实证：interactsh 参数不匹配 → 全部走 dnslog →
+        # 连续 6 次零回调 → 误判封禁）。
+        self._last_poll_error: Optional[str] = None
+        # 审计O：interactsh 常驻订阅进程（该 client 无 -sf，无法"重启续会话"）
+        self._itsh_proc = None
+        self._itsh_buffer: List[OOBInteraction] = []
+        self._itsh_reader_task = None
+        self._itsh_payload_file: str = ""
         self._domain: Optional[str] = None
         self._resolved_provider: Optional[str] = None
         self._itsh_session_file: Optional[str] = None
@@ -156,6 +291,9 @@ class OOBChannel:
         """申请一个带外根域名（线程安全，缓存复用）。"""
         if self._domain:
             return self._domain
+        # P0 熔断：通道熔断期内不再重复申请（注册本身要 8s，失败会拖死 worker）
+        if is_channel_down():
+            return None
         if self.provider in ("auto", "interactsh"):
             d = await self._request_interactsh_domain()
             if d:
@@ -171,6 +309,8 @@ class OOBChannel:
                 self._domain, self._resolved_provider = d, "dnslog"
                 return d
         logger.warning("[OOB] 所有带外通道均不可用（无 interactsh-client 且 dnslog 失败）。")
+        # P0 熔断：全部通道申请失败 → 通道级熔断，避免后续每个引擎各走一遍 8s 注册
+        mark_channel_down("所有带外通道申请失败")
         return None
 
     @staticmethod
@@ -187,11 +327,15 @@ class OOBChannel:
         <payload_store>」短超时启动，注册结果写入会话文件与 payload 文件；随后同一会话
         文件可再次启动以轮询回调。注册完成即返回 oast 域名。
         """
+        # 审计Q：熔断期内不再尝试（避免每次注册白等 8s）
+        if time.monotonic() < _ITSH_DOWN_UNTIL:
+            logger.debug("[OOB] interactsh 短期熔断中，直接跳过（走 dnslog）")
+            return None
         cached = _DOMAIN_CACHE.get("interactsh")
         if cached:
             self._itsh_session_file = _INTERACTSH_SESSION.get("interactsh")
             return cached
-        if not load_tool_config("interactsh-client"):
+        if not resolve_tool_path("interactsh-client"):
             logger.info("[OOB] interactsh-client 未安装，跳过 interactsh 通道。")
             return None
         try:
@@ -201,23 +345,31 @@ class OOBChannel:
             server_note = f" (server={_OOB_INTERACTSH_SERVER})" if _OOB_INTERACTSH_SERVER else ""
             logger.info(f"[OOB] 注册 interactsh 域名{server_note}")
             # 短超时注册：即便 8s 后被 kill，注册与会话在服务端持续有效
+            # 审计O：去掉本机 client 不支持的 -sf / -nf（实测其 -h 只有
+            # -server/-pi/-json/-psf；传 -sf/-nf 会打印 usage 并 exit 1，
+            # 导致注册永远失败、OOB 被迫降级明文 dnslog）。
             result = await run_tool(
                 "interactsh-client",
                 args=self._interactsh_server_args()
-                + ["-json", "-sf", sf, "-psf", ps, "-nf", "-pi", "3"],
+                + ["-json", "-psf", ps, "-pi", "3"],
                 timeout=8,
             )
-            domain = self._extract_itsh_domain(sf, ps, result.get("stdout", ""))
+            domain = self._extract_itsh_domain("", ps, result.get("stdout", ""))
             if domain:
-                self._itsh_session_file = sf
+                global _ITSH_FAIL_STREAK
+                _ITSH_FAIL_STREAK = 0
+                self._itsh_payload_file = ps
                 _DOMAIN_CACHE["interactsh"] = domain
-                _INTERACTSH_SESSION["interactsh"] = sf
-                logger.info(f"[OOB] 已注册 interactsh 域名: {domain} (session={sf})")
+                logger.info(f"[OOB] 已注册 interactsh 域名: {domain}")
+                # 该 client 无 -sf，回调只能靠常驻子进程订阅（见 _start_itsh_stream）
+                await self._start_itsh_stream(ps)
                 return domain
             err = result.get("stderr") or result.get("error") or ""
             logger.warning(f"[OOB] interactsh 注册未取到域名 rc={result.get('returncode', -1)} err={err[:200]}")
+            _mark_itsh_failure()
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[OOB] interactsh 申请域名失败: {e}")
+            _mark_itsh_failure()
         return None
 
     @staticmethod
@@ -326,6 +478,8 @@ class OOBChannel:
         except Exception as exc:  # noqa: BLE001
             # SP15-B 自证口径：任何回查异常（含超时/网络抖动）一律返回空，绝不抛错
             logger.debug(f"[OOB] poll 异常（忽略，返回空）: {exc}")
+            # 审计N：标记轮询故障（见 wait_for_interaction 的统计口径）
+            self._last_poll_error = str(exc)[:200]
             items = []
         if items:
             for _it in items:  # SP14.3-B：通道 provider 随证据链传递
@@ -338,61 +492,111 @@ class OOBChannel:
             return []
         if not self._itsh_session_file:
             self._itsh_session_file = _INTERACTSH_SESSION.get("interactsh")
-        if not self._itsh_session_file:
-            logger.warning("[OOB] interactsh 轮询缺少会话文件，跳过。")
+        # 审计O：本机 interactsh-client 不支持 -sf（传它只会打印 usage 并 exit 1），
+        # 旧"重启进程续会话"轮询彻底失效 → 改为消费常驻子进程累积的回调缓冲。
+        if self._itsh_proc is None and not self._itsh_buffer:
+            await self._start_itsh_stream(self._itsh_payload_file)
+        if self._itsh_proc is None and not self._itsh_buffer:
+            logger.debug("[OOB] interactsh 常驻订阅未就绪，本次无回调")
             return []
-        result = None
+        if not self._itsh_buffer:
+            # 给常驻进程一点时间收回调（受 timeout 约束，绝不空转）
+            await asyncio.sleep(min(1.5, max(0.3, timeout * 0.2)))
+        out = list(self._itsh_buffer)
+        self._itsh_buffer.clear()
+        return out
+
+    # ----------------------------------------------------------
+    # 审计O：interactsh 常驻订阅（替代不支持的 -sf 续会话机制）
+    # ----------------------------------------------------------
+    async def _start_itsh_stream(self, payload_file: str) -> None:
+        """以常驻子进程订阅回调。
+
+        该 client 没有 -sf，无法"短超时注册 → 重启续轮询"，只能常驻并持续把
+        交互以 JSONL 打到 stdout；这里起后台读取协程累积到缓冲，poll 时取走。
+        进程退出由 atexit 兜底 terminate，绝不泄漏。
+        """
+        if self._itsh_proc is not None:
+            return
+        exe = resolve_tool_path("interactsh-client")
+        if not exe:
+            return
         try:
-            # 用同一会话文件重启 interactsh-client，重连并轮询该会话注册期间的回调
-            result = await run_tool("interactsh-client",
-                                    args=self._interactsh_server_args()
-                                    + ["-json", "-sf", self._itsh_session_file],
-                                    timeout=timeout)
-        except asyncio.TimeoutError:
-            logger.debug("[OOB] interactsh poll 超时")
-            return []
+            self._itsh_payload_file = payload_file or self._itsh_payload_file
+            args = [exe] + self._interactsh_server_args() + [
+                "-json", "-psf", self._itsh_payload_file, "-pi", "3"]
+            self._itsh_proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            atexit.register(self._kill_itsh_sync)
+            self._itsh_reader_task = asyncio.create_task(self._read_itsh_stream())
+            logger.info("[OOB] interactsh 常驻订阅已启动")
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"[OOB] interactsh poll 异常: {e}")
-            return []
-        if not result:
-            return []
-        out = result.get("stdout") or ""
-        if not out:
-            return []
-        interactions = []
-        for line in out.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            lc = line.lower()
-            # 弹出版权横幅、未注册 payload 行等噪音；只认协议化的交互 JSON
-            if not line.startswith("{") or '"protocol"' not in lc:
-                continue
+            logger.warning(f"[OOB] interactsh 常驻订阅启动失败: {e}")
+            self._itsh_proc = None
+
+    async def _read_itsh_stream(self) -> None:
+        """后台读取常驻进程 stdout，按行解析交互并入缓冲。"""
+        proc = self._itsh_proc
+        if proc is None or proc.stdout is None:
+            return
+        try:
+            async for raw in proc.stdout:
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line.startswith("{") or '"protocol"' not in line.lower():
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                proto = str(data.get("protocol") or data.get("type") or "unknown").lower()
+                token = ""
+                for key in ("fullId", "subdomain", "token", "dns_name", "shorthost"):
+                    val = str(data.get(key) or "")
+                    head = val.split(".", 1)[0]
+                    if head and head != self._domain:
+                        token = head
+                        break
+                if not token:
+                    continue
+                raw_req = str(data.get("raw_request") or "")
+                self._itsh_buffer.append(OOBInteraction(
+                    token=token, protocol=proto,
+                    tag=str(data.get("type") or proto),
+                    time=str(data.get("timestamp") or ""),
+                    from_addr=str(data.get("remote_address") or ""),
+                    raw_protocol=raw_req.split("\r\n", 1)[0][:120],
+                    extra=data,
+                ))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[OOB] interactsh 流读取结束: {e}")
+
+    def _kill_itsh_sync(self) -> None:
+        """同步兜底：进程退出前终止常驻子进程（atexit 注册）。"""
+        proc = getattr(self, "_itsh_proc", None)
+        if proc is not None and proc.returncode is None:
             try:
-                data = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            proto = str(data.get("protocol") or data.get("type") or "unknown").lower()
-            token = ""
-            for key in ("fullId", "subdomain", "token", "dns_name", "shorthost"):
-                val = str(data.get(key) or "")
-                head = val.split(".", 1)[0]
-                if head and head != self._domain:
-                    token = head
-                    break
-            if not token:
-                continue
-            raw_req = str(data.get("raw_request") or "")
-            interactions.append(OOBInteraction(
-                token=token,
-                protocol=proto,
-                tag=str(data.get("type") or proto),
-                time=str(data.get("timestamp") or ""),
-                from_addr=str(data.get("remote_address") or ""),
-                raw_protocol=raw_req.split("\r\n", 1)[0][:120],
-                extra=data,
-            ))
-        return interactions
+                proc.terminate()
+            except Exception:
+                logger.debug("suppressed exception (core audit)")
+        self._itsh_proc = None
+
+    async def aclose(self) -> None:
+        """显式释放常驻订阅（扫描结束调用；atexit 为兜底）。"""
+        if self._itsh_reader_task is not None:
+            self._itsh_reader_task.cancel()
+            try:
+                await self._itsh_reader_task
+            except (asyncio.CancelledError, Exception):
+                logger.debug("suppressed exception (core audit)")
+            self._itsh_reader_task = None
+        self._kill_itsh_sync()
 
     async def _poll_dnslog(self, timeout: int) -> List[OOBInteraction]:
         try:
@@ -430,6 +634,8 @@ class OOBChannel:
             return out
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[OOB] dnslog poll 异常: {e}")
+            # 审计N：dnslog 为明文第三方、常被限流，其异常同样不计入目标熔断
+            self._last_poll_error = f"dnslog poll error: {e}"[:200]
         return []
 
     # ----------------------------------------------------------
@@ -444,20 +650,42 @@ class OOBChannel:
                 if it.token and it.token.lower() == token]
 
     async def wait_for_interaction(self, token: str, timeout: int = 15,
-                                   interval: float = 1.5) -> List[OOBInteraction]:
-        """轮询等待该 token 出现回调。命中返回命中列表，超时返回空。"""
+                                   interval: float = 1.5,
+                                   target: str = "") -> List[OOBInteraction]:
+        """轮询等待该 token 出现回调。命中返回命中列表，超时/熔断返回空。
+
+        P0：``target`` 传入当前扫描目标。若该目标已连续零回调达阈值（外发被封禁）
+        或通道处于熔断期，则跳过等待直接返回空——不再为注定无回连的等待买单。
+        熔断只跳过"等待"，不产生任何 finding，不影响误报率。
+        """
         token = token.strip().lower()
         if not self._domain or not token:
             return []
+        if is_oob_blocked(target):
+            logger.debug(f"[OOB] 熔断生效，跳过 token={token} 的带外等待（target={target or '*'}）")
+            return []
         deadline = time.monotonic() + timeout
+        hits: List[OOBInteraction] = []
         while time.monotonic() < deadline:
             hits = await self.interactions_for(token, timeout=min(6, timeout))
             if hits:
                 logger.info(f"[OOB] token={token} 捕获 {len(hits)} 条回调 → 实锤")
-                return hits
+                break
             await asyncio.sleep(min(interval, max(0.5, deadline - time.monotonic())))
-        logger.debug(f"[OOB] token={token} 在 {timeout}s 内未收到回调")
-        return []
+        else:
+            logger.debug(f"[OOB] token={token} 在 {timeout}s 内未收到回调")
+        # 驱动目标级熔断：命中清零、未命中累加。
+        # 审计N：轮询本身故障（超时/异常/通道错）时**不**累加——那是"我们没问到"，
+        # 不是"目标没回连"。否则通道故障会被误判成"目标外发被封禁"，在真实目标
+        # 上永久关闭 OOB 检测（等于自废盲打能力）。
+        if self._last_poll_error:
+            logger.debug(
+                f"[OOB] 轮询故障({self._last_poll_error[:80]})，"
+                f"本次不计入目标熔断统计（target={target or '*'}）"
+            )
+        else:
+            record_oob_result(target, bool(hits))
+        return hits
 
     # ----------------------------------------------------------
     # 便捷：一次盲打探测（申请域名 + 生成 token + 地址）
