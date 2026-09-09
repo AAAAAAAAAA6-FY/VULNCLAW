@@ -199,6 +199,13 @@ class IDOREngine(BaseEngine):
 
     def _idor_url(self, ep: str, param: str, value: str) -> str:
         parsed = urlparse(ep)
+        # 路径型 ID（/idor/profile/1）：替换尾部数字段，写回 path 而非 query
+        if param == "id":
+            m = re.search(r'/(\d+)(?=/|$)', parsed.path)
+            if m:
+                new_path = parsed.path[:m.start(1)] + value + parsed.path[m.end(1):]
+                return urlunparse((parsed.scheme, parsed.netloc, new_path,
+                                   parsed.params, parsed.query, parsed.fragment))
         qs = parse_qs(parsed.query)
         qs[param] = [value]
         return urlunparse((parsed.scheme, parsed.netloc, parsed.path,
@@ -227,6 +234,22 @@ class IDOREngine(BaseEngine):
         ut = set(_re.findall(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', txt, _re.I))
         if ut and ut != ub:
             return True
+        # JSON 用户身份差分（修复靶场 id=1001 返回 {"name":"Alice"} 无 PII 漏检）：
+        # 响应均为 JSON 且含 name/username 键、值不同 → 不同用户数据（越权信号）。
+        import json as _json
+        for _t in (base, txt):
+            try:
+                _j = _json.loads(_t)
+            except Exception:
+                return False
+            if not isinstance(_j, dict):
+                return False
+        _kn = [k for k in ("name", "username", "user", "owner", "account") if k in _json.loads(txt)] or None
+        if _kn:
+            _name_b = _json.loads(base).get(_kn[0])
+            _name_t = _json.loads(txt).get(_kn[0])
+            if _name_t and _name_b and _name_t != _name_b:
+                return True
         return False
 
     # ============================================================
@@ -268,14 +291,7 @@ class IDOREngine(BaseEngine):
 
             for mutated_value in mutations[:10]:
                 try:
-                    parsed = urlparse(url)
-                    qs = parse_qs(parsed.query)
-                    qs[param] = [mutated_value]
-                    new_query = urlencode(qs, doseq=True)
-                    test_url = urlunparse((
-                        parsed.scheme, parsed.netloc, parsed.path,
-                        parsed.params, new_query, parsed.fragment
-                    ))
+                    test_url = self._idor_url(url, param, mutated_value)
 
                     responses = await session_manager.compare_requests(
                         test_url, "GET", roles
@@ -337,6 +353,11 @@ class IDOREngine(BaseEngine):
             if self._is_id_value(value):
                 id_params.append((param, value))
 
+        # 路径型 ID（/idor/profile/1）：从 path 尾部数字段提取，供无参端点 IDOR 使用
+        m = re.search(r'/(\d+)(?=/|$)', parsed.path)
+        if m:
+            id_params.append(("id", m.group(1)))
+
         return id_params
 
     def _generate_id_mutations(self, original_id: str) -> List[str]:
@@ -353,6 +374,11 @@ class IDOREngine(BaseEngine):
                 mutations.append("1")
                 mutations.append("999999")
                 mutations.append("999999999")
+                # 大跨度 ID 探测（修复 /idor/profile 靶场 id=1001 漏检）：真实系统用户 ID
+                # 常为千位级（1001/2001…），相邻±1/±2 变异无法命中；补 +1000 与 ×100 档。
+                if num < 900000:
+                    mutations.append(str(num + 1000))
+                    mutations.append(str(max(1001, num * 100)))
                 mutations.append("null")
                 mutations.append("undefined")
                 mutations.append("")
@@ -665,7 +691,7 @@ class JWTEngine(BaseEngine):
         "dev", "dev123", "test", "test123", "prod", "prod123", "stage", "stage123",
     ]
 
-    JWT_PATTERN = r'eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+'
+    JWT_PATTERN = r'eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]*)?'
 
     SENSITIVE_PAYLOAD_FIELDS = [
         "password", "secret", "key", "api_key", "apikey",
@@ -691,6 +717,7 @@ class JWTEngine(BaseEngine):
         session,
         **kwargs
     ) -> Optional[Dict]:
+        import asyncio  # H.2: top3 热路径线程池隔离——JWT 提取/弱口令爆破等 CPU 密集段走 to_thread
         if isinstance(normal_resp, tuple):
             text = normal_resp[1]
             headers = normal_resp[2] if len(normal_resp) > 2 else {}
@@ -698,7 +725,7 @@ class JWTEngine(BaseEngine):
             text = await normal_resp.text()
             headers = normal_resp.headers
 
-        tokens = self._extract_jwt_tokens(text, headers)
+        tokens = await asyncio.to_thread(self._extract_jwt_tokens, text, headers)
 
         if not tokens:
             return None
@@ -1142,17 +1169,25 @@ class JWTEngine(BaseEngine):
         return f"{eh}.{ep}.{self._b64url_encode(mac)}"
 
     async def _jwt_accepted(self, ep: str, forged: str, session) -> Optional[bool]:
-        """主动验证：用伪造 Token 访问端点；以垃圾 Token 作对照。
-        若伪造 Token 返回 <400 而垃圾 Token 被拒(401/403)，判定接受伪造。"""
+        """主动验证：用伪造 Token 访问端点；以结构合法垃圾 Token + 畸形串双对照。
+        判定：
+        - 伪造 <400 且 任一对照被拒(>=400) → True（服务端确实校验 JWT 结构/签名，却接受伪造）
+        - 伪造 <400 但 两份对照都通过 → None（服务端可能完全不校验 → 泛接受，弱判定）
+        - 否则 → False（伪造被拒，服务端校验正常）。
+        畸形串对照覆盖"只拒畸形、默认放行结构合法 JWT"的实现（如 lab 的
+        except→400 / 其余 200 verified），原垃圾对照(结构合法 HS256 假签名)会全 200。"""
         try:
             trash = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.AAAAAA"
+            malformed = "not-a-jwt"
             st_ok, _, _ = await async_get(ep, session=session, timeout=8, no_retry=True,
                                           headers={"Authorization": f"Bearer {forged}"})
             st_bad, _, _ = await async_get(ep, session=session, timeout=8, no_retry=True,
                                            headers={"Authorization": f"Bearer {trash}"})
-            if st_ok < 400 and st_bad in (401, 403):
+            st_mal, _, _ = await async_get(ep, session=session, timeout=8, no_retry=True,
+                                           headers={"Authorization": f"Bearer {malformed}"})
+            if st_ok < 400 and (st_bad >= 400 or st_mal >= 400):
                 return True
-            if st_ok < 400:  # 弱判定：伪造被接受即可疑
+            if st_ok < 400:  # 弱判定：伪造被接受即可疑（服务端可能完全不校验）
                 return None
             return False
         except Exception:
@@ -1177,13 +1212,27 @@ class JWTEngine(BaseEngine):
                 continue
             for tok in list(tokens)[:5]:
                 for forged_none in (self._jwt_forge_none(tok) or []):
-                    if await self._jwt_accepted(ep, forged_none, session) is True:
+                    _acc = await self._jwt_accepted(ep, forged_none, session)
+                    if _acc is True:
                         findings.append({
                             'url': ep, 'type': 'JWT-alg=none伪造', 'severity': 'High',
                             'ai_verdict': '疑似真实漏洞', 'confidence': 'medium',
-                            'evidence': f'端点 {ep} 接受 alg=none 伪造 Token（垃圾 Token 被拒）',
+                            'evidence': f'端点 {ep} 接受 alg=none 伪造 Token（垃圾/畸形 Token 被拒）',
                             'recommendation': '禁止 alg=none；严格校验签名算法白名单（仅允许预期算法）',
                             'method': 'jwt_none_forgery',
+                        })
+                        break
+                    if _acc is None:
+                        # 弱判定：伪造被接受但任何 Token 都被放行（服务端可能不校验）。
+                        # 保留为 Medium 疑似，交由 verify 层复核，避免整条漏检。
+                        findings.append({
+                            'url': ep, 'type': 'JWT-alg=none疑似(服务端泛接受)', 'severity': 'Medium',
+                            'ai_verdict': '疑似', 'confidence': 'low',
+                            'evidence': f'端点 {ep} 接受 alg=none 伪造 Token 且对照 Token 均未拒绝，'
+                                        '服务端可能完全不做 JWT 校验',
+                            'recommendation': '核对服务端是否校验 JWT 签名；禁止 alg=none；'
+                                              '严格校验签名算法白名单（仅允许预期算法）',
+                            'method': 'jwt_none_forgery_weak',
                         })
                         break
                 secret = self._jwt_crack(tok)
@@ -1894,6 +1943,8 @@ class WeakCredentialEngine(BaseEngine):
         "/login", "/signin", "/api/login", "/api/auth/login", "/auth/login",
         "/admin/login", "/administrator", "/wp-login.php", "/user/login",
         "/api/v1/login", "/api/signin", "/account/login", "/api/token",
+        "/admin", "/admin/default", "/admin/", "/default", "/admin/index",
+        "/api/admin", "/console", "/manage",
     )
 
     # 常见默认凭据与极弱口令（设备/中间件默认账号 + TOP 弱口令）
@@ -1940,6 +1991,59 @@ class WeakCredentialEngine(BaseEngine):
         logger.info(f"🔍 [WeakCredential] 检测弱口令/默认凭据: {target}")
 
         endpoints = await self._discover_login_endpoints(base_url, session)
+
+        # 无参端点 Basic 认证探测（线1.4）：401 + WWW-Authenticate: Basic → 默认凭据走 Authorization 头
+        # 候选端点 = 调用方传入 endpoints + 登录路径发现结果，缺一不可（修复 "/admin/default 漏检"：
+        # Basic 认证端点不在 kwargs.endpoints 时仅靠 _discover_login_endpoints 也能命中）
+        _basic_eps: List[str] = []
+        for _ep in list(kwargs.get("endpoints") or []) + list(endpoints):
+            if isinstance(_ep, str) and _ep:
+                _basic_eps.append(_ep)
+                _basic_eps.append(_ep.rstrip("/"))
+        for ep in dict.fromkeys(_basic_eps):
+            if not isinstance(ep, str) or not ep:
+                continue
+            try:
+                _bresp = await async_get(ep, session=session, timeout=self.TIMEOUT, no_retry=True)
+            except Exception:
+                continue
+            if not _bresp or _bresp[0] != 401:
+                continue
+            _bh = _bresp[2] if len(_bresp) > 2 else {}
+            _www = str((_bh or {}).get("WWW-Authenticate", "")).lower()
+            if "basic" not in _www:
+                continue
+            import base64 as _b64
+            for username, password in self.DEFAULT_CREDENTIALS:
+                _tok = _b64.b64encode(f"{username}:{password}".encode()).decode()
+                try:
+                    _resp = await async_get(ep, session=session, timeout=self.TIMEOUT, no_retry=True,
+                                            headers={"Authorization": f"Basic {_tok}"})
+                except Exception:
+                    continue
+                _st = _resp[0]
+                _txt = _resp[1] or ""
+                _hdrs = _resp[2] if len(_resp) > 2 else {}
+                # 成功判定：200/201 且与 401 基线响应体不同（Basic 无会话凭据，_is_success 的
+                # session-cookie/成功词约束不适用，采用差分约束防误报）
+                if _st in (200, 201) and _txt.strip() != (_bresp[1] or "").strip():
+                    findings.append({
+                        "url": ep,
+                        "type": "weak_credential_basic",
+                        "severity": "High",
+                        "title": f"Basic 认证默认凭据可登录：{username}/{password}",
+                        "description": f"端点 {ep} 使用 HTTP Basic 认证且接受默认凭据 `{username}/{password}`（CWE-521）。",
+                        "remediation": "立即修改默认口令，启用强口令策略与失败锁定。",
+                        "recommendation": "修改默认口令并强制首次登录改密。",
+                        "parameter": "authorization",
+                        "method": "GET",
+                        "evidence": f"GET {ep} Authorization: Basic {username}:{password} -> HTTP {_st}（基线 401）",
+                        "confidence": "high",
+                        "cvss": 9.8,
+                    })
+                    logger.warning(f"🚨 发现 Basic 弱口令: {ep} ({username}:{password})")
+                    break
+
         if not endpoints:
             logger.info("   ℹ️ 未发现登录端点，跳过弱口令检测")
             return findings

@@ -144,6 +144,7 @@ class DotNetDeserializationEngine(BaseEngine):
         return hits
 
     async def scan(self, target: str, session, **kwargs) -> List[Dict]:
+        import asyncio  # H.2: top3 热路径线程池隔离
         findings: List[Dict] = []
         timeout = getattr(settings, 'timeout', 30)
         logger.info(f"[DotNetDeserialization] 检测 .NET 反序列化特征 (CWE-502): {target}")
@@ -165,11 +166,11 @@ class DotNetDeserializationEngine(BaseEngine):
             return findings
 
         blob = f"{text}\n{headers_str}"
-        hits = self._passive_check(blob, "响应/头")
+        hits = await asyncio.to_thread(self._passive_check, blob, "响应/头")
 
         for key, values in parse_qs_lite(parsed.query).items():
             for v in values:
-                hits += self._passive_check(v, f"URL 参数 {key}")
+                hits += await asyncio.to_thread(self._passive_check, v, f"URL 参数 {key}")
 
         seen = set()
         for hit in hits:
@@ -203,7 +204,9 @@ class DotNetDeserializationEngine(BaseEngine):
                         resp_text = resp_a[1] if isinstance(resp_a, tuple) else str(resp_a)
                         if not isinstance(resp_text, str):
                             continue
-                        if self._match_error_sig(resp_text):
+                        # K3: 反射失真守卫——payload 原样回显（含 HTML 转义后）判定为反射，
+                        # 不构成"反序列化错误回显"（真实错误栈只回显类型名片段，不回显完整 JSON）。
+                        if self._match_error_sig(resp_text, payload):
                             findings.append({
                                 'url': test_url,
                                 'parameter': param,
@@ -243,7 +246,9 @@ class DotNetDeserializationEngine(BaseEngine):
                 resp_text = resp[1] if isinstance(resp, tuple) else str(resp)
                 if not isinstance(resp_text, str):
                     continue
-                if self._match_error_sig(resp_text):
+                # K3: 反射失真守卫——payload 原样回显（含 HTML 转义后）判定为反射，
+                # 不构成"反序列化错误回显"（真实错误栈只回显类型名片段，不回显完整 JSON）。
+                if self._match_error_sig(resp_text, payload):
                     return {
                         'url': test_url,
                         'parameter': param,
@@ -259,9 +264,22 @@ class DotNetDeserializationEngine(BaseEngine):
                 logger.debug(f"[DotNetDeserialization] check 失败: {e}")
         return None
 
-    def _match_error_sig(self, resp_text: str) -> bool:
+    def _match_error_sig(self, resp_text: str, payload: str = "") -> bool:
+        # K3: 反射失真剔除——若命中签名也出现在 payload 自身（如 ObjectDataProvider/
+        # PresentationFramework/Process 等类型名），要求"响应出现次数 > payload 出现次数"，
+        # 否则判定该次命中只是 payload 被反射回显（真实异常栈的类型名片段不会由
+        # 完整 JSON 携带，次数差保持成立；纯反射时次数相等 → 判不命中）。
         for sig in self.DOTNET_ERROR_SIGS:
-            if re.search(sig, resp_text, flags=re.IGNORECASE):
+            if not re.search(sig, resp_text, flags=re.IGNORECASE):
+                continue
+            if not payload:
+                return True
+            m = re.search(sig, payload, flags=re.IGNORECASE)
+            if not m:
+                return True
+            _resp_n = len(re.findall(sig, resp_text, flags=re.IGNORECASE))
+            _pay_n = len(re.findall(sig, payload, flags=re.IGNORECASE))
+            if _resp_n > _pay_n:
                 return True
         return False
 

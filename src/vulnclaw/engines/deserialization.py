@@ -174,6 +174,7 @@ class DeserializationEngine(BaseEngine):
         return hits
 
     async def scan(self, target: str, session, **kwargs) -> List[Dict]:
+        import asyncio  # H.2: top3 热路径线程池隔离——纯 CPU 子函数走 to_thread 不阻塞事件循环
         findings: List[Dict] = []
         timeout = getattr(settings, 'timeout', 30)
         logger.info(f"[Deserialization] 检测反序列化特征 (CWE-502): {target}")
@@ -195,10 +196,10 @@ class DeserializationEngine(BaseEngine):
             return findings
 
         blob = f"{text}\n{headers_str}"
-        hits = self._passive_check(blob, "响应/头")
+        hits = await asyncio.to_thread(self._passive_check, blob, "响应/头")
         for key, values in parse_qs_lite(parsed.query).items():
             for v in values:
-                hits += self._passive_check(v, f"URL 参数 {key}")
+                hits += await asyncio.to_thread(self._passive_check, v, f"URL 参数 {key}")
 
         seen = set()
         for hit in hits:

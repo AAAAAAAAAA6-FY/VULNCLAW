@@ -1,0 +1,147 @@
+# 中间件 / 平台 未授权暴露检测规则
+#
+# 引擎合并（v2 任务卡：引擎治理）的产物：把 NacosExposureEngine /
+# SolrExposureEngine / ConfluenceExposureEngine 三个"同骨架、异参数"的引擎，
+# 收敛为"一个通用引擎 + 一份规则数据"。
+#
+# 消费方：engines/exposure_fingerprint_engine.py::ExposureFingerprintEngine
+#
+# 设计铁律（沿用原实现，不可破坏）：
+#   1. 先产品指纹、后漏洞特征 —— 指纹未命中直接跳过，普通站点不会误报。
+#   2. 全部只读探测（GET），无 OOB、无破坏性载荷。
+#   3. finding.type 取 title（与原三引擎逐字一致），保证验证链/去重/报告零回归。
+#
+# 新增一个中间件只需在下方加一条规则，无需写 Python。
+#
+# 字段说明：
+#   id                 规则标识（归类和去重用）
+#   name               产品名（日志用）
+#   fingerprint        产品指纹：{path, status, pattern}
+#   fingerprint_finding（可选）指纹响应本身即构成漏洞面时用（如 Solr cores）
+#   probes             漏洞面探测列表：{path, pattern, title, severity, cvss,
+#                                     description, recommendation}
+#   stop_on_first_hit  命中一条 probe 后是否停止（默认 true）
+#   fallback_finding   （可选）指纹命中但 probes 全未命中时的降级提示
+#
+version: 1
+
+rules:
+  # ---------------- Nacos（CVE-2021-29441 风险面） ----------------
+  - id: nacos_exposure
+    name: Nacos
+    fingerprint:
+      path: /nacos/v1/console/health/readiness
+      status: 200
+      pattern: '"UP"|nacos'
+    stop_on_first_hit: true
+    probes:
+      - path: /nacos/v1/auth/users
+        pattern: '"username"\s*:'
+        title: Nacos 未授权访问-用户列表泄露
+        severity: Critical
+        cvss: "9.8"
+        description: "未授权访问 Nacos 用户管理接口 {url}，返回用户列表 JSON，攻击者可枚举账户并配合弱口令进入管理后台（CVE-2021-29441 风险面）。"
+        recommendation: "开启鉴权（nacos.core.auth.enabled=true），改写默认口令，将管理面放入内网并加白名单访问控制。"
+      - path: /nacos/v1/cs/configs?search=accurate&dataId=&group=&pageNo=1&pageSize=9
+        pattern: '"totalCount"\s*:'
+        title: Nacos 未授权访问-配置中心泄露
+        severity: High
+        cvss: "7.5"
+        description: "未授权访问 Nacos 配置中心接口 {url} 可读取配置项，可能泄露数据库口令/云凭证/AK-SK 等敏感配置。"
+        recommendation: "开启 Nacos 鉴权并禁用 /nacos/v1/cs/configs 匿名访问，敏感配置迁移至密钥管理服务（KMS）。"
+
+  # ---------------- Apache Solr ----------------
+  - id: solr_exposure
+    name: Apache Solr
+    fingerprint:
+      path: /solr/admin/cores?indexInfo=false&wt=json
+      status: 200
+      pattern: '"responseHeader"|"instanceDir"|"lucene"'
+    # Solr 原实现：cores 接口未授权即构成核心信息泄露（指纹响应本身就是证据）
+    fingerprint_finding:
+      title: Apache Solr Admin 未授权访问
+      severity: High
+      cvss: "7.5"
+      description: "未授权访问 Solr Admin 核心管理接口 {url}，可读取全部 core 配置/路径信息，配合 CVE-2019-0193 等反序列化/配置执行漏洞可进一步利用。"
+      recommendation: "为 Solr Admin 添加认证（Basic Auth / 反向代理 SSO），仅允许可信网络访问管理接口，升级至已修复版本。"
+    stop_on_first_hit: false
+    probes:
+      - path: /solr/admin/info/system?wt=json
+        pattern: '"solr_spec_version"|"lucene"|"jvm"'
+        title: Apache Solr 版本/系统信息泄露
+        severity: Medium
+        cvss: "5.3"
+        description: "未授权访问 Solr 系统信息接口 {url}，泄露 Solr/Lucene 版本、JVM 与路径信息，攻击者据此检索对应版本已知漏洞进行针对性利用。"
+        recommendation: "对 /solr/admin/info/system 加鉴权，隐藏版本横幅，及时升级 Solr 至官方安全版本。"
+
+  # ---------------- Atlassian Confluence ----------------
+  - id: confluence_exposure
+    name: Atlassian Confluence
+    fingerprint:
+      path: /rest/applinks/1.0/manifest
+      status: 200
+      pattern: '"applicationLinks"|"confluence"'
+    stop_on_first_hit: true
+    probes:
+      - path: /rest/api/content?limit=1
+        pattern: '"results"\s*:|"type"\s*:\s*"page"'
+        title: Confluence 未授权访问-内容读取
+        severity: High
+        cvss: "7.5"
+        description: "未授权访问 Confluence REST API {url} 可匿名读取页面内容（标题/正文摘要），敏感文档可在未登录状态下泄露，并扩大 CVE-2023-22515 等管理面漏洞的攻击面。"
+        recommendation: "为 Confluence 匿名访问关闭 REST API 内容读取（全局权限配置），将实例置于认证反向代理之后，升级至官方安全版本。"
+    # 指纹命中但内容接口未开放：仍提示 AppLinks 信息暴露（原实现的降级分支）
+    fallback_finding:
+      title: Confluence 应用链接信息暴露
+      severity: Medium
+      cvss: "5.3"
+      description: "Confluence 应用链接清单接口 {url} 可匿名访问，暴露产品实例/内网应用名信息。"
+      recommendation: "限制 AppLinks 清单接口的匿名访问，及时升级 Confluence。"
+
+  # ---------------- Prometheus 监控指标未授权暴露 ----------------
+  # 合并自 PrometheusMetricsExposureEngine（logic_leak_engines_2.py:346）。
+  # 原实现：轮询 5 个指标端点，200 + Prometheus 格式指标行(>=5) 即报。
+  # 此处指纹取主端点 /metrics，命中后用其余端点作 probe（零回归：title 与原 type 逐字一致）。
+  - id: prometheus_exposure
+    name: Prometheus
+    fingerprint:
+      path: /metrics
+      status: 200
+      pattern: '#\s*(HELP|TYPE)|go_|process_|node_|up\s+\d|http_requests'
+    stop_on_first_hit: true
+    probes:
+      - path: /metrics
+        pattern: '(#\s*HELP|#\s*TYPE|[a-zA-Z_:][a-zA-Z0-9_:]*\s+\d)'
+        title: Prometheus 监控指标泄露
+        severity: Medium
+        cvss: "5.3"
+        description: "未授权访问 Prometheus /metrics 端点 {url}，返回主机/进程/容器监控指标（CPU/内存/网络/运行时），攻击者可据此测绘资产、定位高价值目标或结合其他漏洞利用。"
+        recommendation: "为 /metrics 端点加认证（Basic Auth / 反向代理 SSO）或仅允许内网访问，避免在公网暴露监控指标。"
+      - path: /prometheus
+        pattern: '(#\s*HELP|#\s*TYPE|[a-zA-Z_:][a-zA-Z0-9_:]*\s+\d)'
+        title: Prometheus 监控指标泄露
+        severity: Medium
+        cvss: "5.3"
+        description: "未授权访问 Prometheus /prometheus 端点 {url}，返回监控指标，可能泄露内部版本/路由/资源使用等敏感信息。"
+        recommendation: "为 /prometheus 端点加认证或仅允许内网访问，避免公网暴露监控指标。"
+      - path: /metrics/prometheus
+        pattern: '(#\s*HELP|#\s*TYPE|[a-zA-Z_:][a-zA-Z0-9_:]*\s+\d)'
+        title: Prometheus 监控指标泄露
+        severity: Medium
+        cvss: "5.3"
+        description: "未授权访问 Prometheus /metrics/prometheus 端点 {url}，返回监控指标，可能泄露内部资源使用等敏感信息。"
+        recommendation: "为 /metrics/prometheus 端点加认证或仅允许内网访问。"
+      - path: /actuator/prometheus
+        pattern: '(#\s*HELP|#\s*TYPE|[a-zA-Z_:][a-zA-Z0-9_:]*\s+\d)'
+        title: Prometheus 监控指标泄露
+        severity: Medium
+        cvss: "5.3"
+        description: "未授权访问 Spring Boot Actuator Prometheus 端点 {url}，返回 JVM/HTTP 监控指标，可能泄露应用内部运行状态。"
+        recommendation: "为 Actuator 端点加认证并禁用 Prometheus 暴露，或仅允许内网访问。"
+      - path: /api/metrics
+        pattern: '(#\s*HELP|#\s*TYPE|[a-zA-Z_:][a-zA-Z0-9_:]*\s+\d)'
+        title: Prometheus 监控指标泄露
+        severity: Medium
+        cvss: "5.3"
+        description: "未授权访问 /api/metrics 端点 {url}，返回监控指标，可能泄露内部运行状态。"
+        recommendation: "为 /api/metrics 端点加认证或仅允许内网访问。"

@@ -385,13 +385,10 @@ def _impersonate_request_api():
         return None, None
 
 
-def _get_anti_adapter():
-    """惰性获取 WAF 反检测策略适配器；不可用时返回 None。"""
-    try:
-        from vulnclaw.core.anti_detection import get_anti_detection
-        return get_anti_detection()
-    except Exception:
-        return None
+# 蜜罐消极区（2026-09-07）：同一主机连续命中 N 条蜜罐/假404 路径 => 该主机提前放弃
+# 后续退避重试（Audible 类 SPA 大站字典路径全 200=蜜罐，逐条 3 次退避纯属空耗）。
+# 任何非蜜罐响应都会重置计数，正常站不受影响。
+_HONEYPOT_SLUMP: Dict[str, int] = {}
 
 
 async def safe_request(
@@ -399,6 +396,7 @@ async def safe_request(
     session,
     method: str = "GET",
     timeout: int = None,
+    js_crypto_context: Optional[dict] = None,
     **kwargs
 ) -> Optional[Tuple[int, str, Dict]]:
     """
@@ -421,20 +419,6 @@ async def safe_request(
 
     while retry_count <= max_retries:
         try:
-            # P0-3：应用反检测策略（延迟 + 注入头）
-            try:
-                _adapter = _get_anti_adapter()
-                if _adapter is not None:
-                    _delay = _adapter.get_delay(url)
-                    if _delay:
-                        await asyncio.sleep(_delay)
-                    _inject = _adapter.get_headers(url)
-                    if _inject:
-                        _hdrs = dict(kwargs.get("headers") or {})
-                        _hdrs.update(_inject)
-                        kwargs["headers"] = _hdrs
-            except Exception:
-                logger.debug("suppressed exception (core audit)")
             if method.upper() == "GET":
                 if _impersonate_available():
                     _imp_get, _ = _impersonate_request_api()
@@ -466,6 +450,14 @@ async def safe_request(
                 text = await resp.text() if hasattr(resp, 'text') else ""
                 headers = dict(getattr(resp, 'headers', {}))
 
+            # ===== K.4 JS 加密参数还原（默认关闭；需显式传 js_crypto_context 才启用） =====
+            if js_crypto_context is not None and text:
+                try:
+                    from vulnclaw.modules.js_crypto_restore import JSCryptoRestorer
+                    js_crypto_context["crypto_points"] = JSCryptoRestorer().analyze(text)
+                except Exception:
+                    logger.debug("suppressed exception (js_crypto_restore)")
+
             # ===== Metrics 埋点：请求计数 + 响应时间 =====
             try:
                 get_metrics().inc_request(method.upper(), int(status) if status is not None else 0)
@@ -482,20 +474,38 @@ async def safe_request(
             if anti_result["is_fake_404"]:
                 logger.warning(f"⚠️ [反制-警告] 疑似假404: {url} - {anti_result['issues']}（继续扫描）")
 
+            # 蜜罐消极计数（2026-09-07）：连续蜜罐/假404 => 该主机进入消极区
+            if anti_result["is_honeypot"] or anti_result["is_fake_404"]:
+                from urllib.parse import urlparse as _urp
+                _hst = _urp(url).netloc or url
+                # 自适应（2026-09-07）：强蜜罐特征（动态UUID/随机占位符）2 条即消极，
+                # 弱特征用配置值（默认 3）；配置中更大值也封顶 3，防无限拖延。
+                if any(("UUID" in _i or "占位符" in _i) for _i in (anti_result.get("issues") or [])):
+                    _slump_th_ = min(int(getattr(settings, "anti_scan_honeypot_consecutive", 3) or 3), 2)
+                else:
+                    _slump_th_ = int(getattr(settings, "anti_scan_honeypot_consecutive", 3) or 3)
+                _cnt = _HONEYPOT_SLUMP.get(_hst, 0) + 1
+                _HONEYPOT_SLUMP[_hst] = _cnt
+                if _cnt == _slump_th_:
+                    logger.warning(f"🛑 蜜罐消极区: {_hst} 连续 {_cnt} 条蜜罐路径——后续对该主机直接放弃请求（大站防拖死）")
+            else:
+                from urllib.parse import urlparse as _urp2
+                _HONEYPOT_SLUMP.pop(_urp2(url).netloc or url, None)
+
             if anti_result["is_rate_limited"] or anti_result["is_ip_blocked"]:
                 logger.warning(f"⚠️ [反制] 触发限流/封禁: {url} - {anti_result['issues']}")
+                from urllib.parse import urlparse as _urp3
+                _hst3 = _urp3(url).netloc or url
+                if _HONEYPOT_SLUMP.get(_hst3, 0) >= _slump_th_:
+                    logger.info(f"🛑 蜜罐消极区生效: {url} 直接放弃（不再退避重试）")
+                    return None
                 if retry_count < max_retries:
-                    # P0-3：WAF 自适应策略链升级 + GET / 探测（200 即锁定）
-                    _level_name = "none"
-                    try:
-                        _adapter = _get_anti_adapter()
-                        if _adapter is not None:
-                            _level_name = await _adapter.record_block(url)
-                            await _adapter.probe(url, session)
-                    except Exception:
-                        logger.debug("suppressed exception (core audit)")
-                    wait = min(2 ** retry_count * 3, 30)
-                    logger.info(f"⏳ 反制等待 {wait}s 后重试（策略: {_level_name}，{retry_count + 1}/{max_retries}）")
+                    from vulnclaw.config.settings import settings as _ast
+                    wait = min(
+                        float(getattr(_ast, "anti_scan_backoff_base", 3.0)) * (2 ** retry_count),
+                        float(getattr(_ast, "anti_scan_backoff_max", 30.0)),
+                    )
+                    logger.info(f"⏳ 反制等待 {wait}s 后重试（{retry_count + 1}/{max_retries}）")
                     await asyncio.sleep(wait)
                     retry_count += 1
                     continue
@@ -516,13 +526,6 @@ async def safe_request(
                 logger.debug(f"5xx 响应直接返回（不重试）: HTTP {status} {url}")
 
             if status < 500 and status not in (429, 408):
-                # P0-3：成功响应 → 记录并锁定当前策略
-                try:
-                    _adapter = _get_anti_adapter()
-                    if _adapter is not None:
-                        await _adapter.record_success(url)
-                except Exception:
-                    logger.debug("suppressed exception (core audit)")
                 try:
                     cache.set(cache_key, (status, text, headers), ttl=300)
                 except Exception:

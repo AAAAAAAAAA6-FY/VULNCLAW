@@ -11,6 +11,7 @@ AI Agent 调度器 - ReAct循环版（路径A核心）- 优化版
 """
 import asyncio
 import json
+import os
 import re
 import time
 from collections import defaultdict, deque
@@ -19,7 +20,7 @@ from typing import Any, Dict, List, Optional
 from vulnclaw.core.logger import logger
 from vulnclaw.core.context import get_scan_context
 from vulnclaw.core.utils import async_get, build_attack_url
-from vulnclaw.core.session_manager import get_session_manager
+from vulnclaw.core.auth.session_manager import get_session_manager
 from vulnclaw.core.settings import settings
 
 # ===== 修复：所有合并后的 AI 模块统一从 ai.core 导入 =====
@@ -163,6 +164,19 @@ class ReActAgent:
         self.context = get_scan_context()
         self.rule_engine = get_rule_engine() # 从 ai.core 获取
         self.tools = TOOL_REGISTRY
+
+        # F.1: 决策审计——think/decide 每轮产物以 JSONL 落盘，供回放与误报根因定位。
+        # 落盘失败静默降级（审计是增强项，绝不影响主流程）。
+        self._audit_path = ""
+        try:
+            from vulnclaw.paths import PROJECT_ROOT
+
+            _d = os.path.join(str(PROJECT_ROOT), "_runtime_cache", "agent_decisions")
+            os.makedirs(_d, exist_ok=True)
+            _safe = re.sub(r"[^A-Za-z0-9_.-]", "_", str(target))[:80] or "target"
+            self._audit_path = os.path.join(_d, f"{_safe}_{int(time.time())}.jsonl")
+        except Exception:  # noqa: BLE001
+            logger.debug("suppressed exception (core audit)")
 
         # A2.1: 角色化子 Agent——窄 prompt + 窄工具集（未知角色/未配置则保持全工具集）
         self.role = str(role or "").strip().lower()
@@ -659,6 +673,28 @@ class ReActAgent:
 
         return list(set(params))[:20]
 
+    def _audit_decision(self, kind: str, payload: Optional[Dict] = None) -> None:
+        """F.1: 把一轮 think/decide 的产物以 JSONL 追加落盘。
+
+        字段：ts / kind / target / role / stage + 调用方传入的 payload。
+        任何异常一律吞掉——审计不得影响扫描主流程（fail-safe）。
+        """
+        if not getattr(self, "_audit_path", ""):
+            return
+        try:
+            rec = {
+                "ts": time.time(),
+                "kind": kind,
+                "target": str(self.target),
+                "role": str(getattr(self, "role", "") or ""),
+                "stage": str(getattr(self, "stage", "") or ""),
+            }
+            rec.update(payload or {})
+            with open(self._audit_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+        except Exception:  # noqa: BLE001
+            logger.debug("suppressed exception (core audit)")
+
     async def _think(self, observation: Dict) -> str:
         params_info = observation.get('params', [])
         high_priority = [p['param'] for p in params_info if p.get('priority') == 'high'][:5]
@@ -894,6 +930,11 @@ ask_expert(question,context,system)：困惑时外询——内部知识盲区/�
                             logger.info(f"[Reflect] 换策略: 避开重复工具 {self._last_action_tool} -> {alts[0]}")
                             action["tool"] = alts[0]
                     self._last_action_tool = action.get("tool")
+                    self._audit_decision("decide", {
+                        "thought": str(thought)[:400],
+                        "action": action,
+                        "source": "llm",
+                    })
                     return action
 
                 if attempt == 0:
@@ -910,8 +951,15 @@ ask_expert(question,context,system)：困惑时外询——内部知识盲区/�
                 if attempt == 0:
                     continue
 
-        # 回退逻辑（原有）
-        logger.warning("⚠️ 决策解析失败，使用智能降级策略")
+        # 回退逻辑（原有）— F.2: LLM 超时/抛错/输出非 JSON 时，走确定性降级
+        # （不靠 LLM 决定下一步），标记 fallback:deterministic 便于检索与验收。
+        logger.warning("⚠️ 决策解析失败，使用智能降级策略 [fallback:deterministic]")
+        self._audit_decision("decide", {
+            "thought": str(thought)[:400],
+            "action": None,
+            "source": "deterministic_fallback",
+            "reason": "llm_decide_failed",
+        })
         real_params = self._recon_observation.get('params', [])
         tech_stack = self._recon_observation.get('tech_stack', [])
         tech_lower = ' '.join(tech_stack).lower()
@@ -1100,7 +1148,14 @@ ask_expert(question,context,system)：困惑时外询——内部知识盲区/�
             return {"info": f"OOB 假设已尝试过，跳过（{dedup_key[:80]}）", "dedup": True}
         self._oob_attempted.add(dedup_key)
 
-        from vulnclaw.core.oob_channel import OOBChannel
+        from vulnclaw.core.oob_channel import (
+            OOBChannel, is_oob_blocked, target_key_from_url,
+        )
+
+        # P0 熔断：外发被封禁时整段跳过（不空发注入请求、不空等回调）
+        _oob_tgt = target_key_from_url(url)
+        if is_oob_blocked(_oob_tgt):
+            return {"info": "OOB 熔断生效（外发被封禁），盲打跳过（不误报）", "blocked": True}
 
         ch = OOBChannel()
         try:
@@ -1128,7 +1183,8 @@ ask_expert(question,context,system)：困惑时外询——内部知识盲区/�
         except Exception as exc:  # noqa: BLE001
             logger.debug(f"[OOBConfirm] 注入请求失败: {exc}")
 
-        hits = await ch.wait_for_interaction(token, timeout=max(4, min(timeout, 25)))
+        hits = await ch.wait_for_interaction(token, timeout=max(4, min(timeout, 25)),
+                                             target=_oob_tgt)
         if not hits:
             return {"info": f"OOB 探测未收到回调（{timeout}s），未确认（不误报）", "probe": obs_dns, "token": token}
 

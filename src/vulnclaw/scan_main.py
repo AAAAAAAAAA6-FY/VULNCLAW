@@ -350,6 +350,8 @@ from urllib.parse import urlparse
 
 
 from dotenv import load_dotenv
+from pathlib import Path as _P
+load_dotenv(str(_P(__file__).resolve().parent.parent.parent / ".env"))  # 强制项目根 .env，防 cwd 漂移漏加载
 
 
 
@@ -616,6 +618,8 @@ def main():
 
 
     parser.add_argument('--cookie-file', help='手动指定 Cookie 文件路径')
+    parser.add_argument('--cookie', help='内联 Cookie 直传（name=value; name=value），'
+                                         '按目标域写入并优先于 Burp 文件生效')
 
 
 
@@ -628,6 +632,10 @@ def main():
     parser.add_argument('--metrics-port', type=int, default=0, help='启动 Prometheus 指标服务器端口（0=禁用）')
 
     parser.add_argument('--http2', action='store_true', help='启用 HTTP/2（需 httpx[http2]，默认关闭）')
+    parser.add_argument('--instruction', default=None,
+                        help='SP27: 内联扫描指令（可直接写账号密码，如 "Login with email: admin@x.com, password: Pass123"）')
+    parser.add_argument('--instruction-file', dest='instruction_file', default=None,
+                        help='SP27: 指令文件路径（UTF-8，与 --instruction 二选一）')
 
     parser.add_argument('--resume', action='store_true', help='从死信队列重放任务（需 --scan-id）')
     parser.add_argument('--resume-scan', dest='resume_scan', action='store_true',
@@ -703,6 +711,9 @@ def main():
 
 
     parser.add_argument('--dangerous', action='store_true', help='危险模式：实际执行利用（默认仅生成 POC）')
+    parser.add_argument('--dangerous-confirm', dest='dangerous_confirm', action='store_true',
+                        help='双因子确认：非交互/CI 环境下配合 --dangerous 才真正放行，'
+                             '防止自动化脚本误带 --dangerous 真实攻击目标（也可用环境变量 DANGEROUS_CONFIRM=1）')
 
 
 
@@ -737,9 +748,23 @@ def main():
     args = parser.parse_args()
 
     # --- 危险操作权限门卫：--dangerous 显式放行（默认 deny） ---
+    # H.3 双因子：交互环境直接放行；非交互/CI 环境需第二因子（--dangerous-confirm
+    # 或 DANGEROUS_CONFIRM=1）才真正 allow，否则停留 deny 并打印警告，防止无人值守
+    # 脚本误带 --dangerous 真实攻击目标（安全红线）。
     if args.dangerous:
+        import os
+        import sys
+
         from vulnclaw.core.danger_guard import guard
-        guard.set_mode("allow")
+
+        interactive = bool(sys.stdin and sys.stdin.isatty())
+        second_factor = getattr(args, "dangerous_confirm", False) or os.environ.get("DANGEROUS_CONFIRM") == "1"
+        if interactive or second_factor:
+            guard.set_mode("allow")
+        else:
+            print("⚠️ [DangerGuard] 检测到 --dangerous 但处于非交互环境且缺第二因子"
+                  "(--dangerous-confirm / DANGEROUS_CONFIRM=1)，已自动保持 deny 模式，"
+                  "不会真实执行利用。如需突破只读，请在交互终端运行或显式传递第二因子。")
 
     # --- S1: --deep 开启 ReAct 深挖（对本地判定模糊的参数做 LLM 多轮深度渗透） ---
     if getattr(args, "deep", False):
@@ -878,11 +903,25 @@ def main():
 
 
 
+    # 2026-09-08: 目标 URL 清洗——剥掉聊天/终端复制带来的反引号、引号、首尾空格，
+    # 否则 `https://vercel.com` 这类粘贴会原样进入 URL，触发 E5 越界拦截与侦察失败。
+    if getattr(args, 'target', None):
+        args.target = args.target.strip().strip("`'\"").strip()
+        if not args.target:
+            parser.error("-t/--target 提供的 URL 为空（仅含反引号/引号）")
+    if getattr(args, 'target_list', None):
+        args.target_list = str(args.target_list).strip()
+
     # P1-3: resume 重放死信队列（不要求 -t，执行完直接退出）
     if getattr(args, 'resume', False):
         sys.exit(run_resume(getattr(args, 'scan_id', '') or ''))
 
-    if not args.target and not args.target_list and not getattr(args, 'code', False):
+    # 插件市场 CLI 子命令不需要 -t 目标（与 --health 同理豁免）
+    _plugin_cli = (
+        getattr(args, 'list_plugins', False) or getattr(args, 'update_plugins', False)
+        or getattr(args, 'auto_install', False) or getattr(args, 'install', None)
+    )
+    if not args.target and not args.target_list and not getattr(args, 'code', False) and not _plugin_cli:
 
 
 
@@ -994,6 +1033,51 @@ def main():
 
 
 
+    if getattr(args, 'cookie', None):
+        _host = (urlparse(args.target).hostname or "").lower()
+        if _host.startswith('www.'):
+            _host = _host[4:]
+        if _host:
+            from vulnclaw.runners.scan_runner import seed_cookie_for_domain
+            seed_cookie_for_domain(_host, args.cookie)
+
+    # Cookie 就绪度自检：burp 文件存在但目标域无匹配 / 文件老化 -> 警示
+    try:
+        import json as _json, os as _os
+        from vulnclaw.core.utils import resolve_burp_cookies_path
+        import time as _time
+        _bf = resolve_burp_cookies_path()
+        if _os.path.exists(_bf):
+            _age = (time.time() - _os.path.getmtime(_bf)) / 86400
+            try:
+                with open(_bf, "r", encoding="utf-8") as f:
+                    _bk = _json.load(f)
+                _targ = (urlparse(args.target).hostname or "").lower()
+                if _targ.startswith("www."):
+                    _targ = _targ[4:]
+                _hits = {k for k in _bk if _targ and (k.lstrip(".") == _targ or k.lstrip(".").endswith("." + _targ))}
+            except BaseException:
+                _hits, _age = set(), 99.0
+            if _targ and not _hits:
+                if _age > 3:
+                    _plugin = Path(PROJECT_ROOT) / "thirdparty" / "extensions" / "BurpExtender.py"
+                    if not _plugin.exists():
+                        print(f"⚠️ burp_cookies.json 已 {_age:.0f} 天未更新，且 Burp 插件尚未生成："
+                              f"先运行  python scan.py setup  生成 thirdparty/extensions/BurpExtender.py，"
+                              f"再到 Burp → Extender → Add 加载它并重新代理目标流量；"
+                              f"或直接 --cookie \"name=value; name=value\" 直传登录态")
+                    else:
+                        print(f"⚠️ burp_cookies.json 已 {_age:.0f} 天未更新（Burp 插件可能未加载）："
+                              f"1) 在 Burp → Extender 确认 Cookie Exporter 已加载并重新代理目标流量; "
+                              f"2) 或直接 --cookie \"name=value; name=value\" 直传; 3) 或 --cookie-file 指定导出文件")
+                else:
+                    print(f"ℹ️ burp_cookies.json 中未找到 {args.target} 的 Cookie（最近 {_age:.0f} 天更新过）。"
+                          f"如已登录目标，可用 --cookie 直传登录态")
+            elif not _targ:
+                print(f"⚠️ 无法从目标解析域名，跳过 Cookie 就绪度检查")
+    except BaseException:
+        pass
+
     if args.no_auth:
 
 
@@ -1094,14 +1178,14 @@ def main():
 
 
 
-            plugins = asyncio.run(list_available_plugins())
-
-
+            try:
+                plugins = list_available_plugins()
+            except Exception as e:  # noqa: BLE001 — 市场源不可达（未发布 Release/网络问题）时友好降级
+                print(f"⚠️ 插件市场暂不可用: {e}")
+                print("   （市场索引随开源版发布后可用；也可手动放置插件到插件目录）")
+                sys.exit(0)
 
             print(f"可用插件 ({len(plugins)} :")
-
-
-
             for p in plugins:
 
 
@@ -1126,7 +1210,7 @@ def main():
 
 
 
-            result = asyncio.run(install_plugin(args.install))
+            result = install_plugin(args.install)
 
 
 
@@ -1162,7 +1246,7 @@ def main():
 
 
 
-            available = asyncio.run(list_available_plugins())
+            available = list_available_plugins()
 
 
 
@@ -1174,7 +1258,7 @@ def main():
 
 
 
-                asyncio.run(install_plugin(p['name']))
+                install_plugin(p['name'])
 
 
 

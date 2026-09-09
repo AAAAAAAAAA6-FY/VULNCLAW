@@ -1,0 +1,89 @@
+# G.1 fixture：合并后的暴露检测引擎（exposure_fingerprint）正反例
+#
+# 说明：每个 case 用 responses 模拟 HTTP 响应（无需真实靶场）。
+#   expect: positive → 引擎应检出（未检出 = FN 漏报）
+#   expect: negative → 引擎不应检出（检出 = FP 误报）
+#
+# 对应规则：src/vulnclaw/core/data/exposure_rules.yaml
+# 这三个 case 同时是"合并引擎 vs 旧引擎"双跑对比的基准。
+
+module: vulnclaw.engines.exposure_fingerprint_engine
+class: ExposureFingerprintEngine
+engine: exposure_fingerprint
+
+target: http://127.0.0.1:8080
+
+cases:
+  # ---------- 正例：Nacos 未授权用户列表 ----------
+  - id: nacos_users_leak
+    expect: positive
+    responses:
+      /nacos/v1/console/health/readiness:
+        status: 200
+        body: '{"status":"UP","nacos":true}'
+      /nacos/v1/auth/users:
+        status: 200
+        body: '{"username":"nacos","password":"$2a$10$xxx"}'
+
+  # ---------- 正例：Nacos 配置中心泄露（用户接口未开放，走第二条 probe）----------
+  - id: nacos_configs_leak
+    expect: positive
+    responses:
+      /nacos/v1/console/health/readiness:
+        status: 200
+        body: '{"status":"UP"}'
+      /nacos/v1/cs/configs:
+        status: 200
+        body: '{"totalCount":3,"pageItems":[{"dataId":"db.properties"}]}'
+
+  # ---------- 正例：Solr Admin 未授权（指纹本身即漏洞面）----------
+  - id: solr_admin_open
+    expect: positive
+    responses:
+      /solr/admin/cores:
+        status: 200
+        body: '{"responseHeader":{"status":0},"lucene":{"solr-spec-version":"8.11.1"}}'
+      /solr/admin/info/system:
+        status: 200
+        body: '{"lucene":{"solr-spec-version":"8.11.1"},"jvm":{"name":"OpenJDK"}}'
+
+  # ---------- 正例：Confluence 未授权内容读取 ----------
+  - id: confluence_content_read
+    expect: positive
+    responses:
+      /rest/applinks/1.0/manifest:
+        status: 200
+        body: '{"type":"applinks","confluence":true}'
+      /rest/api/content:
+        status: 200
+        body: '{"results":[],"type":"page"}'
+
+  # ---------- 反例：普通站点（指纹不命中，绝不能报）----------
+  - id: generic_site_negative
+    expect: negative
+    responses:
+      /nacos/v1/console/health/readiness:
+        status: 200
+        body: '<html><body><h1>Welcome nginx</h1></body></html>'
+      /solr/admin/cores:
+        status: 404
+        body: 'Not Found'
+      /rest/applinks/1.0/manifest:
+        status: 404
+        body: 'Not Found'
+
+  # ---------- 反例：Nacos 指纹命中但漏洞面均需鉴权（不应报未授权）----------
+  # 指纹命中、users/configs 均 401 → 该规则无 fallback_finding，应**不产出** finding。
+  # 这是"指纹命中≠有漏洞"的关键反例，防误报。
+  - id: nacos_fingerprint_only
+    expect: negative
+    responses:
+      /nacos/v1/console/health/readiness:
+        status: 200
+        body: '{"status":"UP","nacos":true}'
+      /nacos/v1/auth/users:
+        status: 401
+        body: '{"error":"unauthorized"}'
+      /nacos/v1/cs/configs:
+        status: 401
+        body: '{"error":"unauthorized"}'

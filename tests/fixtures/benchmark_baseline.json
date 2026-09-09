@@ -1,0 +1,81 @@
+{
+  "summary": [
+    {
+      "engine": "exposure_fingerprint",
+      "TP": 4,
+      "FN": 0,
+      "FP": 0,
+      "TN": 2,
+      "detect_rate": 100.0,
+      "false_rate": 0.0
+    }
+  ],
+  "total": {
+    "TP": 4,
+    "FN": 0,
+    "FP": 0,
+    "TN": 2
+  },
+  "cases": [
+    {
+      "file": "exposure.yaml",
+      "engine": "exposure_fingerprint",
+      "case": "nacos_users_leak",
+      "expect": "positive",
+      "found": true,
+      "verdict": "TP",
+      "severity": "Critical",
+      "top": "Nacos 未授权访问-用户列表泄露"
+    },
+    {
+      "file": "exposure.yaml",
+      "engine": "exposure_fingerprint",
+      "case": "nacos_configs_leak",
+      "expect": "positive",
+      "found": true,
+      "verdict": "TP",
+      "severity": "High",
+      "top": "Nacos 未授权访问-配置中心泄露"
+    },
+    {
+      "file": "exposure.yaml",
+      "engine": "exposure_fingerprint",
+      "case": "solr_admin_open",
+      "expect": "positive",
+      "found": true,
+      "verdict": "TP",
+      "severity": "High",
+      "top": "Apache Solr Admin 未授权访问"
+    },
+    {
+      "file": "exposure.yaml",
+      "engine": "exposure_fingerprint",
+      "case": "confluence_content_read",
+      "expect": "positive",
+      "found": true,
+      "verdict": "TP",
+      "severity": "High",
+      "top": "Confluence 未授权访问-内容读取"
+    },
+    {
+      "file": "exposure.yaml",
+      "engine": "exposure_fingerprint",
+      "case": "generic_site_negative",
+      "expect": "negative",
+      "found": false,
+      "verdict": "TN",
+      "severity": "",
+      "top": ""
+    },
+    {
+      "file": "exposure.yaml",
+      "engine": "exposure_fingerprint",
+      "case": "nacos_fingerprint_only",
+      "expect": "negative",
+      "found": false,
+      "verdict": "TN",
+      "severity": "",
+      "top": ""
+    }
+  ]
+}

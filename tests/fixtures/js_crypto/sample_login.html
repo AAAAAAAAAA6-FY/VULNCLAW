@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html><head><title>login fixture</title>
+<script src="https://cdn.example.com/crypto-js.min.js"></script>
+</head><body>
+<form id="login">
+  <input id="user" value="admin">
+  <input id="pwd" type="password" value="S3cr3t!Pass">
+</form>
+<script>
+// 前端对称加密登录密码后发送（常见防重放/防明文嗅探做法）
+function encryptPassword(pwd) {
+  var key = "hardcodedkey123";            // K.1 PoC：硬编码密钥 -> 可静态还原
+  var iv  = "1234567890123456";
+  var ciphertext = CryptoJS.AES.encrypt(pwd, key, { iv: CryptoJS.enc.Utf8.parse(iv) });
+  return ciphertext.toString();
+}
+var p = document.getElementById("pwd").value;
+console.log(encryptPassword(p));
+
+// 混淆示例：变量名混淆，需反混淆后分析
+var _0xabc1 = function(_0xdef2){ return CryptoJS.Rabbit.encrypt(_0xdef2, "rabbitkey"); };
+</script>
+</body></html>
