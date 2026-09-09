@@ -20,6 +20,7 @@ from vulnclaw.core.logger import logger
 from vulnclaw.core.settings import settings
 from vulnclaw.core.utils import async_get, get_shared_session
 from typing import Dict, List, Optional
+from vulnclaw.dashboard.server import ScanEvent, emit_event
 
 # ===== 修复：从合并文件导入引擎（而非单文件） =====
 from vulnclaw.engines.web_engines import (
@@ -592,24 +593,33 @@ async def execute_tool(name: str, **kwargs) -> Dict:
     if name not in TOOL_REGISTRY:
         return {"error": f"未知工具: {name}"}
     tool = TOOL_REGISTRY[name]
+    # PGEN-EVENT: 工具调用前广播（覆盖最广——所有引擎/工具调用都过此入口）
+    await emit_event(ScanEvent.TOOL_CALL_LOG, {"phase": "call", "tool": name})
     try:
-        return await tool.execute(**kwargs)
+        result = await tool.execute(**kwargs)
+        await emit_event(ScanEvent.TOOL_CALL_LOG, {"phase": "done", "tool": name, "ok": True})
+        return result
     except TypeError as e:
         # PGEN-TCF: 参数类错误 → 按 schema 修复后重试一次（对齐 PentAGI tool_call_fixer）
         fixed = _fix_tool_args(tool, kwargs, str(e))
         if fixed is None:
             logger.error(f"工具 {name} 参数错误（修复失败）: {e}")
+            await emit_event(ScanEvent.TOOL_CALL_LOG, {"phase": "error", "tool": name, "fixed": False})
             return {"error": str(e)}
         logger.warning(
             f"[ToolCallFixer] 工具 {name} 参数已修复重试: 原始{len(kwargs)}项 -> 修复{len(fixed)}项"
         )
         try:
-            return await tool.execute(**fixed)
+            result = await tool.execute(**fixed)
+            await emit_event(ScanEvent.TOOL_CALL_LOG, {"phase": "done", "tool": name, "ok": True, "fixed": True})
+            return result
         except Exception as e2:  # noqa: BLE001
             logger.error(f"工具 {name} 修复后仍失败: {e2}")
+            await emit_event(ScanEvent.TOOL_CALL_LOG, {"phase": "error", "tool": name, "fixed": True})
             return {"error": str(e2)}
     except Exception as e:
         logger.error(f"工具 {name} 执行异常: {e}")
+        await emit_event(ScanEvent.TOOL_CALL_LOG, {"phase": "error", "tool": name})
         return {"error": str(e)}
 
 

@@ -27,6 +27,7 @@ import threading
 import time
 import aiohttp
 from typing import Any, Dict, List, Optional, Tuple, Union
+from vulnclaw.dashboard.server import ScanEvent, emit_event
 
 os.environ["PYTHONIOENCODING"] = "utf-8"
 os.environ["PYTHONUTF8"] = "1"
@@ -1931,6 +1932,9 @@ class VectorMemory:
                         ids=[doc_id]
                     )
                 logger.debug(f"✅ 记忆存储成功: {vuln_type} @ {target_hash}")
+                await emit_event(ScanEvent.VECTOR_STORE_LOG, {
+                    "op": "add", "vuln_type": vuln_type, "success": success,
+                })
             else:
                 async with _chroma_write_lock:
                     await asyncio.to_thread(
@@ -1985,6 +1989,9 @@ class VectorMemory:
                     except:
                         filtered.append(doc_str)
                 return filtered[:n_results]
+            await emit_event(ScanEvent.VECTOR_STORE_LOG, {
+                "op": "recall", "query": (query or "")[:80], "hits": len(documents or []),
+            })
             return documents
         except Exception as e:
             logger.warning(f"记忆检索失败: {e}")
