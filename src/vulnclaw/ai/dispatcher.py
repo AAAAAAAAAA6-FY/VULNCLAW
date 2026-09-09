@@ -244,6 +244,14 @@ class ReActAgent:
         self._oob_attempted: set = set()
         # 外询专家去重：同一问题只委派一次，控制开销与外部调用次数
         self._expert_asked: set = set()
+        # PGEN-SUPERVISE: 监督三件套计数器（对齐 PentAGI ExecutionMonitorDetector/HardLimit/RepeatingDetector）
+        # 连续同工具计数（触发换策略/深度反思）、总工具调用硬上限（优雅终止）、重复阻断阈值。
+        self._same_tool_streak: int = 0
+        self._last_monitor_tool: Optional[str] = None
+        self._total_tool_calls: int = 0
+        self._monitor_same_tool_limit: int = int(getattr(settings, 'agent_monitor_same_tool_limit', 5))
+        self._monitor_total_tool_limit: int = int(getattr(settings, 'agent_monitor_total_tool_limit', 100))
+        self._repeat_block_limit: int = int(getattr(settings, 'agent_repeat_block_limit', 3))
 
     def _ensure_shared_knowledge(self) -> Dict:
         shared = getattr(self.context, self._shared_knowledge_key, None)
@@ -554,6 +562,34 @@ class ReActAgent:
 
             tool_name = action.get("tool") if isinstance(action, dict) else None
             payload = json.dumps(action.get("params", {}), ensure_ascii=False) if isinstance(action, dict) else str(action)
+            # PGEN-SUPERVISE: 监督三件套——连续同工具/总调用/重复阻断（对齐 PentAGI 防跑飞）
+            if tool_name and tool_name in self.tools:
+                self._total_tool_calls += 1
+                if tool_name == self._last_monitor_tool:
+                    self._same_tool_streak += 1
+                else:
+                    self._same_tool_streak = 1
+                    self._last_monitor_tool = tool_name
+                # RepeatingDetector：连续相同工具达阈值 → 强制换策略（下一轮 _decide_action 避开）
+                if self._same_tool_streak >= self._repeat_block_limit and not self._force_strategy_switch:
+                    self._force_strategy_switch = True
+                    logger.warning(
+                        "[Monitor] 重复工具 %s 连续 %d 次，触发强制换策略",
+                        tool_name, self._same_tool_streak,
+                    )
+                # ExecutionMonitorDetector：连续同工具达更高阈值 → 深度反思（mentor 类比）
+                elif self._same_tool_streak >= self._monitor_same_tool_limit:
+                    logger.warning(
+                        "[Monitor] 工具 %s 连续调用 %d 次，建议深度反思策略",
+                        tool_name, self._same_tool_streak,
+                    )
+                    await self._post_step_reflection(thought, action, result, observation, is_valid)
+                # HardLimit：总工具调用达硬上限 → 优雅终止（避免 runaway）
+                if self._total_tool_calls >= self._monitor_total_tool_limit:
+                    logger.warning(
+                        "[Monitor] 工具调用达硬上限 %d，优雅终止 Agent", self._total_tool_calls
+                    )
+                    break
             self._record_tool_outcome(
                 tool_name,
                 bool(await self._verify_action(action, result)),
@@ -1621,7 +1657,8 @@ ask_expert(question,context,system)：困惑时外询——内部知识盲区/�
             f"【可选工具】{known_tools}\n"
             "【要求】按 侦察(recon)→假设(assume)→验证(verify)→利用(exploit) 四阶段，"
             "输出 JSON 数组，每项 {\"phase\":..., \"tool\":工具名, \"reason\":理由, "
-            "\"expected_observation\":预期观察}。工具必须来自可选工具，数量 3-6 个。"
+            "\"expected_observation\":预期观察, \"success_criteria\":该步完成的判定标准}。"
+            "工具必须来自可选工具，数量 3-6 个；verify/exploit 步必须含 success_criteria（对齐 PentAGI 验证点）。"
             "只输出 JSON 数组。"
         )
         try:
@@ -1668,11 +1705,12 @@ ask_expert(question,context,system)：困惑时外询——内部知识盲区/�
                 "tool": tool,
                 "reason": item.get("reason", "") or item.get("rationale", ""),
                 "expected_observation": item.get("expected_observation", "") or item.get("expected", ""),
+                "success_criteria": item.get("success_criteria", "") or item.get("verification", ""),
             }
         else:
             return None
         if str(tool) in self.tools:
-            return {"phase": "attack", "tool": str(tool), "reason": "", "expected_observation": ""}
+            return {"phase": "attack", "tool": str(tool), "reason": "", "expected_observation": "", "success_criteria": ""}
         return None
 
     def _parse_plan(self, data) -> List[Dict]:

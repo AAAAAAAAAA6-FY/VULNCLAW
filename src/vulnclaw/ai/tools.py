@@ -19,7 +19,7 @@ import shlex
 from vulnclaw.core.logger import logger
 from vulnclaw.core.settings import settings
 from vulnclaw.core.utils import async_get, get_shared_session
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 # ===== 修复：从合并文件导入引擎（而非单文件） =====
 from vulnclaw.engines.web_engines import (
@@ -562,12 +562,52 @@ def _register_native_tools() -> int:
 _register_native_tools()
 
 
+def _fix_tool_args(tool, kwargs: Dict, err: str) -> Optional[Dict]:
+    """PGEN-TCF: ToolCallFixer——按工具 schema（parameters: [{name,...}]）修复参数。
+
+    1) 剔除 schema 外的未知参数（unexpected keyword argument）
+    2) missing/required 类错误补齐缺失 schema 参数为安全空值（交工具内部校验兜底）
+    发生实际修复（fixed != kwargs）才返回修复结果；否则 None 不重试。
+    """
+    try:
+        schema = [
+            p.get("name") for p in (getattr(tool, "parameters", None) or [])
+            if isinstance(p, dict) and p.get("name")
+        ]
+    except Exception:  # noqa: BLE001
+        return None
+    if not schema:
+        return None
+    fixed = {k: v for k, v in kwargs.items() if k in schema}
+    err_lower = str(err).lower()
+    if "missing" in err_lower or "required" in err_lower:
+        for s in schema:
+            fixed.setdefault(s, "")
+    if fixed == kwargs:
+        return None
+    return fixed
+
+
 async def execute_tool(name: str, **kwargs) -> Dict:
     if name not in TOOL_REGISTRY:
         return {"error": f"未知工具: {name}"}
     tool = TOOL_REGISTRY[name]
     try:
         return await tool.execute(**kwargs)
+    except TypeError as e:
+        # PGEN-TCF: 参数类错误 → 按 schema 修复后重试一次（对齐 PentAGI tool_call_fixer）
+        fixed = _fix_tool_args(tool, kwargs, str(e))
+        if fixed is None:
+            logger.error(f"工具 {name} 参数错误（修复失败）: {e}")
+            return {"error": str(e)}
+        logger.warning(
+            f"[ToolCallFixer] 工具 {name} 参数已修复重试: 原始{len(kwargs)}项 -> 修复{len(fixed)}项"
+        )
+        try:
+            return await tool.execute(**fixed)
+        except Exception as e2:  # noqa: BLE001
+            logger.error(f"工具 {name} 修复后仍失败: {e2}")
+            return {"error": str(e2)}
     except Exception as e:
         logger.error(f"工具 {name} 执行异常: {e}")
         return {"error": str(e)}

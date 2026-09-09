@@ -1112,7 +1112,7 @@ try:
     LLAMA_AVAILABLE = True
 except ImportError:
     LLAMA_AVAILABLE = False
-    logger.warning("⚠️ llama-cpp-python 未安装，本地推理不可用。安装: pip install llama-cpp-python")
+    logger.info("llama-cpp-python 未安装，本地推理不可用（可选增强，不影响核心扫描）。安装: pip install llama-cpp-python")
 
 
 class LocalLLM:
@@ -1680,7 +1680,7 @@ if _chromadb_probe():
     CHROMADB_AVAILABLE = True
 else:
     CHROMADB_AVAILABLE = False
-    logger.warning("chromadb 不可用（导入探测失败），记忆系统降级为内存版本")
+    logger.info("chromadb 不可用（导入探测失败），记忆系统降级为内存版本（可选增强）")
 
 _chroma_write_lock = asyncio.Lock()
 
@@ -1745,7 +1745,7 @@ class _MemoryFallback:
         self._fail_data = []
         self._max_entries = max_entries
 
-    async def add_experience(self, target, vuln_type, payload, success, evidence, error_msg="", target_host=""):
+    async def add_experience(self, target, vuln_type, payload, success, evidence, error_msg="", target_host="", doc_type="execution"):
         entry = {
             "target": target,
             "target_host": target_host,
@@ -1753,7 +1753,8 @@ class _MemoryFallback:
             "payload": payload,
             "success": success,
             "evidence": evidence[:200],
-            "error_msg": error_msg[:200]
+            "error_msg": error_msg[:200],
+            "doc_type": doc_type,
         }
         if success:
             self._data.append(entry)
@@ -1840,6 +1841,9 @@ class _MemoryFallback:
         else:
             self._fail_data = []
 
+    async def recall_reusable(self, query, n_results=3):
+        # 降级模式不区分 doc_type，直接复用 recall（通用知识也在其中）
+        return await self.recall(query, n_results, exclude_failures=True)
 
 class VectorMemory:
     def __init__(self, collection_name: str = "pentest_memory"):
@@ -1886,7 +1890,8 @@ class VectorMemory:
         payload: str,
         success: bool,
         evidence: str,
-        error_msg: str = ""
+        error_msg: str = "",
+        doc_type: str = "execution"
     ):
         # A3.5: 统一脱敏——目标只存 hash+host，payload/evidence/error_msg 敏感值置 [REDACTED]
         try:
@@ -1913,7 +1918,7 @@ class VectorMemory:
         }
 
         doc_str = json.dumps(doc)
-        doc_id = f"{target_hash}_{vuln_type}_{hash(payload + str(success))}"
+        doc_id = f"{target_hash}_{vuln_type}_{doc_type}_{hash(payload + str(success))}"
 
         try:
             if success:
@@ -1922,7 +1927,7 @@ class VectorMemory:
                         self.collection.add,
                         documents=[doc_str],
                         metadatas=[{"target": target_hash, "target_host": target_host,
-                                    "vuln_type": vuln_type, "success": str(success)}],
+                                    "vuln_type": vuln_type, "success": str(success), "doc_type": doc_type}],
                         ids=[doc_id]
                     )
                 logger.debug(f"✅ 记忆存储成功: {vuln_type} @ {target_hash}")
@@ -1932,7 +1937,7 @@ class VectorMemory:
                         self.fail_collection.add,
                         documents=[doc_str],
                         metadatas=[{"target": target_hash, "target_host": target_host,
-                                    "vuln_type": vuln_type, "payload": payload[:50]}],
+                                    "vuln_type": vuln_type, "payload": payload[:50], "doc_type": doc_type}],
                         ids=[doc_id]
                     )
                 logger.debug(f"❌ 失败教训存储: {vuln_type} @ {target_hash}")
@@ -2035,6 +2040,24 @@ class VectorMemory:
         except Exception as e:
             logger.warning(f"清理失败记录出错: {e}")
 
+
+    async def recall_reusable(self, query: str, n_results: int = 3) -> List[str]:
+        """PGEN-MEM: 分层记忆——召回跨任务可复用知识（doc_type='reusable'），与本次执行历史隔离。"""
+        if self._fallback_mode:
+            return await self._fallback.recall_reusable(query, n_results)
+        try:
+            results = await asyncio.to_thread(
+                self.collection.query,
+                query_texts=[query],
+                n_results=n_results,
+                where={"doc_type": "reusable"},
+            )
+            if results and results.get('documents'):
+                return results['documents'][0]
+            return []
+        except Exception as e:
+            logger.warning(f"可复用记忆检索失败: {e}")
+            return []
 
 _memory = None
 
