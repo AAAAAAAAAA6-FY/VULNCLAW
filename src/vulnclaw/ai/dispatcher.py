@@ -31,6 +31,7 @@ from vulnclaw.ai.core import (
     get_rule_engine,     # rule_engine 已合并到 core.py
 )
 from vulnclaw.ai.tools import TOOL_REGISTRY, execute_tool
+from vulnclaw.dashboard.server import ScanEvent, emit_event
 
 
 # ==================================================================
@@ -584,6 +585,14 @@ class ReActAgent:
                         tool_name, self._same_tool_streak,
                     )
                     await self._post_step_reflection(thought, action, result, observation, is_valid)
+                # PGEN-EVENT: 监督触发即广播到状态总线（Dashboard 未启动则 no-op）
+                if self._same_tool_streak >= self._repeat_block_limit or self._same_tool_streak >= self._monitor_same_tool_limit:
+                    await emit_event(ScanEvent.AGENT_LOG, {
+                        "tool": tool_name,
+                        "streak": self._same_tool_streak,
+                        "total_calls": self._total_tool_calls,
+                        "phase": "supervisor_trigger",
+                    })
                 # HardLimit：总工具调用达硬上限 → 优雅终止（避免 runaway）
                 if self._total_tool_calls >= self._monitor_total_tool_limit:
                     logger.warning(

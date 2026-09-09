@@ -20,7 +20,50 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 from vulnclaw.core.logger import logger
+from enum import Enum
 from vulnclaw.core.settings import PROJECT_CACHE_DIR, settings
+
+
+class ScanEvent(str, Enum):
+    """PGEN-EVENT: 状态总线事件类型——对齐 PentAGI 10 类事件模型
+    (Flow/Task/AgentLog/TerminalLog/SearchLog/VectorStoreLog/ToolCallLog/Screenshot/AssistantLog/MessageLog)。
+
+    VULNCLAW 本地无 Docker 终端/截图场景，terminal_log/screenshot 保留占位便于未来对齐；
+    其余类型为扫描链路（ReAct 思考、工具调用、记忆读写、情报查询）按类型推送，TUI/Web/Tauri 共用。
+    """
+    FLOW = "flow"
+    TASK = "task"
+    AGENT_LOG = "agent_log"
+    TERMINAL_LOG = "terminal_log"
+    SEARCH_LOG = "search_log"
+    VECTOR_STORE_LOG = "vector_store_log"
+    TOOL_CALL_LOG = "tool_call_log"
+    SCREENSHOT = "screenshot"
+    ASSISTANT_LOG = "assistant_log"
+    MESSAGE_LOG = "message_log"
+
+
+_bus: Optional["DashboardServer"] = None
+
+
+def set_event_bus(bus: "DashboardServer") -> None:
+    """PGEN-EVENT: 注入全局状态总线实例（DashboardServer.start 时调用）。"""
+    global _bus
+    _bus = bus
+
+
+async def emit_event(event_type: str, payload: Dict) -> None:
+    """PGEN-EVENT: 扫描链路发射事件到状态总线。
+
+    无 bus 实例（Dashboard 未启动）时静默 no-op，绝不阻塞/影响主扫描流程
+    （对齐审计增强项"增强项绝不影响主流程"原则）。
+    """
+    if _bus is None:
+        return
+    try:
+        await _bus.broadcast_event(event_type, payload)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 class DashboardServer:
@@ -239,6 +282,18 @@ class DashboardServer:
 
         # 清理断开的连接
         self._ws_clients -= disconnected
+
+    async def broadcast_event(self, event_type: str, payload: Dict) -> None:
+        """PGEN-EVENT: 结构化事件广播（对齐 PentAGI 事件模型）。
+
+        封装 broadcast_update，统一带 event_type/timestamp，供扫描链路（ReAct 思考、
+        工具调用、记忆读写、情报查询等）按 ScanEvent 类型推送，TUI/Web/Tauri 共用。
+        """
+        await self.broadcast_update({
+            "type": str(event_type),
+            "timestamp": time.time(),
+            "data": payload,
+        })
 
     async def _broadcast_loop(self) -> None:
         """定时推送扫描进度（每 500ms）。"""
