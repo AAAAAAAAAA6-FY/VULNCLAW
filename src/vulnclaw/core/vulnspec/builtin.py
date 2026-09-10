@@ -200,7 +200,7 @@ _BUILTIN: List[Dict] = [
         "payloads": ["*", "*)(uid=*", "admin*)((|userPassword=*)"],
         "detect": {
             "type": "regex",
-            "patterns": [r"invalid dn", r"javax\.naming", r"80090308", r"ldap_search", r"Bad search filter"],
+            "patterns": [r"invalid dn", r"javax\.naming", r"80090308", r"ldap_search", r"Bad search filter", r"search filter syntax"],
         },
         "severity": "high",
         "cvss": 7.5,
