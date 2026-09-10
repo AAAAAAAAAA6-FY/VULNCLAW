@@ -1212,6 +1212,30 @@ class SQLiEngine(BaseEngine):
                             except BaseException:
                                 logger.debug("suppressed exception (engine audit)")
                         if ab_result.get('verified', False):
+                            # 准确率修复（纯回显/echo 接口）：这类接口把任意输入原样返回，
+                            # 使 A/B 差异（含数字骨架差异）与反射验证双双通过，把“输入被
+                            # 回显”误判为 SQL 布尔盲注。若无害对照值也产生同量级响应差异，
+                            # 说明差异与 SQL 语义无关（仅参数值被回显），按 fail-closed 不报；
+                            # 真注入仍由 error-based / time-based 及声明侧 sql_error 覆盖。
+                            _benign = '1zq7benign'
+                            try:
+                                _bu = build_attack_url(url, param, _benign, parsed_query)
+                                _br = await async_get(_bu, session=session, timeout=timeout, no_retry=True)
+                                if isinstance(_br, tuple) and len(_br) >= 2 \
+                                        and _br[0] not in (0, 429) and _br[0] < 500:
+                                    _bhas, _bdiff = self.has_response_diff(
+                                        normal_resp,
+                                        (_br[0], self.strip_payload_reflection(_br[1] or "", _benign), {}),
+                                        threshold=0.15,
+                                    )
+                                    if _bhas and _bdiff >= 0.15:
+                                        self.log_debug(
+                                            f"参数 {param} 良性对照亦产生响应差异，"
+                                            f"判定纯回显噪声，按 fail-closed 不报布尔盲注"
+                                        )
+                                        return None
+                            except BaseException:
+                                logger.debug("suppressed exception (engine audit)")
                             # ⑧ 第二层补充：A/B逆命题通过后，重放攻击请求做稳定性复核，
                             #    防止一次性抖动通过A/B（SPA/CDN随机差异）
                             try:

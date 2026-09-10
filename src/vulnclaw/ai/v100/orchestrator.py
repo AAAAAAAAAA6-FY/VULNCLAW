@@ -1170,6 +1170,27 @@ class V100Orchestrator:
         if self._enable_default_creds:
             await self._check_default_creds()
 
+        # 多步序列 / 并发竞态线（2026-09-10）：默认关闭（会真实重复提交业务动作，有副作用）
+        if getattr(settings, "sequence_chain_enabled", False):
+            try:
+                await self._run_sequence_chain_line()
+            except Exception:  # noqa: BLE001 - 序列线异常不阻断 extras
+                logger.debug("suppressed exception (core audit)")
+
+        # 声明驱动产线（2026-09-10）：声明集覆盖老引擎够不到的注入位置
+        if getattr(settings, "vulnspec_line_enabled", True):
+            try:
+                await self._run_vulnspec_line()
+            except Exception:  # noqa: BLE001 - 声明线异常不阻断 extras
+                logger.debug("suppressed exception (core audit)")
+
+        # 元orphic 不变量产线（ID 越权候选为只读，零副作用）
+        if getattr(settings, "metamorphic_line_enabled", True):
+            try:
+                await self._run_metamorphic_line()
+            except Exception:  # noqa: BLE001
+                logger.debug("suppressed exception (core audit)")
+
         if self._enable_business_logic:
             await self._run_business_logic_scan()
         if self._enable_api_version:

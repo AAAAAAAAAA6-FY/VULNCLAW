@@ -514,6 +514,57 @@ class ReActAgent:
                 self._strategy_switched, self._strategy_note or "连续失败",
             )
 
+    async def _monitor_tool_usage(
+        self, tool_name, thought=None, action=None, result=None,
+        observation=None, is_valid=False,
+    ) -> bool:
+        """PGEN-SUPERVISE 监督三件套（对齐 PentAGI ExecutionMonitorDetector /
+        HardLimit / RepeatingDetector）：
+
+        - RepeatingDetector：连续同工具达阈值 → 强制换策略（下轮避开）；
+        - ExecutionMonitorDetector：更高阈值 → 深度反思（_post_step_reflection）；
+        - HardLimit：总工具调用达硬上限 → 返回 True（调用方优雅终止，防 runaway）。
+
+        未知工具/无工具名不计数、不终止（与原内联语义一致）。
+        """
+        if not tool_name or tool_name not in self.tools:
+            return False
+        self._total_tool_calls += 1
+        if tool_name == self._last_monitor_tool:
+            self._same_tool_streak += 1
+        else:
+            self._same_tool_streak = 1
+            self._last_monitor_tool = tool_name
+        # RepeatingDetector：连续相同工具达阈值 → 强制换策略（下一轮 _decide_action 避开）
+        if self._same_tool_streak >= self._repeat_block_limit and not self._force_strategy_switch:
+            self._force_strategy_switch = True
+            logger.warning(
+                "[Monitor] 重复工具 %s 连续 %d 次，触发强制换策略",
+                tool_name, self._same_tool_streak,
+            )
+        # ExecutionMonitorDetector：连续同工具达更高阈值 → 深度反思（mentor 类比）
+        elif self._same_tool_streak >= self._monitor_same_tool_limit:
+            logger.warning(
+                "[Monitor] 工具 %s 连续调用 %d 次，建议深度反思策略",
+                tool_name, self._same_tool_streak,
+            )
+            await self._post_step_reflection(thought, action, result, observation, is_valid)
+        # PGEN-EVENT: 监督触发即广播到状态总线（Dashboard 未启动则 no-op）
+        if self._same_tool_streak >= self._repeat_block_limit or self._same_tool_streak >= self._monitor_same_tool_limit:
+            await emit_event(ScanEvent.AGENT_LOG, {
+                "tool": tool_name,
+                "streak": self._same_tool_streak,
+                "total_calls": self._total_tool_calls,
+                "phase": "supervisor_trigger",
+            })
+        # HardLimit：总工具调用达硬上限 → 优雅终止（避免 runaway）
+        if self._total_tool_calls >= self._monitor_total_tool_limit:
+            logger.warning(
+                "[Monitor] 工具调用达硬上限 %d，优雅终止 Agent", self._total_tool_calls
+            )
+            return True
+        return False
+
     async def run(self) -> Dict:
         logger.info(f"🤖 ReAct Agent 启动，目标: {self.target}")
 
@@ -563,42 +614,9 @@ class ReActAgent:
 
             tool_name = action.get("tool") if isinstance(action, dict) else None
             payload = json.dumps(action.get("params", {}), ensure_ascii=False) if isinstance(action, dict) else str(action)
-            # PGEN-SUPERVISE: 监督三件套——连续同工具/总调用/重复阻断（对齐 PentAGI 防跑飞）
-            if tool_name and tool_name in self.tools:
-                self._total_tool_calls += 1
-                if tool_name == self._last_monitor_tool:
-                    self._same_tool_streak += 1
-                else:
-                    self._same_tool_streak = 1
-                    self._last_monitor_tool = tool_name
-                # RepeatingDetector：连续相同工具达阈值 → 强制换策略（下一轮 _decide_action 避开）
-                if self._same_tool_streak >= self._repeat_block_limit and not self._force_strategy_switch:
-                    self._force_strategy_switch = True
-                    logger.warning(
-                        "[Monitor] 重复工具 %s 连续 %d 次，触发强制换策略",
-                        tool_name, self._same_tool_streak,
-                    )
-                # ExecutionMonitorDetector：连续同工具达更高阈值 → 深度反思（mentor 类比）
-                elif self._same_tool_streak >= self._monitor_same_tool_limit:
-                    logger.warning(
-                        "[Monitor] 工具 %s 连续调用 %d 次，建议深度反思策略",
-                        tool_name, self._same_tool_streak,
-                    )
-                    await self._post_step_reflection(thought, action, result, observation, is_valid)
-                # PGEN-EVENT: 监督触发即广播到状态总线（Dashboard 未启动则 no-op）
-                if self._same_tool_streak >= self._repeat_block_limit or self._same_tool_streak >= self._monitor_same_tool_limit:
-                    await emit_event(ScanEvent.AGENT_LOG, {
-                        "tool": tool_name,
-                        "streak": self._same_tool_streak,
-                        "total_calls": self._total_tool_calls,
-                        "phase": "supervisor_trigger",
-                    })
-                # HardLimit：总工具调用达硬上限 → 优雅终止（避免 runaway）
-                if self._total_tool_calls >= self._monitor_total_tool_limit:
-                    logger.warning(
-                        "[Monitor] 工具调用达硬上限 %d，优雅终止 Agent", self._total_tool_calls
-                    )
-                    break
+            # PGEN-SUPERVISE: 监督三件套（行为等价提取为 _monitor_tool_usage，可单测）
+            if await self._monitor_tool_usage(tool_name, thought, action, result, observation, is_valid):
+                break
             self._record_tool_outcome(
                 tool_name,
                 bool(await self._verify_action(action, result)),

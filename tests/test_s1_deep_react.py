@@ -14,8 +14,11 @@ import logging
 import pytest
 
 from vulnclaw.ai import dispatcher as disp
+from vulnclaw.ai import tools as aitools
+from vulnclaw.ai.core import _MemoryFallback
 from vulnclaw.ai.v100 import orchestrator as v100
 from vulnclaw.ai.v100.phases import phases_executor as pex
+from vulnclaw.dashboard import server as srv
 
 
 def _bare_orchestrator():
@@ -378,3 +381,163 @@ async def test_a1_5_failure_lessons_injected_into_think_prompt():
     await agent._think({"params": [], "tech_stack": [], "status": "200"})
     assert "历史失败教训" in captured["prompt"]
     assert "参数[id]" in captured["prompt"]            # 失败教训必带进下轮 prompt
+
+# ---------------------------------------------------------------------------
+# PGEN-SUPERVISE 监督三件套（对齐 PentAGI）：RepeatingDetector /
+# ExecutionMonitorDetector 深度反思 / HardLimit 优雅终止 / 未知工具忽略
+# ---------------------------------------------------------------------------
+def _monitor_agent(**over):
+    agent = _bare_react_agent()
+    agent.tools = {"sqli": object(), "xss": object()}
+    agent._total_tool_calls = 0
+    agent._same_tool_streak = 0
+    agent._last_monitor_tool = None
+    agent._force_strategy_switch = False
+    agent._repeat_block_limit = 3
+    agent._monitor_same_tool_limit = 5
+    agent._monitor_total_tool_limit = 100
+    agent._reflection_calls = []
+
+    async def _fake_reflect(*_a, **_k):
+        agent._reflection_calls.append(_k.get("thought") if _k else None)
+
+    agent._post_step_reflection = _fake_reflect
+    for k, v in over.items():
+        setattr(agent, k, v)
+    return agent
+
+
+@pytest.mark.asyncio
+async def test_monitor_repeating_detector_forces_strategy_switch(caplog):
+    """RepeatingDetector：连续同工具达阈值 → 强制换策略 + 列车计数正确。"""
+    caplog.set_level(logging.DEBUG, logger="pentest_agent")
+    agent = _monitor_agent()
+    for _ in range(3):
+        assert await agent._monitor_tool_usage(
+            "sqli", thought="t", action={"tool": "sqli"},
+            result={}, observation={}, is_valid=True,
+        ) is False
+    assert agent._force_strategy_switch is True      # 达阈值即触发换策略
+    assert agent._same_tool_streak == 3
+    assert agent._total_tool_calls == 3
+    assert "触发强制换策略" in caplog.text
+    # 换策略触发后同工具继续调用不再重复置位（不幂等破坏），但仍计数
+    assert await agent._monitor_tool_usage(
+        "sqli", thought="t", action={"tool": "sqli"}, result={}, observation={}, is_valid=True,
+    ) is False
+    assert agent._total_tool_calls == 4
+
+
+@pytest.mark.asyncio
+async def test_monitor_execution_detector_triggers_reflection(caplog):
+    """ExecutionMonitorDetector：连续同工具达更高阈值 → 深度反思被调用。"""
+    caplog.set_level(logging.DEBUG, logger="pentest_agent")
+    agent = _monitor_agent()
+    for _ in range(5):
+        await agent._monitor_tool_usage(
+            "sqli", thought="t", action={"tool": "sqli"},
+            result={}, observation={"message": "o"}, is_valid=False,
+        )
+    assert len(agent._reflection_calls) >= 1          # 深度反思触发
+    assert agent._force_strategy_switch is True       # 先经 RepeatingDetector 置位
+    assert "建议深度反思策略" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_monitor_hardlimit_graceful_termination(caplog):
+    """HardLimit：总工具调用达硬上限 → 返回 True（优雅终止信号，防 runaway）。"""
+    caplog.set_level(logging.DEBUG, logger="pentest_agent")
+    agent = _monitor_agent(_monitor_total_tool_limit=3)
+    for i in range(3):
+        terminated = await agent._monitor_tool_usage(
+            "sqli" if i % 2 == 0 else "xss", thought="t",
+            action={}, result={}, observation={}, is_valid=True,
+        )
+    assert terminated is True                          # 第 3 次调用达上限
+    assert agent._total_tool_calls == 3
+    assert "优雅终止 Agent" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_monitor_ignores_unknown_tool():
+    """未知工具/无工具名：不计数、不终止（不产生副作用）。"""
+    agent = _monitor_agent()
+    assert await agent._monitor_tool_usage(
+        "unknown_tool", thought="t", action={}, result={}, observation={}, is_valid=True,
+    ) is False
+    assert await agent._monitor_tool_usage(
+        None, thought="t", action={}, result={}, observation={}, is_valid=True,
+    ) is False
+    assert agent._total_tool_calls == 0
+    assert agent._same_tool_streak == 0
+
+# ---------------------------------------------------------------------------
+# PGEN 能力落地专项断言（对面交付 39858e3/e807342 引入，补齐无测试锁定缺口）
+# ToolCallFixer / 记忆分层 doc_type / Planner 验证点 success_criteria / 状态总线 no-op
+# ---------------------------------------------------------------------------
+class _SchemaTool:
+    """带 parameters schema 的假工具：缺 url 即 TypeError（模拟 LLM 漏参）。"""
+    parameters = [{"name": "url"}, {"name": "timeout"}]
+
+    async def execute(self, **kwargs):
+        if "url" not in kwargs:
+            raise TypeError("execute() missing required argument: 'url'")
+        return {"ok": True, "url": kwargs["url"]}
+
+
+class _AlwaysFailTool:
+    parameters = [{"name": "url"}]
+
+    async def execute(self, **kwargs):
+        raise TypeError("boom")
+
+
+@pytest.mark.asyncio
+async def test_tool_call_fixer_repairs_missing_arg(monkeypatch):
+    """PGEN-TCF：缺失必填参数 → 按 schema 补空串重试成功；未知参数被剔除。"""
+    monkeypatch.setitem(aitools.TOOL_REGISTRY, "__fake_schema_tool__", _SchemaTool())
+    res = await aitools.execute_tool("__fake_schema_tool__", bogus=1)
+    assert res == {"ok": True, "url": ""}   # bogus 剔除 + url 补空串
+
+
+@pytest.mark.asyncio
+async def test_tool_call_fixer_retries_only_once(monkeypatch, caplog):
+    """PGEN-TCF：修复后仍失败 → 返回错误且不二次重试（只修一次）。"""
+    caplog.set_level(logging.DEBUG, logger="pentest_agent")
+    monkeypatch.setitem(aitools.TOOL_REGISTRY, "__always_fail_tool__", _AlwaysFailTool())
+    res = await aitools.execute_tool("__always_fail_tool__", unknown=1)
+    assert res == {"error": "boom"}
+    assert "修复后仍失败" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_memory_layering_doc_type_in_fallback():
+    """PGEN-MEM：降级记忆 doc_type 落库，recall_reusable 复用 recall 不抛错。"""
+    mf = _MemoryFallback(max_entries=10)
+    await mf.add_experience("http://t1", "sqli", "payload1", True, "ev1", doc_type="reusable")
+    assert mf._data[0]["doc_type"] == "reusable"        # 分层字段落库
+    assert mf._data[0]["target"] == "http://t1"         # 明文目标仅限降级内存模式
+    hits = await mf.recall_reusable("sqli", n_results=3)
+    assert hits and "sqli" in hits[0]
+
+
+def test_plan_step_carries_success_criteria():
+    """PGEN-PLAN：Planner 验证点——success_criteria 经 _parse_plan 透传保留。"""
+    agent = _bare_react_agent()
+    agent.tools = {"sqli": object()}
+    data = [{
+        "phase": "verify", "tool": "sqli", "reason": "确认注入点",
+        "expected_observation": "行数差异", "success_criteria": "HTTP 200 且 2 rows vs 0 rows",
+    }]
+    steps = agent._parse_plan(data)
+    assert steps and steps[0]["success_criteria"] == "HTTP 200 且 2 rows vs 0 rows"
+    assert steps[0]["expected_observation"] == "行数差异"
+
+
+@pytest.mark.asyncio
+async def test_emit_event_noop_without_bus(monkeypatch):
+    """PGEN-EVENT：未注入 bus 时 emit_event 静默不抛（绝不阻塞扫描）。"""
+    monkeypatch.setattr(srv, "_bus", None)
+    await srv.emit_event(srv.ScanEvent.AGENT_LOG, {"tool": "sqli"})   # 不抛即过
+    assert srv._bus is None

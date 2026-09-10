@@ -21,7 +21,7 @@
    执行时：独立子进程 + 内存限制 + 硬超时 + 无任何凭据环境。
 
 成本护栏：每个目标 LLM 调用上限 1 次（cheap 档），任何异常静默降级 C。
-审计：每次分诊结果 JSON 落盘 data/js_triage/（可随 settings.js_triage_audit_dir 调整）。
+审计：每次分诊结果 JSON 落盘 _runtime_cache/js_triage/（可随 settings.js_triage_audit_dir 调整）。
 """
 from __future__ import annotations
 
@@ -160,7 +160,7 @@ class JSTriage:
         # 可注入 LLM 回调（测试替身/后续替换模型档位）；None=默认 cheap 档直调
         self._llm_ask = llm_ask or self._llm_ask_default
         if audit_dir is None:
-            audit_dir = getattr(settings, "js_triage_audit_dir", "data/js_triage")
+            audit_dir = getattr(settings, "js_triage_audit_dir", "_runtime_cache/js_triage")
         self.audit_dir = Path(str(audit_dir))
 
     # -- 主入口 ------------------------------------------------------------

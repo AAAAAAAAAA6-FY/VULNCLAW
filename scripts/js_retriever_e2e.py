@@ -39,7 +39,7 @@ def fetch(url: str) -> tuple:
 def main() -> int:
     # 1) 起靶场
     proc = subprocess.Popen(
-        [sys.executable, BASE + r"\poc_js_target\sign_lab.py", "--port", str(PORT)],
+        [sys.executable, BASE + r"\scripts\poc_js_target\sign_lab.py", "--port", str(PORT)],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         encoding="utf-8", errors="replace",
     )

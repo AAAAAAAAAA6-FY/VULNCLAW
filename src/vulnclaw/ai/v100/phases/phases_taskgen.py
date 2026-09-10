@@ -165,6 +165,208 @@ async def _run_idor_dual_session_line(self) -> int:
         return 0
 
 
+def _collect_write_candidates(brief, target: str = ""):
+    """收集"非幂等写操作"候选端点（并发竞态探测目标）。
+
+    只取真实观测端点（forms 的 action 优先，其次 crawled_endpoints 的写语义路径），
+    证据优先、宁缺毋滥——无候选则竞态线整条跳过。
+    """
+    import re as _re
+
+    # 动作语义端点（可逆 + 不可逆都先识别，后面按闸门筛掉不可逆/资金类）
+    hint = _re.compile(
+        r"(?:/|^)(?:create|add|submit|order|pay|checkout|claim|coupon|withdraw|"
+        r"transfer|recharge|cart|buy|apply|redeem|favorite|collect|"
+        r"领|券|加购|收藏|兑换|申请)(?:/|$|[_-])",
+        _re.IGNORECASE,
+    )
+    # 不可逆动作：命中即产生真实业务后果（下单/支付/结算/转账…），默认排除
+    irreversible = _re.compile(
+        r"(?:pay|payment|checkout|order|buy|purchase|submit|transfer|withdraw|"
+        r"recharge|refund|settle|下单|支付|购买|结算|转账|提现|充值|退款|提交订单)",
+        _re.IGNORECASE,
+    )
+    cands = []
+    for form in (brief or {}).get("forms", []) or []:
+        if not isinstance(form, dict):
+            continue
+        u = form.get("action") or form.get("url") or ""
+        if isinstance(u, str) and u.startswith(("http://", "https://")):
+            cands.append(u)
+    cands.extend(u for u in (brief or {}).get("crawled_endpoints", []) or []
+                 if isinstance(u, str) and u)
+    if target and str(target).startswith(("http://", "https://")):
+        cands.insert(0, str(target))
+
+    # 安全闸：白名单优先 + 资金类默认排除（竞态成功 = 真实业务/资金变动）
+    allowlist = [s.strip() for s in str(
+        getattr(settings, "sequence_endpoint_allowlist", "") or "").split(",") if s.strip()]
+    allow_financial = bool(getattr(settings, "sequence_allow_financial", False))
+    allow_irreversible = bool(getattr(settings, "sequence_allow_irreversible", False))
+    financial = _re.compile(
+        r"(?:pay|payment|transfer|withdraw|recharge|refund|提现|转账|支付|充值|退款)",
+        _re.IGNORECASE,
+    )
+
+    seen, out = set(), []
+    for u in cands:
+        if u in seen or not hint.search(u):
+            continue
+        if allowlist and not any(a in u for a in allowlist):
+            continue  # 白名单模式：只对显式指定的端点做竞态
+        if not allow_irreversible and irreversible.search(u):
+            continue  # 不可逆动作默认排除：命中即真实业务后果，不可撤销
+        if not allow_financial and financial.search(u):
+            continue  # 资金类端点默认排除，避免真实资金损失
+        seen.add(u)
+        out.append(u)
+    return out
+
+
+async def _run_sequence_chain_line(self) -> int:
+    """多步序列 / 并发竞态线：对非幂等写操作候选端点做并发竞态探测。
+
+    ⚠️ 副作用：竞态探测会真实重复提交业务动作（重复下单/领券/扣减），
+    默认关闭（settings.sequence_chain_enabled=False），仅在明确授权且
+    接受副作用时开启。返回产出 finding 数。
+    """
+    if not getattr(settings, "sequence_chain_enabled", False):
+        return 0
+    try:
+        from vulnclaw.engines.sequence_engines import SequenceChainEngine
+    except Exception as e:  # noqa: BLE001 - 引擎缺失不阻断 extras
+        logger.warning(f"⚠️ [序列链] 引擎初始化失败: {e}")
+        return 0
+    try:
+        engine = SequenceChainEngine()
+        cands = _collect_write_candidates(self._recon_brief or {}, self.target or "")
+        if not cands:
+            logger.info("ℹ️ [序列链] 无非幂等写操作候选端点，跳过")
+            return 0
+        budget = int(getattr(settings, "sequence_max_probes", 3) or 3)
+        made = 0
+        for url in cands[:budget]:
+            try:
+                f = await engine.detect_race(url, session=None, method="POST")
+            except Exception:  # noqa: BLE001 - 单候选失败不阻断
+                logger.debug("suppressed exception (core audit)")
+                continue
+            if f:
+                self._add_finding(f)
+                self._sequence_findings = getattr(self, "_sequence_findings", 0) + 1
+                made += 1
+        logger.info(f"🧩 [序列链] 完成：{len(cands)} 候选 → {made} 发现")
+        return made
+    except Exception as e:  # noqa: BLE001 - 序列线异常不阻断 extras
+        logger.warning(f"⚠️ [序列链] 异常（fail-closed 跳过）: {e}")
+        return 0
+
+
+def _collect_probe_endpoints(brief, target: str = ""):
+    """收集可供声明/元orphic 探针使用的端点。
+
+    探针必须有"可控点"才有意义，因此优先带 query 的 URL；
+    只取真实观测端点（crawled_endpoints / forms action），证据优先。
+    """
+    eps = []
+    for u in (brief or {}).get("crawled_endpoints", []) or []:
+        if isinstance(u, str) and u.startswith(("http://", "https://")):
+            eps.append(u)
+    for form in (brief or {}).get("forms", []) or []:
+        if not isinstance(form, dict):
+            continue
+        u = form.get("action") or form.get("url") or ""
+        if isinstance(u, str) and u.startswith(("http://", "https://")):
+            eps.append(u)
+    if target and str(target).startswith(("http://", "https://")):
+        eps.insert(0, str(target))
+
+    seen, uniq = set(), []
+    for u in eps:
+        if u not in seen:
+            seen.add(u)
+            uniq.append(u)
+    # 带 query 的排前面（无参数的端点没有可控点，探针无事可做）
+    uniq.sort(key=lambda x: ("?" not in x, len(x)))
+    return uniq
+
+
+async def _run_vulnspec_line(self) -> int:
+    """声明驱动产线：对候选端点执行内置漏洞声明集。
+
+    价值：覆盖老引擎够不到的注入位置（JSON / header / cookie / 路径段），
+    并以"加声明不加代码"的方式覆盖 22 类漏洞。返回产出 finding 数。
+    """
+    if not getattr(settings, "vulnspec_line_enabled", True):
+        return 0
+    try:
+        from vulnclaw.core.attack_surface import spec_from_url
+        from vulnclaw.core.vulnspec import SpecRunner
+    except Exception as e:  # noqa: BLE001 - 模块缺失不阻断 extras
+        logger.warning(f"⚠️ [声明线] 初始化失败: {e}")
+        return 0
+    try:
+        eps = _collect_probe_endpoints(self._recon_brief or {}, self.target or "")
+        if not eps:
+            logger.info("ℹ️ [声明线] 无候选端点，跳过")
+            return 0
+        budget = int(getattr(settings, "vulnspec_max_endpoints", 10) or 10)
+        runner = SpecRunner()
+        made = 0
+        for ep in eps[:budget]:
+            try:
+                findings = await runner.run(spec_from_url(ep, "GET"))
+            except Exception:  # noqa: BLE001 - 单端点失败不阻断
+                logger.debug("suppressed exception (core audit)")
+                continue
+            for f in findings or []:
+                self._add_finding(f)
+                made += 1
+        logger.info(f"📐 [声明线] 完成：{len(eps)} 候选 → {made} 发现")
+        return made
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"⚠️ [声明线] 异常（fail-closed 跳过）: {e}")
+        return 0
+
+
+async def _run_metamorphic_line(self) -> int:
+    """元orphic 不变量产线：跨业务通用的逻辑漏洞元规则（零业务知识）。
+
+    只读元规则（ID 越权候选）随开关默认执行；金额篡改 / 重放等会改变业务状态的
+    规则由 `metamorphic_allow_state_changing` 另行控制（默认关闭）。
+    """
+    if not getattr(settings, "metamorphic_line_enabled", True):
+        return 0
+    try:
+        from vulnclaw.core.attack_surface import spec_from_url
+        from vulnclaw.engines.metamorphic_engines import MetamorphicEngine
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"⚠️ [元规则线] 初始化失败: {e}")
+        return 0
+    try:
+        eps = _collect_probe_endpoints(self._recon_brief or {}, self.target or "")
+        if not eps:
+            logger.info("ℹ️ [元规则线] 无候选端点，跳过")
+            return 0
+        budget = int(getattr(settings, "metamorphic_max_endpoints", 10) or 10)
+        engine = MetamorphicEngine()
+        made = 0
+        for ep in eps[:budget]:
+            try:
+                findings = await engine.probe_spec(spec_from_url(ep, "GET"))
+            except Exception:  # noqa: BLE001
+                logger.debug("suppressed exception (core audit)")
+                continue
+            for f in findings or []:
+                self._add_finding(f)
+                made += 1
+        logger.info(f"🧩 [元规则线] 完成：{len(eps)} 候选 → {made} 发现")
+        return made
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"⚠️ [元规则线] 异常（fail-closed 跳过）: {e}")
+        return 0
+
+
 async def _run_nuclei_community_line(self) -> int:
     """C 方案社区线：Nuclei 社区模板通用检测（主域根 + 端点预算）。返回产出 finding 数。"""
     if not getattr(settings, "nuclei_community_line", True):
@@ -1149,5 +1351,7 @@ async def _inject_task_memory_hints(self):
         logger.debug(f"[TaskMem] 记忆召回/注入失败（不影响任务生成）: {exc}")
 
 
-__all__ = ['_check_default_creds', '_gen_cve_task', '_generate_tasks', '_collect_idor_candidates', '_inject_task_memory_hints', '_run_idor_dual_session_line', '_run_nuclei_community_line', '_scan_idor']
+__all__ = ['_check_default_creds', '_gen_cve_task', '_generate_tasks', '_collect_idor_candidates', '_inject_task_memory_hints', '_run_idor_dual_session_line', '_run_nuclei_community_line', '_run_sequence_chain_line', '_collect_write_candidates',
+                 '_run_vulnspec_line', '_run_metamorphic_line', '_collect_probe_endpoints',
+                 '_scan_idor']
 

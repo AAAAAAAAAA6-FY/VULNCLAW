@@ -395,6 +395,38 @@ class Settings(BaseSettings):
     idor_shell_sim_threshold: float = Field(0.85, alias="IDOR_SHELL_SIM_THRESHOLD")
     # 本阶段探测预算（每个候选端点的最大请求对数量）
     idor_max_probes: int = Field(40, alias="IDOR_MAX_PROBES")
+    # ===== 多步序列 / 并发竞态（2026-09-10）=====
+    # ⚠️ 竞态探测会真实重复提交业务动作（重复下单/领券/扣减），存在业务副作用；
+    #    默认关闭，仅在明确授权且接受副作用时开启。
+    # 默认开启：已由"串行预检 + 只测可逆动作"兜底——有防重的正常系统在预检阶段即被判无竞态
+    #    并完全不并发；只有疑似无防重时才并发，且只针对可逆动作（领券/加购/收藏，可撤销）。
+    sequence_chain_enabled: bool = Field(True, alias="SEQUENCE_CHAIN_ENABLED")
+    # 单个端点并发请求数（引擎内部再夹到 [2,20]）
+    sequence_race_concurrency: int = Field(8, alias="SEQUENCE_RACE_CONCURRENCY")
+    # 候选端点预算（写操作端点数）
+    sequence_max_probes: int = Field(3, alias="SEQUENCE_MAX_PROBES")
+    # 多步序列最大步数
+    sequence_max_steps: int = Field(5, alias="SEQUENCE_MAX_STEPS")
+    # 资金类端点（pay/transfer/withdraw/支付/转账/提现/退款…）默认排除——竞态成功即真实资金变动，
+    # 仅在明确知情并接受资金损失风险时开启。
+    sequence_allow_financial: bool = Field(False, alias="SEQUENCE_ALLOW_FINANCIAL")
+    # 不可逆动作（order/pay/checkout/settle/buy/下单/支付/结算/购买…）默认排除。
+    #    可逆动作（领券/加购/收藏/申请/兑换）即使命中也可撤销；不可逆动作命中即真实业务后果，
+    #    仅在明确知情时开启（且资金类还需同时开 sequence_allow_financial）。
+    sequence_allow_irreversible: bool = Field(False, alias="SEQUENCE_ALLOW_IRREVERSIBLE")
+    # 端点白名单（逗号分隔的 URL 片段）。非空时**只**对这些端点做竞态探测——最安全的用法：
+    # 先在靶场/预发确认端点语义，再定点跑，避免自动爬取误伤关键业务。
+    sequence_endpoint_allowlist: str = Field("", alias="SEQUENCE_ENDPOINT_ALLOWLIST")
+    # ===== 元orphic 不变量探针（2026-09-10）：跨业务通用的逻辑漏洞元规则 =====
+    # 总开关。只读元规则（ID 越权候选）零副作用，随本开关默认开启。
+    metamorphic_enabled: bool = Field(True, alias="METAMORPHIC_ENABLED")
+    # 会改变业务状态的元规则（金额篡改会创建订单、重放会重复提交）需显式授权。
+    metamorphic_allow_state_changing: bool = Field(False, alias="METAMORPHIC_ALLOW_STATE_CHANGING")
+    # ===== 编排产线开关（2026-09-10）：把声明引擎与元orphic 探针接入 extras =====
+    vulnspec_line_enabled: bool = Field(True, alias="VULNSPEC_LINE_ENABLED")
+    vulnspec_max_endpoints: int = Field(10, alias="VULNSPEC_MAX_ENDPOINTS")
+    metamorphic_line_enabled: bool = Field(True, alias="METAMORPHIC_LINE_ENABLED")
+    metamorphic_max_endpoints: int = Field(10, alias="METAMORPHIC_MAX_ENDPOINTS")
     max_forms: int = Field(0, alias="MAX_FORMS")                           # 表单数
     max_js_endpoints: int = Field(0, alias="MAX_JS_ENDPOINTS")             # JS/API 端点数（含静态收割、迭代）
     max_api_endpoints: int = Field(0, alias="MAX_API_ENDPOINTS")           # API 端点任务数

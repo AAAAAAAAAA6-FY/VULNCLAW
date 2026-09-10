@@ -18,7 +18,7 @@ target URL（build_attack_url 天然保留原 query，签名随引擎每次 payl
 护栏：
   - budget：settings.js_signer_max_gen_per_target（默认 20），超限返回 None 不抛
   - 原子性：线程安全（并发 taskgen/executor 读）
-  - 审计：每次 generate 落盘 data/js_signer/<ts>.json（与 K.2 triage 审计并列）
+  - 审计：每次 generate 落盘 _runtime_cache/js_signer/<ts>.json（与 K.2 triage 审计并列）
 """
 from __future__ import annotations
 
@@ -101,7 +101,7 @@ class SignerPool:
         self._gen_count: dict[str, int] = {}
         self._lock = threading.Lock()
         if audit_dir is None:
-            audit_dir = getattr(settings, "js_signer_audit_dir", "data/js_signer")
+            audit_dir = getattr(settings, "js_signer_audit_dir", "_runtime_cache/js_signer")
         self.audit_dir = Path(str(audit_dir))
         self._budget = int(getattr(settings, "js_signer_max_gen_per_target", 20) or 20)
 
