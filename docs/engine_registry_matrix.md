@@ -2,13 +2,14 @@
 
 > 由 `scripts/engine_registry_check.py` 生成，**只核对不改注册**。
 > 三方：A 引擎类定义（`engines/*.py`）｜ B 导出（`engines/__init__.py`）｜ C 任务池（`phases_taskgen.py`）。
+> 注意：这里是静态注册矩阵；继承得到的名称、模块常量名称或动态注册可能不在 静态表中。运行时实际发现/实例化数量以扫描报告的 `engine_inventory` 为准。
 
-引擎总数：**73**
+引擎总数：**83**
 
 | 状态 | 数量 | 含义 |
 |---|---|---|
-| OK（已接入注册/调度链路） | 72 | 已出现在 __init__ 导出或 taskgen 任务池（引擎实际为 glob 自动发现，未显式导出属正常） |
-| 两处均缺（需确认是否跑得到） | 1 | 既未导出也未入池，需确认是遗漏注册还是已废弃 |
+| OK（已接入注册/调度链路） | 83 | 已出现在 __init__ 导出或 taskgen 任务池（引擎实际为 glob 自动发现，未显式导出属正常） |
+| 两处均缺（需确认是否跑得到） | 0 | 既未导出也未入池，需确认是遗漏注册还是已废弃 |
 
 ## 明细
 
@@ -16,6 +17,7 @@
 |---|---|---|---|---|---|---|
 | `admin_console_exposure` | framework_zero_day_engines_2.py | AdminConsoleExposureEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
 | `api_security` | api_security_engines.py | APISecurityEngine | 是 | 否 | 是 | OK（已接入注册/调度链路） |
+| `api_version` | api_version.py | APIVersionEngine | 是 | 否 | 是 | OK（已接入注册/调度链路） |
 | `api_version_diff` | auxiliary_engines.py | APIVersionDiffEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
 | `auth_enumeration` | leak_logic_engines.py | AuthEnumerationEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
 | `backend_component_cve` | logic_leak_engines_2.py | BackendComponentFingerprintEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
@@ -30,11 +32,15 @@
 | `cors` | input_engines.py | CORSEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
 | `crlf` | input_engines.py | CRLFEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
 | `csrf` | http_advanced_engines.py | CSRFEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
+| `css_exfiltration` | web_advanced_engines.py | CssExfiltrationEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
+| `deep_chimera` | deep_chimera.py | DeepChimeraEngine | 是 | 否 | 是 | OK（已接入注册/调度链路） |
 | `deserialization` | deserialization.py | DeserializationEngine | 是 | 否 | 是 | OK（已接入注册/调度链路） |
+| `dns_rebinding` | net_engines.py | DnsRebindingEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
 | `dns_security` | net_engines.py | DnsSecurityEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
+| `dom_clobbering` | dom_clobbering.py | DOMClobberingEngine | 是 | 否 | 否 | OK（已接入注册/调度链路） |
 | `dotnet_deserialization` | dotnet_deserialization.py | DotNetDeserializationEngine | 是 | 否 | 是 | OK（已接入注册/调度链路） |
 | `el_injection` | input_engines.py | ELInjectionEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
-| `exposure_fingerprint` | exposure_fingerprint_engine.py | ExposureFingerprintEngine | 否 | 否 | 否 | 两处均缺（需确认是否跑得到） |
+| `exposure_fingerprint` | exposure_fingerprint_engine.py | ExposureFingerprintEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
 | `fastjson_deserialization` | framework_zero_day_engines.py | FastjsonDeserializationEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
 | `file_upload` | input_engines.py | FileUploadEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
 | `graphql` | net_engines.py | GraphQLEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
@@ -53,11 +59,13 @@
 | `llm_injection` | llm_security_engines.py | LLMInjectionEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
 | `log4shell` | framework_zero_day_engines.py | Log4ShellEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
 | `mass_assignment` | api_security_engines.py | MassAssignmentEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
+| `metamorphic` | metamorphic_engines.py | MetamorphicEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
 | `mobile_api` | mobile_engines.py | MobileAPIEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
 | `nacos_exposure` | middleware_exposure_engines.py | NacosExposureEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
 | `nosql` | web_engines.py | NoSQLEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
 | `oauth` | auth_engines.py | OAuthEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
 | `open_redirect` | http_engines.py | OpenRedirectEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
+| `parsing_shadow` | parsing_shadow.py | ParsingShadowEngine | 是 | 否 | 是 | OK（已接入注册/调度链路） |
 | `password_reset` | auth_engines.py | PasswordResetEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
 | `prometheus_metrics` | logic_leak_engines_2.py | PrometheusMetricsExposureEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
 | `prototype_pollution` | web_advanced_engines.py | PrototypePollutionEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
@@ -66,6 +74,7 @@
 | `request_smuggling` | auxiliary_engines.py | RequestSmugglingEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
 | `rfi` | web_engines.py | RFIEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
 | `security_headers` | http_engines.py | SecurityHeadersEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
+| `sequence_chain` | sequence_engines.py | SequenceChainEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
 | `session` | auth_engines.py | SessionEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
 | `shiro_rememberme` | framework_zero_day_engines_2.py | ShiroRememberMeEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
 | `solr_exposure` | middleware_exposure_engines.py | SolrExposureEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
@@ -77,6 +86,7 @@
 | `ssi_injection` | web_advanced_engines.py | SSIInjectionEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
 | `ssrf` | net_engines.py | SSRFEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
 | `ssti` | web_engines.py | SSTIEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
+| `state_chain` | state_chain.py | StateChainEngine | 是 | 否 | 是 | OK（已接入注册/调度链路） |
 | `struts2_ognl` | framework_zero_day_engines.py | Struts2OGNLEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
 | `swagger_api_doc` | logic_leak_engines_2.py | SwaggerApiDocEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
 | `tls_security` | net_engines.py | TlsSecurityEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
@@ -84,52 +94,10 @@
 | `view_state` | framework_zero_day_engines.py | ViewStateEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
 | `weak_credential` | auth_engines.py | WeakCredentialEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
 | `web_cache_deception` | http_advanced_engines.py | WebCacheDeceptionEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
+| `websocket_security` | websocket_security.py | WebSocketSecurityEngine | 是 | 否 | 是 | OK（已接入注册/调度链路） |
 | `xpath_injection` | web_advanced_engines.py | XPathInjectionEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
 | `xss` | web_engines.py | XSSEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
 | `xxe` | net_engines.py | XXEEngine | 否 | 否 | 是 | OK（已接入注册/调度链路） |
-
-## 任务池中未匹配到引擎定义的名字（需人工确认）
-
-- `access_key`
-- `ai_reason`
-- `ai_verdict`
-- `alive_assets`
-- `api_calls_saved`
-- `api_check`
-- `api_key`
-- `api_version`
-- `asset_profile_ttl_hours`
-- `auth_token`
-- `base_len`
-- `burp_params`
-- `business_flow_modeling`
-- `client_secret`
-- `crawl_noparam`
-- `crawl_noparam_ssrf`
-- `crawled_endpoints`
-- `created_at`
-- `csrf_token`
-- `cve_id`
-- `cve_ids`
-- `cve_meta`
-- `cve_scan`
-- `deep_chimera`
-- `enable_subdomain_taskgen`
-- `engine`
-- `engine_bundle`
-- `engine_check`
-- `engines`
-- `global_scan`
-- `idor_max_probes`
-- `incremental_scan`
-- `instruction_context`
-- `js_endpoints`
-- `line_target`
-- `max_extra_engines_per_param`
-- `max_param_mining`
-- `max_paths`
-- `max_subdomain_targets`
-- `max_total_tasks`
 
 ## 处置原则
 

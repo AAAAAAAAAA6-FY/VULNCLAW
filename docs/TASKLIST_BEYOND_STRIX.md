@@ -1132,3 +1132,114 @@
 ### §27.6 文档与安全
 - README「方式三：指令直写账号密码」：用法示例（长句/中文全参数/多账号文件）+ 指令要素表 + 行为安全说明（降级链、失败回退、脱敏、凭据不进 git）。
 - 安全红线：指令文件含真实密码 → 建议 .gitignore；指令内联配合 shell 历史保护；日志侧全程脱敏。
+
+***
+
+## 28. HUNTER_100 批次（2026-09-11，双 Agent 并行；A 池=CodeBuddy CN，B 池=对面）
+
+### §28.0 目标与定位
+
+**要补的能力空洞**：**逻辑漏洞 / 业务逻辑缺陷**。现有 92,426 行核心、75 引擎、25 条声明（vulnspec）
+全部集中在「有 payload 特征」的注入类（SQLi/XSS/SSTI/LFI/CMDi/NoSQL/LDAP/反序列化…），
+对**无 payload 特征**的一类基本零覆盖：越权（IDOR/垂直）、金额/数量篡改、流程跳跃与状态机绕过、
+幂等破坏与竞态、参数域越界（负值/溢出/科学计数）。
+
+**A 池三件套链路**：`A2 逆向出 IR` → `A1 在 IR 上做符号化路径探索` → `A3 把单点发现规划成多步链`。
+护城河逻辑：AI 越强，**确定性验证层 + 业务模型层**越值钱；A2 是 LLM 唯一能"逆向"出的东西，
+A1 是纯确定性（可审计、可复现），A3 是二者的收口。
+
+### §28.1 冻结接口（字段先行；A1/A2/A3/B 池各自独立实现，不再互相等待）
+
+**IR（A2 产出；A1/A3/B2 消费）** —— `ir-1`：
+```
+BusinessIR = {
+  "target": str, "version": "ir-1",
+  "entities":  [{"name","key","fields":[{"name","type","domain"}]}],
+  "endpoints": [{"id","method","path","params":[{"name","in","type","domain","required"}],
+                 "auth":{"required":bool,"role":str|None},
+                 "effects":[{"entity","op","field"}],      # read/write/create/delete
+                 "idempotent":bool,
+                 "observations":{"status":[...],"sample_responses":[...]}}],
+  "transitions":[{"from_state","to_state","via_endpoint",
+                  "preconditions":[...],"postconditions":[...]}],
+  "invariants":[{"id","expr","kind":"arithmetic|monotonic|set|temporal","confidence":float}],
+  "goals":     [{"id","desc","predicate"}],                # 攻击目标谓词
+  "confidence": float,
+  "sources":   [{"kind":"http_trace|js_ast|openapi|llm","ref":str}]
+}
+```
+
+**SymbolicFinding（A1 产出；并入既有 findings 流，字段对齐 `_add_finding`）**：
+```
+{"engine":"symbolic_logic","vuln_type","severity","url","method","parameter","payload",
+ "constraint_trace":[...], "path":[endpoint_id,...],
+ "ir_ref":{"invariant":id|None,"goal":id|None},
+ "evidence","confidence":float,"deterministic":True}
+```
+
+**AttackChain（A3 产出）**：
+```
+{"id","goal","steps":[{"action":"endpoint|engine_action","requires":[...],"produces":[...],
+  "finding_ref"|None}],"feasible":bool,"score":float,"executed":bool,"verify":{...}}
+```
+
+### §28.2 A1 符号执行支柱（新目录 `src/vulnclaw/engines/symbolic/` + 单文件引擎）
+
+| 文件 | 职责 |
+|---|---|
+| `symbolic/values.py` | 符号值 `SymInt/SymFloat/SymStr/SymEnum` + 域（区间/枚举/正则）+ 约束（线性不等式/等值/集合成员） |
+| `symbolic/solver.py` | 约束求解：内置区间传播 + 线性不等式消元；**可选 z3 后端**（装了才用，缺则降级，零新硬依赖） |
+| `symbolic/state.py` | 应用状态（实体实例集 + 会话/角色 + 可达性）；快照/回滚 |
+| `symbolic/executor.py` | 路径探索：转移=HTTP 请求；BFS + 启发式剪枝 + 目标导向反向切片；只读优先 |
+| `symbolic/objectives.py` | 目标谓词库：越权/金额/数量/负值/溢出/流程跳跃/幂等破坏 |
+| `symbolic/detectors.py` | 差分 oracle（同 IR 两次赋值 → 不变量违反）+ B2 不变量引擎对接口 |
+| `symbolic_engine.py` | engines 层入口：`name="symbolic_logic"`，实现 `BaseEngine.detect`，消费 IR → SymbolicFinding |
+
+- **安全闸**：默认只读（`symbolic_allow_state_changing=False`）；写操作必须过 `danger_guard` + 授权；无 IR → fail-closed（不产出）。
+
+### §28.3 A2 LLM 逆向 → IR 还原链（新目录 `src/vulnclaw/core/business_ir/`）
+
+| 文件 | 职责 |
+|---|---|
+| `schema.py` | IR 数据结构 + 校验 + 版本迁移 |
+| `observations.py` | 观测抽取：LiveIntake / HTTP 轨迹 / JS AST / OpenAPI-Swagger / 表单 |
+| `features.py` | 端点聚类、参数类型与域推断、流程推断（referer/navigation/sequence）、认证需求推断 |
+| `llm_extractor.py` | 严格 JSON schema 提示 + 修复回路 + 证据引用；复用 `ai/core.get_llm_client`；**LLM 不可用 → 纯启发式降级** |
+| `validator.py` | 确定性校验：类型交叉验证、转移图可达性、invariant 可计算性、走 `deterministic_dedupe` |
+| `store.py` | 按 target 持久化 `_runtime_cache/ir/<host>.json`（幂等：同输入同输出） |
+
+- 暴露 `build_business_ir(brief, target) -> BusinessIR`；挂载点由主线程接（recon 收尾后，env 可关）。
+
+### §28.4 A3 链规划器（新目录 `src/vulnclaw/ai/v100/planning/`）
+
+| 文件 | 职责 |
+|---|---|
+| `capabilities.py` | 动作能力模型（pre/post 条件；来源 = 引擎能力 + IR transitions） |
+| `planner.py` | 前向/后向搜索（A*/BFS）到 goal 谓词；可行性判定 |
+| `chain_verifier.py` | 逐步验证：每步 post 满足下一步 pre；干跑回放 |
+| `line.py` | `_run_chain_planner_line`（主线程挂 orchestrator extras；与既有 `phases_taskgen._run_sequence_chain_line` 并存，二期收编模板） |
+
+### §28.5 并行纪律（沿用本项目既有约定）
+
+- **每线独占文件 + 独立测试，文件零交集**；A1/A2/A3 三线可同时开工（接口已冻结）。
+- **共享文件由主线程独占接线**（避免多线并发写）：`engines/__init__.py`（引擎入池）、
+  `ai/v100/orchestrator.py`（extras 挂载）、`config/settings.py`（开关）、`phases_*.py`（消费点）。
+  三线读取 settings 一律用 `getattr(settings, "x", default)`，**不得改 settings.py**。
+- 三线产出只新增文件，不改既有文件。
+
+### §28.6 验收标准
+
+- **A1**：对 `local_lab`(8090)/`hard_lab`(8091) 的越权与金额篡改用例产出**确定性** finding；
+  无 IR 时 fail-closed；默认只读；求解器单测覆盖边界（负值/溢出/等值/区间交）。
+- **A2**：给定 ≥5 份离线观测夹具，产出通过 schema 校验的 IR；LLM 不可用降级不抛异常；
+  IR 幂等（同输入同输出）。
+- **A3**：给定 IR + 若干 finding，能规划 ≥1 条可行链并在**干跑**模式验证 pre/post 链闭合；
+  不可行时返回 `feasible=False`（绝不硬编造）。
+- 三线各自 1:1~2:1 测试；lint 0；全量回归无 FAILED；新增行不引入 emoji 红线问题。
+
+### §28.7 LOC 估算与波次
+
+- A1 核心 3.5~6k + 测试 4~7k；A2 核心 2~3.5k + 测试 2.5~4k；A3 核心 1.5~2.5k + 测试 2~3k。
+- **A 池合计 +1.0~1.4 万核心 / +0.9~1.4 万测试**。
+- 波次：第一波 A1+A2+A3 三线齐开 → 主线程接线收口（引擎入池 + orchestrator 挂载 + 端到端联调 + 全量回归）。
+- 基座测量（2026-09-11）：`src` 92,426 行 / `tests` 22,199 行 / `scripts` 9,292 行（Python 合计 ≈12.4 万）。

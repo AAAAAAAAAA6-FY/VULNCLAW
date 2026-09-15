@@ -1,0 +1,380 @@
+{
+  "components": {
+    "schemas": {
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "VULNCLAW 实时监控 Dashboard。REST 分组：\n- api：扫描状态列表、扫描详情、漏洞列表、DAG 进度、Worker 状态、发起扫描（GET/POST /api/*，可选 X-Dashboard-Token 鉴权）；\n- webhook：入站工具生态 ingestion。\nPOST /api/webhook/ingest 请求体：{\"format\": \"nuclei_jsonl|jsonl|vulnclaw_json|burp_xml|zap_json|sarif|csv|raw_http\", \"payload\": \"文本\" | <JSON 数组> | <JSON 对象>}；payload 上限 5 MiB。",
+    "title": "VULNCLAW Dashboard",
+    "version": "1.0.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/": {
+      "get": {
+        "description": "首页：返回 Vue 单页应用。",
+        "operationId": "index__get",
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Index"
+      }
+    },
+    "/api/dag/{scan_id}": {
+      "get": {
+        "description": "获取 DAG 节点状态。",
+        "operationId": "api_dag_api_dag__scan_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scan_id",
+            "required": true,
+            "schema": {
+              "title": "Scan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Api Dag"
+      }
+    },
+    "/api/findings": {
+      "get": {
+        "description": "获取漏洞列表。",
+        "operationId": "api_findings_api_findings_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "scan_id",
+            "required": false,
+            "schema": {
+              "title": "Scan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Api Findings"
+      }
+    },
+    "/api/scans": {
+      "get": {
+        "description": "获取扫描列表。",
+        "operationId": "api_scans_api_scans_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Api Scans"
+      },
+      "post": {
+        "description": "发起新的扫描任务。",
+        "operationId": "api_scans_create_api_scans_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "default": {},
+                "title": "Payload",
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Api Scans Create"
+      }
+    },
+    "/api/scans/{scan_id}": {
+      "get": {
+        "description": "获取扫描详情。",
+        "operationId": "api_scan_detail_api_scans__scan_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scan_id",
+            "required": true,
+            "schema": {
+              "title": "Scan Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Api Scan Detail"
+      }
+    },
+    "/api/status": {
+      "get": {
+        "description": "获取集群状态。",
+        "operationId": "api_status_api_status_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Api Status"
+      }
+    },
+    "/api/webhook/ingest": {
+      "post": {
+        "description": "入站工具生态 ingest：把外部格式 finding 解析并追加到 webhook feed 缓存。\n\n请求体：``{\"format\": \"...\", \"payload\": \"文本\" | list | dict}``。\n返回值：``{\"accepted\", \"skipped\", \"finding_count\", \"ref\"}``。",
+        "operationId": "api_webhook_ingest_api_webhook_ingest_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Api Webhook Ingest",
+        "tags": [
+          "webhook"
+        ]
+      }
+    },
+    "/api/workers": {
+      "get": {
+        "description": "获取 Worker 状态。",
+        "operationId": "api_workers_api_workers_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Api Workers"
+      }
+    },
+    "/health": {
+      "get": {
+        "description": "Health endpoint used by health probes.\n\nDoes NOT require Redis to be up: if Redis is unreachable the\nserver itself is still considered live. Callers that need to\nassert Redis readiness should look at /api/status instead.",
+        "operationId": "health_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Health Health Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Health"
+      }
+    },
+    "/metrics": {
+      "get": {
+        "description": "Minimal Prometheus-style metrics endpoint (text/plain).",
+        "operationId": "metrics_metrics_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Metrics Metrics Get",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Metrics"
+      }
+    },
+    "/ready": {
+      "get": {
+        "description": "Readiness endpoint used by orchestration probes.\n\nUnlike /health (liveness, always 200 when the process is up),\n/ready asserts that the cluster backend (Redis) is reachable so\nthe dashboard can serve real traffic. Returns 200 when ready,\n503 with a reason body when not.",
+        "operationId": "ready_ready_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Ready Ready Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Ready"
+      }
+    }
+  },
+  "tags": [
+    {
+      "description": "Dashboard 核心 REST：状态 / 扫描 / 漏洞 / DAG / Worker / 发起扫描",
+      "name": "api"
+    },
+    {
+      "description": "入站工具生态数据 ingest，把外部 finding 落到 webhook feed 缓存",
+      "name": "webhook"
+    }
+  ]
+}
