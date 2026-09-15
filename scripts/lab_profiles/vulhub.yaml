@@ -1,0 +1,128 @@
+# Vulhub 验证场景清单（operator-supplied）。
+#
+# 本文件不拉取镜像、不启动容器、不声称任何场景已可用。
+# 真实执行需要：Docker daemon + 操作员在授权环境提供 scenario_dir（Vulhub 仓库检出）
+# 与 published_port 的端口映射；revision 必须在拉取时刻锁定（TODO 项）。
+#
+# 与 scripts/lab_vulhub.py 配套：默认 dry-run 打印 start→scan→cleanup 计划；
+# 无 Docker 时 exit 2（不执行、不伪造）。
+name: vulhub
+kind: external-docker
+description: >
+  10 个锁定场景的端到端验证清单。每个场景的 expected_vulnerability 由操作员在
+  授权环境核验；容器启动成功 ≠ 检出漏洞。
+required:
+  - docker
+  - scenario_dir
+  - target_url
+defaults:
+  compose_file: docker-compose.yml
+  target_url: http://127.0.0.1:8080
+  scan_timeout_s: 600
+
+scenarios:
+  - name: ssrf
+    scenario_dir: "<vulhub-repo>/ssrf/  # TODO: pin on authorized run"
+    image_or_revision: "TODO: pin on authorized run"
+    published_port: 8080
+    expected_vulnerability: "SSRF：服务端请求伪造，内网/元数据可达并被回显"
+    start_cmd: "docker compose -f <compose_file> up -d"
+    scan_cmd: "python scan.py scan -t <target_url>"
+    cleanup_cmd: "docker compose -f <compose_file> down -v"
+    notes: "需要本地回显服务配合（如 /proc/self/environ 或内网 httpbin）；OOB 可用时走 D1 通道。"
+
+  - name: fastjson
+    scenario_dir: "<vulhub-repo>/fastjson/  # TODO: pin on authorized run"
+    image_or_revision: "TODO: pin on authorized run"
+    published_port: 8090
+    expected_vulnerability: "Fastjson 反序列化 RCE（版本 < 1.2.47 的 autotype 链）"
+    start_cmd: "docker compose -f <compose_file> up -d"
+    scan_cmd: "python scan.py scan -t <target_url>"
+    cleanup_cmd: "docker compose -f <compose_file> down -v"
+    notes: "无回显链需 OOB（LDAP/JNDI 外带）；真实回调验证见 docs/OOB_VALIDATION.md。"
+
+  - name: log4shell
+    scenario_dir: "<vulhub-repo>/log4j/  # TODO: pin on authorized run"
+    image_or_revision: "TODO: pin on authorized run"
+    published_port: 8983
+    expected_vulnerability: "Log4Shell CVE-2021-44228：JNDI 注入触发带外回连"
+    start_cmd: "docker compose -f <compose_file> up -d"
+    scan_cmd: "python scan.py scan -t <target_url>"
+    cleanup_cmd: "docker compose -f <compose_file> down -v"
+    notes: "以 OOB 回调为唯一实锤口径；无 OOB 服务时不得判阳性。"
+
+  - name: struts2
+    scenario_dir: "<vulhub-repo>/struts2/  # TODO: pin on authorized run"
+    image_or_revision: "TODO: pin on authorized run"
+    published_port: 8080
+    expected_vulnerability: "Struts2 OGNL 表达式注入 RCE（S2-xxx 系列）"
+    start_cmd: "docker compose -f <compose_file> up -d"
+    scan_cmd: "python scan.py scan -t <target_url>"
+    cleanup_cmd: "docker compose -f <compose_file> down -v"
+    notes: "优先选带回显的场景（算术求值），避免依赖 OOB。"
+
+  - name: shiro
+    scenario_dir: "<vulhub-repo>/shiro/  # TODO: pin on authorized run"
+    image_or_revision: "TODO: pin on authorized run"
+    published_port: 8080
+    expected_vulnerability: "Shiro rememberMe 反序列化（默认密钥 + gadget 链）"
+    start_cmd: "docker compose -f <compose_file> up -d"
+    scan_cmd: "python scan.py scan -t <target_url>"
+    cleanup_cmd: "docker compose -f <compose_file> down -v"
+    notes: "先验默认密钥识别（Set-Cookie rememberMe 特征），再验利用链。"
+
+  - name: spring4shell
+    scenario_dir: "<vulhub-repo>/spring/  # TODO: pin on authorized run"
+    image_or_revision: "TODO: pin on authorized run"
+    published_port: 8080
+    expected_vulnerability: "Spring4Shell CVE-2022-22965：classLoader 操纵 RCE"
+    start_cmd: "docker compose -f <compose_file> up -d"
+    scan_cmd: "python scan.py scan -t <target_url>"
+    cleanup_cmd: "docker compose -f <compose_file> down -v"
+    notes: "需要 JDK9+ 与 Tomcat 组合场景；检出口径=错误签名或 OOB。"
+
+  - name: xxe
+    scenario_dir: "<vulhub-repo>/xxe/  # TODO: pin on authorized run"
+    image_or_revision: "TODO: pin on authorized run"
+    published_port: 8080
+    expected_vulnerability: "XXE：外部实体读取服务器文件（或盲 XXE 走 OOB）"
+    start_cmd: "docker compose -f <compose_file> up -d"
+    scan_cmd: "python scan.py scan -t <target_url>"
+    cleanup_cmd: "docker compose -f <compose_file> down -v"
+    notes: "优先有回显场景（/etc/passwd 特征）；盲 XXE 走 OOB。"
+
+  - name: file-upload
+    scenario_dir: "<vulhub-repo>/file-upload/  # TODO: pin on authorized run"
+    image_or_revision: "TODO: pin on authorized run"
+    published_port: 8080
+    expected_vulnerability: "任意文件上传导致 WebShell/RCE"
+    start_cmd: "docker compose -f <compose_file> up -d"
+    scan_cmd: "python scan.py scan -t <target_url>"
+    cleanup_cmd: "docker compose -f <compose_file> down -v"
+    notes: "上传验证属危险操作面，需 DANGEROUS_MODE 与双因子确认。"
+
+  - name: redis-unauthorized
+    scenario_dir: "<vulhub-repo>/redis/  # TODO: pin on authorized run"
+    image_or_revision: "TODO: pin on authorized run"
+    published_port: 6379
+    expected_vulnerability: "Redis 未授权访问（可读写/可写 SSH key 或 crontab）"
+    start_cmd: "docker compose -f <compose_file> up -d"
+    scan_cmd: "python scan.py scan -t <target_url>"
+    cleanup_cmd: "docker compose -f <compose_file> down -v"
+    notes: "非 HTTP 服务：target_url 仍填端口映射地址，验证以 INFO/PING 响应为准。"
+
+  - name: api-bola
+    scenario_dir: "<vulhub-repo>/api/  # TODO: pin on authorized run"
+    image_or_revision: "TODO: pin on authorized run"
+    published_port: 8080
+    expected_vulnerability: "API 越权（BOLA/IDOR）：相邻对象 ID 可越权读写"
+    start_cmd: "docker compose -f <compose_file> up -d"
+    scan_cmd: "python scan.py scan -t <target_url>"
+    cleanup_cmd: "docker compose -f <compose_file> down -v"
+    notes: "需要多身份凭据（settings.api_bola_test 开启）；单身份扫描不构成 BOLA 证据。"
+
+truth:
+  expected: operator-provided Vulhub assertions only
+  note: >
+    容器启动成功不是检出证据；每场景的正例/负例结论必须由场景专属断言
+    （回显特征 / OOB 回调 / 相邻对象对比）支撑，并记录 revision 与命令。

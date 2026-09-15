@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """远端 Agent 池连通性自检：读 .env 的 REMOTE_AGENTS，向每个 type=http 端点发极简请求，
 报告状态。独立运行，只依赖标准库，避免 vulnclaw 的 numpy 崩溃。"""

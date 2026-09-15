@@ -1,0 +1,8 @@
+# VULNCLAW 命名空间（kustomize 目标命名空间；helm 侧由 --namespace 指定）
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vulnclaw
+  labels:
+    app.kubernetes.io/name: vulnclaw
+    app.kubernetes.io/part-of: vulnclaw

@@ -1,0 +1,36 @@
+{
+  "name": "httpbin-reflection",
+  "target": "http://httpbin.org",
+  "note": [
+    "外部测试集（别人的行为样本）：httpbin.org 是公开 HTTP 回显服务。",
+    "⚠️ 它**不是**漏洞靶场，也**不是**\"干净页\"——它会把请求里的一切原样回显，",
+    "   所以不适合当负样本（用它当负样本会把\"回显\"误记成扫描器误报）。",
+    "它的真实价值有两个：",
+    "  1) 正样本：实测 /get、/headers、/html 在带 Origin 时返回",
+    "     `Access-Control-Allow-Origin: <回显的任意源>` 且 `Access-Control-Allow-Credentials: true`",
+    "     —— 这是**真实的 CORS 配置错误**（任意源 + 凭证），不是误报。",
+    "  2) 误报探针：回显形态最容易被\"搜关键字\"的判据误判（本轮实测揪出 graphql 内省判据的假报）。",
+    "合规：公开测试服务，仅只读 GET。"
+  ],
+  "endpoints": {
+    "/get?q=": {
+      "expect": ["CORS"],
+      "min_severity": "Medium",
+      "tier": "hard",
+      "verified": "实测：Origin=https://evil.test → ACAO 回显该源 + ACAC: true"
+    },
+    "/headers?q=": {
+      "expect": ["CORS"],
+      "min_severity": "Medium",
+      "tier": "hard",
+      "verified": "实测同上（同一 CORS 中间件）"
+    },
+    "/html?q=": {
+      "expect": ["CORS"],
+      "min_severity": "Medium",
+      "tier": "hard",
+      "verified": "实测同上（同一 CORS 中间件）"
+    }
+  },
+  "negatives": {}
+}

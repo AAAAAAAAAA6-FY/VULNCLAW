@@ -1,0 +1,25 @@
+# Kustomize 聚合（kubectl 内置支持：kubectl apply -k deploy/k8s）
+#
+# 使用：
+#   kubectl apply -k deploy/k8s          # 部署（namespace 自动创建）
+#   kubectl -n vulnclaw get pods
+#   kubectl -n vulnclaw scale deploy/vulnclaw-worker --replicas=4
+#   kubectl delete -k deploy/k8s
+#
+# 与 Helm 的关系：deploy/helm/vulnclaw 提供参数化安装（values 可覆盖）；
+# 本目录是**固定命名**的纯 manifest（不依赖 helm，kubectl 原生可用），语义一一对齐。
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: vulnclaw
+
+resources:
+  - namespace.yaml
+  - redis.yaml
+  - master.yaml
+  - worker.yaml
+
+# 镜像版本统一覆盖点（改 tag 只需动这一处）
+images:
+  - name: vulnclaw/vulnclaw
+    newTag: "0.1.0"

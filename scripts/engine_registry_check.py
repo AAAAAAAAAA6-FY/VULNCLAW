@@ -30,7 +30,7 @@ OUT = ROOT / "docs" / "engine_registry_matrix.md"
 
 def _read(p: Path) -> str:
     try:
-        return p.read_text(encoding="utf-8", errors="replace")
+        return p.read_text(encoding="utf-8-sig", errors="replace")
     except Exception:  # noqa: BLE001
         return ""
 
@@ -44,15 +44,118 @@ def _defined_engines() -> list[tuple[str, str, str]]:
             tree = ast.parse(_read(f))
         except Exception:  # noqa: BLE001
             continue
+        class_bases = {
+            node.name: {
+                base.id for base in node.bases if isinstance(base, ast.Name)
+            }
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef)
+        }
+        constants = {
+            node.targets[0].id: node.value.value
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        }
+
+        def is_engine_class(class_name: str, seen: set[str] | None = None) -> bool:
+            seen = seen or set()
+            if class_name in seen:
+                return False
+            seen.add(class_name)
+            bases = class_bases.get(class_name, set())
+            return "BaseEngine" in bases or any(is_engine_class(base, seen) for base in bases)
+
         for node in ast.walk(tree):
             if not isinstance(node, ast.ClassDef):
                 continue
+            if not is_engine_class(node.name):
+                continue
             for st in node.body:
-                if isinstance(st, ast.Assign):
-                    for tg in st.targets:
-                        if isinstance(tg, ast.Name) and tg.id == "name" and isinstance(st.value, ast.Constant):
-                            out.append((str(st.value.value), f.name, node.name))
+                if isinstance(st, (ast.Assign, ast.AnnAssign)):
+                    targets = st.targets if isinstance(st, ast.Assign) else [st.target]
+                    value = st.value
+                    for tg in targets:
+                        if isinstance(tg, ast.Name) and tg.id == "name":
+                            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                                out.append((value.value, f.name, node.name))
+                            elif isinstance(value, ast.Name) and value.id in constants:
+                                out.append((constants[value.id], f.name, node.name))
     return out
+
+
+def _read_source(path: Path) -> str:
+    """读取源码文本并去掉 UTF-8 BOM（BOM 会让 ast.parse 直接抛 SyntaxError）。"""
+    return path.read_text(encoding="utf-8-sig", errors="replace")
+
+
+def _pool_names(task_text: str) -> set[str]:
+    """提取 taskgen 里**位于"引擎位"**的名字。
+
+    旧实现用 ``re.findall(r"['\\"]([a-z][a-z0-9_]{3,})['\\"]", task_text)`` 抓全文字符串
+    字面量，结果把字典键/配置字段（``api_key``、``created_at``、``engine``、``engines``、
+    ``invariant_diff_enabled`` …）也当成"任务池里的引擎名"，一次性产出 94 条
+    ``UNMATCHED_IN_POOL`` 噪音——该指标因此完全不可信。
+
+    现在只取四种真正的引擎位：
+      1) ``engine_priority = {...}`` 字典的键；
+      2) 任务字典里 ``{"engine": "x"}`` / ``{"engines": ["x", ...]}`` 的值；
+      3) ``_bump("x", n)`` 这类显式引擎参数；
+      4) ``engine_priority.get("x", n)`` / ``engine_priority.pop("x", None)``。
+    """
+    names: set[str] = set()
+
+    def _add(value: object) -> None:
+        if isinstance(value, str) and re.fullmatch(r"[a-z][a-z0-9_]+", value):
+            names.add(value)
+
+    try:
+        tree = ast.parse(task_text)
+    except Exception as exc:  # noqa: BLE001 - 解析失败时退回"无候选"，不产假命名
+        print(f"[warn] taskgen 解析失败，任务池名字提取跳过: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+        return names
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "engine_priority" for t in node.targets
+        ) and isinstance(node.value, ast.Dict):
+            for k in node.value.keys:
+                if isinstance(k, ast.Constant):
+                    _add(k.value)
+        if isinstance(node, ast.Dict):
+            for k, v in zip(node.keys, node.values):
+                if isinstance(k, ast.Constant) and k.value in ("engine", "engines"):
+                    if isinstance(v, ast.Constant):
+                        _add(v.value)
+                    elif isinstance(v, (ast.List, ast.Tuple)):
+                        for el in v.elts:
+                            if isinstance(el, ast.Constant):
+                                _add(el.value)
+        if isinstance(node, ast.Call):
+            fn = node.func
+            # _bump("sqli", 3)：显式引擎参数
+            if isinstance(fn, ast.Name) and fn.id == "_bump" and node.args:
+                first = node.args[0]
+                if isinstance(first, ast.Constant):
+                    _add(first.value)
+            # **只认 engine_priority.get("x", n) / .pop("x", None)**：
+            # 任意 `.get("x")` 会把业务字典键（evidence/params/type…）一并吞进来，
+            # 这正是上一版 UNMATCHED_IN_POOL 仍是噪音的原因。
+            elif (
+                isinstance(fn, ast.Attribute)
+                and fn.attr in ("get", "pop")
+                and isinstance(fn.value, ast.Name)
+                and fn.value.id == "engine_priority"
+                and node.args
+            ):
+                first = node.args[0]
+                if isinstance(first, ast.Constant):
+                    _add(first.value)
+    return names
 
 
 def _exported_names(init_text: str) -> set[str]:
@@ -91,9 +194,9 @@ def main() -> int:
 
     # 任务池里引用了但未定义的名字（疑似遗留/打字错误）
     defined = {r["name"] for r in rows}
-    pool_names = set(re.findall(r"['\"]([a-z][a-z0-9_]{3,})['\"]", task_text))
+    pool_names = _pool_names(task_text)
     orphan = sorted(n for n in pool_names
-                    if n not in defined and ("engine" in n or "_" in n)
+                    if n not in defined
                     and n not in {"global_engines", "engine_priority", "max_engines_per_param"})
 
     counts: dict[str, int] = {}
@@ -106,6 +209,8 @@ def main() -> int:
         f"> 由 `scripts/engine_registry_check.py` 生成，**只核对不改注册**。",
         "> 三方：A 引擎类定义（`engines/*.py`）｜ B 导出（`engines/__init__.py`）｜ "
         "C 任务池（`phases_taskgen.py`）。",
+        "> 注意：这里是静态注册矩阵；继承得到的名称、模块常量名称或动态注册可能不在 "
+        "静态表中。运行时实际发现/实例化数量以扫描报告的 `engine_inventory` 为准。",
         "",
         f"引擎总数：**{len(rows)}**",
         "",
@@ -129,7 +234,7 @@ def main() -> int:
         "| 引擎名 | 文件 | 类 | 在 __init__ | 在 __all__ | 在任务池 | 状态 |",
         "|---|---|---|---|---|---|---|",
     ]
-    for r in sorted(rows, key=lambda x: (x["status"] != "两处均缺（疑似跑不到）", x["name"])):
+    for r in sorted(rows, key=lambda x: (x["status"] != "两处均缺（需确认是否跑得到）", x["name"])):
         lines.append(
             f"| `{r['name']}` | {r['file']} | {r['class']} | "
             f"{'是' if r['init'] else '否'} | {'是' if r['all'] else '否'} | "

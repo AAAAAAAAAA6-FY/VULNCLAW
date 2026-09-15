@@ -1,0 +1,74 @@
+# VULNCLAW Helm values
+#
+# 默认值 = 单机最小可用（与 docker-compose.yaml 的资源配置同量级）；
+# 生产按需覆盖：`helm install vulnclaw deploy/helm/vulnclaw -f my-values.yaml`
+#
+# ⚠️ 凭据纪律：AI 模型 Key / DASHBOARD_TOKEN / SCAN_API_KEY 一律**不进 values**，
+#    用 `existingSecret` 指向已有 Secret（键名即环境变量名，如 AI_MODEL_CONFIGS）。
+
+image:
+  repository: vulnclaw/vulnclaw
+  # 空 → 使用 Chart.appVersion（避免双处维护版本号）
+  tag: ""
+  pullPolicy: IfNotPresent
+
+#: 已有 Secret 名（键 = 环境变量名）；留空则不注入（容器降级运行，同 compose 的 `required: false`）
+existingSecret: ""
+
+#: 通用环境变量（非敏感）
+env:
+  DANGEROUS_MODE: deny
+  OOB_INTERACTSH_SERVER: ""
+
+redis:
+  image: redis:7-alpine
+  #: 空则用服务名内的默认端口
+  resources:
+    requests:
+      memory: 128Mi
+      cpu: 100m
+    limits:
+      memory: 512Mi
+      cpu: "1"
+  persistence:
+    enabled: true
+    size: 1Gi
+
+master:
+  replicas: 1
+  resources:
+    requests:
+      memory: 512Mi
+      cpu: 250m
+    limits:
+      memory: 2Gi
+      cpu: "2"
+  persistence:
+    enabled: true
+    size: 5Gi
+
+worker:
+  replicas: 2
+  resources:
+    requests:
+      memory: 1Gi
+      cpu: 500m
+    limits:
+      memory: 4Gi
+      cpu: "3"
+  persistence:
+    enabled: true
+    size: 5Gi
+
+#: 探针参数（与 compose healthcheck 的 interval/timeout/retries/start_period 对齐）
+probes:
+  intervalSeconds: 15
+  timeoutSeconds: 5
+  failureThreshold: 5
+  startupPeriodSeconds: 30
+
+#: 镜像拉取密文（私有仓库时配置）
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""

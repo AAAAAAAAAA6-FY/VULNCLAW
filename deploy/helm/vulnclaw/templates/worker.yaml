@@ -1,0 +1,85 @@
+{{/* Worker：执行扫描任务（OOB 回调在 worker 侧执行，同 compose 语义） */}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "vulnclaw.fullname" . }}-worker
+  labels:
+    {{- include "vulnclaw.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  replicas: {{ .Values.worker.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "vulnclaw.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels:
+        {{- include "vulnclaw.labels" . | nindent 8 }}
+        app.kubernetes.io/component: worker
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: worker
+          image: {{ include "vulnclaw.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["--distributed", "--worker", "--redis-url", "{{ include "vulnclaw.redisUrl" . }}"]
+          env:
+            - name: DANGEROUS_MODE
+              value: {{ .Values.env.DANGEROUS_MODE | quote }}
+            - name: REDIS_URL
+              value: "{{ include "vulnclaw.redisUrl" . }}"
+            - name: OOB_INTERACTSH_SERVER
+              value: {{ .Values.env.OOB_INTERACTSH_SERVER | quote }}
+          readinessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import redis; redis.Redis.from_url('{{ include "vulnclaw.redisUrl" . }}', socket_timeout=3).ping()"
+            initialDelaySeconds: {{ .Values.probes.startupPeriodSeconds }}
+            periodSeconds: {{ .Values.probes.intervalSeconds }}
+            timeoutSeconds: {{ .Values.probes.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.failureThreshold }}
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import redis; redis.Redis.from_url('{{ include "vulnclaw.redisUrl" . }}', socket_timeout=3).ping()"
+            initialDelaySeconds: {{ .Values.probes.startupPeriodSeconds }}
+            periodSeconds: {{ .Values.probes.intervalSeconds }}
+            timeoutSeconds: {{ .Values.probes.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.failureThreshold }}
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
+          volumeMounts:
+            - name: scan-data
+              mountPath: /app/_runtime_cache
+      volumes:
+        - name: scan-data
+          {{- if .Values.worker.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "vulnclaw.fullname" . }}-worker-scan-data
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+{{- if .Values.worker.persistence.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "vulnclaw.fullname" . }}-worker-scan-data
+  labels:
+    {{- include "vulnclaw.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: {{ .Values.worker.persistence.size }}
+{{- end }}

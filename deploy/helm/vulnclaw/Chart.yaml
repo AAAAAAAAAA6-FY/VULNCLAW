@@ -1,0 +1,20 @@
+apiVersion: v2
+name: vulnclaw
+description: |
+  VULNCLAW 分布式扫描编排（redis 队列 + master 调度 + N worker 执行）。
+  与 docker-compose.yaml 语义对齐：healthcheck → liveness/readiness probe，
+  资源限制、REDIS_URL 注入、OOB 回调服务注入、扫描数据持久化卷一一对应。
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - security
+  - pentest
+  - scanner
+  - distributed
+home: https://github.com/vulnclaw/vulnclaw
+maintainers:
+  - name: VULNCLAW Contributors
+annotations:
+  # 只读根文件系统/最小权限等强化项由 securityContext 显式声明（见 templates/*.yaml）
+  category: Security

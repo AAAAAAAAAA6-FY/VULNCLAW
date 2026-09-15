@@ -1,0 +1,90 @@
+# Master：DAG 调度（probe 用 redis-py ping，与 compose healthcheck 一致）
+# 与 deploy/helm/vulnclaw/templates/master.yaml 语义等价（固定命名，无模板参数）。
+#
+# ⚠️ 凭据：用 Secret 注入（键名 = 环境变量名），不要写进本文件：
+#   kubectl -n vulnclaw create secret generic vulnclaw-secrets \
+#     --from-literal=AI_MODEL_CONFIGS='{"zhipu":{"api_key":"..."}}' \
+#     --from-literal=DASHBOARD_TOKEN='...'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vulnclaw-master
+  labels:
+    app.kubernetes.io/name: vulnclaw
+    app.kubernetes.io/component: master
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vulnclaw
+      app.kubernetes.io/component: master
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vulnclaw
+        app.kubernetes.io/component: master
+    spec:
+      containers:
+        - name: master
+          image: vulnclaw/vulnclaw:0.1.0
+          imagePullPolicy: IfNotPresent
+          args: ["--distributed", "--master", "--redis-url", "redis://vulnclaw-redis:6379/0"]
+          env:
+            - name: DANGEROUS_MODE
+              value: "deny"
+            - name: REDIS_URL
+              value: "redis://vulnclaw-redis:6379/0"
+            - name: OOB_INTERACTSH_SERVER
+              value: ""
+          envFrom:
+            # 可选：Secret 不存在时仅告警不阻塞（optional: true），与 compose 的 `required: false` 同义
+            - secretRef:
+                name: vulnclaw-secrets
+                optional: true
+          readinessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import redis; redis.Redis.from_url('redis://vulnclaw-redis:6379/0', socket_timeout=3).ping()"
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 5
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import redis; redis.Redis.from_url('redis://vulnclaw-redis:6379/0', socket_timeout=3).ping()"
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 5
+          resources:
+            requests:
+              memory: 512Mi
+              cpu: 250m
+            limits:
+              memory: 2Gi
+              cpu: "2"
+          volumeMounts:
+            - name: scan-data
+              mountPath: /app/_runtime_cache
+      volumes:
+        - name: scan-data
+          persistentVolumeClaim:
+            claimName: vulnclaw-master-scan-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vulnclaw-master-scan-data
+  labels:
+    app.kubernetes.io/name: vulnclaw
+    app.kubernetes.io/component: master
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi

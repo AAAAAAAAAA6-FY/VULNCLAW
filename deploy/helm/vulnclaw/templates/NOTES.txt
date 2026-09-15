@@ -1,0 +1,25 @@
+VULNCLAW 已部署到命名空间 {{ .Release.Namespace }}（release: {{ .Release.Name }}）。
+
+组件：
+  - redis   1 副本（队列/状态后端，probe: redis-cli ping）
+  - master  {{ .Values.master.replicas }} 副本（DAG 调度，args: --distributed --master）
+  - worker  {{ .Values.worker.replicas }} 副本（扫描执行 + OOB 回调，args: --distributed --worker）
+
+查看状态：
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+  kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "vulnclaw.fullname" . }}-master --tail=50
+
+⚠️ 凭据与合规：
+  * AI 模型 Key / DASHBOARD_TOKEN 等**不要**写进 values；
+    用 `--set existingSecret=<已有Secret名>`（键名 = 环境变量名）。
+  * {{ if not .Values.existingSecret }}当前未配置 existingSecret：容器将以"能力降级"方式启动（同 compose 的 .env 可选语义）。{{ else }}已引用 Secret: {{ .Values.existingSecret }}（键名须与环境变量同名）。{{ end }}
+  * 只允许对获得**书面授权**的目标发起扫描。
+  * OOB 回调服务：worker 侧通过 OOB_INTERACTSH_SERVER={{ .Values.env.OOB_INTERACTSH_SERVER | quote }} 注入
+    （留空则 OOB 盲打不可用，带内判定不受影响）。
+
+扩容：
+  helm upgrade {{ .Release.Name }} . -n {{ .Release.Namespace }} --set worker.replicas=4
+  或 kubectl -n {{ .Release.Namespace }} scale deploy/{{ include "vulnclaw.fullname" . }}-worker --replicas=4
+
+卸载：helm uninstall {{ .Release.Name }} -n {{ .Release.Namespace }}
+  ⚠️ PVC 默认保留（数据不丢）；如需清理：kubectl -n {{ .Release.Namespace }} delete pvc -l app.kubernetes.io/instance={{ .Release.Name }}

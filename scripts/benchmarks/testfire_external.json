@@ -1,0 +1,28 @@
+{
+  "name": "testfire-altoromutual",
+  "target": "http://demo.testfire.net",
+  "note": [
+    "外部测试集（别人的漏洞样本）：IBM AltoroMutual 公开漏洞演示站，公开提供用于安全工具测试。",
+    "与 local_lab 的区别：出题人是别人（站点自身的公开漏洞），不是自建靶机 → 用于**防自欺**的泛化验收。",
+    "真值口径：仅收录 2026-09-12 手工实测确认的端点（未确认的一律不写，宁缺毋假）。",
+    "  · 正样本：/search.jsp?query= 实测 payload 原样未转义反射（raw=True / escaped=False）。",
+    "  · 负样本：其余页面实测**均不回显参数**，长期被扫描器误报的形态（表单页/首页）。",
+    "合规：公开授权演示站，只发只读 GET 探测，不做爆破/上传/写入类动作。"
+  ],
+  "endpoints": {
+    "/search.jsp?query=": {
+      "expect": ["XSS"],
+      "min_severity": "High",
+      "tier": "hard",
+      "verified": "手工实测：?query=<script>alert(1)</script> 原样未转义反射（raw=True / escaped=False）"
+    }
+  },
+  "negatives": {
+    "/": "站点首页（静态展示页，不应被任意声明命中）",
+    "/login.jsp?uid=": "登录表单页：参数不回显",
+    "/doLogin?uid=": "登录处理页（GET 无效），无回显",
+    "/index.jsp?content=": "首页内容参数实测不回显（易被误判为 XSS）",
+    "/subscribe.jsp?email=": "订阅表单页：参数不回显",
+    "/feedback.jsp?subject=": "反馈表单页：参数不回显"
+  }
+}

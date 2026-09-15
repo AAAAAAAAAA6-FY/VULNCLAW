@@ -1,0 +1,42 @@
+# VULNCLAW 出站白名单 + 平台级 SSRF/DNS-rebinding 门禁（工作流8 补件）
+#
+# 触发：push 到 master/main 或任意 PR 时执行；
+# 作用：跑 tests/test_egress_ssrf_guard.py，锁死两件事：
+#   1) 防护已接入 aiohttp 主链路（httpx 路径默认关闭，主链路不接 = 防护等于不存在）；
+#   2) 默认 off（EGRESS_ALLOWLIST 空 且 SSRF_GUARD != "1"）时零行为变更（回归门禁）。
+#   另覆盖出站白名单 fnmatch、SSRF 私网/回环拦截、SSRF_ALLOW_PRIVATE 放行、DNS-rebinding。
+#
+# 本地等价命令：
+#   pip install -e ".[dev]"
+#   PYTHONPATH=src python -m pytest tests/test_egress_ssrf_guard.py -q --tb=short
+name: vulnclaw-egress-ssrf-guard
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  egress-ssrf-guard:
+    name: 出站白名单 + SSRF/DNS-rebinding（工作流8）
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖（含开发依赖 pytest/pytest-asyncio/aiohttp）
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: 出站防护接线回归（默认 off 零变更 + 拦截有效性）
+        run: |
+          PYTHONPATH=src python -m pytest tests/test_egress_ssrf_guard.py -q --tb=short -p no:cacheprovider

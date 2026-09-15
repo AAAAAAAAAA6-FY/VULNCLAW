@@ -38,10 +38,22 @@ dependencies = [
     "fastapi>=0.110.0",
     # E1 攻击图统一图模型（networkx 起步，可换 neo4j）
     "networkx>=3.4.0",
+    # 跨进程文件锁（core/utils.py _atomic_write_json / Cookie 并发写）：多开扫描时
+    # 防止同一目标域 Cookie 文件并发写损坏与丢更新；未安装时静默降级为无锁（仅告警）
+    "portalocker>=2.0.0",
 ]
 
 [project.optional-dependencies]
-dev = ["ruff", "mypy", "pre-commit", "pytest", "pytest-cov", "pytest-asyncio"]
+# T04 依赖可复现（2026-09-15）：dev 工具链锁下限，配合 _runtime_cache/requirements-lock.txt
+# （pip freeze 产物，运行时缓存不入库）保证 CI/本地环境可复现。升级需显式改动并跑全量回归。
+dev = [
+    "ruff>=0.16.0",
+    "mypy>=1.10.0",
+    "pre-commit>=3.7.0",
+    "pytest>=8.2.0",
+    "pytest-cov>=5.0.0",
+    "pytest-asyncio>=0.23.0",
+]
 # 高级功能：代码内均为可选导入（try/except ImportError 优雅降级），默认不装、不阻塞 pip install .
 #   curl_cffi            -> SP16.2/SP17.3 TLS 指纹伪装（core/impersonate.py）
 #   chromadb             -> orchestrator 向量记忆（ai/core.py，import chromadb）
@@ -74,6 +86,13 @@ line-length = 140
 target-version = "py311"
 cache-dir = "_runtime_cache/ruff"
 
+[tool.ruff.lint]
+# T02 lint 门禁（2026-09-15）：
+#  - select 与项目现状一致（E4/E7/E9/F 基础语法/未用变量）。
+#  - BLE001（盲 except）不做本地全量开启：存量 957 处已登记为技术债务（T15 异常协议迁移），
+#    新增裸 except 由 CI 的 "New blind-except gate" 步骤对 PR 变更文件以 --no-config 强制拦截。
+select = ["E4", "E7", "E9", "F"]
+
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["E501"]
 # 根 scan.py 是有意保持的薄壳（布局守卫要求 <=15 行），import 无法按 ruff 分组留空行
@@ -84,6 +103,11 @@ testpaths = ["tests"]
 addopts = "-q"
 asyncio_mode = "strict"
 cache_dir = "_runtime_cache/pytest"
+markers = [
+    "integration: exercises a live local or remote target",
+    "network: requires outbound network access",
+    "docker: requires a running Docker daemon",
+]
 
 [tool.coverage.run]
 source = ["src/vulnclaw"]

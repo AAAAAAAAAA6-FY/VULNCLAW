@@ -26,7 +26,9 @@ import asyncio
 import importlib
 import json
 import sys
+import time
 from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
 from typing import Dict, List
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,6 +44,36 @@ except Exception:  # noqa: BLE001 - 桩不可用时继续，多数场景本就�
 
 FIXTURE_DIR = ROOT / "tests" / "fixtures" / "engines"
 BASELINE = ROOT / "tests" / "fixtures" / "benchmark_baseline.json"
+DEFAULT_SCENARIOS_DIR = ROOT / "scripts" / "benchmarks"
+
+
+def _format_metric(value) -> str:
+    """Format a ratio for stable CI output while preserving unavailable values."""
+    return f"{value:.4f}" if isinstance(value, (int, float)) else "NA"
+
+
+def _format_optional_metric(value) -> str:
+    """Format optional counters/timings without turning missing data into zero."""
+    return str(value) if isinstance(value, (int, float)) else "NA"
+
+
+def _meets_quality_gate(value, minimum: float) -> bool:
+    """Missing quality data cannot satisfy a non-zero requested gate."""
+    return minimum <= 0.0 or (
+        isinstance(value, (int, float)) and value >= minimum
+    )
+
+
+def _passes_fixture_gate(
+    detection_rate: float,
+    false_rate: float,
+    min_detection_rate: float,
+    max_false_rate: float,
+) -> bool:
+    return (
+        detection_rate >= min_detection_rate
+        and false_rate <= max_false_rate
+    )
 
 
 def _load_yaml(path: Path) -> Dict:
@@ -51,31 +83,114 @@ def _load_yaml(path: Path) -> Dict:
 
 
 def _make_fake_async_get(responses: Dict):
-    """按 URL 子串匹配返回预设响应（模拟 async_get 的 (status, text, headers)）。"""
+    """按 URL 子串匹配返回预设响应（模拟 async_get 的 (status, text, headers)）。
+
+    支持字段：
+      - status/body/reflect：既有能力（reflect 把 query 参数值拼入 body）；
+      - headers：响应头 dict（CORS 等仅看响应头的引擎需要）；
+      - ws_accept：按请求的 Sec-WebSocket-Key 动态计算 RFC6455 Accept 头
+        （WebSocket 握手语义：Key 每次随机，故 Accept 无法预写，必须动态计算）。
+    """
+    calls = []
 
     async def _get(url, *args, **kwargs):
         s = str(url)
+        calls.append(s)
         for suffix, resp in (responses or {}).items():
             if str(suffix) in s:
                 print(f"      [mock] HIT  {s} -> {resp.get('status', 200)}")
-                return int(resp.get("status", 200)), str(resp.get("body", "")), {}
+                body = str(resp.get("body", ""))
+                if resp.get("reflect"):
+                    values = parse_qs(urlparse(s).query)
+                    reflected = " ".join(
+                        unquote(value)
+                        for entries in values.values()
+                        for value in entries
+                    )
+                    body = body + reflected
+                resp_headers: Dict = dict(resp.get("headers") or {})
+                if resp.get("ws_accept"):
+                    import base64 as _b64
+                    import hashlib as _hl
+                    req_headers = kwargs.get("headers") or {}
+                    key = str(req_headers.get("Sec-WebSocket-Key") or "")
+                    if key:
+                        accept = _b64.b64encode(
+                            _hl.sha1(
+                                (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("utf-8")
+                            ).digest()
+                        ).decode("utf-8")
+                        resp_headers["Sec-WebSocket-Accept"] = accept
+                return int(resp.get("status", 200)), body, resp_headers
         print(f"      [mock] MISS {s} -> 404")
         return 404, "", {}
 
+    _get.calls = calls
     return _get
 
 
+def _make_fake_async_post(responses: Dict):
+    """按 URL 子串匹配返回预设 POST 响应。"""
+    calls = []
+
+    async def _post(url, *args, **kwargs):
+        s = str(url)
+        calls.append(s)
+        for suffix, resp in (responses or {}).items():
+            if str(suffix) in s:
+                return int(resp.get("status", 200)), str(resp.get("body", "")), {}
+        return 404, "", {}
+
+    _post.calls = calls
+    return _post
+
+
 def _run_case(spec: Dict, engine, loop) -> List[Dict]:
-    """注入 mock 响应后跑一次引擎 scan。"""
-    module_name = spec.get("module") or ""
+    """注入 mock 响应后运行 fixture 声明的 scan 或 check 入口。"""
+    module_name = spec.get("module") or getattr(
+        engine.__class__, "__module__", ""
+    )
     fake = _make_fake_async_get(spec.get("responses") or {})
+    fake_post = _make_fake_async_post(spec.get("responses") or {})
+    had_benchmark_fake = hasattr(engine, "_benchmark_fake")
+    previous_benchmark_fake = getattr(engine, "_benchmark_fake", None)
+    setattr(engine, "_benchmark_fake", fake)
     orig = None
+    orig_post = None
     mod = None
+    had_async_get = False
+    had_async_post = False
+    # 其它 HTTP 动词同样按 responses 打桩：旧实现只打 async_get/async_post，
+    # 于是用 async_options/async_put/async_delete 的引擎（verb_tampering、
+    # cache_poison 等）会**真的发网**——fixture 结果既不可复现也不是离线。
+    _extra_helpers = ("async_put", "async_delete", "async_options", "async_head")
+    _extra_saved: Dict[str, object] = {}
     if module_name:
         mod = importlib.import_module(module_name)
+        had_async_get = hasattr(mod, "async_get")
         orig = getattr(mod, "async_get", None)
         mod.async_get = fake
+        had_async_post = hasattr(mod, "async_post")
+        orig_post = getattr(mod, "async_post", None)
+        if had_async_post:
+            mod.async_post = fake_post
+        for _name in _extra_helpers:
+            if hasattr(mod, _name):
+                _extra_saved[_name] = getattr(mod, _name)
+                setattr(mod, _name, fake)
     try:
+        if str(spec.get("method") or "scan").lower() == "check":
+            normal_resp = spec.get("normal_resp") or [200, "", {}]
+            finding = loop.run_until_complete(
+                engine.check(
+                    spec.get("url", spec.get("target", "http://127.0.0.1:8080")),
+                    spec.get("param", "url"),
+                    tuple(normal_resp),
+                    spec.get("parsed_query", ""),
+                    None,
+                )
+            )
+            return [finding] if finding else []
         findings = loop.run_until_complete(
             engine.scan(spec.get("target", "http://127.0.0.1:8080"), None)
         )
@@ -84,14 +199,105 @@ def _run_case(spec: Dict, engine, loop) -> List[Dict]:
         print(f"  [!] case {spec.get('id')} 执行异常: {exc}")
         return []
     finally:
-        if mod is not None and orig is not None:
-            mod.async_get = orig
+        spec["_request_count"] = len(fake.calls)
+        spec["_post_count"] = len(fake_post.calls)
+        if mod is not None:
+            if had_async_get:
+                mod.async_get = orig
+            else:
+                delattr(mod, "async_get")
+            if had_async_post:
+                mod.async_post = orig_post
+            for _name, _saved in _extra_saved.items():
+                setattr(mod, _name, _saved)
+        if had_benchmark_fake:
+            engine._benchmark_fake = previous_benchmark_fake
+        else:
+            delattr(engine, "_benchmark_fake")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--save", action="store_true", help="写入基线文件")
+    ap.add_argument(
+        "--mode", choices=("fixtures", "eval"), default="fixtures",
+        help="fixtures 运行引擎 mock 基准；eval 评估已有扫描报告",
+    )
+    ap.add_argument(
+        "--scenarios-dir", default=str(DEFAULT_SCENARIOS_DIR),
+        help="eval 模式加载 YAML 剧本的文件或目录",
+    )
+    ap.add_argument("--report", help="eval 模式读取的 JSON/SARIF 扫描报告")
+    ap.add_argument(
+        "--min-recall", type=float, default=0.0,
+        help="eval 模式最低召回率，低于此值返回非零状态",
+    )
+    ap.add_argument(
+        "--min-precision", type=float, default=0.0,
+        help="eval 模式最低精确率，低于此值返回非零状态",
+    )
+    ap.add_argument(
+        "--min-evidence-rate", type=float, default=0.0,
+        help="eval 模式最低证据率；报告缺少 finding 时不通过",
+    )
+    ap.add_argument(
+        "--min-reproduction-rate", type=float, default=0.0,
+        help="eval 模式最低复现率；报告缺少 finding 时不通过",
+    )
+    ap.add_argument(
+        "--min-detection-rate", type=float, default=0.0,
+        help="fixtures 模式最低总体检出率",
+    )
+    ap.add_argument(
+        "--max-false-rate", type=float, default=1.0,
+        help="fixtures 模式最高总体误报率",
+    )
     args = ap.parse_args()
+
+    if args.mode == "eval":
+        if not args.report:
+            print("EVAL_REPORT_REQUIRED")
+            return 2
+        report_path = Path(args.report)
+        if not report_path.is_file():
+            print(f"REPORT_NOT_FOUND {report_path}")
+            return 2
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            scenarios = load_scenarios(args.scenarios_dir)
+            result = evaluate_report(report, scenarios)
+        except (OSError, ValueError, TypeError) as exc:
+            print(f"EVAL_FAILED {exc}")
+            return 2
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        print(
+            f"EVAL_RECALL={result['recall']:.4f} "
+            f"EVAL_PRECISION={result['precision']:.4f} "
+            f"MIN_RECALL={args.min_recall:.4f} "
+            f"MIN_PRECISION={args.min_precision:.4f} "
+            f"MIN_EVIDENCE_RATE={args.min_evidence_rate:.4f} "
+            f"MIN_REPRODUCTION_RATE={args.min_reproduction_rate:.4f}"
+        )
+        quality = result["quality"]
+        print(
+            f"EVAL_FINDINGS={quality['finding_count']} "
+            f"EVAL_EVIDENCE_RATE={_format_metric(quality['evidence_rate'])} "
+            f"EVAL_REPRODUCTION_RATE={_format_metric(quality['reproduction_rate'])} "
+            f"EVAL_REQUESTS={_format_optional_metric(quality['request_count'])} "
+            f"EVAL_ELAPSED_SECONDS={_format_optional_metric(quality['elapsed_seconds'])}"
+        )
+        evidence_ok = _meets_quality_gate(
+            quality["evidence_rate"], args.min_evidence_rate
+        )
+        reproduction_ok = _meets_quality_gate(
+            quality["reproduction_rate"], args.min_reproduction_rate
+        )
+        return 0 if (
+            result["recall"] >= args.min_recall
+            and result["precision"] >= args.min_precision
+            and evidence_ok
+            and reproduction_ok
+        ) else 1
 
     if not FIXTURE_DIR.is_dir():
         print(f"NO_FIXTURE_DIR {FIXTURE_DIR}")
@@ -123,7 +329,9 @@ def main() -> int:
                 # 否则 _run_case 拿不到模块名 → mock 不注入 → 引擎走真实 HTTP。
                 case.setdefault("module", module_name)
                 expect = str(case.get("expect") or "positive")
+                started = time.perf_counter()
                 findings = _run_case(case, engine, loop) if engine else []
+                elapsed_seconds = time.perf_counter() - started
                 found = len(findings) > 0
                 if expect == "positive":
                     verdict = "TP" if found else "FN"
@@ -135,6 +343,25 @@ def main() -> int:
                     "expect": expect, "found": found, "verdict": verdict,
                     "severity": (findings[0].get("severity") if findings else ""),
                     "top": top[:48],
+                    "evidence": any(
+                        str(finding.get(key) or "").strip()
+                        for finding in findings
+                        for key in ("evidence", "evidence_chain", "proof", "response_evidence")
+                    )
+                    or any(finding.get("response_evidence") for finding in findings),
+                    "reproduced": any(
+                        finding.get(key) is True
+                        for finding in findings
+                        for key in ("exploit_verified", "exploit_reproduced", "revalidated",
+                                    "exploited", "reproduced", "probe_confirmed", "oob_confirmed")
+                    ) or any(
+                        str(finding.get("blind_repro")) == "confirmed"
+                        for finding in findings
+                    ),
+                    "request_count": int(case.get("_request_count", 0)) + int(
+                        case.get("_post_count", 0)
+                    ),
+                    "elapsed_seconds": round(elapsed_seconds, 6),
                 })
                 st = stats.setdefault(engine_name, {"TP": 0, "FN": 0, "FP": 0, "TN": 0})
                 st[verdict] += 1
@@ -173,23 +400,62 @@ def main() -> int:
             f"{(tot['TP'] / pos * 100) if pos else 0:>9.1f}%"
             f"{(tot['FP'] / neg * 100) if neg else 0:>9.1f}%"
         )
+        detection_rate = (tot["TP"] / pos) if pos else 0.0
+        false_rate = (tot["FP"] / neg) if neg else 0.0
+        quality = {
+            "case_count": len(rows),
+            "evidence_count": sum(1 for row in rows if row["evidence"]),
+            "evidence_rate": (
+                sum(1 for row in rows if row["evidence"]) / len(rows)
+                if rows else None
+            ),
+            "reproduced_count": sum(1 for row in rows if row["reproduced"]),
+            "reproduction_rate": (
+                sum(1 for row in rows if row["reproduced"]) / len(rows)
+                if rows else None
+            ),
+            "request_count": sum(row["request_count"] for row in rows),
+            "elapsed_seconds": round(
+                sum(row["elapsed_seconds"] for row in rows), 6
+            ),
+        }
+        print(
+            f"FIXTURE_DETECTION_RATE={detection_rate:.4f} "
+            f"FIXTURE_FALSE_RATE={false_rate:.4f} "
+            f"MIN_DETECTION_RATE={args.min_detection_rate:.4f} "
+            f"MAX_FALSE_RATE={args.max_false_rate:.4f}"
+        )
+        print(
+            f"FIXTURE_EVIDENCE_RATE={_format_metric(quality['evidence_rate'])} "
+            f"FIXTURE_REPRODUCTION_RATE={_format_metric(quality['reproduction_rate'])} "
+            f"FIXTURE_REQUESTS={quality['request_count']} "
+            f"FIXTURE_ELAPSED_SECONDS={quality['elapsed_seconds']:.6f}"
+        )
         print("=" * 96)
 
         if args.save:
             BASELINE.parent.mkdir(parents=True, exist_ok=True)
             BASELINE.write_text(
-                json.dumps({"summary": summary, "total": tot, "cases": rows},
+                json.dumps({
+                    "summary": summary,
+                    "total": tot,
+                    "quality": quality,
+                    "cases": rows,
+                },
                            ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
             print(f"BASELINE_SAVED={BASELINE}")
-        return 0
+        return 0 if _passes_fixture_gate(
+            detection_rate,
+            false_rate,
+            args.min_detection_rate,
+            args.max_false_rate,
+        ) else 1
     finally:
         loop.close()
 
 
-if __name__ == "__main__":
-    sys.exit(main())
 import os as _os
 
 
@@ -212,7 +478,8 @@ _VULN_TYPE_ALIASES = {
     "jwt": "jwt", "jwt bypass": "jwt", "json web token": "jwt",
     "cors": "cors", "misconfigured cors": "cors",
     "sensitive files": "sensitive_files", "sensitive_file": "sensitive_files",
-    "信息泄露": "info_leak", "information disclosure": "info_leak", "info_leak": "info_leak",
+    "信息泄露": "info_leak", "information disclosure": "info_leak",
+    "info disclosure": "info_leak", "info_leak": "info_leak",
     "directory listing": "directory_listing",
     "csrf": "csrf", "cross-site request forgery": "csrf",
     "open redirect": "open_redirect", "redirect": "open_redirect",
@@ -274,8 +541,9 @@ def _report_findings(report: dict) -> list:
 
 def evaluate_report(report: dict, scenarios: list) -> dict:
     """计算所有剧本期望漏洞的召回率/精确率（旧评测脚本依赖的稳定 API）。"""
+    findings = _report_findings(report)
     found_types = set()
-    for f in _report_findings(report):
+    for f in findings:
         vt = f.get("type") or f.get("vuln_type") or f.get("name")
         if vt:
             canon = normalize_vuln_type(vt)
@@ -292,6 +560,41 @@ def evaluate_report(report: dict, scenarios: list) -> dict:
     fp = found_types - expected
     recall = len(tp) / len(expected) if expected else 1.0
     precision = len(tp) / len(found_types) if found_types else 1.0
+    evidence_count = sum(
+        1 for finding in findings
+        if any(
+            str(finding.get(key) or "").strip()
+            for key in ("evidence", "evidence_chain", "proof", "response_evidence")
+        ) or finding.get("response_evidence")
+    )
+    reproduced_count = sum(
+        1 for finding in findings
+        if any(
+            finding.get(key) is True
+            for key in ("exploit_verified", "exploit_reproduced", "revalidated",
+                        "exploited", "reproduced", "probe_confirmed", "oob_confirmed")
+        ) or str(finding.get("blind_repro")) == "confirmed"
+    )
+    quality = {
+        "finding_count": len(findings),
+        "evidence_count": evidence_count,
+        "evidence_rate": evidence_count / len(findings) if findings else None,
+        "reproduced_count": reproduced_count,
+        "reproduction_rate": reproduced_count / len(findings) if findings else None,
+        "request_count": next(
+            (
+                report.get(key)
+                for key in ("request_count", "total_requests", "total_engine_calls")
+                if isinstance(report.get(key), (int, float))
+            ),
+            None,
+        ),
+        "elapsed_seconds": (
+            report.get("elapsed_seconds")
+            if isinstance(report.get("elapsed_seconds"), (int, float))
+            else None
+        ),
+    }
     return {
         "expected": sorted(expected),
         "found": sorted(found_types),
@@ -299,6 +602,7 @@ def evaluate_report(report: dict, scenarios: list) -> dict:
         "precision": precision,
         "missed": sorted(fn),
         "extra": sorted(fp),
+        "quality": quality,
     }
 
 
@@ -338,3 +642,7 @@ def load_scenarios(path: str) -> list:
     with open(path, "r", encoding="utf-8") as fh:
         data = _yaml.safe_load(fh) or []
     return [TargetScenario.from_dict(d) for d in data]
+
+
+if __name__ == "__main__":
+    sys.exit(main())

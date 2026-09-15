@@ -1,0 +1,86 @@
+{{/* Master：DAG 调度（无端口控制台进程）。probe 用 redis-py ping，语义同 compose */}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "vulnclaw.fullname" . }}-master
+  labels:
+    {{- include "vulnclaw.labels" . | nindent 4 }}
+    app.kubernetes.io/component: master
+spec:
+  replicas: {{ .Values.master.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "vulnclaw.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: master
+  template:
+    metadata:
+      labels:
+        {{- include "vulnclaw.labels" . | nindent 8 }}
+        app.kubernetes.io/component: master
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # master 先于 worker 就绪，但两者都只依赖 redis（与 compose 的 depends_on 等价）
+      containers:
+        - name: master
+          image: {{ include "vulnclaw.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["--distributed", "--master", "--redis-url", "{{ include "vulnclaw.redisUrl" . }}"]
+          env:
+            - name: DANGEROUS_MODE
+              value: {{ .Values.env.DANGEROUS_MODE | quote }}
+            - name: REDIS_URL
+              value: "{{ include "vulnclaw.redisUrl" . }}"
+            - name: OOB_INTERACTSH_SERVER
+              value: {{ .Values.env.OOB_INTERACTSH_SERVER | quote }}
+          readinessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import redis; redis.Redis.from_url('{{ include "vulnclaw.redisUrl" . }}', socket_timeout=3).ping()"
+            initialDelaySeconds: {{ .Values.probes.startupPeriodSeconds }}
+            periodSeconds: {{ .Values.probes.intervalSeconds }}
+            timeoutSeconds: {{ .Values.probes.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.failureThreshold }}
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import redis; redis.Redis.from_url('{{ include "vulnclaw.redisUrl" . }}', socket_timeout=3).ping()"
+            initialDelaySeconds: {{ .Values.probes.startupPeriodSeconds }}
+            periodSeconds: {{ .Values.probes.intervalSeconds }}
+            timeoutSeconds: {{ .Values.probes.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.failureThreshold }}
+          resources:
+            {{- toYaml .Values.master.resources | nindent 12 }}
+          volumeMounts:
+            - name: scan-data
+              mountPath: /app/_runtime_cache
+      volumes:
+        - name: scan-data
+          {{- if .Values.master.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "vulnclaw.fullname" . }}-master-scan-data
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+{{- if .Values.master.persistence.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "vulnclaw.fullname" . }}-master-scan-data
+  labels:
+    {{- include "vulnclaw.labels" . | nindent 4 }}
+    app.kubernetes.io/component: master
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: {{ .Values.master.persistence.size }}
+{{- end }}

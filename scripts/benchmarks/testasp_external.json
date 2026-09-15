@@ -1,0 +1,24 @@
+{
+  "name": "acunetix-testasp",
+  "target": "http://testasp.vulnweb.com",
+  "note": [
+    "外部测试集（别人的漏洞样本）：Acunetix 官方公开的 ASP 测试靶站，明确供扫描器测试使用。",
+    "真值口径：仅收录 2026-09-12 手工实测确认的信号（宁缺毋假）。",
+    "  · 正样本 /search.asp?tfSearch= 实测 payload 原样未转义反射 → 反射型 XSS 成立。",
+    "  · 曾疑似 SQL 注入，经二次精确核对（DB 报错签名 80040e14/ODBC/Unclosed quotation）**全部未命中**",
+    "    → 判为**无 SQL 报错注入**，不写入真值（避免造出假正样本）。",
+    "合规：公开授权靶站，仅只读 GET 探测。"
+  ],
+  "endpoints": {
+    "/search.asp?tfSearch=": {
+      "expect": ["XSS"],
+      "min_severity": "Medium",
+      "tier": "hard",
+      "verified": "手工实测：tfSearch=payload 原样未转义反射"
+    }
+  },
+  "negatives": {
+    "/default.asp?q=": "站点首页类页面，参数不落地回显",
+    "/login.asp?q=": "登录页，参数不回显"
+  }
+}

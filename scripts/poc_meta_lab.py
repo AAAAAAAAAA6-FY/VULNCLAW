@@ -18,7 +18,7 @@ import argparse
 import json
 import secrets
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 
@@ -367,7 +367,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="元orphic 探针验收靶场")
     ap.add_argument("--port", type=int, default=8791)
     args = ap.parse_args()
-    srv = HTTPServer(("127.0.0.1", args.port), _Handler)
+    # 多线程：扫描器并发请求 + HTTP/1.1 keep-alive 下，单线程会被空闲连接阻塞
+    srv = ThreadingHTTPServer(("127.0.0.1", args.port), _Handler)
     print(f"[meta-lab] listening on http://127.0.0.1:{args.port}")
     try:
         srv.serve_forever()

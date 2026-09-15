@@ -15,6 +15,8 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    mem_limit: 512m
+    cpus: "1.0"
     ports:
       - "6379:6379"
     volumes:
@@ -28,6 +30,16 @@ services:
   master:
     build: .
     restart: unless-stopped
+    mem_limit: 2g
+    cpus: "2.0"
+    healthcheck:
+      # liveness/readiness 合一：进程活着且 Redis 可达即 healthy。
+      # master 为无端口控制台进程，直接以 redis-py 探活（slim 镜像内可用）。
+      test: ["CMD", "python", "-c", "import redis; redis.Redis.from_url('redis://redis:6379/0', socket_timeout=3).ping()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     depends_on:
       redis:
         condition: service_healthy
@@ -36,13 +48,26 @@ services:
         required: false
     environment:
       DANGEROUS_MODE: ${DANGEROUS_MODE:-deny}
+      # 容器内固定指向 redis 服务（覆盖 .env 里默认的 localhost:6379）
+      REDIS_URL: redis://redis:6379/0
+      # OOB 自部署 interactsh 服务（OOB 回调验证在 worker 侧执行）
+      OOB_INTERACTSH_SERVER: ${OOB_INTERACTSH_SERVER:-}
     command: ["--distributed", "--master", "--redis-url", "redis://redis:6379/0"]
     volumes:
-      - scan-reports:/app/reports
+      # 报告/日志/死信队列统一在 /app/_runtime_cache 下（reports/logs/dag_dead_letter/cookies）
+      - scan-data:/app/_runtime_cache
 
   worker:
     build: .
     restart: unless-stopped
+    mem_limit: 4g
+    cpus: "3.0"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import redis; redis.Redis.from_url('redis://redis:6379/0', socket_timeout=3).ping()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     depends_on:
       redis:
         condition: service_healthy
@@ -51,12 +76,14 @@ services:
         required: false
     environment:
       DANGEROUS_MODE: ${DANGEROUS_MODE:-deny}
+      REDIS_URL: redis://redis:6379/0
+      OOB_INTERACTSH_SERVER: ${OOB_INTERACTSH_SERVER:-}
     deploy:
       replicas: 2
     command: ["--distributed", "--worker", "--redis-url", "redis://redis:6379/0"]
     volumes:
-      - scan-reports:/app/reports
+      - scan-data:/app/_runtime_cache
 
 volumes:
   redis-data:
-  scan-reports:
+  scan-data:

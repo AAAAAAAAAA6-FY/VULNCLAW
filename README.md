@@ -501,6 +501,23 @@ Intruder / Replay / 协作器，历史数据仍为空。
 `Burp 插件文件不存在: burp_cookies.json`，那只是可选的手动 Cookie 导入文件
 缺失（`CRAWL_AUTHED` 未配置时无影响），不影响桥功能。
 
+#### 无 Burp 部署（Burp 是可选组件，不是依赖）
+
+**没有 Burp Suite 也能完整使用 VULNCLAW**——Burp 桥（代理历史回灌 / REST API
+联动）只是增强项，核心扫描链路（引擎撒网 → AI 审讯 → Agent 深挖 → 报告）
+完全不依赖它：
+
+```text
+1. 注释 .env 里的 PROXY 行（或运行时加 --no-proxy），避免请求被发往
+   未启动的 127.0.0.1:8080 代理导致全站请求失败；
+2. 不配置 BURP_API_URL / BURP_API_KEY 即可——扫描器探活失败会自动
+   跳过代理历史通道，日志只出现一次性告警，不影响任何引擎执行；
+3. thirdparty/burp-bridge/ 目录可以整个保留（不会被加载），也可移除。
+```
+
+> 口径：`PROXY` 未启动是"无 Burp 部署"最常见的假死根因（本地 127.0.0.1
+> 目标自动绕过代理所以看不出）。扫描器启动时已内置代理预检并告警。
+
 **爬虫预算配置说明（为什么爬取次数少 / 如何加大）**：同源链接爬虫
 （`crawl_same_origin`）默认 `max_depth=2、max_urls=80`，备用爬虫默认
 `max_depth=2、max_urls=30`——这是防爆炸上限，本地小型站点两次即可爬完，

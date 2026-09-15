@@ -5,6 +5,10 @@ on:
     branches: [ master, main ]
   pull_request:
     branches: [ master, main ]
+  schedule:
+    # 工作流4 nightly：每日 03:17 UTC（北京时间 11:17）跑质量门禁并归档统计报告
+    - cron: '17 3 * * *'
+  workflow_dispatch:  # 支持手动触发 nightly 统计
 
 jobs:
   test:
@@ -25,10 +29,27 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e .
-          pip install ruff pytest pytest-cov
+          # pytest-asyncio 必装：全量测试大量使用（pyproject asyncio_mode="strict"），
+          # 缺失会导致 collection error 而非失败用例。
+          pip install ruff pytest pytest-cov pytest-asyncio
 
       - name: Lint with ruff
         run: ruff check src/vulnclaw --select E9,F63,F7 --statistics
+
+      - name: New blind-except gate (T02)
+        # T02 增量门禁：对 PR 变更的 .py 文件强制零裸 except（BLE001）。
+        # 存量 957 处为已知债务（T15 迁移），不在此拦截范围内；只拦"新增"。
+        # --no-config 绕开 pyproject 配置，保证本步骤的 BLE001 规则不被弱化。
+        run: |
+          BASE="${GITHUB_BASE_REF:+origin/$GITHUB_BASE_REF}"
+          if [ -z "$BASE" ]; then BASE="HEAD~1"; fi
+          git fetch origin --quiet || true
+          CHANGED=$(git diff --name-only "$BASE"...HEAD -- '*.py' 2>/dev/null || git diff --name-only HEAD~1 -- '*.py' 2>/dev/null)
+          if [ -z "$CHANGED" ]; then
+            echo "no changed python files"
+          else
+            echo "$CHANGED" | xargs ruff check --no-config --select BLE001
+          fi
 
       - name: Run tests
         run: pytest tests/ -q --tb=no --cov=src/vulnclaw --cov-report=term
@@ -38,11 +59,115 @@ jobs:
         # 真实靶场报告可由 D7.1 docker-compose 拉起后由 scan.py 生成并替换 --report
         run: |
           python scripts/benchmark.py --mode eval \
-            --scenarios-dir scripts/benchmarks \
+            --scenarios-dir scripts/benchmarks/dvwa.yaml \
             --report scripts/benchmarks/baseline_report.json \
-            --min-recall 0.8
+            --min-recall 0.8 \
+            --min-precision 0.7
+
+      - name: Engine fixture benchmark gate (G.1)
+        run: |
+          python scripts/benchmark.py \
+            --min-detection-rate 0.8 \
+            --max-false-rate 0.2
+
+      - name: Dataset metrics gate (real results v1)
+        # 口径见 docs/DATASET_SPEC.md：environment_error/unknown 不进分母；
+        # reproduction_rate 仅报告不设门禁（当前为 0）
+        run: |
+          python scripts/dataset_metrics.py \
+            --dataset _runtime_cache/datasets/real_results_v1.jsonl \
+            --min-recall 0.8 \
+            --max-false-rate 0.2 \
+            --min-evidence-rate 0.5
 
       - name: Health check
         run: |
           echo "AI_MODEL_CONFIGS={\"zhipu\":{\"api_key\":\"test\"}}" > .env
           python scan.py --health
+
+      - name: Endpoint P/R gate (eval_prf, local_lab)
+        # 端点级 P/R/F1 持续门禁：真实 HTTP 靶场（local_lab 自动拉起）+ 真值比对，
+        # 任何引擎/声明改动导致的回归在此暴露。阈值 0.95 允许已知缺口
+        # （如 DOM XSS 需浏览器渲染 oracle），但拦截大幅回归；不稳定/不可用一律拦。
+        timeout-minutes: 15
+        run: |
+          python scripts/eval_prf.py --line spec --min-f1 0.95 --no-proxy
+
+  supply-chain:
+    # F1 供应链门禁（离线）：SBOM + 许可证清单 + 第三方工具 SHA256 完整性。
+    # 刻意不引入外部 SBOM 扫描器/联网校验：CI 只做确定性校验，避免新的供应链依赖。
+    # thirdparty/ 二进制不入库 → 完整性校验对缺失工具 fail-open（打印 SKIP 原因），
+    # 哈希不符仍硬失败（exit 2）：策略与口径见 docs/SUPPLY_CHAIN.md。
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Generate SBOM (offline, CycloneDX-style)
+        run: python scripts/sbom.py --output SBOM.json
+
+      - name: License inventory (UNKNOWN 如实列出)
+        run: python scripts/sbom.py --licenses-md docs/LICENSES.md
+
+      - name: Third-party tool integrity (fail-open on missing, exit 2 on mismatch)
+        run: python scripts/verify_tools.py --json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: SBOM.json
+          if-no-files-found: warn
+
+  nightly-benchmark:
+    # 工作流4：夜间质量门禁 + 统计报告归档（仅 schedule / 手动触发；push/PR 不跑，避免拖慢合并）
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Dataset metrics gate + 统计报告（含环境信息）
+        run: |
+          python scripts/dataset_metrics.py \
+            --dataset _runtime_cache/datasets/real_results_v1.jsonl \
+            --min-recall 0.8 \
+            --max-false-rate 0.2 \
+            --min-evidence-rate 0.5 \
+            --json-out nightly/dataset_metrics_v1.json
+
+      - name: Engine fixture benchmark gate (G.1)
+        run: |
+          python scripts/benchmark.py \
+            --min-detection-rate 0.8 \
+            --max-false-rate 0.2
+
+      - name: Upload nightly statistics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-statistics-${{ github.run_id }}
+          path: nightly/
+          if-no-files-found: warn
+          retention-days: 30

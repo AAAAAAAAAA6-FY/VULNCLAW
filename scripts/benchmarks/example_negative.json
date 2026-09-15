@@ -1,0 +1,15 @@
+{
+  "name": "example-com-clean",
+  "target": "http://example.com",
+  "note": [
+    "外部测试集（**纯精度/负样本**）：example.com 是 IANA 维护的静态示例页。",
+    "它不反射参数、不发 CORS 头、无已知漏洞 —— 真实世界里\"干净页\"的典型形态。",
+    "任何命中都是真实误报（本轮实测：命中 0，符合预期）。",
+    "本清单只有负样本、没有正样本，因此不参与 Recall，只压 Precision。",
+    "合规：仅对该静态页发只读 GET。"
+  ],
+  "endpoints": {},
+  "negatives": {
+    "/": "静态示例页：不反射参数、无 CORS、无已知漏洞"
+  }
+}
