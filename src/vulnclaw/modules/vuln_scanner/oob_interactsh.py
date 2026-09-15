@@ -23,7 +23,11 @@ async def get_interactsh_domain_async() -> Optional[str]:
     """
     try:
         from vulnclaw.core.oob_channel import OOBChannel
-        domain = await OOBChannel(provider="interactsh").request_domain()
+        # provider=auto：interactsh 优先、dnslog 降级（含审计Q 熔断：
+        # oast 公共服务器不可达时连续失败 2 次→熔断 300s 期间直接走 dnslog，
+        # 不再每次白等 8s）。硬编码 interactsh 会让引擎 OOB 在 oast 不通、
+        # dnslog 可用的环境下完全失效。
+        domain = await OOBChannel(provider="auto").request_domain()
         if domain:
             logger.info(f"📡 [Interactsh] 获取到域名: {domain}")
         else:
@@ -55,12 +59,19 @@ async def get_interactsh_poll(domain: str, timeout: int = 15,
             target_key_from_url,
         )
         _tgt = target or target_key_from_url(domain or "")
-        if is_oob_blocked(_tgt):
-            logger.debug("📡 [Interactsh poll] OOB 熔断生效，跳过轮询")
-            return []
-        ch = OOBChannel(provider="interactsh")
+        # provider=auto：与申请侧同一降级链（interactsh → dnslog），
+        # 保证 oast 不可达环境下 poll 仍能消费 dnslog 回调。
+        ch = OOBChannel(provider="auto")
         await ch.request_domain()  # 从缓存恢复已注册域名与会话文件
-        items = await ch.poll(timeout=timeout)
+        if is_oob_blocked(_tgt):
+            # 熔断只跳过"等待"，不做"忽略"：先零等待查一次缓冲——若命中，
+            # 说明此前的盲打已真实回连（判定有误），按回调解除熔断。
+            items = await ch.poll(timeout=min(6, timeout))
+            if not items:
+                logger.debug("📡 [Interactsh poll] OOB 熔断生效，跳过轮询")
+                return []
+        else:
+            items = await ch.poll(timeout=timeout)
         # 驱动目标级熔断：命中清零、零回调累加
         record_oob_result(_tgt, bool(items))
         out: List[Dict] = []
@@ -68,7 +79,13 @@ async def get_interactsh_poll(domain: str, timeout: int = 15,
             extra = getattr(it, "extra", None) or {}
             d = dict(extra)
             # 兼容旧消费者的 kebab-case 键
-            d.setdefault("raw-request", d.get("raw_request", "") or "")
+            # dnslog 回调的命中标识在 extra["data"]（如 <token>.<domain>），
+            # interactsh 在 raw_request。两者都要接住，否则引擎侧
+            # `scan_id in raw` 判定在 dnslog 通道下永远不命中。
+            d.setdefault(
+                "raw-request",
+                d.get("raw_request", "") or str(extra.get("data") or ""),
+            )
             d.setdefault("q-type", d.get("q-type") or d.get("type") or d.get("protocol") or "")
             d.setdefault("protocol", d.get("protocol", "") or "")
             out.append(d)

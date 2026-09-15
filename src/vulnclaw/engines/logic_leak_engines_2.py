@@ -73,11 +73,11 @@ class BackupFileLeakEngine(BaseEngine):
             if not isinstance(text, str) or not text:
                 continue
             matched = False
-            if sig[0].startswith(("PK\x03", "Rar!", "\x1f\x8b")):
+            if sig.startswith(("PK\x03", "Rar!", "\x1f\x8b")):
                 # 二进制魔数
-                matched = text.startswith(sig[0])
+                matched = text.startswith(sig)
             else:
-                matched = re.search(sig[0], text) is not None
+                matched = re.search(sig, text) is not None
             if not matched:
                 continue
             # 排除"默认 404/共用模板"虚拟匹配：env 类要求至少两个 key=value
@@ -454,11 +454,18 @@ class JsLibraryCveEngine(BaseEngine):
         if status != 200 or not text:
             return findings
 
-        detected: Dict[str, str] = {}
-        for lib_name, pattern in self.LIBRARY_PATTERNS:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                detected[lib_name] = match.group(1)
+        # H.2 扩展：库识别 = N 条正则扫全文响应体，纯 CPU 挪线程池
+        import asyncio
+
+        def _detect_libraries() -> Dict[str, str]:
+            d: Dict[str, str] = {}
+            for lib_name, pattern in self.LIBRARY_PATTERNS:
+                m = re.search(pattern, text, re.IGNORECASE)
+                if m:
+                    d[lib_name] = m.group(1)
+            return d
+
+        detected = await asyncio.to_thread(_detect_libraries)
 
         if not detected:
             return findings

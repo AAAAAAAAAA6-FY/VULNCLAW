@@ -14,6 +14,7 @@
 集成点：scan.py 中 --agents 参数可由 AdaptiveConcurrency 动态覆盖。
 """
 import asyncio
+import re
 import time
 
 from vulnclaw.core.logger import logger
@@ -47,6 +48,39 @@ class AdaptiveConcurrency:
         logger.info(
             f"📊 AdaptiveConcurrency 初始化: initial={initial} range=[{min_val}, {max_val}]"
         )
+
+    # 起步值动态化（H.3）：对"已知不会限流"的目标（本机回环/私网/本地靶场），
+    # 从 3 爬到可用并发要浪费好几轮试探；这类目标允许更高的起步值。
+    # 外部目标不受影响（反扫描敏感，起步值保持 settings 默认的保守值）。
+    _LOCAL_HOST_MARKERS = ("127.0.0.1", "localhost", "::1", "0.0.0.0")
+
+    @classmethod
+    def _is_local_target(cls, target: str) -> bool:
+        """回环 / 私网（RFC1918）/ *.local / 内网主机名 视为'可高起步'目标。"""
+        if not target:
+            return False
+        low = target.lower()
+        if any(m in low for m in cls._LOCAL_HOST_MARKERS):
+            return True
+        if ".local" in low or "testphp" in low or "vulnweb" in low:
+            return True
+        m = re.search(r"//([0-9.]+)", low)
+        if m:
+            parts = m.group(1).split(".")
+            if len(parts) == 4:
+                a, b = int(parts[0]), int(parts[1])
+                if a == 10 or a == 192 and b == 168:
+                    return True
+                if a == 172 and 16 <= b <= 31:
+                    return True
+        return False
+
+    def _boost_initial_for(self, target: str) -> int:
+        """按目标类型返回本次探测的起步并发（可高起步目标 ×local_boost，封顶 max）。"""
+        boost = getattr(settings, "adaptive_concurrency_local_boost", 3)
+        if boost <= 1 or not self._is_local_target(target):
+            return self.initial
+        return min(self.max_val, self.initial * boost)
 
     @property
     def current(self) -> int:
@@ -100,6 +134,9 @@ class AdaptiveConcurrency:
         )
 
         async with self._lock:
+            # H.3 起步值动态化：本地/私网目标直接从高起步值开始本轮调整
+            # （外部目标保持跨 probe 持久化的旧值，行为不变）。
+            self._current = self._boost_initial_for(target)
             if error_rate >= 0.5:
                 self._current = self.min_val
             elif avg_rt < 1.0 and error_rate < 0.05:
@@ -141,9 +178,11 @@ def get_adaptive_concurrency() -> AdaptiveConcurrency:
     """获取全局 AdaptiveConcurrency 单例。"""
     global _instance
     if _instance is None:
+        # 修复：原来用 getattr(settings, "ADAPTIVE_CONCURRENCY_INITIAL", 3)——
+        # pydantic 字段名是小写，大写属性不存在 → 环境变量配置被静默无视、永远回退 3。
         _instance = AdaptiveConcurrency(
-            initial=getattr(settings, "ADAPTIVE_CONCURRENCY_INITIAL", 3),
-            min_val=getattr(settings, "ADAPTIVE_CONCURRENCY_MIN", 1),
-            max_val=getattr(settings, "ADAPTIVE_CONCURRENCY_MAX", 20),
+            initial=settings.adaptive_concurrency_initial,
+            min_val=settings.adaptive_concurrency_min,
+            max_val=settings.adaptive_concurrency_max,
         )
     return _instance

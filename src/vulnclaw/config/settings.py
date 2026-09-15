@@ -46,9 +46,32 @@ class Settings(BaseSettings):
     max_concurrent: int = Field(10, alias="MAX_CONCURRENT")
     proxy: Optional[str] = Field(None, alias="PROXY")
     proxy_list: Annotated[List[str], NoDecode] = Field(default_factory=list, alias="PROXY_LIST")
+    # ===== 带外回连（OOB）声明线（2026-09-12）=====
+    # 盲漏洞（盲 SSRF / 盲 RCE / 盲 XXE）的证据不在响应里，而在"目标是否回连我们"。
+    # 未配置时 oob 型声明一律不探测（fail-closed：宁可漏报不误报）。
+    oob_base_url: str = Field("", alias="OOB_BASE_URL")       # 注入到载荷里的回调基址
+    oob_hits_file: str = Field("", alias="OOB_HITS_FILE")     # 命中通道：监听器把回调路径逐行写入
+    oob_wait_seconds: float = Field(6.0, alias="OOB_WAIT_SECONDS")
+    # 组件漏洞知识库（由 scripts/build_component_kb.py 用 OSV 数据生成，产物不入库）。
+    # 缺失时 component 判据自动降级为内置手写签名 —— 不会因 KB 不可用而误报。
+    component_kb_path: str = Field(os.path.join("thirdparty", "osv", "component_kb.json"),
+                                   alias="COMPONENT_KB_PATH")
+    # 外部现成知识源生成的声明签名（sqlmap 报错 / gitleaks 密钥 / Retire.js 组件）
+    external_sigs_path: str = Field(os.path.join("thirdparty", "rules", "external_sigs.json"),
+                                    alias="EXTERNAL_SIGS_PATH")
     max_scan_time: int = Field(3600, alias="MAX_SCAN_TIME")
     # E5.1 scope 硬约束白名单（逗号分隔：example.com 匹配自身及子域；*.*.example.com 通配；10.0.0.0/8 CIDR；精确 IP）
     allowed_scope: str = Field("", alias="ALLOWED_SCOPE")
+
+    # ========== 供应链安全：出站白名单 + 平台级 SSRF/DNS-rebinding 防护（工作流8）==========
+    # 三者默认均为 off，绝不改变现有扫描行为（内部靶场/本地 lab 靠 SSRF_ALLOW_PRIVATE 放行）。
+    # EGRESS_ALLOWLIST：非空才启用出站白名单。逗号分隔 host，支持 fnmatch 通配（*.corp.internal），空值段忽略。
+    egress_allowlist: str = Field("", alias="EGRESS_ALLOWLIST")
+    # SSRF_GUARD：非 "1" 即关闭平台级 SSRF/DNS-rebinding 防护。"1" 时解析 host，对解析出的每个 IP 做
+    # loopback/private/link-local 判定（不在 SSRF_ALLOW_PRIVATE 内即拒绝），并做首次/重解析一致性（防 DNS-rebinding）。
+    ssrf_guard: str = Field("0", alias="SSRF_GUARD")
+    # SSRF_ALLOW_PRIVATE：SSRF_GUARD=1 时的私网/回环放行白名单（逗号分隔 CIDR/单 IP，如 10.0.0.0/8,127.0.0.1）。
+    ssrf_allow_private: str = Field("", alias="SSRF_ALLOW_PRIVATE")
 
     # ========== OSINT 外发合规（2026-09-08） ==========
     # 默认开启：recon 会把目标域名发往公网 OSINT 源（crt.sh / AlienVault OTX / urlscan.io）。
@@ -201,6 +224,15 @@ class Settings(BaseSettings):
     oob_poll_timeout: int = Field(10, alias="OOB_POLL_TIMEOUT")                  # OOB 轮询超时（原 10）
 
     # ========== 硬编码参数改为 env 读取（新增通用字段） ==========
+    # 自动成长-方向2 读取端（2026-09-15）：经验账本反哺扫描主链路。
+    # 默认 False：吸收端（maybe_absorb_scan）与读取端（误报抑制签名 / 历史 payload 推荐）
+    # 全部保持关闭，现有扫描行为零影响；显式开启后才会查账本产生抑制/注入。
+    enable_growth_feedback: bool = Field(False, alias="ENABLE_GROWTH_FEEDBACK")
+    # 成长飞轮影子模式（growth/bridges，T11）：即使 enable_growth_feedback=False，
+    # 也照常**计算**推荐/抑制判定，但**不应用**（不注入 payload、不拦截 finding），
+    # 只累计命中率 —— 用真实流量积累"该不该翻转主开关"的数据背书，避免裸开主链路。
+    # 默认开（零行为影响，纯统计）；主开关打开后统计照常，以实盘为准。
+    growth_shadow_mode: bool = Field(True, alias="GROWTH_SHADOW_MODE")
     enable_waf_bypass: bool = Field(True, alias="ENABLE_WAF_BYPASS")
     agent_max_iterations: int = Field(15, alias="AGENT_MAX_ITERATIONS")
     agent_max_failures_per_param: int = Field(3, alias="AGENT_MAX_FAILURES_PER_PARAM")
@@ -208,6 +240,10 @@ class Settings(BaseSettings):
     max_paths: int = Field(150, alias="MAX_PATHS")  # 默认提高到150，避免漏扫
     # ========== S1: ReActAgent 接入 V100 主链路（深挖阶段） ==========
     enable_react_dive: bool = Field(True, alias="ENABLE_REACT_DIVE")  # 默认开（深挖受预算/无AI降级保护）；--deep 或 env 显式控制
+    # 验收/调试用：跳过"本地判定模糊"门槛强制深挖（默认关）。
+    # 正常扫描下引擎判出高危的参数会被排除，深挖候选常为空 → agent 线零产出、零审计；
+    # 需要验收 ReActAgent 链路或排查误报根因时显式开启（会产生真实 LLM 调用）。
+    react_dive_force: bool = Field(False, alias="REACT_DIVE_FORCE")
     react_dive_max_params: int = Field(3, alias="REACT_DIVE_MAX_PARAMS")  # 每轮最多深挖参数数
     react_dive_max_iterations: int = Field(5, alias="REACT_DIVE_MAX_ITERATIONS")  # 每参数 ReAct 轮数
     react_dive_budget: float = Field(150.0, alias="REACT_DIVE_BUDGET")  # 每参数总预算（秒）
@@ -369,6 +405,10 @@ class Settings(BaseSettings):
     max_response_size_mb: int = Field(50, alias="MAX_RESPONSE_SIZE_MB")
     cache_ttl: int = Field(7200, alias="CACHE_TTL")
     cache_backend: str = Field("memory", alias="CACHE_BACKEND")
+    redis_url: str = Field("redis://localhost:6379/0", alias="REDIS_URL")
+    # K.2 JS 沙箱单次执行超时(s)：原硬编码 10s 在高负载（全量测试/多任务并发）下
+    # 会把 node 冷启动+执行挤爆 → B 路误降级 C。加宽默认并允许 env 覆盖。
+    js_sandbox_timeout: float = Field(30.0, alias="JS_SANDBOX_TIMEOUT")
     port_scan_tool: str = Field("nmap", alias="PORT_SCAN_TOOL")
     port_scan_ports: str = Field(
         "80,443,8080,8443,3000,5000,7000,8000,9000,3306,5432,6379,9200,27017",
@@ -400,6 +440,23 @@ class Settings(BaseSettings):
     #    默认关闭，仅在明确授权且接受副作用时开启。
     # 默认开启：已由"串行预检 + 只测可逆动作"兜底——有防重的正常系统在预检阶段即被判无竞态
     #    并完全不并发；只有疑似无防重时才并发，且只针对可逆动作（领券/加购/收藏，可撤销）。
+    # ===== B2: L3 差分不变量引擎（2026-09-11）=====
+    # 对动作语义端点跑绑定/金额/一次性/状态跳跃检查器（角色差分走 idor_dual_session 线）
+    invariant_diff_enabled: bool = Field(True, alias="INVARIANT_DIFF_ENABLED")
+    invariant_diff_max_probes: int = Field(30, alias="INVARIANT_DIFF_MAX_PROBES")
+
+    # ===== B3: L3 剧本生成器（LLM 功能语义标注 + 差分剧本，2026-09-11）=====
+    # 从首页/robots/JS 端点提取功能清单 → 领域模板生成结构化剧本 → 逐动作差分
+    playbook_enabled: bool = Field(True, alias="PLAYBOOK_ENABLED")
+    # 剧本生成上限（LLM 标注可能产生多个功能×端点，保守起见限额）
+    playbook_max_playbooks: int = Field(10, alias="PLAYBOOK_MAX_PLAYBOOKS")
+    # 单剧本执行预算（秒，所有动作差分合计）
+    playbook_budget_s: int = Field(120, alias="PLAYBOOK_BUDGET_S")
+    # ===== A1 符号执行复核（2026-09-11，对面落地）=====
+    # B3 剧本 -> BusinessIR -> A1 确定性求解；候选默认不入报告（needs_verification）
+    symbolic_enabled: bool = Field(True, alias="SYMBOLIC_ENABLED")
+    # 候选自动入账开关（默认关：未经验证的推导绝不污染报告，验证层裁决后转真实）
+    symbolic_auto_report: bool = Field(False, alias="SYMBOLIC_AUTO_REPORT")
     sequence_chain_enabled: bool = Field(True, alias="SEQUENCE_CHAIN_ENABLED")
     # 单个端点并发请求数（引擎内部再夹到 [2,20]）
     sequence_race_concurrency: int = Field(8, alias="SEQUENCE_RACE_CONCURRENCY")
@@ -479,6 +536,15 @@ class Settings(BaseSettings):
     phase_timeout_report_s: int = Field(60, alias="PHASE_TIMEOUT_REPORT_S")
     phase_timeout_fallback_s: int = Field(180, alias="PHASE_TIMEOUT_FALLBACK_S")
 
+    # ---- B4 资产面枚举端（道3，2026-09-11）----
+    # 总开关与预算：默认 90s 总硬超时（各面并发+独立限流+超时降级，绝不影响主流程）
+    asset_surface_enabled: bool = Field(True, alias="ASSET_SURFACE_ENABLED")
+    asset_surface_budget_s: int = Field(90, alias="ASSET_SURFACE_BUDGET_S")
+    # 公开仓库线索开关（受 osint_disable 总闸约束；无 GitHub token 时按公共 API 限流静默降级）
+    asset_surface_repos: bool = Field(True, alias="ASSET_SURFACE_REPOS")
+    # 可选的 GitHub Token（授予仓库搜索一定配额；空=匿名公共搜索）
+    github_token: str = Field("", alias="GITHUB_TOKEN")
+
     max_param_mining: int = Field(0, alias="MAX_PARAM_MINING")                   # 参数挖掘条目喂给引擎的上限（0=不限制）
     max_crawl_seed_urls: int = Field(0, alias="MAX_CRAWL_SEED_URLS")       # 迭代爬虫种子 URL
     max_crawl_batch: int = Field(0, alias="MAX_CRAWL_BATCH")               # 每轮爬虫批处理 URL
@@ -491,6 +557,10 @@ class Settings(BaseSettings):
     max_url_pool: int = Field(0, alias="MAX_URL_POOL")                     # 深挖线索 URL 池
     max_engines_per_param: int = Field(0, alias="MAX_ENGINES_PER_PARAM")   # 单参数选用的引擎数
     max_total_tasks: int = Field(300, alias="MAX_TOTAL_TASKS")              # 任务生成总上限（控制膨胀：关增量后端点级bundle爆炸；0=不限制）
+    # 覆盖兜底：为参数循环未覆盖到的引擎补任务，避免尾部引擎长期 never_ran（8766 实测 67/81）。
+    # 默认只补 20 个——小目标上无条件补满会让请求量翻倍，宁可少补、逐轮摊薄。
+    coverage_fallback_max: int = Field(20, alias="COVERAGE_FALLBACK_MAX")     # 最多补多少引擎（0=不限）
+    coverage_fallback_chunk: int = Field(4, alias="COVERAGE_FALLBACK_CHUNK")  # 每个兜底 bundle 的引擎数
     negative_endpoints: str = Field("", alias="NEGATIVE_ENDPOINTS")          # 已知负样本端点（逗号分隔，如 /safe）；命中则落库前判误报丢弃
     max_test_params_per_endpoint: int = Field(0, alias="MAX_TEST_PARAMS_PER_ENDPOINT")  # 单端点测试参数数
     max_burp_history: int = Field(0, alias="MAX_BURP_HISTORY")             # Burp 历史解析条数
@@ -551,6 +621,7 @@ class Settings(BaseSettings):
             self.max_test_params_per_endpoint = 5
             self.max_burp_history = 50
             self.max_total_tasks = 200  # safe 模式更保守（控制任务膨胀）
+            self.coverage_fallback_max = 8  # safe 档兜底更保守：只补最缺的少数引擎
             self.max_subdomains = 50
             self.enable_target_probe = True  # safe 档保留探测——动态测容量反而降低压力
         return self
@@ -817,6 +888,34 @@ class Settings(BaseSettings):
             "vitest.config.ts",
             "cypress.json",
             "playwright.config.ts",
+            # ===== 扩充：中间件/管控面/SSO/云原生（2026-09-13） =====
+            # SSO / 身份
+            "sso", "saml", "saml/login", "saml/acs", "simplesaml", "simplesamlphp",
+            "adfs", "adfs/ls", "openid", ".well-known/openid-configuration",
+            ".well-known/webfinger", ".well-known/security.txt",
+            # CMS / 框架
+            "wp-json", "wp-json/wp/v2", "wp-content", "wp-includes", "xmlrpc.php",
+            "wp-trackback.php", "wp-admin/setup-config.php", "wp-admin/install.php",
+            "drupal", "joomla/administrator", "moodle", "moodle/login",
+            # 运维/监控管控面
+            "grafana", "grafana/login", "prometheus", "prometheus/api/v1", "alertmanager",
+            "kibana", "elasticsearch", "_cat", "_cluster/health", "_nodes",
+            "consul", "consul/ui", "vault", "vault/ui", "etcd/v2", "etcd/v3",
+            "traefik", "traefik/api", "caddy", "caddy/api", "portainer", "portainer/api",
+            "minio", "minio/login", "minio/health", "nacos", "nacos/v1",
+            "druid", "druid/index.html", "druid/webview", "sonarqube", "sonar", "sonar/login",
+            "nexus", "nexus/#/", "artifactory", "jenkins", "jenkins/login",
+            "j_acegi_security_check", "hudson", "cacti", "cacti/index.php",
+            "zabbix", "zabbix/index.php", "nagios", "nagios/cgi-bin",
+            "manager/html", "host-manager/html", "activemq", "activemq/web", "activemq/admin",
+            "spark", "spark/master", "flink", "jolokia", "jolokia/list", "jmx", "jmxrmi",
+            # K8s / 云原生
+            "api/v1", "apis", "healthz", "readyz", "livez", "kube-public", "kubernetes",
+            "metrics/cadvisor", ".kube/config",
+            # 其他常见暴露面
+            "phpinfo", "phpinfo.php", "info.php", "phpMyAdmin", "pma/index.php",
+            "webmail", "roundcube", "owa", "ecp", "exchange", "rpc",
+            "socket.io", "socket.io/?EIO=4",
         ],
         alias="COMMON_DIRS"
     )
@@ -834,8 +933,51 @@ class Settings(BaseSettings):
 
     # ========== Sprint 1: 自适应并发 ==========
     adaptive_concurrency_initial: int = Field(3, alias="ADAPTIVE_CONCURRENCY_INITIAL")
+    # H.3: 本地/私网目标的并发起步倍率（initial×boost，封顶 max）；
+    # 外部目标不受影响。1 = 关闭动态起步（行为退回原状）。
+    adaptive_concurrency_local_boost: int = Field(3, alias="ADAPTIVE_CONCURRENCY_LOCAL_BOOST")
     adaptive_concurrency_min: int = Field(1, alias="ADAPTIVE_CONCURRENCY_MIN")
     adaptive_concurrency_max: int = Field(20, alias="ADAPTIVE_CONCURRENCY_MAX")
+
+    # ========== P3 能力开关（2026-09-15：此前消费端全靠 getattr 默认关，未声明=写了不生效）==========
+    # 扫描队列背压闸门（core/backpressure.py）：pending ≥ 高水位阻塞新任务、< 低水位放行。
+    backpressure_enabled: bool = Field(False, alias="BACKPRESSURE_ENABLED")
+    # 多智能体辩论复核（verification_gateway.multi_agent_verify_batch）：
+    # 3 视角多数票（≥2）判误报，与单模型粗筛互斥替代；不可用时自动回退粗筛。
+    multi_agent_verify: bool = Field(False, alias="MULTI_AGENT_VERIFY")
+    # 三层 AI 决策（ai/v100/decision_layers.py）：战略/战术层规划以 strategic_priority 注入任务生成。
+    ai_three_layer: bool = Field(False, alias="AI_THREE_LAYER")
+    # RL bandit 状态持久化路径（ai/v100/bandit.py）：非空才落盘（tmp+os.replace 原子写）。
+    rl_bandit_state_path: str = Field("", alias="RL_BANDIT_STATE_PATH")
+    # 自动成长：OSV 情报增量摄入 → 组件声明草稿台账（growth/component_osv_ingest.py）。
+    enable_growth_ingest: bool = Field(False, alias="ENABLE_GROWTH_INGEST")
+    # Redis 断连 fail-stop（distributed/redis_backend，P0-8）：开启后 Redis 不可用
+    # 直接抛错，禁止降级到节点本地内存（默认关，保持无 Redis 单机可用性）。
+    redis_fail_stop: bool = Field(False, alias="REDIS_FAIL_STOP")
+    # Redis 降级 WAL（distributed/redis_backend，P0-8 补）：Redis 不可用降级到节点
+    # 本地内存期间的写入追加落盘，Redis 恢复后回放，避免"降级期写入永久丢失"
+    # （此前降级写入只活在本进程内存，进程一退就丢，且从不回灌 Redis）。
+    # 默认开（数据正确性优先）；仅降级路径触发，Redis 正常时不产生磁盘开销。
+    redis_wal_enabled: bool = Field(True, alias="REDIS_WAL_ENABLED")
+    # WAL 落盘路径；留空=默认 `_runtime_cache/redis_ctx_wal.jsonl`。
+    redis_wal_path: str = Field("", alias="REDIS_WAL_PATH")
+    # 代码审计批准根目录（code/repo_manager 本地目录边界，P0-2）：
+    # 逗号分隔的 realpath 前缀；**为空=不强制**（保持旧可用性，仅日志），
+    # 生产/MCP 暴露场景务必配置，拒绝批准根之外的本地目录。
+    code_audit_allowed_roots: str = Field("", alias="CODE_AUDIT_ALLOWED_ROOTS")
+    # 沙箱网络命令出口防护（core/sandbox.py，P0-3）：开启后拒绝指向
+    # loopback/link-local/RFC1918/ULA/云元数据 的网络命令目标，只放行授权外部目标。
+    sandbox_egress_guard: bool = Field(True, alias="SANDBOX_EGRESS_GUARD")
+    # 原生 YAML 模板解释器一致性审计（cve_nuclei._native_template_audit）：
+    # nuclei 跑完后用纯 Python 解释器对同目标双跑单请求模板子集，按 template-id
+    # 对比一致/差异（只审计不改主结果）。
+    native_templates_compare: bool = Field(False, alias="NATIVE_TEMPLATES_COMPARE")
+    # WAF 绕过有界预算（engines/base.try_waf_bypass，P1-15b）：
+    # 单参数单轮绕过的最大请求数 / 最长墙钟秒数。绕过链是四段式
+    # （签名确认→静态绕过→本地变异→AI 生成），对"一律 403"的硬拦截目标
+    # 会退化为无界放大；设 0/负值=不启用绕过。AI 段额外受墙钟限制。
+    waf_bypass_max_requests: int = Field(8, alias="WAF_BYPASS_MAX_REQUESTS")
+    waf_bypass_max_seconds: float = Field(15.0, alias="WAF_BYPASS_MAX_SECONDS")
 
     # ========== Sprint 1: Slack 通知插件 ==========
 

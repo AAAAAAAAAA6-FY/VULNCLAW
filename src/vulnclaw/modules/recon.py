@@ -31,7 +31,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from vulnclaw.core.logger import logger
 from vulnclaw.core.settings import settings, TMP_DIR
-from vulnclaw.core.tool_registry import run_tool
+from vulnclaw.core.tool_registry import run_tool, tool_available
+# 合并文件顶部需先导入 typing：本文件 104/838/867 行的模块级函数签名在加载时求值，
+# 而原 typing 导入位于第 956 行（port scanner 段），顺序错位 → Py3.11 上 import 即 NameError。
+from typing import Any, Dict, List, Optional, Set
 
 MAX_THREADS = settings.max_concurrent
 COMPLIANT_THREADS = max(10, settings.max_concurrent // 4)
@@ -93,12 +96,105 @@ def _run_cmd_safe(cmd: list, timeout: int = 300) -> tuple:
 
 
 def _run_tool_sync(name: str, args: list, timeout: int = None) -> tuple:
-    result = asyncio.run(run_tool(name, args=args, timeout=timeout))
+    # P3-12：run_sync 安全包装（事件循环内调用不再炸）
+    from vulnclaw.core.utils import run_sync as _run_sync_name
+    result = _run_sync_name(run_tool(name, args=args, timeout=timeout))
     return (
         result.get("stdout", ""),
         result.get("stderr", result.get("error", "")),
         result.get("returncode", -1),
     )
+
+
+async def run_ehole_finger_async(targets: List[str], timeout: int = 120) -> Dict[str, list]:
+    """EHole 指纹识别（可选外部工具）→ {url: [指纹名]}。
+
+    接线纪律（源于 2026-09-11 事故）：
+      · 可用性判定走 core.tool_registry.tool_available（禁止 shutil.which）
+      · 旗标对齐 `EHole finger -h` 实测：`-l <文件>`、`-o <file.json>`、`-t <线程>`
+      · 结果解析：EHole **无命中时不落盘**，因此读不到文件按"无指纹"处理（不是失败）
+    任何异常一律静默降级——指纹只是增强，绝不能拖垮 recon。
+    """
+    out: Dict[str, list] = {}
+    if not targets:
+        return out
+    try:
+        from vulnclaw.core.tool_registry import run_tool, tool_available
+        if not tool_available("EHole"):
+            return out
+    except Exception:  # noqa: BLE001
+        return out
+
+    list_fd, list_path = tempfile.mkstemp(suffix=".txt", prefix="ehole_targets_")
+    os.write(list_fd, "\n".join(targets).encode("utf-8", "ignore"))
+    os.close(list_fd)
+    out_fd, out_path = tempfile.mkstemp(suffix=".json", prefix="ehole_out_")
+    os.close(out_fd)
+    try:
+        await run_tool("EHole", args=["finger", "-l", list_path, "-o", out_path,
+                                      "-t", "20"], timeout=timeout)
+        if not (os.path.exists(out_path) and os.path.getsize(out_path) > 0):
+            return out  # 无命中：EHole 不写文件
+        with open(out_path, "r", encoding="utf-8", errors="ignore") as fh:
+            rows = json.load(fh)
+        if not isinstance(rows, list):
+            return out
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            url = str(r.get("url") or r.get("URL") or "").strip()
+            if not url:
+                continue
+            names = []
+            for k in ("cms", "name", "fid", "fingerprint"):
+                v = r.get(k)
+                if isinstance(v, str) and v.strip() and v.strip() not in names:
+                    names.append(v.strip())
+            if names:
+                out[url.rstrip("/")] = names
+        return out
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"EHole 指纹识别跳过: {exc}")
+        return out
+    finally:
+        for p in (list_path, out_path):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except OSError:
+                pass
+
+
+async def enrich_alive_fingerprints(alive: list, timeout: int = 120) -> list:
+    """用 EHole 补齐存活资产的"技术指纹"（增强项，失败不影响原数据）。
+
+    内置 FINGERPRINTS 只认几十种常见中间件；EHole 有上千条重点系统指纹
+    （OA / VPN / Weblogic / phpMyAdmin…），能显著提升"资产里有什么"的可见性。
+    """
+    if not alive:
+        return alive
+    try:
+        targets = [str(a.get("url") or "").rstrip("/") for a in alive
+                   if isinstance(a, dict) and a.get("url")]
+        fp = await run_ehole_finger_async(targets, timeout=timeout)
+        if not fp:
+            return alive
+        for a in alive:
+            if not isinstance(a, dict):
+                continue
+            key = str(a.get("url") or "").rstrip("/")
+            names = fp.get(key) or []
+            if not names:
+                continue
+            techs = list(a.get("technologies") or [])
+            for n in names:
+                if n not in techs:
+                    techs.append(n)
+            a["technologies"] = techs
+        logger.info(f"      🧬 EHole 指纹增强：{len(fp)} 个资产命中")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"EHole 指纹增强跳过: {exc}")
+    return alive
 
 
 def alive_scan(subdomains: list, compliant: bool = False) -> list:
@@ -194,7 +290,9 @@ def alive_scan(subdomains: list, compliant: bool = False) -> list:
             with open(temp_subs, 'r', encoding="utf-8") as stdin_file:
                 stdin_data = stdin_file.read()
 
-            result = asyncio.run(
+            # P3-12：run_sync 安全包装
+            from vulnclaw.core.utils import run_sync as _run_sync_tool2
+            result = _run_sync_tool2(
                 run_tool(
                     "httprobe",
                     args=["-c", "50", "-t", str(HTTPX_TIMEOUT * 1000)],
@@ -828,7 +926,9 @@ def get_subdomains(domain: str, compliant: bool = True) -> list:
             asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
         except ImportError:
             logger.debug("suppressed exception (core audit)")
-        return asyncio.run(get_subdomains_async(domain, compliant))
+        # P3-12：run_sync 安全包装（事件循环内调用不再炸）
+        from vulnclaw.core.utils import run_sync as _run_sync_sub
+        return _run_sync_sub(get_subdomains_async(domain, compliant))
 
     # 如果当前线程已在运行 loop（比如被 to_thread/run_in_executor 丢进来的 worker 线程）：
     # 直接 asyncio.run 会更简单、更稳定（每个 run() 创建全新独立 loop）
@@ -1114,7 +1214,7 @@ import shutil
 from urllib.parse import urljoin, urlparse, urlunparse
 
 from vulnclaw.core.logger import logger
-from vulnclaw.core.tool_registry import run_tool
+from vulnclaw.core.tool_registry import run_tool, tool_available
 
 # ============================================================
 # E3.3: 纯 HTTP 兜底爬虫——零外部工具依赖（方案③）
@@ -1178,7 +1278,10 @@ class EndpointCollector:
         }
 
     def _check_tool(self, tool_name: str) -> bool:
-        return shutil.which(tool_name) is not None
+        # 必须用 tool_available，不能用 shutil.which：第三方工具（如 gospider 在
+        # thirdparty/gospider/ 下）不在系统 PATH，shutil.which 会判 False 把它静默跳过，
+        # 而 tool_available 与 run_tool 同解析口径，能命中 thirdparty 下的二进制。
+        return tool_available(tool_name)
 
     async def collect(self, target_domain: str, subdomains: List[str],
                       js_endpoints: List[str], max_subdomains: int = 50) -> Set[str]:
@@ -1701,30 +1804,37 @@ async def crawl_same_origin(target: str, session=None, max_depth: int = 2, max_u
     _STATIC = ('.css', '.js', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico',
                '.woff', '.woff2', '.ttf', '.pdf', '.zip', '.mp3', '.mp4')
 
+    # 可复用渲染会话（借鉴 Scrapling 的 Fetcher 设计）：浏览器只启动一次、page 池化
+    # 跨 URL 复用，替代旧实现"每个 URL 冷启动一次 chromium"。后端优先 patchright
+    # （隐身，对抗反爬）→ 回退标准 playwright；两者都不可用则整体降级纯 HTTP。
+    _render_session = None
+    if render:
+        try:
+            from vulnclaw.core.render_session import open_render_session
+            _render_session = await open_render_session()
+        except Exception as exc:  # noqa: BLE001 - 渲染不可用一律回退 HTTP
+            logger.debug(f"渲染会话不可用，回退 HTTP 爬取: {exc}")
+            _render_session = None
+        if _render_session is None:
+            logger.debug("渲染后端不可用，本次爬取降级为纯 HTTP")
+            render = False
+
     async def _fetch_html(url: str):
-        """D1 渲染爬取：render=True 时优先 playwright 渲染 JS 取 DOM；失败回退 HTTP。"""
-        if render:
-            try:
-                from playwright.async_api import async_playwright
-                async with async_playwright() as p:
-                    b = await p.chromium.launch(headless=True)
-                    pg = await b.new_page()
-                    resp = await pg.goto(url, timeout=15000, wait_until="networkidle")
-                    status = resp.status if resp is not None else 200
-                    html = await pg.content()
-                    # R2-A S1: 浏览器渲染流 → LiveIntake 回注（开关关时零成本短路）
-                    try:
-                        from urllib.parse import urlparse as _up, parse_qs as _pq
-                        from vulnclaw.modules.live_intake import feed_live
-                        _q = _pq(_up(url).query, keep_blank_values=True)
-                        feed_live(url, params={k: (v[0] if v else "") for k, v in _q.items()},
-                                  source="render")
-                    except BaseException:
-                        logger.debug("suppressed exception (live intake render)")
-                    await b.close()
-                    return status, html
-            except BaseException:
-                logger.debug("suppressed exception (core audit)")
+        """D1 渲染爬取：render=True 时用复用渲染会话取 DOM；失败回退纯 HTTP。"""
+        if _render_session is not None:
+            fetched = await _render_session.fetch(url)
+            if fetched is not None:
+                status, html = fetched
+                # R2-A S1: 浏览器渲染流 → LiveIntake 回注（开关关时零成本短路）
+                try:
+                    from urllib.parse import urlparse as _up, parse_qs as _pq
+                    from vulnclaw.modules.live_intake import feed_live
+                    _q = _pq(_up(url).query, keep_blank_values=True)
+                    feed_live(url, params={k: (v[0] if v else "") for k, v in _q.items()},
+                              source="render")
+                except BaseException:
+                    logger.debug("suppressed exception (live intake render)")
+                return status, html
         try:
             resp = await async_get(url, session=session, timeout=10, no_retry=True)
         except BaseException:
@@ -1797,13 +1907,21 @@ async def crawl_same_origin(target: str, session=None, max_depth: int = 2, max_u
     from vulnclaw.core.target_capacity_probe import get_safe_concurrency
     _cc = get_safe_concurrency() or int(getattr(_st, "max_crawl_concurrency", 0) or 16)
     sem = asyncio.Semaphore(_cc)
-    while head < len(queue):
-        if len(results) >= max_urls:
-            break
-        url, depth = queue[head]
-        head += 1
-        async with sem:
-            await _visit(url, depth)
+    try:
+        while head < len(queue):
+            if len(results) >= max_urls:
+                break
+            url, depth = queue[head]
+            head += 1
+            async with sem:
+                await _visit(url, depth)
+    finally:
+        # 渲染会话必须在本函数退出前关闭，否则浏览器进程会随并发扫描泄漏
+        if _render_session is not None:
+            try:
+                await _render_session.close()
+            except Exception:  # noqa: BLE001 - 关闭失败不影响已收集结果
+                logger.debug("渲染会话关闭异常（忽略）")
     return {u: sorted(p) for u, p in results.items()}
 
 

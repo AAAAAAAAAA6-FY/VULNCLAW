@@ -48,6 +48,77 @@ def _is_allowed(command: str, args: List[str]) -> bool:
     return True
 
 
+# ---- P0-3 出口防护：网络命令目标地址校验 ----
+_NETWORK_COMMANDS = {"curl", "wget", "ping", "dig", "host", "nslookup", "whois", "http"}
+# 域名型拒绝（云元数据/内网命名）
+_DENY_HOST_SUFFIXES = (
+    ".internal", ".local", ".localdomain", ".home.arpa",
+    "metadata.google.internal", "instance-data",
+)
+_METADATA_IPS = ("169.254.169.254", "100.100.100.200", "192.0.0.192", "fd00:ec2::254")
+
+
+def _egress_target_denied(arg: str) -> bool:
+    """参数是否为被禁止的内网/本机/云元数据目标（True=拒绝）。
+
+    覆盖范围：IP 字面量（IPv4/IPv6）判 loopback / link-local / RFC1918 /
+    ULA / 保留段 / 元数据地址；域名判 .internal/.local 等内网后缀。
+    已知边界（记录在案，不假装解决）：DNS rebinding、HTTP 重定向越界、
+    IPv6 隧道需在网络层（容器 netns / egress proxy）兜底，本函数只做静态校验。
+    """
+    import ipaddress
+    from urllib.parse import urlsplit
+
+    s = str(arg or "").strip()
+    if not s:
+        return False
+    host = s
+    if "://" in s:
+        host = urlsplit(s).hostname or ""
+    else:
+        # 形如 host:port / user@host
+        host = s.split("@")[-1]
+        if host.startswith("["):  # [::1]:80
+            host = host[1:].split("]")[0]
+        else:
+            host = host.split("/")[0].split(":")[0]
+    host = host.strip().strip(".")
+    if not host:
+        return False
+    if host.lower() in ("localhost", "localhost.localdomain", "ip6-localhost", "::1"):
+        return True
+    if host in _METADATA_IPS or host.startswith("169.254.") or host.startswith("100.100."):
+        return True
+    low = host.lower()
+    if any(low == suf.lstrip(".") or low.endswith(suf) for suf in _DENY_HOST_SUFFIXES):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False  # 域名：仅后缀规则命中才拒绝
+    return bool(
+        ip.is_private or ip.is_loopback or ip.is_link_local
+        or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+    )
+
+
+def _egress_guard(command: str, args: List[str]) -> Optional[str]:
+    """网络命令出口校验；放行返回 None，拒绝返回可读原因。"""
+    try:
+        from vulnclaw.config.settings import settings
+        if not getattr(settings, "sandbox_egress_guard", True):
+            return None
+    except Exception:  # noqa: BLE001 - 配置不可读时不阻断（功能可用性优先）
+        return None
+    base = os.path.basename(shlex.split(command or "")[0]) if command else ""
+    if base not in _NETWORK_COMMANDS:
+        return None
+    for a in args:
+        if _egress_target_denied(str(a)):
+            return f"网络目标位于内网/本机/云元数据地址段，沙箱出口已拒绝: {a}"
+    return None
+
+
 async def run_sandboxed(
     command: str, args: Optional[List[str]] = None, timeout: int = SANDBOX_TIMEOUT
 ) -> Dict:
@@ -60,6 +131,11 @@ async def run_sandboxed(
             "blocked": True,
             "error": "命令不在白名单或含禁止参数（沙箱策略）",
         }
+    # P0-3：网络命令出口校验（内网/本机/云元数据 → 拒绝）
+    denied = _egress_guard(command, args)
+    if denied:
+        logger.warning(f"🚫 [Sandbox] 出口拦截: {command} {args} — {denied}")
+        return {"success": False, "blocked": True, "error": denied, "egress_blocked": True}
     try:
         os.makedirs(SANDBOX_WORKDIR, exist_ok=True)
         argv = [os.path.basename(shlex.split(command)[0])] + args

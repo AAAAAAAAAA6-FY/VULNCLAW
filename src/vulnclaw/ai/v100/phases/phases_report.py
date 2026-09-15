@@ -300,6 +300,8 @@ def _build_evidence_chain(vuln: Dict, cap_len: int = 4000) -> List[str]:
 
 
 async def _generate_report(self) -> Dict:
+    from vulnclaw.core.scanner import get_engine_inventory
+
     elapsed = int(time.time() - self._start_time)
     severity_count = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0, "Info": 0}
     for v in self.findings:
@@ -359,6 +361,7 @@ async def _generate_report(self) -> Dict:
     queue_stats = self.task_queue.get_stats()
     balancer_stats = self.balancer.get_stats()
     model_stats = await self.get_model_stats_cached()
+    engine_inventory = get_engine_inventory()
     report = {
         "target": self.target,
         "scan_time": __import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -377,6 +380,7 @@ async def _generate_report(self) -> Dict:
         "http2_ws_findings": self._http2_ws_findings,
         "cache_poison_findings": self._cache_poison_findings,
         "verified_findings": len(self.findings),
+        "engine_inventory": engine_inventory,
         "vulnerabilities": findings_ordered,
         "severity_stats": severity_count,
         "pending_review": list(getattr(self, "_pending_review", []) or []),

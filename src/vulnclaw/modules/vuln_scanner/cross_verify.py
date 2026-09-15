@@ -109,14 +109,14 @@ def _mark_confirmed(vuln: Dict, tool: str, out: str) -> None:
 
 async def _run_commix(vuln: Dict, spec: Dict) -> Optional[bool]:
     """Commix 独立确认命令注入。工具缺失/失败 → None（保留引擎判定）。"""
-    if shutil.which("commix") is None:
+    from vulnclaw.core.tool_registry import run_tool, tool_available
+    if not tool_available("commix"):
         logger.debug("[交叉验证层] commix 未安装，跳过 CMDi 对照")
         return None
     url = str(vuln.get("url", vuln.get("target", "")) or "")
     param = str(vuln.get("parameter", vuln.get("param", "")) or "")
     if not url or not param:
         return None
-    from vulnclaw.core.tool_registry import run_tool
     timeout = int(spec.get("timeout", 90))
     with tempfile.TemporaryDirectory(prefix="cross_commix_") as td:
         result = await run_tool(

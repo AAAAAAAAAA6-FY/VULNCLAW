@@ -13,6 +13,8 @@ Log4ShellEngine / FastjsonDeserializationEngine / Struts2OGNLEngine / Spring4She
 import asyncio
 import re
 import base64
+import secrets
+import time
 from typing import Dict, List, Optional, Tuple
 
 from vulnclaw.core.logger import logger
@@ -63,13 +65,73 @@ async def _run_oob_scan(
         return None
     dedup.add(key)
 
-    from vulnclaw.core.oob_channel import OOBChannel, is_oob_blocked
+    from vulnclaw.core.oob_channel import (
+        OOBChannel,
+        is_oob_blocked,
+        local_oob_channel,
+        local_oob_ldap_base,
+        wait_local_oob,
+    )
 
     # P0 熔断：外发被封禁（连续零回调达阈值）或通道熔断中 → 整段跳过。
     # 不透传空等（oob_wait=12s）与注定无回连的注入请求（每个 payload 一个 HTTP）。
     if is_oob_blocked(_origin_of(url)):
         logger.debug(f"[{engine_name}] OOB 熔断生效，跳过 {url} 的带外盲打")
         return None
+
+    # 本地回环模式：目标在本机/私网时（scan_runner 已按目标判定启用本地监听器，
+    # settings.oob_base_url / oob_hits_file / local_oob_ldap_base 已就绪），远端外带域
+    # 对私网目标不可达 → 改用 127.0.0.1 的 HTTP/LDAP(TCP) 监听器闭环：JNDI（ldap/rmi）
+    # 与 HTTP 型载荷都能被本机监听器捕获，DNS 型载荷本地无法回连，跳过。
+    from vulnclaw.config import settings as _st
+    _local_base = str(getattr(_st, "oob_base_url", "") or "").strip().rstrip("/")
+    _local_ldap = local_oob_ldap_base()
+    if _local_base and _local_ldap:
+        token = secrets.token_hex(8)
+        ldap_host = _local_ldap.split("://", 1)[-1]   # 127.0.0.1:PORT
+        obs_http = f"{_local_base}/{token}"
+        obs_tcp = f"{ldap_host}/{token}"              # -> ldap://127.0.0.1:PORT/{token}/a
+        sent = 0
+        for template in payload_templates:
+            t_lower = template.lower()
+            if "dns:" in t_lower or "getbyname" in t_lower:
+                continue  # DNS 型载荷本地无法回连
+            payload = template.replace("{OBS_HTTP}", obs_http).replace("{OBS_DNS}", obs_tcp)
+            attack_url = build_attack_url(url, param, payload, parsed_query)
+            try:
+                await async_get(attack_url, session=session, timeout=settings.timeout, no_retry=True, allow_redirects=False)
+            except Exception:  # noqa: BLE001
+                pass
+            sent += 1
+            await asyncio.sleep(0.4)
+        if not sent:
+            return None
+        if not await wait_local_oob(token, timeout=oob_wait):
+            return None
+        chan = local_oob_channel(token) or "tcp"
+        return enrich_finding({
+            'url': url,
+            'parameter': param,
+            'payload': f'OOB 本地回环 {type_label} -> {obs_http}',
+            'type': f'{type_label}(本地回环实锤)',
+            'severity': 'Critical',
+            'ai_verdict': '高',
+            'confidence': 'high',
+            'evidence': (
+                f'{evidence_note}。本地目标注入后本机监听器收到回连（token={token}，'
+                f'LDAP/TCP 监听 {ldap_host}），'
+                f'复现：curl -s --max-time 5 \'{obs_http}\''
+                f' —— 无回显环境本地实锤，可能可 RCE'
+            ),
+            'oob_evidence': {
+                'ts': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                'channel': chan,
+                'token': token,
+                'detail': obs_http if chan == 'http' else f"{_local_ldap}/{token}",
+                'reproduce': f"curl -s --max-time 5 '{obs_http}'",
+            },
+            'recommendation': recommendation,
+        })
 
     ch = OOBChannel()
     try:
@@ -146,7 +208,13 @@ async def _run_oob_scan(
 # Log4ShellEngine（Log4j2 JNDI / Lookup 注入，CVE-2021-44228 系列）
 # ============================================================
 class Log4ShellEngine(BaseEngine):
-    """Log4j2 Lookup 注入检测（基于 ${lookup} 解析值回显判定，非外带回显）"""
+    """Log4j2 Lookup 注入检测（基于 ${lookup} 解析值回显判定，非外带回显）
+
+    能力边界声明（2026-09-15 评审补录）
+    - can_detect: 基于 ${lookup} 内联解析值回显比对（sys:java.version / java:version / sys:os.name / date:yyyy / env:USER）判定 JNDI Lookup 注入（CVE-2021-44228 系列）。
+    - cannot_detect: 无回显（blind）场景且无外带回显通道时无法判定；RCE 深度利用（反弹 shell/文件写入/远程加载 class）不在本引擎范围；${...} 被旋转或净化导致解析无回显时会漏检。
+    - 前置条件: 请求参数/请求头能被目标 Log4j2 记录并触发 lookup 解析；解析结果需在实际响应中内联回显。
+    """
 
     name = "log4shell"
     description = "Log4j2 Lookup 注入检测（${lookup} 内联解析值回显）"
@@ -242,7 +310,13 @@ class Log4ShellEngine(BaseEngine):
 # FastjsonDeserializationEngine（autoType 反序列化）
 # ============================================================
 class FastjsonDeserializationEngine(BaseEngine):
-    """Fastjson autoType 反序列化探测（报错回显指纹）"""
+    """Fastjson autoType 反序列化探测（报错回显指纹）
+
+    能力边界声明（2026-09-15 评审补录）
+    - can_detect: 向 JSON 数据注入 @type autoType payload（AutoCloseable/Class/JdbcRowSetImpl 等），依据报错回显指纹（fastjson/JsonException/autoType/JdbcRowSetImpl 等关键词）识别 fastjson 反序列化。
+    - cannot_detect: 关闭 autoType 或 fail-fast 不抛错的版本无报错指纹会漏检；盲打无回显场景；gadget 链二次利用在目标不出网时无法确认 RCE。
+    - 前置条件: 请求体为 JSON 且可到达反序列化入口；服务端会对非法 @type 抛错并在响应中回显异常信息。
+    """
 
     name = "fastjson_deserialization"
     description = "Fastjson autoType 反序列化探测（报错回显指纹）"

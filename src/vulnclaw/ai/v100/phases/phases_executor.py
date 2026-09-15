@@ -6,6 +6,7 @@
 
 """Implementation functions for the v100 executor phase."""
 import asyncio
+import contextlib
 import time
 import ast
 import json
@@ -39,11 +40,24 @@ def _engine_task_target_allowed(self, task) -> tuple:
         target = str(task.get("target", "") or "")
         if not target:
             return True, "无目标"
-        host = (_up_d(target).hostname or "").lower()
+        parsed = _up_d(target)
+        host = (parsed.hostname or "").lower()
         if not host:
             return True, "目标无 host（相对路径，交由请求层判定）"
-        main = (_up_d(str(getattr(self, "target", "") or "")).hostname or "").lower()
+        main_parsed = _up_d(str(getattr(self, "target", "") or ""))
+        main = (main_parsed.hostname or "").lower()
         if main and (host == main or host.endswith("." + main)):
+            # 同主机端口隔离：主目标显式指定端口时，任务有效端口须一致，
+            # 防同主机多服务（本地多靶场 8791 vs 8090）跨目标串扫。
+            main_port = main_parsed.port
+            if main_port is not None:
+                task_port = parsed.port if parsed.port is not None else (
+                    443 if (parsed.scheme or "").lower() == "https" else 80)
+                if task_port != main_port:
+                    entries = parse_scope()
+                    if entries and url_in_scope(target, entries):
+                        return True, "allowed_scope 白名单"
+                    return False, f"host={host} 端口越界(main:{main_port} task:{task_port})"
             return True, "主域/子域"
         entries = parse_scope()
         if entries and url_in_scope(target, entries):
@@ -239,7 +253,19 @@ async def _execute_with_limiting(self):
         )
     # 消费点3：引擎任务并发优先读目标请求能力探测结果（未探测/失败 → None → 原静态默认值）
     from vulnclaw.core.target_capacity_probe import get_safe_concurrency
-    MAX_CONCURRENT = int(get_safe_concurrency() or getattr(settings, "orchestrator_max_concurrent", 10))
+    # 工作流10：显式扫描模式指定的并发优先（用户显式意图 > 自动探测）
+    _profile_conc = int(getattr(self, "scan_concurrency", 0) or 0)
+    # 工作流10：--adaptive 自适应并发（探测目标 RTT/错误率后给推荐并发；默认关闭）
+    if getattr(self, "scan_adaptive", False):
+        try:
+            from vulnclaw.core.adaptive_concurrency import get_adaptive_concurrency
+            _adaptive_rec = int(await get_adaptive_concurrency().probe(self.target) or 0)
+            if _adaptive_rec > 0:
+                _profile_conc = _adaptive_rec
+                logger.info(f"   [adaptive] 目标探测推荐并发: {_adaptive_rec}")
+        except Exception as exc:  # noqa: BLE001 - 探测失败回退原并发
+            logger.debug(f"自适应并发探测失败（忽略）: {exc}")
+    MAX_CONCURRENT = _profile_conc or int(get_safe_concurrency() or getattr(settings, "orchestrator_max_concurrent", 10))
     # 第3次修复：attack 阶段预算硬顶（settings.attack_node_budget，P0 已收口为正式字段，
     # 默认 500s 且须小于外层 phase_timeout_scan_s=600）。LLM QPS 降级(1.5~2.1)时任务
     # 墙钟时间不可控，用 deadline 保证 attack 节点耗时上限。超预算任务判败出队
@@ -269,6 +295,17 @@ async def _execute_with_limiting(self):
         while True:
             if queue_ended.is_set():
                 return
+            # P3-9 背压：verify 待处理堆积超阈值时暂停取新任务（默认关：
+            # settings.backpressure_enabled=False 恒放行，行为不变）
+            try:
+                from vulnclaw.core.backpressure import get_backpressure_gate
+                _bp = get_backpressure_gate()
+                _pending = getattr(self, "_pending_verify", None)
+                if _bp.enabled and _pending is not None:
+                    while not _bp.should_proceed(len(_pending)) and not queue_ended.is_set():
+                        await asyncio.sleep(_bp.poll)
+            except Exception:  # noqa: BLE001 - 背压为增强项，异常绝不影响 worker
+                pass
             # 诊断 watchdog：记录每个 worker 当前所处阶段
             self._dbg_workers[worker_id] = "get_next"
             # 拿到真实 task_id → 不再用 time.time() 传假值
@@ -776,10 +813,17 @@ async def _execute_engine_bundle(self, task: Dict) -> Optional[Dict]:
                 )
                 return None
 
-    results = await asyncio.gather(
-        *(_run_one(name) for name in engines),
-        return_exceptions=False,
-    )
+    # 整改清单 item 3：外层取消（整扫中止/超时）时显式回收所有 _run_one 子协程，
+    # 杜绝子任务以 "cancelling" 态堆积成孤儿协程。仅做取消回收、不加硬超时，
+    # 避免误杀合法慢引擎导致漏检（fail-closed 优先于速度）。
+    gather_task = asyncio.gather(*(_run_one(name) for name in engines), return_exceptions=False)
+    try:
+        results = await gather_task
+    except asyncio.CancelledError:
+        gather_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await gather_task
+        raise
     local_results = [
         {"engine": name, "result": result}
         for name, result in zip(engines, results)
@@ -922,6 +966,15 @@ def _collect_react_candidates(self) -> List[str]:
     bundle_results = getattr(self, "_bundle_results", None) or {}
     if not bundle_results:
         return []
+    # 验收/调试：REACT_DIVE_FORCE=true 时跳过"模糊"门槛，把所有已执行参数交深挖，
+    # 用于验证 ReActAgent 链路本身（默认关闭，不改变正常扫描行为）。
+    if getattr(settings, "react_dive_force", False):
+        forced = [p for p in bundle_results if p]
+        logger.warning(
+            f"⚠️ [ReActDive] react_dive_force 已开启：跳过模糊判定门槛，"
+            f"强制深挖 {len(forced)} 个参数（会产生真实 LLM 调用与审计记录）"
+        )
+        return forced
     param_has_strong = set()
     for f in getattr(self, "findings", []) or []:
         p = f.get("parameter") or f.get("param") or ""
@@ -1499,6 +1552,15 @@ async def _execute_engine_check(self, task: Dict) -> Optional[Dict]:
     if not engine:
         logger.debug(f"   ⚠️ 未知引擎: {engine_name}")
         return None
+    # P4-2: 机器事实覆盖账本——V100 直调 engine.check 绕过了 scanner.run_engine，
+    # 导致 bundle 引擎（含 coverage_fallback 兜底）长期不落账、coverage 永远 never_ran
+    # （实测 8090：兜底引擎已 pick 执行，gaps 仍 66）。此处补同口径记账，异常零传播。
+    _ledger = None
+    try:
+        from vulnclaw.core.coverage import get_coverage_ledger
+        _ledger = get_coverage_ledger(target=str(target))
+    except Exception:  # noqa: BLE001
+        _ledger = None
     # 优化5: 获取正常响应（single-flight）—— 并发任务对同一 target 只发一次 baseline GET。
     # 注意：key 保持完整 URL（含 query），不按 path 归一化，避免基线语义变化引发误报。
     async with self._normal_responses_lock:
@@ -1550,7 +1612,32 @@ async def _execute_engine_check(self, task: Dict) -> Optional[Dict]:
         )
         self._total_engine_calls += 1
         self._record_engine_metric(engine_name, time.monotonic() - _t0, hit=bool(result))
+        if _ledger is not None:
+            try:
+                _ledger.record_run(str(target), engine_name,
+                                   findings=1 if result else 0,
+                                   duration=round(time.monotonic() - _t0, 3))
+            except Exception:  # noqa: BLE001
+                pass
         if result:
+            # 自动成长-读取端（2026-09-15）：账本强误报指纹过滤（默认关零影响）。
+            # 命中 (vuln_type, 归一化参数) 强误报签名 -> 不进待验证队列，不计命中。
+            # 注：此时 result 尚无 parameter 字段（下方排队才补），
+            # 直接以任务参数为准补一个快照字段供抑制匹配，不改动原始 result 结构。
+            try:
+                from vulnclaw.growth.bridges import suppress_findings
+                _snap = dict(result)
+                _snap.setdefault("parameter", param)
+                _kept, _suppressed = suppress_findings(_snap)
+                if _suppressed:
+                    logger.info(f"   ⏭️ [Growth] 账本抑制强误报: {result.get('type', engine_name)} on {param}")
+                    if _kept is None:
+                        await self.rate_limiter.record_success(current_model)
+                        if provider_key:
+                            await self.balancer.record_result(provider_key, success=True)
+                        return None
+            except Exception:  # noqa: BLE001
+                pass
             # S3: SQLi 类检出 → sqlmap 轻量确认（POC 级，不提取数据），升级为实锤
             # 关键：确认失败/异常绝不影响引擎原始检出，避免丢 finding
             try:
@@ -1613,6 +1700,11 @@ async def _execute_engine_check(self, task: Dict) -> Optional[Dict]:
             await self.balancer.record_result(provider_key, success=False, status_code=408)
         logger.warning(f"   ⏭️ 引擎检查超时(60s): {engine_name} {param}")
         self._record_engine_metric(engine_name, time.monotonic() - _t0, hit=False, timeout=True)
+        if _ledger is not None:
+            try:
+                _ledger.record_failed(str(target), engine_name, "timeout")
+            except Exception:  # noqa: BLE001
+                pass
         return None
     except Exception as e:
         error_str = str(e)
@@ -1622,5 +1714,10 @@ async def _execute_engine_check(self, task: Dict) -> Optional[Dict]:
             await self.balancer.record_result(provider_key, success=False, status_code=500)
         logger.debug(f"   ❌ 执行失败: {e}")
         self._record_engine_metric(engine_name, time.monotonic() - _t0, hit=False, error=True)
+        if _ledger is not None:
+            try:
+                _ledger.record_failed(str(target), engine_name, error_str[:200])
+            except Exception:  # noqa: BLE001
+                pass
         return None
 __all__ = ['_run_business_logic_scan', '_run_api_version_scan', '_run_smuggling_scan', '_run_http2_ws_scan', '_run_cache_poison_scan', '_run_burp_scan', '_execute_with_limiting', '_run_one_task', '_execute_task', '_safe_parse_bundle_json', '_execute_engine_bundle', '_execute_global_scan', '_execute_engine_check', '_run_react_deep_dive', '_collect_react_candidates', '_merge_react_findings', '_run_chain_router', '_chain_ssrf', '_chain_upload', '_generate_clues_for_dive', '_persist_scan_memory', '_run_multi_agent_dive', '_resolve_agent_conflicts', '_sticky_mark_failed']

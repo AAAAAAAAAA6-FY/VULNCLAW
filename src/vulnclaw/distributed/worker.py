@@ -22,6 +22,7 @@ import uuid
 from typing import Dict, List, Optional
 
 from vulnclaw.core.logger import logger
+from vulnclaw.distributed import PROTOCOL_VERSION, validate_envelope
 
 
 class DistributedWorker:
@@ -168,6 +169,13 @@ class DistributedWorker:
             return None
         task = json.loads(task_data)
 
+        # P2-19 编排端口协议：拉取后校验信封（只告警不阻断，同 Master 侧口径）。
+        ok, errs = validate_envelope(
+            "task", task, task.get("protocol_version", PROTOCOL_VERSION))
+        if not ok:
+            logger.warning(
+                f"⚠️ [Worker:{self._worker_id}] 任务信封不合规（仍执行）: {errs}")
+
         # P3-3: 任务 TTL 检查（过期直接丢弃并 ACK）
         ttl = task.get("ttl") or 0
         submitted_at = task.get("submitted_at") or time.time()
@@ -306,11 +314,22 @@ class DistributedWorker:
         return result
 
     async def report_result(self, task_id: str, result: Dict) -> None:
-        """上报任务结果。"""
+        """上报任务结果（P0-10：**幂等提交**）。
+
+        故障转移窗口内同一任务可能被二次投递；这里用 `SETNX` 抢占结果槽——
+        抢占失败说明结果已由（本任务的前一次投递或另一 worker）提交，
+        本次执行只做 no-op，避免结果覆盖/重复 finding。
+        """
         await self._connect()
 
         result_key = f"{self._prefix}:result:{task_id}"
-        await self._redis.set(result_key, json.dumps(result, default=str))
+        payload = json.dumps(result, default=str)
+        claimed = await self._redis.setnx(result_key, payload)
+        if not claimed:
+            logger.warning(
+                f"⚠️ [Worker:{self._worker_id}] 任务 {task_id} 结果已存在，"
+                f"本次为重复投递 → 放弃写入（幂等 no-op）"
+            )
 
         # 删除任务分配记录
         assigned_key = f"{self._prefix}:assigned:{self._worker_id}:{task_id}"

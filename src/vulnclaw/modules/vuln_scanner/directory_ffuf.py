@@ -17,7 +17,7 @@ import re
 from vulnclaw.core.logger import logger
 from vulnclaw.core.settings import settings
 from vulnclaw.core_modules.cache import SQLiteCache
-from typing import List
+from typing import List, Tuple
 
 # P1-1: FFUF 结果 SQLite 持久化缓存（Key=ffuf:{target_hash}:{wordlist_mtime}，24h TTL）
 _ffuf_cache = SQLiteCache(name="ffuf", ttl=86400)
@@ -109,6 +109,9 @@ async def run_ffuf_async(target: str, concurrency: int = 20, timeout: int = 120)
     # ========== P1-1: FFUF 结果增量缓存 ==========
     # Key = ffuf:{target_hash}:{wordlist_mtime}；命中直接返回（24h TTL）；
     # miss 时跳过上次已发现路径，仅重试上次 404/429 路径（增量）。
+    # 评测/回归开关：VULNCLAW_FFUF_CACHE=0 时完全旁路缓存（读写都不走），
+    # 防止持久缓存污染 P/R/F1 评测与耗时对照（评测脚本 eval_prf.py 已默认置 0）。
+    cache_enabled = os.environ.get("VULNCLAW_FFUF_CACHE", "1").strip().lower() not in ("0", "false", "off")
     target_hash = hashlib.sha256(target.encode("utf-8")).hexdigest()[:16]
     if extra_dict_path and os.path.isfile(extra_dict_path):
         wl_mtime = str(int(os.path.getmtime(extra_dict_path)))
@@ -116,13 +119,13 @@ async def run_ffuf_async(target: str, concurrency: int = 20, timeout: int = 120)
         wl_mtime = hashlib.md5("|".join(wordlist).encode("utf-8")).hexdigest()[:12]
     cache_key = f"ffuf:{target_hash}:{wl_mtime}"
 
-    cached = _ffuf_cache.get(cache_key)
+    cached = _ffuf_cache.get(cache_key) if cache_enabled else None
     if cached is not None:
         _dirs = cached.get("dirs", []) if isinstance(cached, dict) else list(cached)
         logger.info(f"📂 [FFUF] 🎯 缓存命中 {cache_key} → {len(_dirs)} 条路径（24h TTL，跳过 ffuf）")
         return _dirs
 
-    old = _ffuf_cache.get_raw(cache_key) or {}
+    old = (_ffuf_cache.get_raw(cache_key) or {}) if cache_enabled else {}
     old_dirs = set(old.get("dirs", []) or [])
     old_not_found = [p for p in (old.get("not_found", []) or []) if p not in old_dirs]
     if old_dirs or old_not_found:
@@ -215,6 +218,14 @@ async def run_ffuf_async(target: str, concurrency: int = 20, timeout: int = 120)
                 except Exception as e:
                     logger.warning(f"📂 [FFUF] 读取/解析输出异常: {e}")
         logger.info(f"📂 [FFUF] 发现目录: {len(dirs)} 条")
+        # P1-1 修复补全：此前只有读没有写（缓存永远 miss、增量模式从未生效）。
+        # 仅在 ffuf 正常退出且确有产出时写入；not_found 一并记录供下轮增量重试。
+        if cache_enabled and code == 0 and (dirs or not_found):
+            _ffuf_cache.set(cache_key, {"dirs": dirs, "not_found": not_found})
+            logger.info(
+                f"📂 [FFUF] 结果写入缓存 {cache_key}"
+                f"（dirs={len(dirs)} not_found={len(not_found)}，24h TTL）"
+            )
         return dirs
     except asyncio.TimeoutError:
         logger.warning(f"📂 [FFUF] 进程通信超时 (> {timeout + 30}s)；cmd={' '.join(cmd)}")

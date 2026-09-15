@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from vulnclaw.core.finding_schema import apply_schema_inplace
 from vulnclaw.core.logger import logger
 from vulnclaw.core.utils import ensure_scheme
 
@@ -260,10 +261,75 @@ if (__data && __data.nodes && __data.nodes.length) {
 </script>
 """
 
+def ensure_attack_graph(report_data) -> None:
+    """E1.5 兜底接线：非 AI 路径（scan_runner / code_audit）报告缺攻击图时按需构建。
+
+    - 缺失才构建，已有（AI ``phases_report`` 生产者）则不覆盖；
+    - 无资产/漏洞节点时不注入空图；
+    - 任何异常静默降级，绝不影响报告主流程。
+    """
+    try:
+        if not isinstance(report_data, dict):
+            return
+        ag = report_data.get("attack_graph")
+        if isinstance(ag, dict) and ag.get("nodes"):
+            ensure_risk_propagation(report_data)  # 已有图（AI 路径）：仅补风险传播
+            return
+        if not (report_data.get("vulnerabilities") or report_data.get("alive_assets")
+                or report_data.get("subdomains")):
+            return
+        from vulnclaw.core.attack_graph import AttackGraph
+        _g = AttackGraph().build_from_report(report_data)
+        _data = _g.to_json()
+        if not _data.get("nodes"):
+            return
+        report_data["attack_graph"] = _data
+        if not report_data.get("attack_paths"):
+            report_data["attack_paths"] = _g.top_attack_paths(top_k=5)
+        logger.info(f"   E1.5 攻击图兜底: {len(report_data['attack_paths'])} 条 TOP 攻击路径")
+        ensure_risk_propagation(report_data)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"E1.5 攻击图兜底构建失败（忽略）: {exc}")
+
+
+def ensure_risk_propagation(report_data) -> None:
+    """E1.5+ 风险传播兜底：攻击图就绪后在报告上补 ``risk_propagation`` 块（与 E1.5 同模式）。
+
+    - 幂等：已有 ``risk_propagation`` / 报告无攻击图 → 直接返回，绝不覆盖；
+    - 只读：从 ``attack_graph``（networkx node_link JSON）还原 DiGraph 后做确定性传播；
+    - 异常静默降级，绝不影响报告主流程。
+    """
+    try:
+        if not isinstance(report_data, dict) or report_data.get("risk_propagation"):
+            return
+        ag = report_data.get("attack_graph")
+        if not (isinstance(ag, dict) and ag.get("nodes")):
+            return
+        from networkx.readwrite import json_graph
+
+        from vulnclaw.core.risk_propagation import propagate_risk
+
+        data = dict(ag)
+        if "links" in data and "edges" not in data:
+            data["edges"] = data.pop("links")  # 兼容 networkx <3.5 的边键
+        data.pop("stats", None)  # stats 不是 node_link 字段
+        try:
+            nxg = json_graph.node_link_graph(data, directed=True, edges="edges")
+        except TypeError:  # 旧版 networkx：边键参数名不同
+            nxg = json_graph.node_link_graph(data, directed=True, link="edges")
+        result = propagate_risk(nxg)
+        if result.get("sources"):
+            report_data["risk_propagation"] = result
+            logger.info(f"   E1.5+ 风险传播: {len(result['top_assets'])} 个 TOP 资产风险")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"E1.5+ 风险传播构建失败（忽略）: {exc}")
+
+
 def _build_attack_graph_block(report_data):
     """E1.3: 由报告攻击图生成 HTML 段（交互 D3 图 + 离线可见的 TOP 路径列表）。"""
     import html as html_escape
     import json as _json
+    ensure_attack_graph(report_data)
     ag = report_data.get("attack_graph") or {}
     paths = report_data.get("attack_paths") or []
     paths_html = ""
@@ -297,7 +363,47 @@ def _build_attack_graph_block(report_data):
     return paths_html, script_html
 
 
-def generate_html_report(report_data, html_file="report.html"):
+def _build_risk_block(report_data) -> str:
+    """E1.5+：风险传播 TOP 资产表（纯 HTML，无 JS/CDN 依赖，离线必可见）。
+
+    口径与 core/risk_propagation 一致：严重度 × 置信度为种子，沿攻击边 decay=0.6
+    取最强路径；资产分为其漏洞分之和（封顶 100）。无数据时返回空串（不注入空表）。
+    """
+    import html as html_escape
+
+    ensure_risk_propagation(report_data)
+    rp = report_data.get("risk_propagation") or {}
+    assets = rp.get("top_assets") or []
+    if not assets:
+        return ""
+    rows = []
+    for item in assets:
+        asset = html_escape.escape(str(item.get("asset", "")))
+        score = float(item.get("score") or 0)
+        vtype = html_escape.escape(str(item.get("type", "")))
+        sev = html_escape.escape(str(item.get("severity", "")))
+        path = html_escape.escape(" → ".join(item.get("path") or []))
+        color = "#dc3545" if score >= 15 else ("#fd7e14" if score >= 8 else "#6c757d")
+        rows.append(
+            '<tr><td><code>%s</code></td>'
+            '<td style="color:%s; font-weight:bold;">%.2f</td>'
+            '<td>%s</td><td>%s</td>'
+            '<td style="font-size:12px; color:#666;">%s</td></tr>'
+            % (asset, color, score, vtype, sev, path)
+        )
+    return (
+        '<h3 style="margin-top:16px;">🎯 风险传播 TOP 资产</h3>'
+        '<table style="width:100%; border-collapse:collapse;" border="1" cellpadding="6">'
+        '<thead><tr><th>资产</th><th>风险分</th><th>最高危漏洞</th><th>严重级</th><th>传播路径</th></tr></thead>'
+        # 注意：本段样式含裸 %（width:100%），不能用 % 格式化拼接，统一走 f-string
+        f'<tbody>{"".join(rows)}</tbody></table>'
+        '<p style="color:#666; font-size:12px;">'
+        '风险分口径：严重度权重 × 置信度概率为种子，沿攻击边以 decay=0.6 衰减取最强路径；'
+        '资产分为其漏洞分之和（封顶 100）。</p>'
+    )
+
+
+def generate_html_report(report_data, html_file="report.html", detail: str = 'full', max_findings: int = 50, max_evidence: int = MAX_EVIDENCE_LENGTH):
     """生成 HTML 报告 - 同步版本"""
     try:
         # C1.4: 渲染前先落盘 PoC 产物并标注 finding（异常隔离，绝不影响报告主流程）
@@ -306,7 +412,8 @@ def generate_html_report(report_data, html_file="report.html"):
             generate_poc_artifacts(report_data, _base_dir)
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"[C1.4] PoC 产物生成失败（忽略）: {exc}")
-        html_content = render_html(report_data)
+        ensure_attack_graph(report_data)  # E1.5：非 AI 路径攻击图兜底（缺失才构建）
+        html_content = render_html(report_data, detail=detail, max_findings=max_findings, max_evidence=max_evidence)
         with open(html_file, 'w', encoding='utf-8') as f:
             f.write(html_content)
         # A8.3：漏报率回归基线（仅当 REGRESSION_BASELINE 设置）
@@ -363,6 +470,14 @@ def normalize_vulns(vulns):
         if key in seen:
             continue
         seen.add(key)
+        # G 组: 五档证据规范字段（rule_hit / response_evidence / verified /
+        # reproduced / oob_success）。在浅拷贝上应用，不改动调用方原 finding——
+        # 保证 HTML / Markdown / SARIF 三种格式从同一口径取数。
+        try:
+            from vulnclaw.core.models import apply_evidence_schema
+            v = apply_evidence_schema(dict(v))
+        except Exception:
+            v = dict(v)
         unique.append(v)
 
     def rank(v):
@@ -375,6 +490,89 @@ def normalize_vulns(vulns):
 
     unique.sort(key=rank)
     return unique
+
+
+def _truncate_text(value, max_chars: int) -> str:
+    """???????????????????????????"""
+    if value is None:
+        return ""
+    text = str(value)
+    if len(text) <= max_chars:
+        return text
+    suffix = f" ... [?????? {len(text)}]"
+    if max_chars <= len(suffix):
+        return text[:max_chars].rstrip()
+    return text[: max_chars - len(suffix)].rstrip() + suffix
+
+
+def compact_report(report_data, detail: str = "summary", max_findings: int = 25, max_evidence: int = MAX_EVIDENCE_LENGTH):
+    """???????????? CLI/API ???????
+
+    detail:
+      - summary: ??????? N ??????????
+      - compact: ???????????? full ??????
+      - full: ????????????????
+    """
+    if detail not in {"summary", "compact", "full"}:
+        raise ValueError(f"unsupported detail={detail!r}")
+
+    base = dict(report_data or {})
+    vulns = normalize_vulns(base.get("vulnerabilities", []))
+    severity_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0, "unknown": 0}
+    type_counts = {}
+    for vuln in vulns:
+        sev = str(vuln.get("severity", "unknown")).strip().lower() or "unknown"
+        severity_counts[sev] = severity_counts.get(sev, 0) + 1
+        name = str(vuln.get("type", "unknown")) or "unknown"
+        type_counts[name] = type_counts.get(name, 0) + 1
+
+    display_limit = max(0, int(max_findings))
+    selected = []
+    for vuln in vulns[:display_limit]:
+        item = dict(vuln)
+        if detail != "full":
+            for key in ("evidence", "detail", "summary", "description", "response", "request", "raw"):
+                if key in item and isinstance(item[key], str):
+                    item[key] = _truncate_text(item[key], int(max_evidence))
+            # summary / compact 共用核心识别字段白名单。
+            # payload / oob_evidence / ai_verdict / cwe / owasp / verdict 属
+            # 「OOB 实锤复现必需品」：payload 供 curl/复现输出，oob_evidence 为
+            # 带外回调证据、ai_verdict/verdict/cwe/owasp 为判定与分类依据，
+            # 一并在 summary/compact 中保留，避免裁剪后丢失关键证据。
+            safe_keys = [
+                "type", "severity", "url", "parameter", "method", "source", "confidence",
+                "remediation_tier", "remediation", "evidence", "summary", "title",
+                "payload", "oob_evidence", "ai_verdict", "verdict", "cwe", "owasp",
+            ]
+            if detail == "compact":
+                # compact 在 summary 基础上再收窄：去掉扩展描述/修复字段与判定字段，
+                # 仅保留最小识别集 + OOB 实锤复现字段
+                safe_keys = [
+                    "type", "severity", "url", "parameter", "method", "source",
+                    "confidence", "evidence", "payload", "oob_evidence",
+                ]
+            item = {k: item.get(k) for k in safe_keys if k in item}
+        selected.append(item)
+
+    base["summary"] = {
+        "total_vulnerabilities": len(vulns),
+        "displayed_vulnerabilities": len(selected),
+        "by_severity": severity_counts,
+        "by_type": {k: v for k, v in sorted(type_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:10]},
+    }
+    base["reporting"] = {
+        "detail": detail,
+        "max_findings": display_limit,
+        "max_evidence": int(max_evidence),
+        "truncated": len(vulns) > len(selected),
+        "hidden_count": max(0, len(vulns) - len(selected)),
+    }
+    if detail == "full":
+        base["vulnerabilities"] = vulns
+        return base
+
+    base["vulnerabilities"] = selected
+    return base
 
 
 # ============================================================
@@ -425,6 +623,8 @@ def build_distribution(findings):
     by_severity = {}
     target_counter = {}
     for f in findings or []:
+        if not isinstance(f, dict):
+            continue
         ftype = str(f.get("type") or "unknown")
         sev = str(f.get("severity") or "").strip().lower() or "unknown"
         inner = by_type.setdefault(ftype, {})
@@ -449,13 +649,18 @@ def enrich_report(report_data):
 
     仅新增额外字段（report_data["distribution"]、finding["remediation_tier"]），
     不改写任何既有键；幂等可重复调用。返回原 report_data（便于链式/单测）。
+    B1：同时就地补写 finding schema v1 附加键（apply_schema_inplace，纯新增，
+    非 dict 条目跳过，保证坏 finding 不阻断报告链路）。
     """
     vulns = report_data.get("vulnerabilities") or []
     report_data["distribution"] = build_distribution(vulns)
     for f in vulns:
+        if not isinstance(f, dict):
+            continue
         f["remediation_tier"] = suggest_remediation(
             str(f.get("severity") or "").lower(), f.get("remediation")
         )
+        apply_schema_inplace(f)
     return report_data
 
 
@@ -496,15 +701,16 @@ def render_pending_review_section(vulns: List[Dict]) -> str:
     return "".join(parts)
 
 
-def render_html(enhanced_report):
+def render_html(enhanced_report, detail: str = 'full', max_findings: int = 50, max_evidence: int = MAX_EVIDENCE_LENGTH):
     """渲染 HTML 报告内容 - 修复：证据截断"""
     import html as html_escape
 
     # SP17.4：注入 distribution 与逐条 remediation_tier（只增不改既有字段）
-    enrich_report(enhanced_report)
+    report_view = compact_report(enhanced_report, detail=detail, max_findings=max_findings, max_evidence=max_evidence)
+    enrich_report(report_view)
 
-    target = enhanced_report.get('target', '')
-    vulns = normalize_vulns(enhanced_report.get('vulnerabilities', []))
+    target = report_view.get('target', '')
+    vulns = normalize_vulns(report_view.get('vulnerabilities', []))
     vuln_count = len(vulns)
     critical = len([v for v in vulns if v.get('severity') == 'Critical'])
     high = len([v for v in vulns if v.get('severity') == 'High'])
@@ -523,7 +729,8 @@ def render_html(enhanced_report):
 
     vuln_items_html = []
     # P2-5: 按漏洞类型映射 OWASP 修复建议
-    for v in vulns[:50]:
+    # 注意：compact_report 已按 max_findings 裁剪过，这里直接遍历展示集，不再硬编码 50
+    for v in vulns:
         severity = v.get('severity', 'unknown')
         sev_class = severity.lower()
         vuln_type_raw = str(v.get('type', '未知'))
@@ -534,8 +741,9 @@ def render_html(enhanced_report):
         vuln_confidence = html_escape.escape(str(v.get('confidence', '') or ''))
 
         evidence_raw = v.get('evidence', '') or ''
-        if len(evidence_raw) > MAX_EVIDENCE_LENGTH:
-            evidence = html_escape.escape(str(evidence_raw[:MAX_EVIDENCE_LENGTH]))
+        _ev_max = max(0, int(max_evidence))
+        if len(evidence_raw) > _ev_max:
+            evidence = html_escape.escape(str(evidence_raw[:_ev_max]))
             evidence += "\n... [证据过长，已截断，请查看 JSON 报告获取完整内容]"
         else:
             evidence = html_escape.escape(str(evidence_raw))
@@ -551,6 +759,20 @@ def render_html(enhanced_report):
         repro_html = "".join(f"<li>{html_escape.escape(s)}</li>" for s in repro_steps)
         # R2-A S2: 来源溯源徽标（param_mining / live:*）
         source_badge = _source_badge(v)
+        # G 组: 五档证据徽标（rule_hit / response_evidence / verified /
+        # reproduced / oob_success）—— HTML / Markdown / SARIF 同语义
+        ev_badges_html = ""
+        for _flag, _label, _color in (
+            ("rule_hit", "规则命中", "#856404"),
+            ("response_evidence", "响应证据", "#004085"),
+            ("verified", "验证成功", "#155724"),
+            ("reproduced", "复现成功", "#0d5c46"),
+            ("oob_success", "OOB 回调", "#383d41"),
+        ):
+            if v.get(_flag):
+                ev_badges_html += (f'<span style="display:inline-block;background:{_color};'
+                                   f'color:#fff;border-radius:3px;padding:1px 6px;'
+                                   f'font-size:11px;margin-right:4px;">{_label}</span>')
         # C1.4: 已落盘 PoC 产物 → 该漏洞条目内附产物链接
         poc_link_html = ""
         if v.get('poc_file'):
@@ -586,6 +808,7 @@ def render_html(enhanced_report):
             {f'<br><span style="color:#666;">参数: </span>{vuln_param}' if vuln_param else ''}
             {f'<br><span style="color:#666;">置信度: </span><strong>{vuln_confidence}</strong>' if vuln_confidence else ''}
             {source_badge}
+            {f'<br>' + ev_badges_html if ev_badges_html else ''}
             <br>
             <span style="color:#666;">证据: </span>
             <pre style="background:#f8f9fa; padding:8px; border-radius:4px; overflow-x:auto; white-space:pre-wrap; word-wrap:break-word; max-height:300px; font-size:12px; margin:4px 0;">{evidence}</pre>
@@ -607,8 +830,11 @@ def render_html(enhanced_report):
     vuln_section = ''.join(vuln_items_html)
 
     attack_paths_html, attack_graph_script = _build_attack_graph_block(enhanced_report)
-    if len(vulns) > 50:
-        vuln_section += f'<p style="color:#666; font-style:italic;">... 共 {len(vulns)} 个漏洞，仅显示前 50 个。请查看 JSON 报告获取完整列表。</p>'
+    risk_html = _build_risk_block(enhanced_report)
+    _hidden = (report_view.get("reporting") or {}).get("hidden_count", 0)
+    if _hidden > 0:
+        vuln_section += (f'<p style="color:#666; font-style:italic;">... 共 {len(vulns) + _hidden} 个漏洞，'
+                         f'仅显示前 {len(vulns)} 个。请查看 JSON 报告获取完整列表。</p>')
 
     lifecycle_block = _render_lifecycle_block(enhanced_report)
     # C1.4: PoC 产物清单段（generate_poc_artifacts 已在 generate_html_report 前置落盘）
@@ -690,6 +916,7 @@ def render_html(enhanced_report):
             </p>
         </div>
         {attack_paths_html}
+        {risk_html}
         {attack_graph_script}
         <h2>📋 漏洞明细</h2>
         <div class="filter-bar">
@@ -921,7 +1148,7 @@ def render_ai_test_guide(clue):
     '''
 
 
-def generate_markdown_report(report_data, output_path):
+def generate_markdown_report(report_data, output_path, detail: str = 'full', max_findings: int = 30, max_evidence: int = MAX_EVIDENCE_LENGTH):
     """生成 Markdown 报告"""
     lines = []
     enrich_report(report_data)  # SP17.4：注入 distribution 与 remediation_tier
@@ -938,19 +1165,36 @@ def generate_markdown_report(report_data, output_path):
     lines.append("")
 
     vulns = normalize_vulns(report_data.get("vulnerabilities", []))
+    # 对齐 HTML 语义：full 全量展示，summary/compact 按 max_findings 截断
+    _md_limit = len(vulns) if detail == "full" else max(0, int(max_findings))
     if vulns:
         lines.append("## 漏洞明细")
-        for v in vulns[:30]:
+        for v in vulns[:_md_limit]:
             vuln_type = v.get('type', 'Unknown')
             severity = v.get('severity', 'Low')
             url = v.get('url', '')
             evidence = v.get('evidence', '') or ''
-            if len(evidence) > MAX_EVIDENCE_LENGTH:
-                evidence = evidence[:MAX_EVIDENCE_LENGTH] + "\n... [证据过长，请查看 JSON 报告]"
+            _ev_max = max(0, int(max_evidence))
+            if len(evidence) > _ev_max:
+                evidence = evidence[:_ev_max] + "\n... [证据过长，请查看 JSON 报告]"
             lines.append("")
             lines.append(f"### {vuln_type}")
             lines.append(f"- **严重性**: {severity}")
             lines.append(f"- **URL**: {url}")
+            # G 组: 五档证据标记（与 HTML/SARIF 同语义，仅打印为真的档位）
+            _ev_flags = []
+            if v.get("rule_hit"):
+                _ev_flags.append("规则命中")
+            if v.get("response_evidence"):
+                _ev_flags.append("响应证据")
+            if v.get("verified"):
+                _ev_flags.append("验证成功")
+            if v.get("reproduced"):
+                _ev_flags.append("复现成功")
+            if v.get("oob_success"):
+                _ev_flags.append("OOB 回调")
+            if _ev_flags:
+                lines.append(f"- **证据链路**: {' | '.join(_ev_flags)}")
             lines.append("- **证据**:")
             lines.append("```")
             lines.append(evidence)
@@ -973,8 +1217,8 @@ def generate_markdown_report(report_data, output_path):
                 _label, _ = _source_label(_src)
                 lines.append(f"- **溯源来源**: {_label}（`{_src}`）")
             lines.append("---")
-        if len(vulns) > 30:
-            lines.append(f"\n... 共 {len(vulns)} 个漏洞，仅显示前 30 个。请查看 JSON 报告获取完整列表。")
+        if len(vulns) > _md_limit:
+            lines.append(f"\n... 共 {len(vulns)} 个漏洞，仅显示前 {_md_limit} 个。请查看 JSON 报告获取完整列表。")
     else:
         lines.append("✅ 未发现安全漏洞。")
 
@@ -1162,6 +1406,15 @@ def generate_poc_artifacts(report_data: Dict, base_dir: str, max_artifacts: int 
         enumerate(vulns),
         key=lambda kv: (order.get(str(kv[1].get("severity", "Info")), 5), kv[0]),
     )[:max_artifacts]
+    # (url, type, parameter) -> 原始 finding：normalize_vulns 返回浅拷贝，
+    # poc_file/poc_origin 需回写到原对象，后续 HTML/Markdown 渲染再取即得
+    _orig_by_key = {}
+    for _v0 in report_data.get("vulnerabilities") or []:
+        _k0 = (
+            str(_v0.get("url", "")), str(_v0.get("type", "")),
+            str(_v0.get("parameter", "") or ""),
+        )
+        _orig_by_key.setdefault(_k0, _v0)
     poc_dir = os.path.join(base_dir, "poc")
     try:
         os.makedirs(poc_dir, exist_ok=True)
@@ -1195,9 +1448,25 @@ def generate_poc_artifacts(report_data: Dict, base_dir: str, max_artifacts: int 
             rel = f"poc/{fname}"
             v["poc_file"] = rel
             v["poc_origin"] = origin
+            # P3-④：PoC 内容摘要。**读回磁盘字节**算，而非对 content 字符串算——
+            # Windows 文本模式会把 \n 落成 \r\n，直接算 content 会导致
+            # 后续按文件验真时误判"证据被篡改"。
+            try:
+                import hashlib as _hashlib
+                with open(os.path.join(poc_dir, fname), "rb") as _fh:
+                    v["poc_sha256"] = _hashlib.sha256(_fh.read()).hexdigest()
+            except Exception:  # noqa: BLE001
+                pass
+            _k = (str(v.get("url", "")), str(v.get("type", "")), str(v.get("parameter", "") or ""))
+            _orig = _orig_by_key.get(_k)
+            if _orig is not None and _orig is not v:
+                _orig["poc_file"] = rel
+                _orig["poc_origin"] = origin
+                _orig["poc_sha256"] = v.get("poc_sha256", "")
             artifacts.append({
                 "file": rel, "type": str(v.get("type", "")),
                 "severity": str(v.get("severity", "")), "origin": origin,
+                "sha256": str(v.get("poc_sha256") or ""),
             })
         except Exception as exc:  # noqa: BLE001
             logger.debug(f"[C1.4] PoC 产物生成跳过（{v.get('type', '')}）: {exc}")
@@ -1302,6 +1571,7 @@ def generate_sarif(report_data: Dict, out_path: str = "") -> Dict:
     """把报告漏洞列表转换为 SARIF 2.1.0 JSON 结构，可写入 out_path（若提供）。"""
     import json as _json
     enrich_report(report_data)  # SP17.4：注入 distribution 与 remediation_tier
+    ensure_attack_graph(report_data)  # E1.5：非 AI 路径攻击图兜底（缺失才构建）
     rule_ids = {}
     sarif_rules = []
     results = []
@@ -1331,7 +1601,13 @@ def generate_sarif(report_data: Dict, out_path: str = "") -> Dict:
             "properties": {"confidence": str(v.get("confidence", "") or ""),
                            "cvss": v.get("cvss", 0) or 0, "type": vtype,
                            # SP14.3: OOB 回调证据（平行字段，未触发 OOB 时为 None）
-                           "oob_evidence": v.get("oob_evidence")},
+                           "oob_evidence": v.get("oob_evidence"),
+                           # G 组: 五档证据规范字段（与网关 SARIF 同语义）
+                           "rule_hit": bool(v.get("rule_hit")),
+                           "response_evidence": bool(v.get("response_evidence")),
+                           "verified": bool(v.get("verified")),
+                           "reproduced": bool(v.get("reproduced")),
+                           "oob_success": bool(v.get("oob_success"))},
         })
     sarif = {
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
@@ -1628,6 +1904,7 @@ __all__ = [
     "build_distribution",
     "enrich_report",
 
+    "compact_report",
     "generate_markdown_report",
     "generate_html_report",
     "render_html",

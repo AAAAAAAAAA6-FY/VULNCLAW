@@ -248,6 +248,34 @@ class SqliteCheckpointStore:
             self._touch_locked()
             conn.commit()
 
+    def add_findings(self, findings: List[Dict]) -> int:
+        """P1-11：批量落盘 findings（单事务 executemany，替代逐条 commit）。
+
+        与 `add_finding` 语义一致（INSERT OR REPLACE，按 fid 幂等），
+        但只做一次 `_touch` + 一次 `commit`——收尾阶段写上千条时不再触发
+        上千次 fsync。
+
+        Returns:
+            实际写入条数（空列表/无字典项返回 0）。
+        """
+        if not findings:
+            return 0
+        now = time.time()
+        rows = [
+            (self._finding_id(f), json.dumps(f, default=str, ensure_ascii=False), now)
+            for f in findings
+            if isinstance(f, dict)
+        ]
+        if not rows:
+            return 0
+        with self._lock:
+            conn = self._connect()
+            conn.executemany(
+                "INSERT OR REPLACE INTO finding(fid,data,ts) VALUES(?,?,?)", rows)
+            self._touch_locked()
+            conn.commit()
+        return len(rows)
+
     def load_findings(self) -> List[Dict]:
         with self._lock:
             rows = self._connect().execute("SELECT data FROM finding ORDER BY ts").fetchall()

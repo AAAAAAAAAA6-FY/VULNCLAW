@@ -46,6 +46,7 @@ class CoverageLedger:
         self.completed_at: Optional[float] = None
         self.scan_complete: bool = False
         self._rows: List[Dict[str, Any]] = []
+        self._quotas: List[Dict[str, Any]] = []
 
     # ---------- 记录 ----------
     def record(
@@ -80,6 +81,50 @@ class CoverageLedger:
 
     def record_blocked(self, asset: str, engine: str, reason: str) -> None:
         self.record(asset, engine, STATUS_BLOCKED, reason=reason)
+
+    # ---------- 配额消耗遥测（观测第1步：为"静态预算→规模函数"提供数据） ----------
+    def record_quota(self, line: str, limit: int, candidates: int, executed: int,
+                     findings: int = 0, note: str = "") -> None:
+        """计划线配额消耗记账。
+
+        - truncated > 0（candidates > limit）→ **saturated**：预算截断了候选，
+          说明该升预算或改成按目标规模推导；
+        - executed < limit 且 candidates <= limit → **wasted**：配额没用满，纯浪费；
+        - verdict 三态（saturated/wasted/balanced）+ 截断量，是后续把 7 个静态预算
+          （idor_max_probes 等）接进 compute_adaptive_budget 的数据依据。
+        """
+        limit = max(int(limit or 0), 0)
+        candidates = max(int(candidates or 0), 0)
+        executed = max(int(executed or 0), 0)
+        truncated = max(0, candidates - executed)
+        if candidates <= 0:
+            # 实测教训（rest.vulnweb.com 首扫）：计划线"无候选/无身份"早退若不落账，
+            # 整条线在账本里隐身——那恰恰是配额动态化最该看见的信号。
+            verdict = "no_candidates"
+        elif candidates > limit:
+            verdict = "saturated"
+        elif executed < limit:
+            verdict = "wasted"
+        else:
+            verdict = "balanced"
+        row: Dict[str, Any] = {
+            "line": str(line or ""), "limit": limit, "candidates": candidates,
+            "executed": executed, "findings": int(findings or 0),
+            "truncated": truncated, "verdict": verdict,
+        }
+        if note:
+            row["note"] = str(note)
+        self._quotas.append(row)
+        logger.info(
+            f"📊 [quota] {row['line']}: limit={limit} candidates={candidates} "
+            f"executed={executed} truncated={truncated} → {verdict}"
+        )
+
+    def quota_usage(self) -> Dict[str, Any]:
+        """配额消耗聚合：哪些线饱和（该升）、哪些线浪费（该降/该按规模算）。"""
+        saturated = [q["line"] for q in self._quotas if q["verdict"] == "saturated"]
+        wasted = [q["line"] for q in self._quotas if q["verdict"] == "wasted"]
+        return {"lines": self._quotas, "saturated": saturated, "wasted": wasted}
 
     # ---------- 上下文管理器（异常自动标记 failed） ----------
     def track(self, asset: str, engine: str):
@@ -140,6 +185,7 @@ class CoverageLedger:
             "rows": self._rows,
             "rollup": rollup,
             "gaps": self.gaps(engine_fullset),
+            "quota_usage": self.quota_usage(),
             "stats": {
                 "assets_covered": len(rollup["by_asset"]),
                 "engine_runs": len(self._rows),

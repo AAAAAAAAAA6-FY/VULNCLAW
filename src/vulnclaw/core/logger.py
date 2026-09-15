@@ -13,6 +13,10 @@
 import logging
 import sys
 import os
+import json
+import re
+import threading
+import uuid
 from datetime import datetime
 
 # ===== 获取项目根目录（src/vulnclaw/core/logger.py → 上溯 3 级，与 paths.py 对齐）=====
@@ -25,17 +29,106 @@ os.makedirs(LOG_DIR, exist_ok=True)
 # ===== 日志文件名 =====
 LOG_FILE = os.path.join(LOG_DIR, f"scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
 
+# ===== 平台自保护：日志凭据脱敏过滤器（fail-open，脱敏异常绝不影响日志）=====
+class _RedactFilter(logging.Filter):
+    """输出前把日志中的明文凭据替换为掩码（Authorization/Cookie/token/私钥等）。
+
+    默认走 core.utils.redact_secrets 的**保守内置规则**（Authorization/Cookie/
+    key=value 凭据/PEM 私钥）。可选传入 ``extra_pattern`` 做自定义正则脱敏：
+    命中片段整体替换为 ``[REDACTED]``。任何异常都 fail-open 放行原日志。
+    """
+
+    def __init__(self, extra_pattern=None, mask="[REDACTED]"):
+        super().__init__()
+        self.extra_pattern = re.compile(extra_pattern) if extra_pattern is not None else None
+        self.mask = mask
+
+    def _redact(self, value):
+        if not isinstance(value, str):
+            return value
+        try:
+            from vulnclaw.core.utils import redact_secrets  # 延迟导入避免循环依赖
+            out = redact_secrets(value)  # 保守内置规则
+            if self.extra_pattern is not None:
+                out = self.extra_pattern.sub(self.mask, out)
+            return out
+        except Exception:  # noqa: BLE001 - 脱敏失败必须放行日志
+            return value
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            if isinstance(record.msg, str):
+                record.msg = self._redact(record.msg)
+            else:
+                record.msg = self._redact(str(record.msg))
+            if record.args:
+                if isinstance(record.args, tuple):
+                    record.args = tuple(self._redact(a) for a in record.args)
+                elif isinstance(record.args, dict):
+                    record.args = {k: self._redact(v) for k, v in record.args.items()}
+                else:
+                    record.args = self._redact(record.args)
+        except Exception:  # noqa: BLE001 - 脱敏失败必须放行日志
+            pass
+        return True
+
+
+# ===== 结构化日志：trace 上下文（thread-local，供 JSON 输出 trace_id）=====
+_LOCAL = threading.local()
+
+
+def set_trace_context(trace_id: str) -> None:
+    """设置当前线程/协程的 trace_id（透传到结构化日志）。"""
+    _LOCAL.trace_id = trace_id
+
+
+def get_trace_context() -> str:
+    """获取当前线程的 trace_id（未设置返回空串）。"""
+    return getattr(_LOCAL, "trace_id", "")
+
+
+def new_trace_id() -> str:
+    """生成新 trace_id（uuid4 hex）并设为当前上下文。"""
+    tid = uuid.uuid4().hex
+    set_trace_context(tid)
+    return tid
+
+
+# ===== 结构化日志 JSON formatter（env STRUCTURED_LOG=1 启用）=====
+class _JsonFormatter(logging.Formatter):
+    """输出 {ts, level, name, trace_id, message} 的 JSON 行（不引入第三方依赖）。"""
+
+    def format(self, record: logging.LogRecord) -> str:
+        try:
+            return json.dumps({
+                "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+                "level": record.levelname,
+                "name": record.name,
+                "trace_id": get_trace_context(),
+                "message": record.getMessage(),
+            }, ensure_ascii=False)
+        except Exception:  # noqa: BLE001 - 失败回退标准格式
+            return super().format(record)
+
+
 # ===== 配置根日志记录器 =====
 if not logging.getLogger().handlers:
+    # 结构化日志开关：STRUCTURED_LOG=1 → 控制台+文件都用 JSON 格式（含 trace_id）
+    _structured = os.environ.get("STRUCTURED_LOG", "0") == "1"
+
     # 控制台处理器（INFO 级别）
     # MCP / stdio 协议使用 stdout 传输 JSON-RPC，必须将日志留给 stderr。
     console_handler = logging.StreamHandler(sys.stderr)
     console_handler.setLevel(logging.INFO)
-    console_format = logging.Formatter(
-        '[%(asctime)s] [%(levelname)s] %(message)s',
-        datefmt='%H:%M:%S'
-    )
+    if _structured:
+        console_format: logging.Formatter = _JsonFormatter()  # type: ignore[assignment]
+    else:
+        console_format = logging.Formatter(
+            '[%(asctime)s] [%(levelname)s] %(message)s',
+            datefmt='%H:%M:%S'
+        )
     console_handler.setFormatter(console_format)
+    console_handler.addFilter(_RedactFilter())  # 控制台不输出明文凭据
 
     # 文件处理器（DEBUG 级别，记录所有）
     from logging.handlers import RotatingFileHandler, MemoryHandler
@@ -46,11 +139,15 @@ if not logging.getLogger().handlers:
         encoding='utf-8'
     )
     file_handler.setLevel(logging.DEBUG)
-    file_format = logging.Formatter(
-        '[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
+    if _structured:
+        file_format: logging.Formatter = _JsonFormatter()  # type: ignore[assignment]
+    else:
+        file_format = logging.Formatter(
+            '[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
     file_handler.setFormatter(file_format)
+    file_handler.addFilter(_RedactFilter())  # 日志文件不落明文凭据
 
     # ============================================================
     # 瓶颈6：每条日志的 FileHandler.flush 会同步阻塞事件循环
@@ -88,4 +185,4 @@ except Exception:  # noqa: BLE001 - 容器不可用时不影响日志模块本�
     pass
 
 # ===== 导出 =====
-__all__ = ['logger', 'LOG_DIR', 'LOG_FILE']
+__all__ = ['logger', 'LOG_DIR', 'LOG_FILE', 'set_trace_context', 'get_trace_context', 'new_trace_id']

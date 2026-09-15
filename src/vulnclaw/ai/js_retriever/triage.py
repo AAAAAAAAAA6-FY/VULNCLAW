@@ -267,11 +267,14 @@ class JSTriage:
             with io.open(fd, "w", encoding="utf-8") as fh:
                 fh.write(script)
             try:
+                # 超时可配置（JS_SANDBOX_TIMEOUT，默认 30s）：原硬编码 10s 在全量测试
+                # 负载下会被 node 冷启动+调度挤爆 → TimeoutExpired → B 路误降级 C（实测 flaky）。
+                sandbox_timeout = float(getattr(settings, "js_sandbox_timeout", 30.0))
                 proc = await asyncio.to_thread(
                     subprocess.run,
                     [node, "--max-old-space-size=64", tmp],
                     capture_output=True, text=True, encoding="utf-8",
-                    errors="replace", timeout=10.0,
+                    errors="replace", timeout=sandbox_timeout,
                 )
             except subprocess.TimeoutExpired:
                 return {"ok": False, "safe": True, "reason": "timeout"}

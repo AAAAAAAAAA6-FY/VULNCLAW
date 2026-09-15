@@ -18,7 +18,13 @@ HTTP 客户端单例管理 - 支持 HTTP/2（P0-1）
   - TLS 指纹与 aiohttp 不同，可能触发 WAF；故保持默认关闭，由用户显式开启
 """
 import asyncio
+import fnmatch
+import ipaddress
+import os
+import socket
+import threading
 from typing import Any, Dict, Optional, Tuple
+from urllib.parse import urlparse
 
 from vulnclaw.core.logger import logger
 from vulnclaw.core.settings import settings
@@ -94,6 +100,171 @@ async def _scope_guard(request) -> None:
         return
     if not url_in_scope(url):
         raise ScopeGuardError(f"E5 越界请求被 HTTP 客户端层拦截（超出 allowed_scope）: {url}")
+
+
+# ============================================================
+# 出站白名单 + 平台级 SSRF/DNS-rebinding 防护（工作流8）
+#   三类防护默认均为 off，绝不改变现有扫描行为。
+# ============================================================
+
+# 压缩炸弹阈值（模块级，可用环境变量覆盖）
+MAX_RESPONSE_BYTES = int(os.environ.get("MAX_RESPONSE_BYTES", str(64 * 1024 * 1024)))
+MAX_COMPRESSION_RATIO = int(os.environ.get("MAX_COMPRESSION_RATIO", "1000"))
+
+
+class EgressBlockError(Exception):
+    """出站 host 不在 EGRESS_ALLOWLIST 白名单内，被 HTTP 客户端层拦截。"""
+
+
+class SSRFGuardError(Exception):
+    """平台级 SSRF / DNS-rebinding 防护拦截。"""
+
+
+# DNS-rebinding 记录：host -> 首次解析的 IP 元组
+_resolve_lock = threading.Lock()
+_first_resolved: Dict[str, Tuple[str, ...]] = {}
+
+
+def _parse_host(url: str) -> str:
+    try:
+        host = (urlparse(url).hostname or "").strip().lower()
+        return host.lstrip("[").rstrip("]") if host else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def check_egress(url: str) -> None:
+    """出站白名单：EGRESS_ALLOWLIST 非空且 host 不匹配 → 拒绝（记 warning）。
+
+    默认（配置为空）放行一切，保持现有扫描行为。
+    """
+    raw = str(getattr(settings, "egress_allowlist", "") or "").strip()
+    entries = [e.strip() for e in raw.split(",") if e.strip()]
+    if not entries:
+        return  # 默认放开
+    if not url.lower().startswith(("http://", "https://")):
+        return
+    host = _parse_host(url)
+    if not host:
+        return
+    for entry in entries:
+        if fnmatch.fnmatch(host, entry):
+            return
+    logger.warning(f"🛡️ 出站白名单拦截（EGRESS_ALLOWLIST）: {url}")
+    raise EgressBlockError(f"出站 host 不在 EGRESS_ALLOWLIST 内: {host}")
+
+
+def _parse_allow_networks(allow_raw: str) -> list:
+    nets = []
+    for a in [x.strip() for x in allow_raw.split(",") if x.strip()]:
+        try:
+            nets.append(ipaddress.ip_network(a, strict=False))
+        except ValueError:
+            try:
+                nets.append(ipaddress.ip_network(a))
+            except ValueError:
+                continue
+    return nets
+
+
+def _is_restricted_ip(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return addr.is_loopback or addr.is_private or addr.is_link_local
+
+
+def check_ssrf(url: str) -> None:
+    """平台级 SSRF/DNS-rebinding 防护：SSRF_GUARD=1 时启用。
+
+    - 解析 host → 对每个解析 IP 判定 loopback/private/link-local，不在 SSRF_ALLOW_PRIVATE 内即拒绝。
+    - DNS-rebinding：记录首次解析 IP，重解析不一致 → 拒绝。
+    默认（SSRF_GUARD != "1"）关闭，保持现有行为。
+    """
+    if str(getattr(settings, "ssrf_guard", "0") or "") != "1":
+        return  # 默认关闭
+    if not url.lower().startswith(("http://", "https://")):
+        return
+    host = _parse_host(url)
+    if not host:
+        return
+    allow_nets = _parse_allow_networks(str(getattr(settings, "ssrf_allow_private", "") or ""))
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return  # 解析失败放行，交由连接层处理
+    ips: list = []
+    for res in infos:
+        addr = str(res[4][0])
+        if addr not in ips:
+            ips.append(addr)
+    # DNS-rebinding 一致性
+    cur = tuple(ips)
+    with _resolve_lock:
+        prev = _first_resolved.get(host)
+        if prev is None:
+            _first_resolved[host] = cur
+        elif cur != prev:
+            logger.warning(f"🛡️ DNS-rebinding 检测（{host} 解析结果变化），已拒绝: {url}")
+            raise SSRFGuardError(f"DNS-rebinding: {host} 解析结果不一致")
+    # 私网判定
+    for ip in ips:
+        if _is_restricted_ip(ip) and not any(
+            ipaddress.ip_address(ip) in n for n in allow_nets
+        ):
+            logger.warning(f"🛡️ SSRF 防护拦截私网地址 {ip}（不在 SSRF_ALLOW_PRIVATE 内）: {url}")
+            raise SSRFGuardError(f"SSRF: {host} 解析到受保护地址 {ip}")
+
+
+def _read_response_body(resp) -> bytes:
+    """读取响应体并施加压缩炸弹/超大响应防护（单一执行点收口）。
+
+    规则：
+      1. Content-Length 头超上限 → 直接拒绝（记 warning，返回空）。
+      2. 压缩类 content-encoding（gzip/deflate/br）解压后校验最终字节数上限，
+         并以 Content-Length（压缩尺寸代理）计算压缩比：超限 → 截断到上限 + warning。
+      3. 阈值内与原 resp.text 行为一致（不影响正常响应）。
+    """
+    headers = getattr(resp, "headers", None) or {}
+    content_length = None
+    if hasattr(headers, "get"):
+        try:
+            cl = headers.get("Content-Length")
+            if cl:
+                content_length = int(str(cl))
+        except (TypeError, ValueError):
+            content_length = None
+    # 规则 1：Content-Length 已超上限 → 拒绝读取
+    if content_length is not None and content_length > MAX_RESPONSE_BYTES:
+        logger.warning(
+            f"⚠️ 响应 Content-Length={content_length} 超过上限 {MAX_RESPONSE_BYTES} 字节，已拒绝读取"
+        )
+        return b""
+    body = resp.content  # httpx 已自动解压 gzip/deflate/br
+    if not isinstance(body, bytes):
+        body = bytes(body or b"")
+    if len(body) > MAX_RESPONSE_BYTES:
+        logger.warning(f"⚠️ 响应体 {len(body)} 字节超过上限 {MAX_RESPONSE_BYTES}，已截断")
+        return body[:MAX_RESPONSE_BYTES]
+    # 规则 2：压缩类编码解压后校验压缩比
+    enc = (headers.get("Content-Encoding") or "").lower() if hasattr(headers, "get") else ""
+    if enc in ("gzip", "deflate", "br") and content_length:
+        ratio = len(body) / max(content_length, 1)
+        if ratio > MAX_COMPRESSION_RATIO:
+            logger.warning(
+                f"⚠️ 响应压缩比 {ratio:.0f}x 超过上限 {MAX_COMPRESSION_RATIO}x，已截断到 "
+                f"{MAX_RESPONSE_BYTES} 字节"
+            )
+            return body[:MAX_RESPONSE_BYTES]
+    return body
+
+
+def _decode_body(body: bytes) -> str:
+    try:
+        return body.decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        return str(body)
 
 
 class _SessionManager:
@@ -206,8 +377,14 @@ async def _http2_request(
     if "auth" in kwargs:
         req_kwargs["auth"] = kwargs.pop("auth")
     try:
+        check_egress(url)  # 出站白名单（EGRESS_ALLOWLIST 非空才启用）
+        check_ssrf(url)  # 平台级 SSRF/DNS-rebinding（SSRF_GUARD=1 才启用）
         resp = await client.request(method, url, follow_redirects=redirect, **req_kwargs)
-        return resp.status_code, resp.text, dict(resp.headers)
+        raw_body = _read_response_body(resp)  # 压缩炸弹/超大响应防护
+        return resp.status_code, _decode_body(raw_body), dict(resp.headers)
+    except (EgressBlockError, SSRFGuardError) as exc:
+        logger.warning(f"出站安全防护拦截请求 {url}: {exc}")
+        return None
     except (httpx.TimeoutException, httpx.HTTPError) as exc:
         logger.debug(f"HTTP/2 {method} 请求错误 {url}: {exc}")
         return None
@@ -222,4 +399,10 @@ __all__ = [
     "http2_get",
     "http2_post",
     "get_http2_manager",
+    "check_egress",
+    "check_ssrf",
+    "EgressBlockError",
+    "SSRFGuardError",
+    "MAX_RESPONSE_BYTES",
+    "MAX_COMPRESSION_RATIO",
 ]

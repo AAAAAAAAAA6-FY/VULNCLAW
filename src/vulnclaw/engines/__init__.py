@@ -53,7 +53,7 @@ from .logic_leak_engines_2 import (
     VerbTamperingEngine,
 )
 from .mobile_engines import MobileAPIEngine
-from .net_engines import DnsSecurityEngine, GraphQLEngine, SSRFEngine, TlsSecurityEngine, XXEEngine
+from .net_engines import DnsRebindingEngine, DnsSecurityEngine, GraphQLEngine, SSRFEngine, TlsSecurityEngine, XXEEngine
 from .web_engines import CMDIEngine, LFIEngine, NoSQLEngine, RFIEngine, SQLiEngine, SSTIEngine, XSSEngine
 from .http_advanced_engines import CSRFEngine, WebCacheDeceptionEngine
 from .middleware_exposure_engines import (
@@ -63,16 +63,19 @@ from .middleware_exposure_engines import (
 )
 from .framework_zero_day_engines import FastjsonDeserializationEngine, Log4ShellEngine, Spring4ShellEngine, Struts2OGNLEngine, ViewStateEngine
 from .leak_logic_engines import AuthEnumerationEngine, SourceCodeLeakEngine, SpringActuatorEngine
-from .web_advanced_engines import JSONPHijackingEngine, PrototypePollutionEngine, SSIInjectionEngine, XPathInjectionEngine
+from .web_advanced_engines import CssExfiltrationEngine, JSONPHijackingEngine, PrototypePollutionEngine, SSIInjectionEngine, XPathInjectionEngine
 from .websocket_security import WebSocketSecurityEngine
+from .dom_clobbering import DOMClobberingEngine
 from .deep_chimera import DeepChimeraEngine
 from .biz_oracle_engines import DualSessionOracleEngine
 from .state_chain import StateChainEngine
 from .parsing_shadow import ParsingShadowEngine
+from .symbolic_engine import SymbolicLogicEngine
 
 __all__ = [
     "BaseEngine",
     "CaseInsensitiveDict",
+    "SymbolicLogicEngine",
     "IDOREngine",
     "JWTEngine",
     "OAuthEngine",
@@ -114,6 +117,8 @@ __all__ = [
     "SSIInjectionEngine",
     "PrototypePollutionEngine",
     "JSONPHijackingEngine",
+    "CssExfiltrationEngine",
+    "DOMClobberingEngine",
     "CSRFEngine",
     "WebCacheDeceptionEngine",
     "Log4ShellEngine",
@@ -136,6 +141,7 @@ __all__ = [
     "PrometheusMetricsExposureEngine",
     "TlsSecurityEngine",
     "DnsSecurityEngine",
+    "DnsRebindingEngine",
     "MassAssignmentEngine",
     "WeakCredentialEngine",
     "JsLibraryCveEngine",

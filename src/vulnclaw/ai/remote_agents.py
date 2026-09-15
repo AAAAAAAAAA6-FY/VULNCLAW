@@ -726,6 +726,16 @@ class HTTPBackend(AgentBackend):
             body = await resp.json(content_type=None)
         if resp.status >= 400:
             raise RuntimeError(f"HTTP Agent 调用失败 HTTP {resp.status}: {str(body)[:200]}")
+        # 部分推理型 Provider（尤其 OpenRouter 的 :free 推理模型）在 max_tokens 偏小时，
+        # 会把预算全烧在 reasoning 上导致正式回答缺失，返回 {"id":..,"error":..} 但 HTTP 200。
+        # 这类情况单独报错，避免与真正的网关异常混淆（否则只能看到「格式异常」无从下手）。
+        if isinstance(body, dict) and "choices" not in body:
+            err = body.get("error")
+            if err:
+                raise RuntimeError(f"HTTP Agent 网关返回错误(HTTP {resp.status}): {str(err)[:200]}")
+            raise RuntimeError(
+                f"HTTP Agent 响应缺少 choices（可能 max_tokens 过小被截断）: {str(body)[:200]}"
+            )
         try:
             return str(body["choices"][0]["message"]["content"])
         except (KeyError, IndexError, TypeError):
@@ -946,7 +956,9 @@ def run_remote_analysis(
 ) -> Optional[str]:
     """同步版委派入口（内部跑事件循环）。"""
     try:
-        return asyncio.run(
+        # P3-12：run_sync 安全包装（事件循环内调用不再炸）
+        from vulnclaw.core.utils import run_sync
+        return run_sync(
             delegate_analysis(prompt=prompt, system=system, temperature=temperature, max_tokens=max_tokens)
         )
     except RuntimeError:

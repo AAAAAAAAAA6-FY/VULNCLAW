@@ -313,10 +313,20 @@ async def _deep_recon_internal(self, brief: dict, domain: str):
                 return []
             logger.info(f"      💚 [2/10] 存活探测 (全部 {len(subs)} 个子域名)...")
             loop = asyncio.get_running_loop()
-            return await asyncio.wait_for(
+            alive_list = await asyncio.wait_for(
                 loop.run_in_executor(None, lambda: alive_scan(subs, False)),
                 timeout=180
             )
+            # 指纹增强（EHole，可选外部工具）：缺失/超时/异常一律静默跳过
+            try:
+                from vulnclaw.modules.recon import enrich_alive_fingerprints
+                alive_list = await asyncio.wait_for(
+                    enrich_alive_fingerprints(alive_list), timeout=150)
+            except TimeoutError:
+                logger.debug("EHole 指纹增强超时，跳过")
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"EHole 指纹增强跳过: {e}")
+            return alive_list
         except TimeoutError:
             logger.warning("      Alive scan timeout (180s), skipping")
         except Exception as e:
@@ -557,6 +567,40 @@ async def _deep_recon_internal(self, brief: dict, domain: str):
         if isinstance(result, Exception):
             logger.warning(f"      ⚠️ 步骤 {index} 异常（不影响主流程）: {result}")
     logger.info(f"      ✅ [并发组2] 完成，耗时 {time.time() - group2_start:.2f}s")
+
+    ## ===== B4 资产面枚举端（道3）：6 面并发 + 授权合并进目标池（2026-09-11） =====
+    if getattr(settings, "asset_surface_enabled", True):
+        try:
+            from vulnclaw.modules.asset_surface import enumerate_asset_surface
+            _surface = await asyncio.wait_for(
+                enumerate_asset_surface(self.target, domain=domain, brief=brief),
+                timeout=int(getattr(settings, "asset_surface_budget_s", 90) or 90) + 10,
+            )
+            if _surface and isinstance(_surface, dict):
+                brief["asset_surface"] = _surface
+                # 授权范围内新端点并入 crawled_endpoints（TaskGen 端点级任务直接消费）
+                _eps = _surface.get("extra_scan_urls") or []
+                if _eps:
+                    _M4 = brief.get("crawled_endpoints") or []
+                    _seen4 = {e.get("url") for e in _M4 if isinstance(e, dict) and e.get("url")}
+                    _new4 = []
+                    for _u4 in _eps:
+                        if _u4 in _seen4 or len(_new4) >= 2000:
+                            continue
+                        _new4.append({"url": _u4, "params": []})
+                        _seen4.add(_u4)
+                    if _new4:
+                        brief["crawled_endpoints"] = _M4 + _new4
+                        logger.info(f"      \U0001F517 [B4] 合流 {len(_new4)} 个资产面端点 → crawled_endpoints")
+                # 移动端/新子域候选并入 subdomains（活存部分已被 B4 内部校验）
+                _sd = list(dict.fromkeys(_surface.get("subdomains_candidates") or []))
+                if _sd:
+                    brief["subdomains"] = list(
+                        dict.fromkeys(list(brief.get("subdomains") or []) + _sd)
+                    )
+        except Exception as _be:  # noqa: BLE001
+            logger.warning(f"      \u26A0\uFE0F [B4] 资产面枚举失败（不影响主流程）: {_be}")
+
 async def _iterative_api_explorer(self, seed_urls: list[str], max_rounds: int = 8) -> list[str]:
     discovered = set()
     queue = list(seed_urls)

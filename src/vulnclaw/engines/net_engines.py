@@ -13,6 +13,7 @@ import re
 import ssl
 import time
 import asyncio
+import ipaddress
 import datetime
 import json
 import random
@@ -31,6 +32,7 @@ except Exception:  # pragma: no cover - 环境未安装 dnspython
 
 from vulnclaw.core.logger import logger
 from vulnclaw.core.settings import settings
+from vulnclaw.core.oob_channel import local_oob_ldap_base, wait_local_oob
 from vulnclaw.engines.base import BaseEngine
 from typing import Dict, List, Optional, Tuple
 
@@ -63,10 +65,23 @@ SSRF（服务端请求伪造）检测引擎 - 重构版
 
 
 class SSRFEngine(BaseEngine):
-    """SSRF 服务端请求伪造检测引擎"""
+    """SSRF 服务端请求伪造检测引擎
+
+    能力边界声明（2026-09-15 评审补录）
+    - can_detect: HTTP/HTTPS 内网 IP/段回连（127.0.0.1、10/172/192 段、IPv6）、file:// 本地文件读取、云元数据端点、dict/gopher/ftp 等非 HTTP 协议、URL 绕过与地址变形（整数/十六进制 IP、DNS rebind）；命中可由交互式回显或 OOB 盲打（Interactsh / 本地回环）确认。
+    - cannot_detect: 服务端不出网且无任何回显时无法确认（OOB 无效）；加密/不可解包的 HTTPS 链路中回连特征不可见；WAF 拦截使注入参数不生效；非参数级上下文（纯 GET 无注入点）不在覆盖范围。
+    - 前置条件: 存在可由服务端作为请求目标发出去的 URL 类参数（url/path/redirect/callback 等）；服务端需会出站请求（DNS/HTTP OOB 通道可用或响应会回显）；目标可达。
+    """
 
     name = "ssrf"
     description = "SSRF 服务端请求伪造检测引擎"
+
+    # 覆盖全部 payload（内网IP/段、云元数据、file/dict/gopher/ftp 协议、
+    # URL 绕过、地址变形、内网端口扫描 ≈70 个）。
+    # 原 max_payloads=20 会把协议/变形/端口段整体截断，导致真实扫描
+    # 与 fixture 均漏检 file://、dict://、整数 IP 绕过、SSH banner 等核心场景。
+    # 慢速场景由 is_static（payloads[:8]）与 compliant 模式另行控制。
+    max_payloads = 80
 
     # 优先测试的参数名
     priority_params = [
@@ -140,6 +155,11 @@ class SSRFEngine(BaseEngine):
         ("http://127.0.0.1%2f..", "路径绕过"),
         ("http://127.0.0.1/../evil.com", "目录绕过"),
         ("http://127.0.0.1:80@evil.com", "端口绕过"),
+
+        # ===== DNS rebind / 通配解析域名（解析到 127.0.0.1，绕过域名黑名单）=====
+        ("http://127.0.0.1.nip.io", "DNS rebind(nip.io)"),
+        ("http://localtest.me", "DNS rebind(localtest.me)"),
+        ("http://rebind-vlcc.internal", "DNS rebind(内网域名)"),
 
         # ===== 地址变形（整数/十六进制/短IP/八进制） =====
         ("http://2130706433", "整数IP-127.0.0.1"),
@@ -227,11 +247,14 @@ class SSRFEngine(BaseEngine):
         if is_static:
             payloads = payloads[:8]
 
-        # ===== 2.5 OOB 盲打通道（Interactsh，⑦）=====
+        # ===== 2.5 OOB 盲打通道（Interactsh 或本地回环，⑦）=====
         # 注入 http://<scanid>.<interactsh-domain>/ 到 url/redirect/file 参数，
-        # DNS/HTTP 轮询命中即确认真 SSRF（不依赖响应回显，天然抗 WAF/CDN 过滤）
+        # DNS/HTTP 轮询命中即确认真 SSRF（不依赖响应回显，天然抗 WAF/CDN 过滤）；
+        # 私网目标启用本地回环（settings.oob_base_url）时走 127.0.0.1 监听器闭环。
         interactsh_domain = kwargs.get('interactsh_domain', None)
-        if interactsh_domain:
+        from vulnclaw.config import settings as _st
+        _local_loop_active = bool(str(getattr(_st, "oob_base_url", "") or "").strip())
+        if interactsh_domain or _local_loop_active:
             oob_finding = await self._test_ssrf_oob(
                 url, param, parsed_query, session, interactsh_domain
             )
@@ -449,8 +472,16 @@ class SSRFEngine(BaseEngine):
         1. 注入唯一 scan_id 前缀域名，后端若发起请求会触发 DNS 解析与 HTTP 回调；
         2. 短轮询 Interactsh，命中（DNS/HTTP 回调包含 scan_id）即确认真 SSRF；
         3. 未命中返回 None，交由 verify 阶段 do_oob_poll 钩子做长轮询确认。
+
+        本地回环模式：目标在本机/私网时（settings.oob_base_url 已由 scan_runner
+        按目标判定启用），远端外带域不可达 → 注入 http://127.0.0.1:{port}/{scan_id}
+        并轮询本机 hits 文件，命中即本地实锤。
         """
-        if not interactsh_domain:
+        from vulnclaw.config import settings as _st
+        _local_base = str(getattr(_st, "oob_base_url", "") or "").strip().rstrip("/")
+        _local_ldap = local_oob_ldap_base()
+
+        if not interactsh_domain and not (_local_base and _local_ldap):
             return None
 
         from vulnclaw.modules.vuln_scanner.oob_interactsh import get_interactsh_poll
@@ -461,6 +492,41 @@ class SSRFEngine(BaseEngine):
         _oob_target = target_key_from_url(url)
         if is_oob_blocked(_oob_target):
             logger.debug(f"SSRF OOB 熔断生效，跳过 {url} 的带外盲打")
+            return None
+
+        # ===== 本地回环：私网目标用 127.0.0.1 监听器闭环，不走 Interactsh =====
+        if _local_base and _local_ldap:
+            oob_records = []
+            for oob_url, desc in (
+                (f"{_local_base}/{scan_id}/", "SSRF-本地HTTP回连"),
+                (f"{_local_base}/{scan_id}/ssrf-probe", "SSRF-本地路径探测"),
+            ):
+                attack_url = build_attack_url(url, param, oob_url, parsed_query)
+                try:
+                    resp = await async_get(attack_url, session=session, timeout=10, no_retry=True, allow_redirects=False)
+                    if isinstance(resp, tuple):
+                        oob_records.append((oob_url, resp[0]))
+                except Exception as e:
+                    logger.debug(f"SSRF OOB 请求失败 {oob_url}: {e}")
+            if not oob_records:
+                return None
+            if await wait_local_oob(scan_id, timeout=8):
+                return {
+                    'url': url,
+                    'parameter': param,
+                    'payload': oob_records[0][0],
+                    'type': 'SSRF-OOB本地回环确认',
+                    'severity': 'High',
+                    'ai_verdict': '高',
+                    'confidence': 'high',
+                    'evidence': (
+                        f"本地监听器命中 scan_id={scan_id}（HTTP/TCP 回连）: "
+                        f"{oob_records[0][0]}"
+                    ),
+                    'diff_ratio': 0.9,
+                    'oob_confirmed': True,
+                    'method': 'oob_ssrf'
+                }
             return None
 
         # 命中与扫描周期隔离：OOB 命中记录以 scan_id 前缀标识
@@ -716,6 +782,28 @@ class XXEEngine(BaseEngine):
         'Redis', 'MySQL', 'PostgreSQL', 'MongoDB',
     ]
 
+    # 安全加固响应的显式拒绝语义（fail-closed：这是"未中招"的证据，不是漏洞特征）。
+    # 典型：Java 禁用 DOCTYPE 后返回 "DOCTYPE is disallowed when the feature
+    # http://apache.org/xml/features/disallow-doctype-decl set to true"，
+    # 其中 "DOCTYPE" 字样命中过泛的 XXE_INDICATORS，曾被误判为 XXE 实锤。
+    SAFE_XXE_REJECTION_MARKERS = [
+        'disallow-doctype',
+        'doctype is disallowed',
+        'doctype is not allowed',
+        'doctype is forbidden',
+        'doctype disabled',
+        'external entities are disabled',
+        'entity expansion disabled',
+        'xxe protection',
+    ]
+
+    @classmethod
+    def _is_safe_xxe_rejection(cls, text: str) -> bool:
+        if not text:
+            return False
+        t = text.lower()
+        return any(m in t for m in cls.SAFE_XXE_REJECTION_MARKERS)
+
     async def check(
         self,
         url: str,
@@ -808,6 +896,14 @@ class XXEEngine(BaseEngine):
                         continue
 
                     if self._has_xxe_indicator(text):
+                        # 安全加固响应（显式禁用 DOCTYPE/外部实体）本身含 "DOCTYPE"
+                        # 等字样，但恰是"未中招"的证据 —— fail-closed 跳过，防把
+                        # 加固响应误判为 XXE 实锤。
+                        if self._is_safe_xxe_rejection(text):
+                            self.log_debug(
+                                "响应为安全拒绝语义（DOCTYPE/外部实体被禁用），跳过 XXE 判定"
+                            )
+                            continue
                         evidence = self._extract_xxe_evidence(text, payload)
                         return {
                             'url': url,
@@ -1288,6 +1384,91 @@ class GraphQLEngine(BaseEngine):
             logger.debug("suppressed exception (engine audit)")
         return None
 
+    async def test_alias_batching(
+        self,
+        endpoint: str,
+        session,
+        alias_count: int = 10
+    ) -> Optional[Dict]:
+        """alias 批量提取/限流绕过：单请求内用 N 个 alias 复用同一字段。
+        若响应同时返回全部 alias 结果（未被限流/拒绝）→ 存在单请求批量绕过面，
+        可绕过基于请求数的限流并放大单请求数据提取量。"""
+        aliases = " ".join(f"a{i}: __typename" for i in range(alias_count))
+        query = f"query {{ {aliases} }}"
+        try:
+            resp = await async_post(
+                endpoint, json={"query": query}, session=session, timeout=15
+            )
+            if isinstance(resp, tuple):
+                status, text = resp[0], resp[1] or ""
+            else:
+                status, text = resp.status, await resp.text()
+            if status != 200 or not text:
+                return None
+            try:
+                data = json.loads(text)
+            except Exception:
+                return None
+            if not isinstance(data, dict):
+                return None
+            d = data.get('data')
+            if isinstance(d, dict):
+                hit = [k for k in d.keys() if re.fullmatch(r"a\d+", str(k))]
+                if len(hit) >= 5:
+                    return {
+                        'url': endpoint,
+                        'type': 'GraphQL alias 批量(限流绕过面)',
+                        'severity': 'Medium',
+                        'ai_verdict': '中',
+                        'confidence': 'high',
+                        'evidence': (
+                            f'GraphQL alias 批量(限流绕过面) — 单请求内 {len(hit)} 个 alias '
+                            f'均被服务端执行并返回，可绕过基于请求数的限流/审计'
+                        ),
+                        'recommendation': '限制单请求 alias 数量或启用查询复杂度分析 + 基于 token 的限流',
+                    }
+        except Exception:
+            logger.debug("suppressed exception (engine audit)")
+        return None
+
+    async def test_http_request_batch(
+        self,
+        endpoint: str,
+        session
+    ) -> Optional[Dict]:
+        """HTTP 请求级批量(限流绕过面)：POST JSON 数组 [{q},{q},...]。
+        若服务端接受并返回多元素 data → 支持批量 → 可绕过基于请求数的限流/审计。"""
+        import json
+        queries = [{"query": "query { __typename }"} for _ in range(3)]
+        try:
+            resp = await async_post(
+                endpoint, json=queries, session=session, timeout=15
+            )
+            if isinstance(resp, tuple):
+                status, text = resp[0], resp[1] or ""
+            else:
+                status, text = resp.status, await resp.text()
+            if status != 200:
+                return None
+            try:
+                data = json.loads(text)
+            except Exception:
+                return None
+            if (isinstance(data, list) and len(data) >= 2
+                    and all(isinstance(x, dict) and 'data' in x for x in data)):
+                return {
+                    'url': endpoint,
+                    'type': 'GraphQL 请求级批量(限流绕过面)',
+                    'severity': 'Medium',
+                    'ai_verdict': '中',
+                    'confidence': 'high',
+                    'evidence': f'GraphQL 请求级批量(限流绕过面) — POST JSON 数组 [{len(data)} 个查询] 全部被执行；响应：{text[:120]}',
+                    'recommendation': '限制请求级批量或启用基于 token/复杂度的限流'
+                }
+        except Exception:
+            logger.debug("suppressed exception (engine audit)")
+        return None
+
     async def test_recursive_query(
         self,
         endpoint: str,
@@ -1701,6 +1882,14 @@ class GraphQLEngine(BaseEngine):
                 })
 
             result = await self.test_alias_collision(endpoint, session)
+            if result:
+                findings.append(result)
+
+            result = await self.test_alias_batching(endpoint, session)
+            if result:
+                findings.append(result)
+
+            result = await self.test_http_request_batch(endpoint, session)
             if result:
                 findings.append(result)
 
@@ -2580,4 +2769,198 @@ class DnsSecurityEngine(BaseEngine):
             "evidence": evidence,
             "confidence": "high",
             "cvss": cvss,
+        }
+
+
+# ============================================================
+
+# DNS Rebinding 检测引擎
+# 说明：面向域名资产的目标级全局引擎（由 V100 global_scan 调度）。
+# 检测面：判定目标域名是否具备"可被 DNS rebinding 利用"的特征——
+#   TOCTOU 竞争（两次解析 IP 翻转/轮换）、多 A 记录公网+私网混合
+#   （可被用于同源校验绕过，指向内网）。
+# 依赖：dnspython（可选）；阻塞 DNS 调用统一放入线程池，避免阻塞事件循环。
+# 铁律：fail-closed 低误报——解析失败 / 无记录 / 目标自身就在内网 / 仅低 TTL
+#   均不产出 finding，只在 logger.info 记录低 TTL 特征。
+# ============================================================
+
+
+class DnsRebindingEngine(BaseEngine):
+    """DNS Rebinding 探测引擎（TOCTOU 竞争逻辑）"""
+
+    name = "dns_rebinding"
+    description = "DNS Rebinding 探测（TOCTOU 竞争 / 多 A 记录混合网段 / 低 TTL）"
+
+    DNS_TIMEOUT = 5
+    # 竞争窗口内两次解析的必要间隔（秒）。TTL 极低（接近 0）时缓存几乎即时刷新，
+    # 用 0.5s 仍足以观察轮换；普通低 TTL 用 min(ttl,2) 等待缓存过期。该等待是
+    # rebinding 竞争检测的固有开销（最多 2s 一次 resolve），属可接受的必要成本。
+    RACE_INTERVAL = 2.0
+    MIN_RACE_INTERVAL = 0.5
+    LOW_TTL_THRESHOLD = 60
+
+    async def check(
+        self,
+        url: str,
+        param: str,
+        normal_resp: Tuple[int, str, Dict],
+        parsed_query: str,
+        session,
+        **kwargs
+    ) -> Optional[Dict]:
+        """参数级入口：DNS rebinding 与 URL 参数无关，统一走 scan() 全局检测。"""
+        return None
+
+    async def scan(self, target: str, session, **kwargs) -> List[Dict]:
+        """扫描目标域名是否具备可被 rebinding 利用的特征。"""
+        findings: List[Dict] = []
+        host = self._extract_host(target)
+        if not host:
+            return findings
+        if not DNS_AVAILABLE:
+            logger.info("DNS rebinding 检测跳过：未安装 dnspython")
+            return findings
+
+        # 第一次解析：收集 IP 集合 + rrset TTL
+        try:
+            first_ips, ttl = await asyncio.to_thread(self._resolve_a, host)
+        except Exception as exc:  # DNS 解析失败 / 无记录 → fail-closed
+            logger.debug(f"DNS rebinding 首次解析失败/无记录: {host} ({exc})")
+            return findings
+        first_ips = {str(ip) for ip in (first_ips or ())}
+        if not first_ips:
+            return findings
+        # 首次解析结果本身是私网/本机地址 → 目标自己就在内网，无 rebinding 意义
+        if all(self._is_private(ip) for ip in first_ips):
+            logger.debug(f"DNS rebinding 目标自身为内网地址，跳过: {host}")
+            return findings
+
+        # 多 A 记录：单查询返回公网+私网混合网段 IP → rebinding 特征（Medium）
+        if self._is_mixed_network(first_ips):
+            findings.append(self._mk_finding(
+                host,
+                "DNS 重绑定（多网段混合 A 记录）",
+                "Medium",
+                "medium",
+                f"DNS rebinding 风险：{host} 单查询返回混合网段 IP"
+                f"（{', '.join(sorted(first_ips))}），可被用于同源校验绕过",
+                "域名单次解析同时返回公网与私网 IP，攻击者可通过轮换 A 记录"
+                "先通过私网源地址审查再指向内网，绕过同源校验。",
+                "避免将内网 IP 与公网 IP 配置在同一个 DNS 域名下；对信任域名做"
+                "'解析结果必须为公网 IP'的严格校验，并配置 DNSSEC。",
+            ))
+
+        # TOCTOU 竞争：等待缓存过期窗口后第二次解析，比较两次 IP 集合
+        interval = self._race_interval(ttl)
+        if interval > 0:
+            await asyncio.sleep(interval)
+        try:
+            second_ips, _ttl2 = await asyncio.to_thread(self._resolve_a, host)
+            second_ips = {str(ip) for ip in (second_ips or ())}
+        except Exception as exc:
+            # 第二轮失败：保留已产出的混合网段 finding；其余场景 fail-closed
+            logger.debug(f"DNS rebinding 第二次解析失败/无记录: {host} ({exc})")
+            return findings
+
+        if first_ips != second_ips:
+            findings.append(self._mk_finding(
+                host,
+                "DNS 重绑定（TOCTOU IP 轮换）",
+                "High",
+                "high",
+                f"DNS rebinding 风险：{host} 两次解析 IP 不一致"
+                f"（{', '.join(sorted(first_ips))} → {', '.join(sorted(second_ips))}），"
+                f"TTL={ttl}s，存在 TOCTOU 竞争窗口",
+                "目标域名的两次解析返回不同 IP 集合（含新增/移除/翻转到私网），"
+                "配合极低 TTL 可在缓存过期后指向内网地址，绕过同源校验实现内网访问。",
+                "对信任域名限制必须持续解析到固定公网 IP；对 SSRF/转发类入口按"
+                "响应 IP 二次校验，禁止访问 RFC1918/回环地址，并对敏感域名做固定 IP 白名单。",
+            ))
+        elif ttl is not None and 0 < ttl < self.LOW_TTL_THRESHOLD:
+            # 仅低 TTL 且两次解析一致：特征不足，fail-closed 不产出 finding
+            logger.info(f"DNS rebinding 特征观察：{host} TTL={ttl}s（低），"
+                        f"但两轮解析 IP 稳定（{', '.join(sorted(first_ips))}），不判定为风险")
+
+        logger.info(f"DNS rebinding 检测完成：{host}，发现 {len(findings)} 个问题")
+        return findings
+
+    # ---------- 内部实现 ----------
+
+    @staticmethod
+    def _extract_host(target: str) -> str:
+        """从目标提取 host（剥端口）；空 / IP 直连返回空。"""
+        raw = (target or "").strip()
+        if not raw:
+            return ""
+        if "://" not in raw:
+            raw = "https://" + raw
+        host = (urlparse(raw).hostname or "").lower().rstrip(".")
+        if not host:
+            return ""
+        # 纯 IP 直连（含 IPv4 字面量）→ 无 rebinding 意义
+        if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", host):
+            return ""
+        return host
+
+    def _resolve_a(self, host: str):
+        """同步解析 A 记录；返回 (IP list, TTL)。由 asyncio.to_thread 调用。
+
+        测试可 monkeypatch 本方法返回固定元组；TTL 缺失时返回 None。
+        """
+        answer = dns.resolver.resolve(host, "A", lifetime=self.DNS_TIMEOUT)
+        ips = [rdata.address for rdata in answer if hasattr(rdata, "address")]
+        ttl = getattr(getattr(answer, "rrset", None), "ttl", None)
+        return ips, ttl
+
+    @staticmethod
+    def _race_interval(ttl) -> float:
+        """两次解析的竞争窗口间隔：TTL≤0 用最小区间，否则 min(ttl, 2) 且有下限。"""
+        try:
+            t = float(ttl)
+        except (TypeError, ValueError):
+            return DnsRebindingEngine.RACE_INTERVAL
+        if t <= 0:
+            return DnsRebindingEngine.MIN_RACE_INTERVAL
+        return max(DnsRebindingEngine.MIN_RACE_INTERVAL,
+                   min(t, DnsRebindingEngine.RACE_INTERVAL))
+
+    @staticmethod
+    def _is_private(ip: str) -> bool:
+        """判定 IP 是否为私网/本机/链路本地/保留地址。"""
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return False
+        return addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved
+
+    @classmethod
+    def _is_mixed_network(cls, ips) -> bool:
+        """多 A 记录：集合中同时含（至少一条）公网与私网 IP 即视为混合网段。"""
+        if len(ips) < 2:
+            return False
+        kinds = {"private" if cls._is_private(ip) else "public" for ip in ips}
+        return "private" in kinds and "public" in kinds
+
+    @staticmethod
+    def _mk_finding(
+        host: str,
+        ftype: str,
+        severity: str,
+        confidence: str,
+        evidence: str,
+        description: str,
+        recommendation: str,
+    ) -> Dict:
+        return {
+            "url": host,
+            "type": ftype,
+            "severity": severity,
+            "confidence": confidence,
+            "title": ftype,
+            "description": description,
+            "evidence": evidence,
+            "recommendation": recommendation,
+            "remediation": recommendation,
+            "parameter": "",
+            "method": "GET",
         }

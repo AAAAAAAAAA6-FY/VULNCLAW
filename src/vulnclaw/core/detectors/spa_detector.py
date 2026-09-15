@@ -12,7 +12,7 @@ def _get_random_path_token(length: int) -> str:
 class SpaFingerprintDetector:
     """SPA假404检测器 - 通过随机路径探测识别SPA应用"""
     
-    def __init__(self, session: requests.Session):
+    def __init__(self, session: aiohttp.ClientSession):
         self.session = session
         self.is_spa = False
         self.homepage_content = None

@@ -256,20 +256,29 @@ async def _verify_cross_batch(self, group: list) -> Optional[Dict[int, Dict]]:
             f"    证据包: {str(_pk)[:900]}\n"
             f"    观测: {_pr}"
         )
-    prompt = (
-        "你是 Web 漏洞证据型验证官。以下是同一 URL 与参数上多个检测引擎给出的漏洞候选，"
-        "每候选附【证据包】与【probe 观测结果】。请逐条独立裁决，不受同组其他条目影响。\n"
-        "\n"
-        "【裁决规则】\n"
-        "1. 反射/回显类漏洞：只有载荷回显（reflect=true）或明确响应差分才可 confirm；\n"
-        "2. 无客观证据或 probe 缺失/失败（ok=false）：必须判 confirmed=false 且 confidence=low"
-        "（证据不足）；\n"
-        "3. 绝不猜测，宁可证据不足。\n\n"
-        + "\n".join(lines)
-        + "\n\n只输出 JSON 数组，不要任何解释性文字，格式：\n"
-        '[{"index": 0, "confirmed": true, "confidence": "high", "reason": "证据式理由"}]\n'
-        "confidence 只能是 high / medium / low。"
-    )
+    # T12：prompt 收口到统一注册表（ai/prompt_registry），带版本号与样例回归集。
+    # 模板文本与内嵌原字面量逐字一致，只换引用不换内容；注册表缺失时回退兜底，
+    # 绝不因注册表问题打断验证链路。
+    try:
+        from vulnclaw.ai.prompt_registry import render as _render_prompt
+        prompt = _render_prompt("verify.cross_batch", items="\n".join(lines))
+    except Exception:  # noqa: BLE001 - 注册表不可用 → 回退内嵌原文
+        prompt = ""
+    if not prompt:
+        prompt = (
+            "你是 Web 漏洞证据型验证官。以下是同一 URL 与参数上多个检测引擎给出的漏洞候选，"
+            "每候选附【证据包】与【probe 观测结果】。请逐条独立裁决，不受同组其他条目影响。\n"
+            "\n"
+            "【裁决规则】\n"
+            "1. 反射/回显类漏洞：只有载荷回显（reflect=true）或明确响应差分才可 confirm；\n"
+            "2. 无客观证据或 probe 缺失/失败（ok=false）：必须判 confirmed=false 且 confidence=low"
+            "（证据不足）；\n"
+            "3. 绝不猜测，宁可证据不足。\n\n"
+            + "\n".join(lines)
+            + "\n\n只输出 JSON 数组，不要任何解释性文字，格式：\n"
+            '[{"index": 0, "confirmed": true, "confidence": "high", "reason": "证据式理由"}]\n'
+            "confidence 只能是 high / medium / low。"
+        )
     try:
         raw = await self._ask_ai(
             prompt,
@@ -381,7 +390,7 @@ async def _verify_all_findings(self):
         if sev in ("Low", "Info") and self._should_upgrade_low_info(v):
             v["severity"] = "Medium"
             sev = "Medium"
-            logger.info(f"   猬嗭笍 强证据升级验证档位： {v.get('type', '未知')} → Medium")
+            logger.info(f"   ⬆️ 强证据升级验证档位： {v.get('type', '未知')} → Medium")
         if sev in ['Critical', 'High']:
             critical_high.append(v)
         elif sev == 'Medium':
@@ -507,8 +516,26 @@ async def _verify_all_findings(self):
             # 降级时无条件做技术验证（HTTP 状态/响应差异/回显检测不依赖 LLM），
             # 正常路径仍按 severity 计划决定。
             if plan["do_http_verify"] or llm_degraded or budget_exhausted:
+                # 自动成长-供给端消费（2026-09-15）：finding 无 payload 时，
+                # 用账本推荐的历史有效载荷补位再技术验证（默认关零影响，失败静默）。
+                # 仅补复制出的验证用 payload，不改 finding 原始字段。
+                _verify_vuln = vuln
+                if not str(vuln.get("payload", "") or "").strip():
+                    try:
+                        from vulnclaw.growth.bridges import adaptive_payloads
+                        _rec = adaptive_payloads(str(vuln.get("type", "") or ""), k=1)
+                        if _rec:
+                            _verify_vuln = dict(vuln)
+                            _verify_vuln["payload"] = _rec[0]
+                            _verify_vuln["growth_payload_source"] = "ledger_recommend"
+                            logger.info(
+                                f"   [Growth] 历史 payload 补位验证: "
+                                f"{vuln.get('type', '?')}@{vuln.get('parameter', '')}"
+                            )
+                    except Exception:  # noqa: BLE001,S110
+                        pass
                 technical_result = await safe_verify_vulnerability(
-                    vuln,
+                    _verify_vuln,
                     self.session,
                     interactsh_domain=self._collaborator_domain,
                 )
@@ -653,11 +680,20 @@ async def _verify_all_findings(self):
                 try:
                     plan = self._severity_verify_plan(vuln.get("severity", "Low"))
                     if plan["do_exploit"]:
+                        _t0 = _time.perf_counter()
                         exploit_result = await SafeExploit.auto_exploit(vuln, self.session)
                         if exploit_result.get("exploitable"):
                             vuln["exploited"] = True
                             vuln["exploit_method"] = exploit_result.get("method")
                             vuln["exploit_evidence"] = exploit_result.get("evidence")
+                            # G 组: 标准 reproduction/verification 字段落回（与
+                            # apply_evidence_schema 五档同口径——exploited 信号已使
+                            # reproduced/verified=True）。仅实锤时写入，绝不填假数据。
+                            vuln["reproduced"] = True
+                            vuln["repro_evidence"] = str(exploit_result.get("evidence") or "")
+                            vuln["repro_command"] = str(vuln.get("curl_command") or "")
+                            vuln["repro_result"] = str(exploit_result.get("method") or "")
+                            vuln["verify_elapsed_ms"] = int((_time.perf_counter() - _t0) * 1000)
                             # P2-2: OOB 回调确认是强证据，confidence 置 100
                             if exploit_result.get("confidence") == 100:
                                 vuln["confidence"] = 100
@@ -790,7 +826,11 @@ async def _verify_cross(
             "\n"
             f"【probe 观测结果】\n{_probe_summary(probe)}\n"
             "\n"
-            "请只回答\"是 / 否 / 证据不足\"，并给出一条最有力的证据行作为理由。"
+            "请只回答问题并**仅输出一个 JSON 对象**（不要 markdown 代码块、不要额外文字）：\n"
+            '{"confirmed": "是|否|证据不足", "confidence": "high|medium|low", '
+            '"reason": "一条最有力的证据行", "evidence_ref": ["证据1", "证据2"], '
+            '"curl_poc": "复现该判定的 curl 命令（单行可直接执行）"}\n'
+            "规则：证据不足/无法构造 curl 时对应字段给空字符串或空数组，绝不编造。"
         )
         # P2-1: verify 复杂推理优先使用大模型（glm-4.7），提高判定质量
         available_models = []
@@ -822,7 +862,7 @@ async def _verify_cross(
                 preferred_client = get_llm_client(force_new=False, models=[preferred_model])
                 available_models.insert(0, (preferred_model, preferred_client))
             except Exception:
-                logger.debug("棣栭€夐獙璇佹ā鍨嬩笉鍙敤: %s", preferred_model)
+                logger.debug("首选验证模型不可用: %s", preferred_model)
         if len(available_models) < max(3, model_count):
             for model in self._model_pool:
                 if len(available_models) >= max(3, model_count):
@@ -847,9 +887,11 @@ async def _verify_cross(
                 return await asyncio.wait_for(
                     client.ask(
                         prompt,
-                        system="Answer only yes or no and provide a brief reason.",
+                        system=("Answer ONLY a single JSON object per the schema; "
+                                "no markdown, no extra text."),
                         temperature=0.1,
-                        max_tokens=200,
+                        max_tokens=400,
+                        force_json=True,
                         wrap_data=True,  # 安全加固
                         use_cache=True,  # P1-2: 语义缓存（1h TTL，重复验证命中直接返回）
                         usage_site="verify:cross"  # SP8
@@ -870,6 +912,12 @@ async def _verify_cross(
             timeout=30
         )
         votes = []
+        # 结构化语义确认产物收集器（成立理由/证据引用/curl PoC，首个非空胜出）
+        reasons: dict = {}
+        try:
+            from vulnclaw.modules.vuln_scanner import safe_extract_json
+        except Exception:  # noqa: BLE001 - 解析器不可用则走兼容回退
+            safe_extract_json = None
         for (provider_key, _), result in zip(selected_models, model_results):
             if isinstance(result, asyncio.CancelledError):
                 raise result
@@ -878,7 +926,27 @@ async def _verify_cross(
                 votes.append(False)
                 continue
             try:
-                is_vuln = "是" in result or "true" in result.lower()
+                data = (safe_extract_json(str(result))
+                        if (safe_extract_json and isinstance(result, str)) else None)
+                if isinstance(data, dict) and data.get("confirmed") is not None:
+                    # 结构化输出优先：只看 confirmed 字段，避免 reason 文本中的
+                    # "是"字造成误判（原实现全文关键词匹配的隐患）。
+                    raw_v = data.get("confirmed")
+                    is_vuln = (raw_v is True
+                               or str(raw_v).strip().lower() in ("是", "true", "yes"))
+                    if is_vuln:
+                        if not reasons.get("reason") and data.get("reason"):
+                            reasons["reason"] = str(data["reason"])[:300]
+                        if not reasons.get("evidence_ref") and data.get("evidence_ref"):
+                            ev = data["evidence_ref"]
+                            reasons["evidence_ref"] = (
+                                [str(x)[:200] for x in ev][:5]
+                                if isinstance(ev, list) else [str(ev)[:200]])
+                        if not reasons.get("curl_poc") and data.get("curl_poc"):
+                            reasons["curl_poc"] = str(data["curl_poc"])[:600]
+                else:
+                    # 兼容回退：非 JSON 输出沿用原关键词判定（零行为回归）
+                    is_vuln = "是" in result or "true" in result.lower()
                 votes.append(is_vuln)
                 logger.debug(f"模型 {provider_key} 判定: {is_vuln}")
             except Exception as e:
@@ -887,12 +955,20 @@ async def _verify_cross(
         confirmed_count = sum(votes)
         required_votes = 2 if len(selected_models) > 1 else 1
         if confirmed_count >= required_votes:
-            return {
+            out = {
                 "confirmed": True,
                 "severity": "High",
                 "confidence": "高",
                 "votes": [{"provider": selected_models[i][0], "is_vuln": v} for i, v in enumerate(votes)]
             }
+            # 结构化语义确认产物（供报告/复现消费）：成立理由 + 证据引用 + curl PoC
+            if reasons.get("reason"):
+                out["ai_reason"] = reasons["reason"]
+            if reasons.get("evidence_ref"):
+                out["evidence_ref"] = reasons["evidence_ref"]
+            if reasons.get("curl_poc"):
+                out["curl_poc"] = reasons["curl_poc"]
+            return out
         elif confirmed_count == 1:
             return {
                 "confirmed": False,
@@ -916,7 +992,17 @@ async def _poll_collaborator_callback(self, expected_scan_id: Optional[str] = No
     若给定 expected_scan_id（SSRF-OOB pending finding 携带的 oob_scan_id），
     仅返回与该 scan_id 精确配对的交互，避免其他扫描/其他 finding 的
     OOB 回调造成误配对（⑦ 闭环：DNS/HTTP 命中确认才可升级 High）。
+
+    本地回环：私网目标的 pending finding 用本机监听器（hits 文件）闭环，
+    命中即确认，无需远端 OOB 通道。
     """
+    if expected_scan_id:
+        try:
+            from vulnclaw.core.oob_channel import wait_local_oob
+            if await asyncio.wait_for(wait_local_oob(expected_scan_id, timeout=3), timeout=4):
+                return {"local": True, "scan_id": expected_scan_id, "protocol": "http"}
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"本地 OOB 回连检查失败: {e}")
     if not self._collaborator_domain:
         return False
     try:
@@ -1102,4 +1188,78 @@ def hallucination_suppress(orch, findings: list) -> list:
     return out
 
 
-__all__ = ['_severity_verify_plan', '_should_upgrade_low_info', '_llm_degraded', '_local_rule_verify', '_verify_all_findings', '_verify_cross', '_poll_collaborator_callback', '_verify_with_burp_repeater', 'llm_judge_dedup', 'hallucination_suppress']
+# ============================================================
+# H 组: orchestrator 拆分 —— verify 阶段编排（自 orchestrator 迁入，
+# 只搬不改：DAG / 重试 / 审计行为保持原样，依赖经 bind_phase_methods 绑定）
+# ============================================================
+async def _run_verify_block(self) -> None:
+    """SH17.1：verify 阶段主体（流式停 + 全量验证 + C9/C10 后处理）。"""
+    # 等所有流式 verify 把存量 pending 跑完；再收尾剩余未被流式 pick 的。
+    await self._stop_stream_verify(wait_pending=True)
+    _pt = _time.monotonic()
+    await self._verify_all_findings()
+    # C9/C10: AI 去重 + 幻觉抑制（配置默认开启；异常则保留原始结果，绝不阻断出报告）
+    try:
+        if getattr(settings, "llm_as_judge_dedup", False) or getattr(settings, "hallucination_suppression", False):
+            from vulnclaw.ai.v100.phases.phases_verify import llm_judge_dedup, hallucination_suppress
+            self.findings = await llm_judge_dedup(self, self.findings)
+            self.findings = hallucination_suppress(self, self.findings)
+            # 后处理可能重排/裁剪 findings，重建去重索引保持一致
+            self._seen_ut = {(str(f.get("url", "")), str(f.get("type", ""))) for f in self.findings}
+    except Exception as _ce:  # noqa: BLE001
+        logger.warning(f"⚠️ C9/C10 后处理异常，保留原始 findings: {_ce}")
+    self._phase_timings['verify'] = _time.monotonic() - _pt
+
+
+def _apply_final_review_gate(self) -> None:
+    """终稿收敛（负向裁决）：verify 层未背书或显式存疑的 finding，若缺任一实锤证据，
+    降为 Info 并列入报告 pending_review 桶（保留 original_severity / type / evidence 可追溯）。
+    规则可解释：doubted = ai_verdict 含存疑标记，或 verdict==suspicious 且 ai_verdict 非"真实漏洞"
+    （即 verify 未背书，包括引擎裸模板/空值/预算跳过）。真漏洞经 verify 背书为"真实漏洞"或
+    带实锤字段（cross_confirmed / burp_verified / exploited / oob_confirmed）一律不动。
+    开关：settings.final_review_gate（默认 True）。幂等。
+    """
+    try:
+        if not getattr(settings, "final_review_gate", True):
+            return
+        _doubt_markers = ("待人工复核", "低优先级", "非漏洞", "预算已满",
+                          "未确认", "无回显/无响应证据", "响应异常", "LLM 降级", "LLM降级")
+        _hard_proof = ("cross_confirmed", "cross_tool_confirmed",
+                       "burp_verified", "burp_confirmed",
+                       "exploited", "oob_confirmed", "oob_callback")
+        downgraded = 0
+        for f in self.findings:
+            if f.get("verdict") == "pending_review":
+                continue
+            av = str(f.get("ai_verdict", ""))
+            verdict = str(f.get("verdict", ""))
+            doubted = any(m in av for m in _doubt_markers)
+            if f.get("cross_tool_pending"):
+                doubted = True  # E3: 业务逻辑单点且无差分证据 → 必须复核
+            if not doubted and verdict == "suspicious" and "真实漏洞" not in av:
+                doubted = True  # verify 未背书（裸模板/空/跳过），宁缺毋滥
+            if not doubted:
+                continue
+            if any(f.get(k) for k in _hard_proof) or f.get("confirmation_sources"):
+                continue
+            sev = str(f.get("severity", "Low")).strip().capitalize()
+            f["original_severity"] = sev
+            f["severity"] = "Info"
+            f["verdict"] = "pending_review"
+            f["pending_review_reason"] = av or "验证未背书（engine 模板）"
+            self._pending_review.append({
+                k: f.get(k) for k in ("url", "type", "parameter", "ai_verdict",
+                                      "original_severity", "payload", "evidence")
+                if f.get(k) is not None
+            })
+            downgraded += 1
+        if downgraded:
+            logger.warning(
+                f"⚠️ [终稿收敛] {downgraded} 条 AI/技术均未实锤的存疑发现已降级 Info "
+                f"并列入报告 pending_review 桶（人工复核后再提升）"
+            )
+    except Exception as _ge:  # noqa: BLE001
+        logger.warning(f"终稿收敛异常（跳过，保留原样）: {_ge}")
+
+
+__all__ = ['_severity_verify_plan', '_should_upgrade_low_info', '_llm_degraded', '_local_rule_verify', '_verify_all_findings', '_verify_cross', '_poll_collaborator_callback', '_verify_with_burp_repeater', 'llm_judge_dedup', 'hallucination_suppress', '_run_verify_block', '_apply_final_review_gate']

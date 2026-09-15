@@ -23,7 +23,17 @@ from vulnclaw.core.logger import logger
 from vulnclaw.core.settings import settings
 from vulnclaw.core.utils import build_attack_url, async_get, obfuscate_payload
 from vulnclaw.engines.base import BaseEngine, _parse_response
+from vulnclaw.core.stats import welch_significant, mean_of
 from typing import Dict, List, Optional, Tuple
+
+# P1-15b：同参数被 WAF 阻断（403/406）达到该次数且绕过未成功 → 停止后续 payload。
+# 只留一次"换 payload 再试"的余地（防单个 payload 被特定规则拦就误停）。
+_WAF_BLOCK_BAIL = 2
+# P1-15b：同参数连续"不稳定响应"（0/429/5xx，含被反制封禁判定为 status 0）
+# 达到该次数即停止后续 payload——目标不合作时继续全量检测只是空转。
+_UNSTABLE_BAIL = 2
+# P1-15b：DB 指纹探测连续多少次"响应与基线无相似"就提前放弃（目标不合作）
+_FINGERPRINT_UNHELPFUL_BAIL = 3
 
 
 # ============================================================
@@ -154,6 +164,11 @@ class XSSEngine(BaseEngine):
         payloads = self.reorder_payloads_by_param(param)
         if is_static:
             payloads = payloads[:5]
+        else:
+            # P1-③：探针判上下文 → 针对性 payload 优先（检出更快更准；只重排不删除）
+            ctx = await self._probe_reflection_context(url, param, parsed_query, session)
+            if ctx != "body":
+                payloads = self._prioritize_payloads_for_context(payloads, ctx)
 
         for payload, desc in payloads:
             if not is_static and self.enable_obfuscation and random.random() > 0.3:
@@ -180,6 +195,51 @@ class XSSEngine(BaseEngine):
                 await asyncio.sleep(0.2)
 
         return None
+
+    # 上下文 → payload 优先选择器（P1-③，2026-09-15）：命中任一子串的 payload 提前。
+    # 只重排不删除 —— 判定端三层逻辑不变，零 FN 风险。
+    _CTX_PAYLOAD_HINTS = {
+        # script 文本区：只有逃逸型（闭合标签/语句中断）有效
+        "script": ("</script", "alert(1)//", "})alert"),
+        # 属性区：闭合引号 + 事件处理器
+        "attr": ("onmouseover=", "onfocus=", "onclick=", "onerror=", "ontoggle=", "onstart=", "onload="),
+        # 标签名位置：直接补全事件标签
+        "tag": ("<svg", "<img", "<details", "<video", "<audio", "<marquee", "<body", "<iframe"),
+    }
+
+    def _prioritize_payloads_for_context(self, payloads: List[Tuple[str, str]], ctx: str) -> List[Tuple[str, str]]:
+        hints = self._CTX_PAYLOAD_HINTS.get(ctx)
+        if not hints or not payloads:
+            return payloads
+        pri, rest = [], []
+        for item in payloads:
+            p = str(item[0]).lower()
+            (pri if any(h in p for h in hints) else rest).append(item)
+        return pri + rest
+
+    async def _probe_reflection_context(
+        self,
+        url: str,
+        param: str,
+        parsed_query: str,
+        session
+    ) -> str:
+        """一次探针请求判定反射上下文（'script'|'attr'|'tag'|'body'）。
+
+        marker 含引号+标签形态，让反射点落进哪个区域就能被 _locate_reflection_context
+        正确归类；探测失败/未回显一律回退 'body'（零回归：回退时 payload 顺序不变）。
+        """
+        marker = 'vz7q9m2k"><svg/x>'
+        attack_url = build_attack_url(url, param, marker, parsed_query)
+        try:
+            resp = await async_get(attack_url, session=session, timeout=settings.timeout, no_retry=True)
+            _status, text, _ = await _parse_response(resp)
+        except BaseException:
+            return "body"
+        text = text or ""
+        if 'vz7q9m2k' not in text:
+            return "body"
+        return self._locate_reflection_context(text, marker)
 
     async def _test_xss_payload(
         self,
@@ -237,7 +297,7 @@ class XSSEngine(BaseEngine):
                     'evidence': evidence,
                     'diff_ratio': 0.5,
                 }
-                if await self._verify_xss_browser(attack_url):
+                if await self._verify_xss_browser(attack_url, payload):
                     result['browser_verified'] = True
                     result['severity'] = 'Critical'
                     result['evidence'] += "；浏览器执行验证命中（弹窗/事件触发），已确认可执行"
@@ -279,45 +339,47 @@ class XSSEngine(BaseEngine):
 
         return None
 
-    async def _verify_xss_browser(self, attack_url: str) -> bool:
-        """A1 XSS 浏览器执行验证：用 headless 加载 PoC，监听 alert/confirm/prompt 弹窗，
-        命中即确认该注入点真正可执行（而非仅字符串反射）。playwright 不可用时返回 False，
-        不改变原"反射型"结论（安全降级）。
+    async def _verify_xss_browser(self, attack_url: str, payload: str = "") -> bool:
+        """A1 XSS 浏览器执行验证：统一走 RenderSession（页池复用，禁冷启动），
+        监听 alert/confirm/prompt 弹窗 + JS 运行时 sink 命中（P3-10）。
+
+        弹窗命中即确认可执行；runtime 命中必须**含 payload 碎片**（与 vulnspec
+        同一防误报规则——页面自身 JS 初始化调 innerHTML 不算）。渲染不可用返回
+        False，不改变原"反射型"结论（安全降级）。
         """
         if not getattr(settings, 'xss_browser_verify', True):
             return False
         try:
-            from playwright.async_api import async_playwright
+            from vulnclaw.core.render_session import RenderSession, render_available
         except ImportError:
             return False  # 浏览器不可用，不降级原结论
-
-        timeout = getattr(settings, 'xss_browser_timeout', 15)
+        if not render_available():
+            return False
         try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                page = await browser.new_page()
-                dialog_fired = asyncio.Event()
-                async def _on_dialog(dialog):
-                    dialog_fired.set()
-                    try:
-                        await dialog.dismiss()
-                    except BaseException:
-                        logger.debug("suppressed exception (engine audit)")
-                page.on("dialog", _on_dialog)
-                try:
-                    await page.goto(attack_url, timeout=timeout * 1000, wait_until="domcontentloaded")
-                except BaseException:
-                    logger.debug("suppressed exception (engine audit)")
-                try:
-                    await page.wait_for_event("dialog", timeout=2000)
-                except BaseException:
-                    logger.debug("suppressed exception (engine audit)")
-                verified = dialog_fired.is_set()
-                await browser.close()
-                return verified
+            async with RenderSession() as rs:
+                if rs is None:
+                    return False
+                res = await rs.render_for_dialog_ex(attack_url)
         except Exception as e:
             self.log_debug(f"XSS 浏览器验证异常: {e}")
             return False
+        if res is None:
+            return False  # 渲染故障按"未确认"处理，不得当作命中
+        dialog_hit, runtime_hits = res
+        if dialog_hit:
+            return True
+        if not runtime_hits:
+            return False
+        # payload 碎片校验：runtime sink 的 detail 必须含 payload 核心 24 字符
+        core = (payload.replace('<', '').replace('>', '')
+                .replace('"', '').replace("'", '').strip()[:24])
+        if not core:
+            return False
+        for h in runtime_hits:
+            detail = str(h.get("detail", "")) if isinstance(h, dict) else str(h)
+            if core in detail:
+                return True
+        return False
 
     async def _is_param_reflected(
         self,
@@ -353,69 +415,99 @@ class XSSEngine(BaseEngine):
         except BaseException:
             return True
 
+    def _locate_reflection_context(self, text: str, payload: str) -> str:
+        """定位 payload 反射点的 HTML 上下文（P2-②，2026-09-15）。
+
+        返回 'script'|'comment'|'attr'|'tag'|'body'。基于字符串位置的启发式
+        （零解析开销，1MB 响应也 <1ms，不引入 BeautifulSoup 每请求解析成本）：
+        - script:  位于 <script>...</script> 文本区内
+        - comment: 位于 <!-- --> 内
+        - attr:    位于某标签的属性区内（'<' 与反射点之间出现 '='）
+        - tag:     位于标签名位置（<svg 之后、'>' 之前且无 '='）
+        - body:    自由 HTML 区（默认）
+        """
+        try:
+            text_lower = text.lower()
+            probe = (payload or "")[:24]
+            idx = text.find(probe)
+            if idx < 0:
+                idx = text_lower.find(probe.lower())
+            if idx < 0:
+                return "body"
+            if text_lower.rfind("<script", 0, idx) > text_lower.rfind("</script>", 0, idx):
+                return "script"
+            if text.rfind("<!--", 0, idx) > text.rfind("-->", 0, idx):
+                return "comment"
+            lt = text.rfind("<", 0, idx)
+            gt = text.rfind(">", 0, idx)
+            if lt > gt and lt >= 0:
+                between = text[lt:idx]
+                if "=" in between:
+                    return "attr"
+                # '<' 后到反射点之间没有 '='：反射点位于标签名处
+                # （如 <svg... 的 'svg' 处，甚至 '<' 与首字母之间）
+                if re.match(r"<\s*[a-zA-Z0-9-]*$", between):
+                    return "tag"
+            return "body"
+        except BaseException:
+            return "body"
+
     def _is_xss_reflected(self, text: str, payload: str) -> bool:
+        """三层判定（2026-09-15 重构为"结构反射 → 上下文可达性 → 收紧残面"）：
+
+        层 1：payload 结构必须真的回显（原样 / 前缀 / 核心片段 / 实体编码变体）。
+        层 2：反射点上下文决定可执行性 —— 注释内永不执行；script 文本区内
+              只有能逃出当前 JS 语法的 payload（</script> 闭合型、;alert(1)//
+              语句型）才有效，HTML 标签型在字符串内是死 payload。
+        层 3：payload 完全未回显时，仅接受"事件处理器=形态"（onerror=）的
+              注入痕迹；裸词（alert/script/eval）不再构成命中——SPA 大站
+              外壳 JS 必含这些词（2026-09-08 修复过一次全站误报，此处收紧
+              残余面）。
+        """
         clean_payload = payload.replace('<', '').replace('>', '').replace('"', '').replace("'", '')
         if len(clean_payload) < 5:
             return False
 
-        key_indicators = []
-        if 'alert' in payload.lower():
-            key_indicators.append('alert')
-        if 'script' in payload.lower():
-            key_indicators.append('script')
-        if 'onerror' in payload.lower():
-            key_indicators.append('onerror')
-        if 'onload' in payload.lower():
-            key_indicators.append('onload')
-        if 'onmouseover' in payload.lower():
-            key_indicators.append('onmouseover')
-        if 'javascript:' in payload.lower():
-            key_indicators.append('javascript:')
-        if 'eval' in payload.lower():
-            key_indicators.append('eval')
-        if 'prompt' in payload.lower():
-            key_indicators.append('prompt')
-        if 'confirm' in payload.lower():
-            key_indicators.append('confirm')
-
-        # 2026-09-08 修复：不允许"正文出现 alert/onerror 等单词即判反射"。
-        # SPA 大站外壳自带 JS 必含这些词（Audible 基线: alertx3/onerrorx10/onloadx10），
-        # 曾致全站反射型 XSS 误报。改为：整个 payload 的 HTML 骨架（tag+attr）出现才算反射，
-        # 若无骨架标签则退化为"裸事件词出现 且 页面骨架含 <adbl/可注入属性上下文"（均跳过）。
         text_lower = text.lower()
-        has_skeleton = False
-        for tag in ("<script", "<img", "<svg", "<video", "<audio", "<iframe",
-                    "<body", "<a", "<form", "<textarea", "</script>"):
-            if tag in text_lower:
-                has_skeleton = True
-                break
-        if not has_skeleton:
-            return False
-        for indicator in key_indicators:
-            if indicator in text_lower:
-                return True
 
-        encoded_payloads = [
-            payload,
-            payload.replace('<', '&lt;'),
-            payload.replace('>', '&gt;'),
-            payload.replace('"', '&quot;'),
-            payload.replace("'", '&#39;'),
-        ]
-        for encoded in encoded_payloads:
-            if encoded in text:
-                return True
+        # ---- 层 1：结构反射确认 ----
+        head = payload[:32]
+        if not (head and head in text):
+            core_variants = [
+                clean_payload,
+                clean_payload.replace(' ', '%20'),
+                payload.replace('<', '&lt;').replace('>', '&gt;'),
+                payload.replace('"', '&quot;').replace("'", '&#39;'),
+            ]
+            if not any(v and v in text for v in core_variants):
+                # ---- 层 3：无结构反射，仅认"事件处理器=形态" ----
+                for word in ('onerror', 'onload', 'onmouseover', 'onfocus', 'ontoggle'):
+                    if word in payload.lower() and (word + '=') in text_lower:
+                        return True
+                return False
 
-        return False
+        # ---- 层 2：上下文可达性（P2-②）----
+        ctx = self._locate_reflection_context(text, payload)
+        if ctx == "comment":
+            return False  # HTML 注释内永不执行
+        if ctx == "script":
+            # script 文本区内：只有能逃出当前 JS/字符串语法的 payload 才有效
+            p = payload.lstrip().lower()
+            if p.startswith('</script') or ';' in payload or '//' in payload:
+                return True
+            return False  # HTML 标签型落在 script 字符串内 = 死 payload
+        return True
 
     def _extract_reflected_evidence(self, text: str, payload: str) -> str:
+        ctx = self._locate_reflection_context(text, payload)
+        prefix = f"[context={ctx}] "
         for part in ['alert', 'script', 'onerror', 'onload', 'onmouseover', 'prompt', 'confirm']:
             if part in text:
                 idx = text.find(part)
                 if idx != -1:
                     start = max(0, idx - 30)
                     end = min(len(text), idx + 60)
-                    return text[start:end]
+                    return prefix + text[start:end]
 
         for encoded in [payload, payload.replace('<', '&lt;')]:
             if encoded in text:
@@ -423,9 +515,9 @@ class XSSEngine(BaseEngine):
                 if idx != -1:
                     start = max(0, idx - 20)
                     end = min(len(text), idx + len(encoded) + 20)
-                    return text[start:end]
+                    return prefix + text[start:end]
 
-        return "检测到 XSS 反射特征"
+        return prefix + "检测到 XSS 反射特征"
 
     def _has_js_execution(self, text: str) -> bool:
         js_patterns = [
@@ -759,13 +851,20 @@ class SQLiEngine(BaseEngine):
             ("' OR 1=1--", ["MySQL", "PostgreSQL", "SQL Server"]),
         ]
 
+        _unhelpful = 0
         for fp_payload, possible_dbs in finger_payloads:
+            # P1-15b：目标不合作（WAF/限流/封禁 → 响应与基线毫无相似）时，
+            # 继续跑满 6 个指纹 payload 只是空转放大请求量，连续无信息即停。
+            if _unhelpful >= _FINGERPRINT_UNHELPFUL_BAIL:
+                logger.debug(f"[{self.name}] 指纹探测连续 {_unhelpful} 次无有效响应，提前终止")
+                break
             try:
                 test_url = build_attack_url(url, param, fp_payload, parsed_query)
                 resp = await async_get(test_url, session=session, timeout=5, no_retry=True)
                 if isinstance(resp, tuple) and len(resp) >= 2:
                     status, text = resp[0], resp[1] if resp[1] else ""
                 else:
+                    _unhelpful += 1
                     continue
 
                 if status == normal_status and abs(len(text) - normal_len) < 50:
@@ -789,6 +888,8 @@ class SQLiEngine(BaseEngine):
                                 self._fingerprint_cache[cache_key] = (db_type, time.time())
                             logger.info(f"[{self.name}] 识别数据库: {db_type}")
                             return db_type, True
+                else:
+                    _unhelpful += 1
             except BaseException:
                 logger.debug("suppressed exception (engine audit)")
 
@@ -894,41 +995,86 @@ class SQLiEngine(BaseEngine):
         session,
         sleep_seconds: int = 5
     ) -> Tuple[bool, float]:
-        """验证时间盲注 - 修复：增加网络 RTT 基线"""
+        """验证时间盲注 —— 2026-09-15 统计化（P2-①）。
+
+        旧逻辑：1 次基线 + 1 次 A/B，阈值 = baseline_rtt + 1.0（手拍）。
+        一次 2.7s 的网络尖峰（TLS 握手/代理冷启动）即可越过，把抖动判成注入。
+
+        新逻辑：3 次基线 + 2 次注入 + 2 次对照（无 sleep 的同构 payload），
+        用 Welch t 检验（core.stats，双侧 p≈0.02）判断"注入组显著慢于对照"，
+        同时要求实用差值下限 max(1.5s, sleep*0.4)——统计显著但幅度无意义
+        （如 0.3s 的"显著差异"）不进报告。保留两条旧语义兜底：
+        ①注入请求超时而对照正常 → 强信号；②样本不足 → 旧单次判据（fail-safe）。
+        """
+        # 基线 1 次：只用于 fail-safe 兜底阈值。多次采样必须留给"疑似命中"
+        # 的目标 —— 对抗性测试对无效目标的请求数有硬上限（如 500/WAF 页 ≤16），
+        # 无差别加采样会把请求预算打爆。
         baseline_start = time.time()
         try:
             await async_get(url, session=session, timeout=3, no_retry=True)
             baseline_rtt = time.time() - baseline_start
         except BaseException:
             baseline_rtt = 0.5
-
         threshold = baseline_rtt + 1.0
 
         url_sleep = build_attack_url(url, param, payload_sleep, parsed_query)
         url_no_sleep = build_attack_url(url, param, payload_no_sleep, parsed_query)
 
         try:
-            start_sleep = time.time()
-            await async_get(url_sleep, session=session, timeout=sleep_seconds + 5, no_retry=True)
-            elapsed_sleep = time.time() - start_sleep
+            # ---- 第一轮：单次 A/B 快速判据（旧逻辑，零额外开销）----
+            # 无效目标（正常页/500/WAF）在此止步，请求数与改动前一致。
+            treatment: List[float] = []
+            control: List[float] = []
+            t0 = time.time()
+            try:
+                await async_get(url_sleep, session=session, timeout=sleep_seconds + 5, no_retry=True)
+                treatment.append(time.time() - t0)
+            except asyncio.TimeoutError:
+                treatment.append(float(sleep_seconds + 4))  # 截断观测：超时≈很慢
+            t0 = time.time()
+            try:
+                await async_get(url_no_sleep, session=session, timeout=10, no_retry=True)
+                control.append(time.time() - t0)
+            except asyncio.TimeoutError:
+                control.append(10.0)
 
-            start_no_sleep = time.time()
-            resp_no_sleep = await async_get(url_no_sleep, session=session, timeout=10, no_retry=True)
-            elapsed_no_sleep = time.time() - start_no_sleep
+            quick_diff = mean_of(treatment) - mean_of(control)
+            if quick_diff <= threshold:
+                return False, quick_diff  # 快速排除：不做统计采样
 
-            diff = elapsed_sleep - elapsed_no_sleep
-            if diff > threshold:
+            # ---- 第二轮：疑似命中 → 补 1 组样本做 Welch 检验 ----
+            # 单次网络尖峰（TLS 握手/代理冷启动）能越过快速判据，但撑不过统计检验。
+            t0 = time.time()
+            try:
+                await async_get(url_sleep, session=session, timeout=sleep_seconds + 5, no_retry=True)
+                treatment.append(time.time() - t0)
+            except asyncio.TimeoutError:
+                treatment.append(float(sleep_seconds + 4))
+            t0 = time.time()
+            try:
+                await async_get(url_no_sleep, session=session, timeout=10, no_retry=True)
+                control.append(time.time() - t0)
+            except asyncio.TimeoutError:
+                control.append(10.0)
+
+            diff = mean_of(treatment) - mean_of(control)
+
+            # 旧语义兜底①：注入请求超时（延迟≥timeout）而对照组正常 → 强信号
+            if any(t >= sleep_seconds + 3 for t in treatment) and \
+                    control and mean_of(control) < max(2.0, sleep_seconds * 0.5):
+                return True, diff
+
+            sig, t_val = welch_significant(treatment, control)
+            # 实用差值用**绝对下限**：不能用 sleep_seconds 折算 ——
+            # sleep_seconds 是调用方传的"期望注入时长"（默认 5s），而 payload
+            # 实际生效时长由目标决定（实测靶机是 2s 门限），按它折算会漏报。
+            if sig and diff >= 1.5:
+                return True, diff
+            # 旧语义兜底②：统计不可判定（t=0，如两组无差异/样本异常）→ 退回旧判据
+            if t_val == 0.0 and diff > threshold:
                 return True, diff
             return False, diff
 
-        except asyncio.TimeoutError:
-            try:
-                resp_no_sleep = await async_get(url_no_sleep, session=session, timeout=5, no_retry=True)
-                if isinstance(resp_no_sleep, tuple) and resp_no_sleep[0] != 0:
-                    return True, float(sleep_seconds + 2)
-            except BaseException:
-                logger.debug("suppressed exception (engine audit)")
-            return False, 0.0
         except Exception as e:
             logger.debug(f"时间盲注验证异常: {e}")
             return False, 0.0
@@ -1083,6 +1229,11 @@ class SQLiEngine(BaseEngine):
                         pass  # 含 SQL 报错特征 → 继续走下方报错注入判定
                     else:
                         self.log_debug(f"攻击响应不稳定 (状态码 {attack_status})，跳过 payload: {payload[:30]}")
+                        # P1-15b：目标持续不可达/限流（含反制封禁判定为 status 0）
+                        # → 继续全量检测只会空转放大请求量，达到阈值即停。
+                        if self._note_waf_block(url, param) >= _UNSTABLE_BAIL:
+                            self.log_debug("目标持续不稳定，停止该参数后续 SQLi 检测")
+                            break
                         continue
 
                 if attack_status in (403, 406) and len(attack_text) < 100:
@@ -1093,6 +1244,10 @@ class SQLiEngine(BaseEngine):
                     )
                     if bypass_result:
                         return bypass_result
+                    # P1-15b：绕过未成功且已被拦 ≥2 次 → 停止该参数后续检测
+                    if self._note_waf_block(url, param) >= _WAF_BLOCK_BAIL:
+                        self.log_debug("WAF 持续阻断且绕过未成功，停止该参数后续 SQLi 检测")
+                        break
                     continue
 
                 waf_type = await self.detect_waf(attack_text)
@@ -1104,6 +1259,9 @@ class SQLiEngine(BaseEngine):
                     )
                     if bypass_result:
                         return bypass_result
+                    if self._note_waf_block(url, param) >= _WAF_BLOCK_BAIL:
+                        self.log_debug(f"WAF ({waf_type}) 持续阻断且绕过未成功，停止后续检测")
+                        break
                     continue
 
                 matched_phrases = self._matched_sql_error_phrases(attack_text)
@@ -1649,6 +1807,10 @@ class LFIEngine(BaseEngine):
                     )
                     if bypass_result:
                         return bypass_result
+                    # P1-15b：绕过未成功且已被拦 ≥2 次 → 停止该参数后续检测
+                    if self._note_waf_block(url, param) >= _WAF_BLOCK_BAIL:
+                        self.log_debug("WAF 持续阻断且绕过未成功，停止该参数后续检测")
+                        break
                     continue
 
                 waf_type = await self.detect_waf(attack_text)
@@ -1660,6 +1822,9 @@ class LFIEngine(BaseEngine):
                     )
                     if bypass_result:
                         return bypass_result
+                    if self._note_waf_block(url, param) >= _WAF_BLOCK_BAIL:
+                        self.log_debug(f"WAF ({waf_type}) 持续阻断且绕过未成功，停止后续检测")
+                        break
                     continue
 
                 if self._is_file_included(attack_text):
@@ -1848,7 +2013,13 @@ class LFIEngine(BaseEngine):
 # CMDIEngine
 # ============================================================
 class CMDIEngine(BaseEngine):
-    """命令注入检测引擎"""
+    """命令注入检测引擎
+
+    能力边界声明（2026-09-15 评审补录）
+    - can_detect: 向命令类参数（cmd/exec/run/command/ping 等）注入分隔符/管道/反引号/命令替换 payload，基于回显特征、命令输出与 sleep/ping 时间基盲注判定；支持 interactsh 外带确认。
+    - cannot_detect: 命令无回显且无外带通道时仅时间基盲注可判定、其它 payload 失效；WAF 转义或过滤元字符；输出被统一过滤抹平回显差异时可靠性下降。
+    - 前置条件: 输入可到达系统命令拼接层（参数可注入点）；需要回显或时间延迟可观测／OOB 通道可用。
+    """
     name = "cmdi"
     description = "命令注入检测引擎"
 
@@ -2029,6 +2200,10 @@ class CMDIEngine(BaseEngine):
                     )
                     if bypass_result:
                         return bypass_result
+                    # P1-15b：绕过未成功且已被拦 ≥2 次 → 停止该参数后续检测
+                    if self._note_waf_block(url, param) >= _WAF_BLOCK_BAIL:
+                        self.log_debug("WAF 持续阻断且绕过未成功，停止该参数后续检测")
+                        break
                     continue
 
                 waf_type = await self.detect_waf(attack_text)
@@ -2040,6 +2215,9 @@ class CMDIEngine(BaseEngine):
                     )
                     if bypass_result:
                         return bypass_result
+                    if self._note_waf_block(url, param) >= _WAF_BLOCK_BAIL:
+                        self.log_debug(f"WAF ({waf_type}) 持续阻断且绕过未成功，停止后续检测")
+                        break
                     continue
 
                 if self._has_cmd_output(attack_text, _normal_text or "", payload):
@@ -2262,7 +2440,13 @@ class CMDIEngine(BaseEngine):
 # SSTIEngine
 # ============================================================
 class SSTIEngine(BaseEngine):
-    """SSTI 模板注入检测引擎"""
+    """SSTI 模板注入检测引擎
+
+    能力边界声明（2026-09-15 评审补录）
+    - can_detect: 依赖 L0 反射门禁确认参数值到达模板渲染层后，L1/L2 盲打 payload 匹配、L3 升级 RCE 实锤（注入确认或已暴露引擎签名时）；覆盖 Jinja2/Django/Twig/Freemarker/Smarty 等已知模板引擎签名。
+    - cannot_detect: 参数值无回显（L0 反射门禁失败）则直接跳过；纯前端客户端模板注入；自定义模板引擎不在签名覆盖内；加密/压缩响应掩盖特征。
+    - 前置条件: 参数值需在实际响应中回显（L0 门禁必过）；目标使用已知模板引擎或签名覆盖范围内。
+    """
 
     name = "ssti"
     description = "SSTI 模板注入检测引擎"
@@ -2356,6 +2540,43 @@ class SSTIEngine(BaseEngine):
         ("${" + '"'.join(["new", "java.lang.Runtime.getRuntime().exec('id')"]) + "}", "Runtime", "Freemarker RCE"),
     ]
 
+    # L0 回显探针（2026-09-15）：SSTI 成立的前提是"用户输入被渲染进响应"。
+    # 纯字母数字 marker 经任何模板/编码/净化处理后仍应原样回显；无回显 = 本参数
+    # 走不到模板渲染层，直接跳过 L1/L2（对 500 错误页/固定页从 21 发降到 1 发）。
+    L0_PROBE_MARKER = "vcz9q2m7k"
+
+    async def _check_reflection_gate(
+        self,
+        url: str,
+        param: str,
+        parsed_query: str,
+        session,
+        normal_text: str = ""
+    ) -> bool:
+        """返回 True = 继续 L1/L2；False = 该参数到不了模板渲染层，直接放弃。
+
+        三条放行任一成立：
+          ① 探针 marker 原样回显（最强信号：输入确实被渲染）；
+          ② 探针 **2xx** 且响应与基线不同（参数确实影响了输出——"渲染了但被转义/
+             截断/二次加工"的目标属于此类，旧判据会把它们全部误杀）；
+          ③ 探测过程异常（fail-open，保持旧行为）。
+        仍拦得住的：任何输入都返回同一张固定页的目标（4xx/5xx 错误页、截断页、
+        1MB 静态填充）—— 这正是当初加门禁要省下的 21 发盲打。
+        """
+        attack_url = build_attack_url(url, param, self.L0_PROBE_MARKER, parsed_query)
+        try:
+            resp = await async_get(attack_url, session=session, timeout=settings.timeout, no_retry=True)
+            _status, text, _ = await _parse_response(resp)
+        except BaseException:
+            return True
+        text = text or ""
+        if self.L0_PROBE_MARKER in text:
+            return True
+        if 200 <= int(_status or 0) < 300 and normal_text:
+            if text.strip() != str(normal_text).strip():
+                return True
+        return False
+
     async def check(
         self,
         url: str,
@@ -2376,6 +2597,11 @@ class SSTIEngine(BaseEngine):
         detected_engines = self._detect_template_engine(normal_text)
         if detected_engines:
             self.log_info(f"检测到模板引擎: {', '.join(detected_engines)}")
+
+        # L0 门禁：探针不回显 → 输入到不了渲染层，SSTI 不可能成立，跳过 L1/L2 盲打
+        if not await self._check_reflection_gate(url, param, parsed_query, session, normal_text):
+            self.log_debug(f"参数 {param} 值无回显（L0 探针未反射），跳过 SSTI 检测")
+            return None
 
         l1_result = await self._check_l1(
             url, param, normal_resp, normal_text, parsed_query, session, compliant
@@ -2578,7 +2804,12 @@ class SSTIEngine(BaseEngine):
                 resp = await async_get(attack_url, session=session, timeout=settings.timeout, no_retry=True)
                 status, text, _ = await _parse_response(resp)
 
-                if expected in text and len(text) < 10000:
+                # 短 expected（如 ${.lang} -> "en"）过于泛化：Forbidden/rendered 等
+                # 任何含 "en" 的响应都会误判为 L2 配置泄露。expected 长度 <3 时
+                # 要求响应主体即该值（真实求值场景响应就是计算结果本身）。
+                if expected in text and len(text) < 10000 and (
+                    len(expected) >= 3 or text.strip().lower() == expected.lower()
+                ):
                     if expected not in normal_text:
                         return {
                             'url': url,
@@ -2789,6 +3020,10 @@ class NoSQLEngine(BaseEngine):
                     )
                     if bypass_result:
                         return bypass_result
+                    # P1-15b：绕过未成功且已被拦 ≥2 次 → 停止该参数后续检测
+                    if self._note_waf_block(url, param) >= _WAF_BLOCK_BAIL:
+                        self.log_debug("WAF 持续阻断且绕过未成功，停止该参数后续检测")
+                        break
                     continue
 
                 waf_type = await self.detect_waf(attack_text)
@@ -2800,6 +3035,9 @@ class NoSQLEngine(BaseEngine):
                     )
                     if bypass_result:
                         return bypass_result
+                    if self._note_waf_block(url, param) >= _WAF_BLOCK_BAIL:
+                        self.log_debug(f"WAF ({waf_type}) 持续阻断且绕过未成功，停止后续检测")
+                        break
                     continue
 
                 if self._has_nosql_error(attack_text):

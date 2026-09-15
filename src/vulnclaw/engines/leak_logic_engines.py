@@ -158,6 +158,25 @@ class SourceCodeLeakEngine(_ProbeEngine):
     GIT_HEAD_RE = __import__("re").compile(r'ref:\s*refs/heads/', __import__("re").I)
     SVN_ENTRIES_RE = __import__("re").compile(r'^(?:dir|file)($|\t)', __import__("re").M)
     DS_STORE_MAGIC = b"\x00\x00\x00\x01Bud1"
+    # .gitignore 判定的排除/命中特征：真 .gitignore 是纯文本模式表，
+    # 200 兜底的 HTML 页（SPA/网关把未知路径回落到首页）不是。
+    _HTML_FALLBACK_RE = __import__("re").compile(
+        r"(?i)<!doctype|<html|<head|<body|<script|<div|<title")
+    _GITIGNORE_LINE_RE = __import__("re").compile(
+        r"(?m)^\s*[#!]?\s*[A-Za-z0-9_./*\[\]?{}!-]{2,}")
+
+    def _looks_like_gitignore(self, text: str) -> bool:
+        """是否像真正的 .gitignore 内容。
+
+        旧判据只有 `status == 200 and text.strip()` —— 任何"根路径 200 兜底页"
+        （SPA / CDN / WAF 把未知路径回落首页）都会被判成 High 级源码泄露（误报）。
+        现在要求：非 HTML 兜底页，且至少有一行像 gitignore 模式。
+        """
+        if not text or not text.strip():
+            return False
+        if self._HTML_FALLBACK_RE.search(text):
+            return False
+        return bool(self._GITIGNORE_LINE_RE.search(text))
 
     async def scan(self, target: str, session, **kwargs) -> List[Dict]:
         findings: List[Dict] = []
@@ -180,7 +199,7 @@ class SourceCodeLeakEngine(_ProbeEngine):
                 evidence = "git config 泄露，可能暴露仓库地址/子模块/凭据"
             elif path == ".git/HEAD" and self.GIT_HEAD_RE.search(text):
                 evidence = "git HEAD 泄露，可尝试 .git 对象回源下载源码"
-            elif path == ".gitignore" and status == 200 and text.strip():
+            elif path == ".gitignore" and status == 200 and self._looks_like_gitignore(text):
                 evidence = "gitignore 泄露（目录结构/文件线索）"
             elif path == ".svn/entries" and self.SVN_ENTRIES_RE.search(text):
                 evidence = "svn entries 泄露（文件/目录列表）"

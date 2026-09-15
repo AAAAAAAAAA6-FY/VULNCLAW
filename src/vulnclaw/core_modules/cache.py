@@ -90,6 +90,9 @@ class SQLiteCache(CacheBackend):
     - Key 形如 `ffuf:{target_hash}:{wordlist_mtime}`；
     - value 为 JSON 序列化任意对象；ttl 默认 24h（86400s）；
     - `get_raw()` 不判断 TTL 返回旧值，供"缓存 miss 时增量重试"读取过期记录；
+    - `get()` 读到过期记录**只判 miss、不删行**——删除会销毁 get_raw 的增量重试数据源
+      （实测踩坑：读时删除导致过期记录的增量重试永远拿不到旧值）；
+      过期行由下一次 `set()`（INSERT OR REPLACE）自然覆盖，或 `delete()` 显式清理；
     - `stats()` 提供命中率可观测（命中/未命中/命中率）。
     """
     _class_lock = threading.Lock()
@@ -135,9 +138,7 @@ class SQLiteCache(CacheBackend):
                 return default
             value, expire = row
             if expire < now:
-                with self._lock:
-                    self._conn.execute("DELETE FROM kv WHERE key=?", (key,))
-                    self._conn.commit()
+                # 只判 miss、不删行：删除会销毁 get_raw 的增量重试数据源（见类 docstring）
                 self._misses += 1
                 return default
             self._hits += 1
@@ -193,11 +194,28 @@ class SQLiteCache(CacheBackend):
 
 
 def get_cache():
+    """按 settings.cache_backend 返回通用缓存后端。
+
+    - memory  （默认）进程内字典；评测/回归的安全默认值（天然隔离，无跨运行污染）
+    - file        单机文件 JSON
+    - sqlite      标准库 SQLite（WAL），**跨进程/跨运行持久**，零外部依赖；
+                  推荐：想要 redis 的"跨运行复用"收益但不想引入外部服务时用这个
+    - redis       外部 Redis（需安装 redis 包并启动服务）；多进程/分布式共享时用；
+                  包缺失或连接失败时**回退 memory** 并告警（绝不因缓存拖垮扫描）
+    """
     backend = getattr(settings, 'cache_backend', 'memory')
     if backend == "file":
         return FileCache()
-    else:
-        return MemoryCache()
+    if backend == "sqlite":
+        # 通用键空间与 ffuf 缓存分库，避免键冲突
+        return SQLiteCache(name="general", ttl=7200)
+    if backend == "redis":
+        try:
+            from vulnclaw.core_modules.redis_cache import RedisCache
+            return RedisCache()
+        except Exception as e:  # noqa: BLE001 — 缓存永不致命：不可用即回退
+            logger.warning(f"[Cache] redis 后端不可用（{e}），回退 memory")
+    return MemoryCache()
 
 
 cache = get_cache()

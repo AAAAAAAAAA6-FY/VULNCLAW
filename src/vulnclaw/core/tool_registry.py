@@ -14,6 +14,7 @@ import re
 import subprocess
 import os
 import shutil
+import sys
 import time
 import yaml
 from pathlib import Path
@@ -133,16 +134,60 @@ def _executable_candidates(path: Path) -> bool:
     return path.suffix == "" and os.access(path, os.X_OK)
 
 
+# 自动发现允许的最大相对路径深度：thirdparty/<tool>.exe（1 层）
+# 或 thirdparty/<dir>/<tool>.exe（2 层，目录型分发）。
+_AUTO_DISCOVERY_MAX_DEPTH = 2
+
+# 明确排除的顶层目录前缀：这些是"人工交互式套件"而非可编排的扫描工具，
+# 其内部/启动脚本被登记只会污染 Agent 工具表（实测曾出现
+# Burp Suite_CN.bat / Burp Suite_EN.bat / Burp Suite_Keygen.bat / 清除数据.bat）。
+_AUTO_DISCOVERY_EXCLUDE_PREFIXES = ("BurpSuite",)
+
+
+def _auto_discovery_included(executable: Path) -> bool:
+    """该可执行文件是否应被自动登记为受管工具。
+
+    只接受 thirdparty/<tool>.exe 与 thirdparty/<dir>/<tool>.exe 两种布局。更深的层
+    属于"第三方工具自带的内部二进制"，它们不是扫描工具：
+      • BurpSuite V2026.7.3/jre/bin/{java,javac,javaw,jdb,keytool,jabswitch,
+        jaccessinspector,jaccesswalker,kinit,klist,ktab,rmiregistry,serialver}.exe
+      • OneForAll/thirdparty/massdns/…/massdns.exe（OneForAll 自带子依赖）
+    实测这些会被 rglob 抓进 tools_auto.yaml，把 Agent 的工具清单冲成噪音
+    （曾出现 java/javac/jdb/keytool/klist/ktab/rmiregistry 等伪工具）。
+    """
+    if not _executable_candidates(executable):
+        return False
+    try:
+        rel_parts = executable.relative_to(THIRDPARTY_PATH).parts
+    except ValueError:  # 不在 thirdparty 下（理论不可达）
+        return False
+    if len(rel_parts) > _AUTO_DISCOVERY_MAX_DEPTH:
+        return False
+    return not rel_parts[0].startswith(_AUTO_DISCOVERY_EXCLUDE_PREFIXES)
+
+
 def discover_auto_tools() -> Dict[str, Any]:
-    """扫描 thirdparty 并合并新增/变动的可执行文件，不覆盖 tools.yaml 条目。"""
+    """扫描 thirdparty 并合并新增/变动的可执行文件，不覆盖 tools.yaml 条目。
+
+    登记范围见 _auto_discovery_included；同时剪除历史遗留的噪音条目
+    （第三方内部二进制）与二进制已不存在的失效条目。
+    """
     auto_data = _read_yaml(TOOLS_AUTO_CONFIG_PATH)
     auto_tools = auto_data.get("tools", {})
     configured = _read_yaml(TOOLS_CONFIG_PATH).get("tools", {})
     changed = False
 
+    # 剪枝 1：历史遗留的越界条目（旧版 rglob 无深度限制写入的 JRE/子依赖噪音）
+    # 剪枝 2：二进制已不存在的失效条目
+    for stale in list(auto_tools.keys()):
+        recorded = str((auto_tools.get(stale) or {}).get("executable") or "")
+        if not recorded or not _auto_discovery_included(Path(recorded)):
+            auto_tools.pop(stale, None)
+            changed = True
+
     if THIRDPARTY_PATH.exists():
         for executable in THIRDPARTY_PATH.rglob("*"):
-            if not _executable_candidates(executable):
+            if not _auto_discovery_included(executable):
                 continue
             name = executable.stem
             if name in configured:
@@ -195,6 +240,53 @@ def resolve_tool_path(name: str) -> Optional[str]:
     return path
 
 
+def resolve_configured_tool(name: str, config: Optional[Dict[str, Any]]) -> Optional[str]:
+    """按「配置 executable → 注册名」两段解析工具路径。
+
+    配置里常写裸文件名（如 arjun 的 "arjun.exe"），而工具实际位于子目录
+    （thirdparty/arjun/arjun.exe）。对裸文件名 get_tool_path 只查系统 PATH 与
+    thirdparty 顶层，必然落空；按注册名解析才能命中 thirdparty/<name>/ 目录型分发。
+
+    缺这层回退会让「治理目录已声明 + 二进制确实存在」的工具在 run_tool 处直接
+    失败（arjun 曾因此报 "未找到工具: arjun"，使 param_discovery 能力全程空转）。
+    """
+    if not config:
+        return resolve_tool_path(name)
+    return resolve_tool_path(config.get("executable", name)) or resolve_tool_path(name)
+
+
+def tool_available(name: str) -> bool:
+    """工具是否可用（PATH 或 thirdparty，含目录型分发的内部可执行）。
+
+    与 run_tool 的解析口径完全一致（run_tool → _run_tool_impl → resolve_tool_path），
+    因此"tool_available 为真"等价于"run_tool 能找到这个工具"。
+
+    **禁止用 shutil.which 做工具门禁**：thirdparty 下的工具（arjun / gitleaks /
+    EHole / testssl.sh 等）不在系统 PATH，用 which 判定会让"已在治理目录声明、
+    二进制也确实存在"的能力被静默跳过——run_arjun 曾因此永久早退，
+    使 param_discovery 能力形同虚设。
+    """
+    try:
+        return bool(resolve_tool_path(name))
+    except Exception:  # noqa: BLE001 - 可用性判定绝不抛错
+        return False
+
+
+def _build_command(tool_path: str, args: List[str]) -> List[str]:
+    """构建子进程命令行；对脚本型工具自动前插解释器。
+
+    Windows 不能直接 exec `.py`/`.pl`，否则 run_tool 会 returncode=-1 静默失败
+    （典型如 nikto：thirdparty/nikto/nikto.py 是 perl 脚本的 python 薄包装，
+    必须 `python nikto.py` 才能跑起来）。`.pl` 直接前插 perl。其它扩展按原样。
+    """
+    low = (tool_path or "").lower()
+    if low.endswith(".py"):
+        return [sys.executable, tool_path] + list(args)
+    if low.endswith(".pl"):
+        return [(shutil.which("perl") or "perl"), tool_path] + list(args)
+    return [tool_path] + list(args)
+
+
 def _probe_capabilities(tool_path: str) -> Optional[Dict[str, Any]]:
     """通过帮助/version 输出建立轻量能力指纹。"""
     fingerprint = f"{tool_path}:{os.path.getmtime(tool_path)}"
@@ -204,7 +296,7 @@ def _probe_capabilities(tool_path: str) -> Optional[Dict[str, Any]]:
     for probe in (["-help"], ["-h"], ["-version"]):
         try:
             proc = subprocess.run(
-                [tool_path] + probe,
+                _build_command(tool_path, probe),
                 capture_output=True,
                 text=True,
                 timeout=5,
@@ -254,7 +346,7 @@ async def _discover_tool(name: str) -> Optional[Dict[str, Any]]:
 
 def _raw_command(name: str, args: List[str], timeout: int) -> Dict[str, Any]:
     tool_path = resolve_tool_path(name) or shutil.which(name)
-    cmd = [tool_path or name] + args
+    cmd = _build_command(tool_path or name, args)
     cmd_str = " ".join(cmd)
     try:
         proc = subprocess.run(
@@ -287,13 +379,24 @@ class SandboxUnavailableError(RuntimeError):
     """docker 后端不可用（未装 SDK / 守护进程未起 / 执行失败）。"""
 
 
-async def _sandbox_local(cmd: List[str], timeout: int, stdin_text: Optional[str]):
-    """local 后端：直接子进程执行（等价于原 run_tool 行为）。"""
+async def _sandbox_local(cmd: List[str], timeout: int, stdin_text: Optional[str],
+                         env: Optional[Dict[str, str]] = None):
+    """local 后端：直接子进程执行（等价于原 run_tool 行为）。
+
+    env：可选环境变量增量——会与当前进程环境**合并**（不替换），避免覆盖 PATH
+    等导致工具自身依赖（如 perl）解析失败。仅用于规避特定工具的运行时环境问题
+    （如 Nikto/perl 在中文 locale 下数值比较崩溃，需注入 LC_ALL=C）。
+    """
+    child_env = None
+    if env:
+        child_env = dict(os.environ)
+        child_env.update(env)
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdin=asyncio.subprocess.PIPE if stdin_text is not None else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=child_env,
     )
     if stdin_text is not None:
         stdout, stderr = await asyncio.wait_for(
@@ -344,7 +447,8 @@ async def _sandbox_docker(cmd: List[str], timeout: int, stdin_text: Optional[str
 
 
 async def sandbox_run(cmd: List[str], timeout: int, stdin_text: Optional[str] = None,
-                     level: str = "read", backend: Optional[str] = None) -> tuple:
+                     level: str = "read", backend: Optional[str] = None,
+                     env: Optional[Dict[str, str]] = None) -> tuple:
     """统一沙箱执行入口。
 
     - level=read：直接 local（无需隔离，省开销）。
@@ -362,7 +466,7 @@ async def sandbox_run(cmd: List[str], timeout: int, stdin_text: Optional[str] = 
             return await _sandbox_docker(cmd, timeout, stdin_text)
         except SandboxUnavailableError as exc:
             logger.warning(f"⚠️ [Sandbox] Docker 隔离不可用，降级 local: {exc}")
-    return await _sandbox_local(cmd, timeout, stdin_text)
+    return await _sandbox_local(cmd, timeout, stdin_text, env=env)
 
 
 async def run_tool(
@@ -371,6 +475,7 @@ async def run_tool(
     timeout: Optional[int] = None,
     extra_args: Optional[List[str]] = None,
     stdin_text: Optional[str] = None,
+    env: Optional[Dict[str, str]] = None,
     **kwargs
 ) -> Dict[str, Any]:
     """统一工具调用入口（含工具治理层钩子）。
@@ -396,7 +501,7 @@ async def run_tool(
     try:
         result = await _run_tool_impl(
             name, args=args, timeout=timeout, extra_args=extra_args,
-            stdin_text=stdin_text, **kwargs
+            stdin_text=stdin_text, env=env, **kwargs
         )
         ok = bool(result.get("success"))
         error = str(result.get("error") or "")
@@ -419,6 +524,7 @@ async def _run_tool_impl(
     timeout: Optional[int] = None,
     extra_args: Optional[List[str]] = None,
     stdin_text: Optional[str] = None,
+    env: Optional[Dict[str, str]] = None,
     **kwargs
 ) -> Dict[str, Any]:
     """
@@ -495,8 +601,8 @@ async def _run_tool_impl(
         # A5.5: 无配置（工具未安装）→ 附降级说明
         return _attach_fallback(name, await asyncio.to_thread(_raw_command, name, args or [], timeout or 60))
 
-    # 解析工具路径
-    tool_path = resolve_tool_path(config.get("executable", name))
+    # 解析工具路径（「配置 executable → 注册名」两段回退，见 resolve_configured_tool）
+    tool_path = resolve_configured_tool(name, config)
     if not tool_path:
         # A5.5: 工具缺失 → 统一失败构造（记录统计 + 降级说明）
         return _finalize_failure(name, f"未找到工具: {name}")
@@ -534,14 +640,15 @@ async def _run_tool_impl(
     output_file_enabled = config.get("output_file", False)
 
     # 构建命令
-    cmd = [tool_path] + args
+    cmd = _build_command(tool_path, args)
     cmd_str = " ".join(cmd)
 
     logger.debug(f"🔧 [Tool] {name}: {cmd_str}")
 
     try:
         try:
-            returncode, stdout_text, stderr_text = await sandbox_run(cmd, timeout, stdin_text, level=_op_level)
+            returncode, stdout_text, stderr_text = await sandbox_run(
+                cmd, timeout, stdin_text, level=_op_level, env=env)
         except asyncio.TimeoutError:
             logger.warning(f"⏰ [Tool] {name} 超时 ({timeout}s)")
             return _finalize_failure(name, f"Timeout after {timeout}s", -1, cmd_str)

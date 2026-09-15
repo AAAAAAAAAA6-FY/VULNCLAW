@@ -593,6 +593,14 @@ class ReActAgent:
 
             action = await self._decide_action(thought)
             self.history.append({"iteration": self.iteration, "action": action})
+            # F.1b: 轮级审计——不论 _decide_action 走 LLM 成功 / 确定性降级 / 失败参数早退
+            # 哪条分支，每轮都留一条。实测曾出现"深挖确实跑了但 agent_decisions 零文件"，
+            # 根因就是审计只埋在部分分支上；轮级审计保证"跑过必有痕"。
+            self._audit_decision("round", {
+                "iteration": self.iteration,
+                "thought": str(thought)[:400],
+                "action": action,
+            })
             # A1.3: 本轮回合消费完策略切换标志；记录近期工具用于信息增益衰减
             self._force_strategy_switch = False
             if isinstance(action, dict) and action.get("tool") in self.tools:
@@ -982,6 +990,12 @@ ask_expert(question,context,system)：困惑时外询——内部知识盲区/�
                     param = params.get("param", "")
                     if param in self._failed_params:
                         logger.info(f"⏭️ 参数 {param} 已在失败列表，自动跳过")
+                        # F.1: 早退分支也必须留痕——否则"深挖跑了但零审计文件"无法回溯
+                        self._audit_decision("decide", {
+                            "thought": str(thought)[:400],
+                            "action": {"tool": "finish", "param": param},
+                            "source": "skip_failed_param",
+                        })
                         return {
                             "tool": "finish",
                             "reason": f"参数 {param} 已失败多次，跳过"
@@ -1435,6 +1449,14 @@ ask_expert(question,context,system)：困惑时外询——内部知识盲区/�
                         evidence=f.get("evidence", ""),
                         error_msg=""
                     )
+                    # P2-④：深挖有效手法回灌经验账本（feedback_ledger，
+                    # confirm 判定 → recommend_payloads 可复用，fp 污染自动剔除）
+                    try:
+                        from vulnclaw.growth.feedback_ledger import get_feedback_ledger
+                        get_feedback_ledger().absorb_finding(
+                            f, verdict="confirm", target=self.target)
+                    except Exception:
+                        logger.debug("suppressed exception (growth ledger audit)")
                     tool_name = action.get("tool", "unknown")
                     logger.debug(f"📖 记忆已记录: {f.get('type')} (工具: {tool_name})")
         elif observation.get("type") == "error":

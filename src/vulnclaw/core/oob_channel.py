@@ -53,13 +53,328 @@ _OAST_DOMAIN_RE = re.compile(
 # 注册/轮询均走该私有服务，摆脱公共 oast.me 的限流与单点故障；未设置则用公共服务器。
 _OOB_INTERACTSH_SERVER = (os.environ.get("OOB_INTERACTSH_SERVER") or "").strip()
 
+
+def validate_interactsh_server(server: Optional[str] = None) -> Dict[str, object]:
+    """Validate the configured interactsh endpoint without making a network call.
+
+    This is deliberately only a syntax/safety check.  A valid URL does not prove
+    that an interactsh deployment is reachable or that callbacks will arrive.
+    """
+    from urllib.parse import urlsplit
+
+    value = (server if server is not None else os.environ.get(
+        "OOB_INTERACTSH_SERVER", "")).strip()
+    if not value:
+        return {"configured": False, "valid": True, "server": "", "error": ""}
+    parsed = urlsplit(value)
+    error = ""
+    if parsed.scheme not in ("http", "https"):
+        error = "must use http:// or https://"
+    elif not parsed.hostname:
+        error = "missing hostname"
+    elif parsed.username or parsed.password:
+        error = "credentials are not allowed"
+    elif parsed.query or parsed.fragment:
+        error = "query strings and fragments are not allowed"
+    elif parsed.path not in ("", "/"):
+        error = "path component is not supported"
+    return {
+        "configured": True,
+        "valid": not error,
+        "server": value,
+        "error": error,
+    }
+
+
+def get_oob_diagnostics() -> Dict[str, object]:
+    """Return offline OOB readiness information; never contacts an OOB service."""
+    config = validate_interactsh_server()
+    client = resolve_tool_path("interactsh-client")
+    return {
+        **config,
+        "provider": "interactsh",
+        "client_available": bool(client),
+        "client_path": client or "",
+        "network_checked": False,
+        "callback_verified": False,
+    }
+
 # A1.3：支持的带外回调协议（LDAP/RMI/SMB/SMTP + 既有 DNS/HTTP）
 _OOB_PROTOCOLS = ("ldap", "rmi", "smb", "smtp", "dns", "http", "https")
+
+
+# ----------------------------------------------------------
+# 本地 OOB 回环（reproduced 闭环，2026-09-14）
+# ----------------------------------------------------------
+# 场景：目标是本机/私网（自建靶场/内网演练）时，目标能回连 127.0.0.1——
+# 本地监听器让"盲 SSRF / 盲命令注入"等 OOB 声明从"恒 0"变成可闭环证伪。
+# 仅 HTTP 型回调（payload 形如 http://127.0.0.1:PORT/{token}）；外部目标回连
+# 不到本机 → 调用方必须先用 maybe_enable_local_oob_for_target 判断来源。
+class LocalOOBListener:
+    """本机 HTTP 回调监听器：请求路径逐行写入 hits 文件，供 oracle 轮询。"""
+
+    def __init__(self, hits_file: str):
+        self.hits_file = hits_file
+        self.port = 0
+        self._srv = None
+
+    def start(self) -> int:
+        import http.server
+        import threading
+        hits = self.hits_file
+
+        class _H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                try:
+                    with open(hits, "a", encoding="utf-8") as fh:
+                        fh.write(self.path + "\n")
+                except OSError:
+                    pass
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                try:
+                    self.wfile.write(b"ok")
+                except OSError:
+                    pass
+
+            def log_message(self, *args):
+                return
+
+        self._srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _H)
+        self.port = int(self._srv.server_address[1])
+        threading.Thread(target=self._srv.serve_forever, daemon=True).start()
+        return self.port
+
+    def stop(self) -> None:
+        try:
+            if self._srv is not None:
+                self._srv.shutdown()
+                self._srv.server_close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+class LocalLDAPListener:
+    """本机 LDAP/TCP 回调监听器（2026-09-15）：JNDI 型盲打回连闭环。
+
+    Log4Shell / Fastjson 的 jndi:ldap://127.0.0.1:PORT/{token} 注入后，目标侧
+    JNDI 解析会以原始 TCP 回连该端口并携带 token。监听器把连接首包（含 token）
+    逐行写入与 HTTP 监听器共用的 hits 文件，`_oob_token_seen` 子串匹配即可闭环
+    ——无需完整 LDAP 协议解码（低误报铁律：只有"目标真回连了本机端口"才算实锤）。
+    """
+
+    def __init__(self, hits_file: str):
+        self.hits_file = hits_file
+        self.port = 0
+        self._srv = None
+
+    def start(self) -> int:
+        import socketserver
+        import threading
+        hits = self.hits_file
+
+        class _H(socketserver.BaseRequestHandler):
+            def handle(self):  # noqa: D401
+                # JNDI LDAP 回连时序：首包是匿名 bind（不含 token），随后才是携带
+                # 搜索 DN=token 的 search 请求。只读首包会漏 token → 累积读取至
+                # 短窗口结束或连接关闭，把整段会话文本写入 hits 供子串匹配。
+                import socket as _socket
+                chunks = []
+                try:
+                    self.request.settimeout(0.6)
+                    deadline = time.monotonic() + 1.5
+                    while time.monotonic() < deadline and sum(len(c) for c in chunks) < 4096:
+                        try:
+                            data = self.request.recv(1024)
+                        except _socket.timeout:
+                            break
+                        if not data:
+                            break
+                        chunks.append(data)
+                except OSError:
+                    pass
+                try:
+                    raw = b"".join(chunks)
+                    line = raw.decode("utf-8", errors="replace").strip()
+                    if line:
+                        with open(hits, "a", encoding="utf-8") as fh:
+                            fh.write("ldap " + line[:800] + "\n")
+                except OSError:
+                    pass
+                finally:
+                    try:
+                        self.request.close()
+                    except OSError:
+                        pass
+
+        self._srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), _H)
+        self.port = int(self._srv.server_address[1])
+        threading.Thread(target=self._srv.serve_forever, daemon=True).start()
+        return self.port
+
+    def stop(self) -> None:
+        try:
+            if self._srv is not None:
+                self._srv.shutdown()
+                self._srv.server_close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+_LOCAL_LISTENER: Optional["LocalOOBListener"] = None
+_LOCAL_LDAP_LISTENER: Optional["LocalLDAPListener"] = None
+_LOCAL_HITS_FILE: str = ""
+_LOCAL_LDAP_BASE: str = ""
+
+
+def enable_local_oob() -> Optional[str]:
+    """启动本地 OOB 监听并写入 settings.oob_base_url / oob_hits_file。
+
+    幂等：重复调用复用同一监听器。返回 base_url（如 http://127.0.0.1:54321）。
+    LDAP 监听器与 HTTP 共享 hits 文件；JNDI 盲打地址通过 `local_oob_ldap_base()`
+    获取，外部目标回连不到本机 → 调用方必须先用 maybe_enable_local_oob_for_target
+    判断来源（与 HTTP 回环同一约束）。
+    """
+    global _LOCAL_LISTENER, _LOCAL_LDAP_LISTENER, _LOCAL_HITS_FILE, _LOCAL_LDAP_BASE
+    try:
+        from vulnclaw.config import settings as _st
+        if _LOCAL_LISTENER is None:
+            fd, hits = tempfile.mkstemp(prefix="oob_hits_", suffix=".txt")
+            os.close(fd)
+            _LOCAL_LISTENER = LocalOOBListener(hits)
+            _LOCAL_LISTENER.start()
+            _LOCAL_HITS_FILE = hits
+        if _LOCAL_LDAP_LISTENER is None:
+            _LOCAL_LDAP_LISTENER = LocalLDAPListener(_LOCAL_HITS_FILE)
+            _LOCAL_LDAP_LISTENER.start()
+            _LOCAL_LDAP_BASE = f"ldap://127.0.0.1:{_LOCAL_LDAP_LISTENER.port}"
+        base = f"http://127.0.0.1:{_LOCAL_LISTENER.port}"
+        _st.oob_base_url = base
+        _st.oob_hits_file = _LOCAL_HITS_FILE
+        return base
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[OOB] 本地监听启动失败: {exc}")
+        return None
+
+
+def local_oob_ldap_base() -> str:
+    """本地 LDAP 回环基址（如 ldap://127.0.0.1:54322）；未启用返回空串。"""
+    return _LOCAL_LDAP_BASE
+
+
+def local_oob_token_seen(token: str) -> bool:
+    """本地回环命中判定：hits 文件逐行子串匹配 token（HTTP 路径 / LDAP 会话）。
+
+    本地监听器把回调路径/会话文本逐行写入 settings.oob_hits_file；
+    token 为随机 hex（≥8 字符），子串匹配无串台风险。
+    """
+    token = (token or "").strip().lower()
+    if not token:
+        return False
+    try:
+        from vulnclaw.config import settings as _st
+        hits = str(getattr(_st, "oob_hits_file", "") or "").strip()
+    except Exception:  # noqa: BLE001
+        return False
+    if not hits:
+        return False
+    try:
+        with open(hits, "r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                if token in line.lower():
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+async def wait_local_oob(token: str, timeout: int = 12) -> bool:
+    """本地回环轮询等待：token 出现在 hits 文件即命中（零网络、纯本机）。"""
+    deadline = time.monotonic() + max(1, timeout)
+    while time.monotonic() < deadline:
+        if local_oob_token_seen(token):
+            return True
+        await asyncio.sleep(0.5)
+    return False
+
+
+def local_oob_channel(token: str) -> str:
+    """返回本地回环命中通道：'ldap'（TCP/JNDI 会话）/'http'（HTTP 路径）/''（未命中）。"""
+    token = (token or "").strip().lower()
+    if not token:
+        return ""
+    try:
+        from vulnclaw.config import settings as _st
+        hits = str(getattr(_st, "oob_hits_file", "") or "").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+    if not hits:
+        return ""
+    try:
+        with open(hits, "r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                if token not in line.lower():
+                    continue
+                return "ldap" if line.lstrip().lower().startswith("ldap") else "http"
+    except OSError:
+        pass
+    return ""
+
+
+def disable_local_oob() -> None:
+    """停止本地 OOB 监听（hits 文件保留供事后审计）。"""
+    global _LOCAL_LISTENER, _LOCAL_LDAP_LISTENER, _LOCAL_LDAP_BASE
+    try:
+        if _LOCAL_LDAP_LISTENER is not None:
+            _LOCAL_LDAP_LISTENER.stop()
+    except Exception:  # noqa: BLE001
+        pass
+    _LOCAL_LDAP_LISTENER = None
+    _LOCAL_LDAP_BASE = ""
+    try:
+        if _LOCAL_LISTENER is not None:
+            _LOCAL_LISTENER.stop()
+    except Exception:  # noqa: BLE001
+        pass
+    _LOCAL_LISTENER = None
+
+
+def maybe_enable_local_oob_for_target(target: str) -> Optional[str]:
+    """目标为本机/私网时启用本地 OOB 回环；否则返回 None（绝不启用）。
+
+    外部目标回连不到 127.0.0.1，启用只会让每个 OOB 声明白等等待秒数。
+    """
+    try:
+        from urllib.parse import urlparse
+        h = (urlparse(str(target or "")).hostname or "").lower()
+        if not h:
+            return None
+        _local = h in ("localhost", "::1", "0.0.0.0") or h.startswith("127.")
+        if not _local and (h.startswith("10.") or h.startswith("192.168.")):
+            _local = True
+        if not _local and h.startswith("172."):
+            try:
+                _local = 16 <= int(h.split(".")[1]) <= 31
+            except Exception:  # noqa: BLE001
+                _local = False
+        if not _local:
+            return None
+        base = enable_local_oob()
+        if base:
+            logger.info(f"[OOB] 本地目标 → 启用本地 OOB 回环: {base}")
+        return base
+    except Exception:  # noqa: BLE001
+        return None
 
 # A1.4：OOB 回调证据链审计（进程内持久化 + 去重）
 # 满足「token→interaction 落库，支持跨轮次复核、去重与事后审计」——
 # 在单次扫描进程内累积全部回调，按 (token,protocol,time,from,raw) 去重，
 # 供引擎/verify/报告侧事后审计，避免重复计数与串台误读。进程级单例，无需新建文件。
+# 内存审计链封顶（P3-13，2026-09-15）：回调已逐条落盘 JSONL
+# （_append_oob_evidence_jsonl），**磁盘是审计完整性的真源**；内存只保留最近
+# N 条，防长时间扫大网时无界增长（不改审计语义，证据一条不丢）。
+_OOB_AUDIT_MAX = 10000
 _OOB_AUDIT: List["OOBInteraction"] = []
 _OOB_AUDIT_SEEN: set = set()
 
@@ -125,6 +440,12 @@ def channel_down_remaining() -> float:
 def record_oob_result(target: str, hit: bool) -> None:
     """记录一次带外探测结果（hit=是否收到回调），驱动目标级熔断。"""
     key = (target or _OOB_GLOBAL_TARGET).strip().lower() or _OOB_GLOBAL_TARGET
+    # 工作流8：OOB 命中率指标（hit/miss）
+    try:
+        from vulnclaw.core_modules.metrics import get_metrics
+        get_metrics().inc_oob_event("hit" if hit else "miss")
+    except Exception:  # noqa: BLE001 - 指标是增强项
+        pass
     if hit:
         _OOB_HIT_COUNT[key] = _OOB_HIT_COUNT.get(key, 0) + 1
         _OOB_MISS_STREAK[key] = 0
@@ -390,7 +711,17 @@ class OOBChannel:
         return None
 
     async def _request_dnslog_domain(self) -> Optional[str]:
-        """dnslog.cn 备选通道（HTTP，无二进制依赖）。"""
+        """dnslog.cn 备选通道（HTTP，无二进制依赖）。
+
+        会话语义：dnslog.cn 用 cookie 把「session ↔ 当前域名」绑定，重复调用
+        getdomain.php 会切换绑定并使旧域名下的记录不可查。故域名必须缓存复用
+        （与 interactsh 通道一致）：否则引擎侧 get_interactsh_poll 新建 channel
+        时会反复重新申请 → 共享 session 的 cookie 漂移 → 已注入 token 的回调
+        永远查不到（真扫实证：auto 降级链 0 hits，显式 dnslog 3 hits）。
+        """
+        cached = _DOMAIN_CACHE.get("dnslog")
+        if cached:
+            return cached
         try:
             from vulnclaw.core.utils import get_shared_session
             import aiohttp
@@ -400,6 +731,7 @@ class OOBChannel:
                 text = await resp.text()
             text = (text or "").strip()
             if text and "." in text and " " not in text:
+                _DOMAIN_CACHE["dnslog"] = text
                 logger.info(f"[OOB] 已申请 dnslog 域名: {text}")
                 return text
         except Exception as e:  # noqa: BLE001
@@ -554,13 +886,7 @@ class OOBChannel:
                 if not isinstance(data, dict):
                     continue
                 proto = str(data.get("protocol") or data.get("type") or "unknown").lower()
-                token = ""
-                for key in ("fullId", "subdomain", "token", "dns_name", "shorthost"):
-                    val = str(data.get(key) or "")
-                    head = val.split(".", 1)[0]
-                    if head and head != self._domain:
-                        token = head
-                        break
+                token = self._extract_itsh_token(data)
                 if not token:
                     continue
                 raw_req = str(data.get("raw_request") or "")
@@ -576,6 +902,34 @@ class OOBChannel:
             raise
         except Exception as e:  # noqa: BLE001
             logger.debug(f"[OOB] interactsh 流读取结束: {e}")
+
+
+    def _extract_itsh_token(self, data: Dict) -> str:
+        """从一条 interactsh 交互里解析「触发回调的 token」（子域首标签）。
+
+        低误报铁律（A1.4 串台防护的落地）：模块头声明「只认注册过的真实带外
+        域名发来的回调」，但旧实现直接取 fullId/subdomain 首标签，不校验该域名
+        是否落在本次注册域名之下——任何 FQDN 形态的候选值都会被当成"我们的 token"
+        绑定到 finding（自部署/异常服务端、或被篡改的交互记录即可制造误关联）。
+        现要求 FQDN 候选值必须收口于本次注册域名，且不得就是根域名本身；
+        裸标签（无点，如某些版本的 shorthost）无法判定归属，沿用旧行为。
+        候选字段逐个尝试，命中即返回；全部不可信返回 ""（该条交互丢弃）。
+        """
+        domain = str(self._domain or _DOMAIN_CACHE.get("interactsh") or "")
+        domain = domain.strip(".").lower()
+        for key in ("fullId", "subdomain", "token", "dns_name", "shorthost"):
+            val = str(data.get(key) or "").strip().strip(".")
+            if not val:
+                continue
+            head = val.split(".", 1)[0]
+            if not head or head == domain:
+                continue
+            if "." in val and domain:
+                low = val.lower()
+                if low == domain or not low.endswith("." + domain):
+                    continue  # 非本通道注册域名 → 该字段不可信，试下一个候选字段
+            return head
+        return ""
 
     def _kill_itsh_sync(self) -> None:
         """同步兜底：进程退出前终止常驻子进程（atexit 注册）。"""
@@ -642,12 +996,35 @@ class OOBChannel:
     # 按 token 判定
     # ----------------------------------------------------------
     async def interactions_for(self, token: str, timeout: int = 15) -> List[OOBInteraction]:
-        """返回匹配指定 token 前缀的回调。"""
+        """返回匹配指定 token 的回调（精确相等，大小写不敏感）。
+
+        poll 取走缓冲后，未被本次过滤命中的其它 token 回调只留在审计链；
+        本次未命中时按 token 兜底查审计链，避免"并发等待时回调被先行 token
+        的 poll 取走"造成的漏绑定（token 每次注入随机生成，精确匹配无串台风险）。
+        """
         token = token.strip().lower()
         if not token:
             return []
-        return [it for it in await self.poll(timeout=timeout)
-                if it.token and it.token.lower() == token]
+        fresh = [it for it in await self.poll(timeout=timeout)
+                 if it.token and it.token.lower() == token]
+        if fresh:
+            return fresh
+        return list(get_oob_audit(token))
+
+    def _local_hits(self, token: str) -> List[OOBInteraction]:
+        """纯内存查取：审计链 + 当前缓冲中匹配 token 的回调（零网络零等待）。
+
+        熔断快速路径专用——熔断的设计目标是"不为注定无回连的等待买单"，但
+        已经收到的回调是实锤，必须能在零成本的前提下发现并解除熔断。
+        """
+        token = token.strip().lower()
+        if not token:
+            return []
+        out = list(get_oob_audit(token))
+        for it in list(self._itsh_buffer):
+            if it.token and it.token.lower() == token and it not in out:
+                out.append(it)
+        return out
 
     async def wait_for_interaction(self, token: str, timeout: int = 15,
                                    interval: float = 1.5,
@@ -661,9 +1038,18 @@ class OOBChannel:
         token = token.strip().lower()
         if not self._domain or not token:
             return []
+        # 熔断快速路径：零网络、零等待地查一次内存（缓冲 + 审计链）——已收到的
+        # 实锤不应因熔断被当成"无回连"漏掉（FN 防护）；内存无命中才真正跳过等待，
+        # 保持熔断"不再为注定无回连的等待买单"的成本语义。
         if is_oob_blocked(target):
-            logger.debug(f"[OOB] 熔断生效，跳过 token={token} 的带外等待（target={target or '*'}）")
-            return []
+            hits = self._local_hits(token)
+            if not hits:
+                logger.debug(f"[OOB] 熔断生效，跳过 token={token} 的带外等待（target={target or '*'}）")
+                return []
+            logger.info(f"[OOB] 熔断中但缓冲/审计已有 token={token} 回调 → 命中并解除熔断")
+            if not self._last_poll_error:
+                record_oob_result(target, True)
+            return hits
         deadline = time.monotonic() + timeout
         hits: List[OOBInteraction] = []
         while time.monotonic() < deadline:
@@ -714,6 +1100,14 @@ class OOBChannel:
             return
         _OOB_AUDIT_SEEN.add(key)
         _OOB_AUDIT.append(it)
+        # P3-13：内存审计链封顶（落盘在先，磁盘保完整；内存只留最近 N 条）。
+        # 裁剪时同步重建去重集，避免 SEEN 无界增长。
+        if len(_OOB_AUDIT) > _OOB_AUDIT_MAX:
+            del _OOB_AUDIT[: len(_OOB_AUDIT) - _OOB_AUDIT_MAX]
+            _OOB_AUDIT_SEEN.clear()
+            for _it in _OOB_AUDIT:
+                _OOB_AUDIT_SEEN.add(
+                    (_it.token, _it.protocol, _it.time, _it.from_addr, _it.raw_protocol))
         _append_oob_evidence_jsonl(
             it.evidence_view(channel=self._resolved_provider or ""))
 
@@ -787,5 +1181,5 @@ def get_oob_evidence(token: Optional[str] = None) -> List[Dict]:
 
 __all__ = [
     "OOBChannel", "OOBInteraction", "make_oob_probe", "get_oob_audit",
-    "get_oob_evidence",
+    "get_oob_evidence", "validate_interactsh_server", "get_oob_diagnostics",
 ]

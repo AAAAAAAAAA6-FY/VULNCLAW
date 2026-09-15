@@ -319,7 +319,8 @@ class APIVersionDiffEngine(BaseEngine):
     def _parse_response(self, resp):
         if isinstance(resp, tuple):
             return resp[0], resp[1] if resp[1] else ""
-        return resp.status, asyncio.run(resp.text())
+        from vulnclaw.core.utils import sync_resp_text
+        return resp.status, sync_resp_text(resp)
 
 
 # ============================================================
@@ -560,7 +561,8 @@ class RequestSmugglingEngine(BaseEngine):
     def _parse_response(self, resp):
         if isinstance(resp, tuple):
             return resp[0], resp[1] if resp[1] else ""
-        return resp.status, asyncio.run(resp.text())
+        from vulnclaw.core.utils import sync_resp_text
+        return resp.status, sync_resp_text(resp)
 
 
 # ============================================================

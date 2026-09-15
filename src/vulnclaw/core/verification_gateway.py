@@ -258,6 +258,89 @@ async def _llm_prescreen(batch: list[dict]) -> dict[int, dict] | None:
         return None
 
 
+async def multi_agent_verify_batch(batch: list[dict], votes_required: int = 2) -> dict[int, dict] | None:
+    """多智能体辩论式复核（P3-7，2026-09-15）。
+
+    3 路**独立视角**并发质询同一批 findings（技术可行性 / 证据充分性 / 误报风险），
+    多数票（默认 ≥2）判"高把握误报"才标记 —— 单模型粗筛的主观偏好被三视角交叉
+    抑制。
+
+    纪律：
+    - 任何一路失败按**弃权**（不改变结论）；全部失败返回 None
+      → 调用方回退 `_llm_prescreen`（等价现状，零回归）；
+    - 只标记 high 把握误报，不直接丢弃 finding（沿用"宁漏筛勿误杀"）；
+    - 开关默认关（settings.multi_agent_verify=False），与单模型粗筛互斥替代。
+    """
+    try:
+        from vulnclaw.ai.core import get_llm_client
+
+        client = get_llm_client()
+        if client is None:
+            return None
+        lines = [
+            f"[{i}] type={f.get('type', '?')} | severity={f.get('severity', '?')} | "
+            f"url={f.get('url', '')} | param={f.get('parameter', '')} | "
+            f"evidence={str(f.get('evidence', ''))[:200]}"
+            for i, f in enumerate(batch)
+        ]
+        body = "\n".join(lines)
+        perspectives = (
+            "你是漏洞验证专家A，从**技术可行性**角度审查（该类型漏洞在此技术栈上是否真实可能）：",
+            "你是漏洞验证专家B，从**证据充分性**角度审查（evidence 是否足以支撑结论，还是仅凭猜测）：",
+            "你是漏洞验证专家C，从**误报风险**角度审查（是否为常见误报模式：版本误判/回显误判/公共页面特征）：",
+        )
+
+        async def _one_vote(system: str) -> dict | None:
+            try:
+                prompt = (
+                    f"{system}\n以下为待复核的漏洞清单。只标记「把握非常高的明显误报」，"
+                    "不确定的不要标记。\n\n" + body
+                    + '\n\n只输出 JSON：{"verdicts": [{"index": 0, "likely_vuln": false, "confidence": "high"}]}'
+                )
+                raw = await client.ask(
+                    prompt, system="只输出 JSON，不要解释。", temperature=0.0,
+                    max_tokens=900, task_type="filter", usage_site="gateway:debate")
+                from vulnclaw.modules.vuln_scanner import safe_extract_json
+
+                data = safe_extract_json(raw)
+                if isinstance(data, dict):
+                    data = data.get("verdicts") or []
+                out: dict[int, dict] = {}
+                for item in data or []:
+                    if isinstance(item, dict):
+                        try:
+                            out[int(item.get("index"))] = {
+                                "likely_vuln": bool(item.get("likely_vuln")),
+                                "confidence": str(item.get("confidence", "low")).lower(),
+                            }
+                        except (TypeError, ValueError):
+                            continue
+                return out  # 解析成功但无标记 = 明确反对票（空 dict）；调用失败才是 None（弃权）
+            except Exception:  # noqa: BLE001 - 单路失败 = 弃权
+                return None
+
+        results = await asyncio.gather(*(_one_vote(p) for p in perspectives))
+        valid = [r for r in results if isinstance(r, dict)]
+        if not valid:
+            return None
+        out: dict[int, dict] = {}
+        for i, _f in enumerate(batch):
+            # 每路对该 finding 的表态：有标记=支持误报；无标记=None（反对票）。
+            # 分母含所有成功表态的路（弃权路不计），多数票按此计算。
+            votes = [r.get(i) for r in valid]
+            false_votes = sum(
+                1 for v in votes
+                if v and v.get("likely_vuln") is False
+                and str(v.get("confidence", "")).lower() == "high")
+            if false_votes >= int(votes_required):
+                out[i] = {"likely_vuln": False, "confidence": "high",
+                          "debate_votes": f"{false_votes}/{len(votes)}"}
+        return out or None
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[Gateway] 多智能体辩论复核不可用（整层跳过）: {exc}")
+        return None
+
+
 async def _probe_one(f: dict, session) -> dict:
     """可选 HTTP 重放探测：基线 vs 载荷（复用砖 1 的 Repeater 判定语义）。"""
     try:
@@ -588,6 +671,13 @@ def build_verified_sarif(findings: list[dict], gateway_version: str = GATEWAY_VE
                 "blind_evidence": f.get("blind_evidence", ""),
                 # P0-3: 证据三分类（fact/inference/unproven_hypothesis），不参与凭证链哈希
                 "evidence_class": f.get("evidence_class", ""),
+                # G 组: 五档证据规范字段（rule_hit / response_evidence / verified /
+                #       reproduced / oob_success），与主扫描 SARIF 同语义，不参与凭证链哈希
+                "rule_hit": bool(f.get("rule_hit")),
+                "response_evidence": bool(f.get("response_evidence")),
+                "verified": bool(f.get("verified")),
+                "reproduced": bool(f.get("reproduced")),
+                "oob_success": bool(f.get("oob_success")),
                 # 以下四项为凭证链出证字段的**全量原值**——审计反查
                 # （verify_gateway_output）据此重建哈希输入，缺一即链式暴露
                 "parameter": str(f.get("parameter", "")),
@@ -654,13 +744,30 @@ async def run_gateway(
             f.setdefault("signals", []).append(f"local_rule:{hit}")
 
     if use_llm:
-        verdicts = await _llm_prescreen(findings)
-        if verdicts:
-            for i, f in enumerate(findings):
-                v = verdicts.get(i)
-                if v and v.get("likely_vuln") is False and str(v.get("confidence", "")).lower() == "high":
-                    f["llm_gate_reject"] = True
-                    f.setdefault("signals", []).append("llm_gate_reject")
+        # P3-7：多智能体辩论复核（默认关）。开启且可用时替代单模型粗筛；
+        # 不可用/全失败自动回退 —— 两者输出结构一致，下游零改动。
+        verdicts = None
+        _debate_on = False
+        try:
+            from vulnclaw.core.settings import settings as _settings
+            _debate_on = bool(getattr(_settings, "multi_agent_verify", False))
+        except Exception:  # noqa: BLE001
+            _debate_on = False
+        if _debate_on:
+            verdicts = await multi_agent_verify_batch(findings)
+            if verdicts:
+                for i, _f in enumerate(findings):
+                    if verdicts.get(i):
+                        _f["llm_gate_reject"] = True
+                        _f.setdefault("signals", []).append("llm_gate_reject:debate")
+        if verdicts is None:
+            verdicts = await _llm_prescreen(findings)
+            if verdicts:
+                for i, f in enumerate(findings):
+                    v = verdicts.get(i)
+                    if v and v.get("likely_vuln") is False and str(v.get("confidence", "")).lower() == "high":
+                        f["llm_gate_reject"] = True
+                        f.setdefault("signals", []).append("llm_gate_reject")
 
     if probe:
         try:
@@ -689,6 +796,14 @@ async def run_gateway(
     for f in findings:
         f["confidence"] = score_confidence(f)
         f["status"] = status_of(f)
+        # G 组: 五档证据规范字段（rule_hit / response_evidence / verified /
+        # reproduced / oob_success）——与主扫描报告路径（normalize_vulns）同源。
+        try:
+            from vulnclaw.core.models import apply_evidence_schema
+
+            apply_evidence_schema(f)
+        except Exception as exc:  # noqa: BLE001 - 规范层缺席不阻断网关出证
+            logger.debug(f"[Gateway] 证据规范层不可用（跳过）: {exc}")
 
     out_path = Path(output_path) if output_path else inp.with_name(inp.stem + ".verified.sarif")
     out_path.parent.mkdir(parents=True, exist_ok=True)

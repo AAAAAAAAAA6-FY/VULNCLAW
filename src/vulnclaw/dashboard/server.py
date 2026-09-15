@@ -14,6 +14,7 @@ FastAPI + WebSocket 实现：
 启动: python -m dashboard.server --port 8080
 """
 import asyncio
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -22,6 +23,10 @@ from typing import Any, Dict, List, Optional, Set
 from vulnclaw.core.logger import logger
 from enum import Enum
 from vulnclaw.core.settings import PROJECT_CACHE_DIR, settings
+from vulnclaw.core.interop import import_any, to_native_findings, resolve_format
+
+#: 入站 webhook payload 上限（字节）
+_WEBHOOK_PAYLOAD_MAX = 5 * 1024 * 1024
 
 
 class ScanEvent(str, Enum):
@@ -93,14 +98,27 @@ class DashboardServer:
         self._prefix = prefix
         self._app = None
         self._ws_clients: Set[Any] = set()  # WebSocket 客户端集合
+        # P1-14：每客户端有界队列 + 后台泵，广播不再阻塞扫描主链路
+        # （慢客户端只会丢自己的事件，不会把背压传导到 emit_event 调用方）
+        self._ws_queues: Dict[Any, Any] = {}
+        self._ws_pumps: Dict[Any, Any] = {}
+        self._ws_queue_size = int(getattr(settings, "dashboard_ws_queue_size", 256) or 256)
+        self._dropped_events = 0
         self._broadcast_task = None
         self._redis = None
         self._token = getattr(settings, "dashboard_token", "") or ""
-        # 合规收口：非回环绑定且未配置 token 时醒目告警
+        # 合规收口（fail-closed）：非回环绑定必须配置 token，否则**拒绝启动**——
+        # 无鉴权对外暴露 = 局域网内任何主机都可查看结果并远程发起扫描。
+        # 回环绑定保持无鉴权放行（本地便利，零行为回归），仅提示。
         _loopback = host in ("127.0.0.1", "localhost", "::1")
         if not _loopback and not self._token:
-            logger.warning("🚨 [Dashboard] 绑定非回环地址且未配置 DASHBOARD_TOKEN，局域网内任何主机"
-                           "都可查看扫描结果并远程发起扫描；建议仅本地使用或配置 token（.env DASHBOARD_TOKEN=xxx）")
+            raise RuntimeError(
+                f"⛔ [Dashboard] fail-closed：绑定非回环地址（{host}）时必须配置 "
+                "DASHBOARD_TOKEN（.env），否则任何主机都可查看扫描结果并远程发起扫描。"
+                "本机使用请改绑 127.0.0.1，或设置 DASHBOARD_TOKEN=xxx")
+        if _loopback and not self._token:
+            logger.info("📊 [Dashboard] 未配置 DASHBOARD_TOKEN（仅回环绑定、无鉴权）；"
+                        "如需对外暴露请先配置 token。")
         # Avoid re-attempting a broken Redis connection on every single
         # broadcast tick; the event loop gets blocked when each attempt
         # spends 1s on TCP RST. Backoff is reset as soon as any attempt
@@ -122,7 +140,21 @@ class DashboardServer:
         from fastapi.staticfiles import StaticFiles
         from fastapi.responses import HTMLResponse, JSONResponse
 
-        app = FastAPI(title="VULNCLAW Dashboard", version="1.0.0")
+        app = FastAPI(
+            title="VULNCLAW Dashboard",
+            version="1.0.0",
+            description=(
+                "VULNCLAW 实时监控 Dashboard。REST 分组：\n"
+                "- api：扫描状态列表、扫描详情、漏洞列表、DAG 进度、Worker 状态、发起扫描（GET/POST /api/*，可选 X-Dashboard-Token 鉴权）；\n"
+                "- webhook：入站工具生态 ingestion。\n"
+                "POST /api/webhook/ingest 请求体：{\"format\": \"nuclei_jsonl|jsonl|vulnclaw_json|burp_xml|zap_json|sarif|csv|raw_http\", "
+                "\"payload\": \"文本\" | <JSON 数组> | <JSON 对象>}；payload 上限 5 MiB。"
+            ),
+            openapi_tags=[
+                {"name": "api", "description": "Dashboard 核心 REST：状态 / 扫描 / 漏洞 / DAG / Worker / 发起扫描"},
+                {"name": "webhook", "description": "入站工具生态数据 ingest，把外部 finding 落到 webhook feed 缓存"},
+            ],
+        )
         self._app = app
 
         # --- 静态文件 ---
@@ -211,6 +243,28 @@ class DashboardServer:
                 "ping": "pong",
             }
 
+        @app.get("/ready")
+        async def ready() -> Dict[str, Any]:
+            """Readiness endpoint used by orchestration probes.
+
+            Unlike /health (liveness, always 200 when the process is up),
+            /ready asserts that the cluster backend (Redis) is reachable so
+            the dashboard can serve real traffic. Returns 200 when ready,
+            503 with a reason body when not.
+            """
+            from fastapi.responses import JSONResponse as _JSONResponse
+
+            cluster = await self._get_cluster_status()
+            if cluster.get("status") == "redis_unavailable":
+                return _JSONResponse({"status": "not_ready", "reason": "redis_unavailable"},
+                                     status_code=503)
+            return {
+                "status": "ready",
+                "service": "dashboard",
+                "version": getattr(app, "version", "1.0.0"),
+                "redis": "ok",
+            }
+
         @app.get("/metrics")
         async def metrics() -> str:
             """Minimal Prometheus-style metrics endpoint (text/plain)."""
@@ -236,7 +290,67 @@ class DashboardServer:
                 "# TYPE dashboard_redis_up gauge\n"
                 f"dashboard_redis_up {redis_up}\n"
             )
+            # 工作流8 补缺：融合扫描器侧 Prometheus 指标（P50/P95/P99、引擎耗时、
+            # 请求/漏洞/AI 计数等）。扫描器与 dashboard 若同进程（本地单机），直接
+            # 转储其 registry；缺 prometheus_client 或 registry 为空时静默跳过，
+            # 不破坏原有 4 组集群 gauge 输出。
+            try:
+                from vulnclaw.core_modules.metrics import get_metrics as _get_metrics
+                from prometheus_client import generate_latest as _gen_latest
+
+                _metrics = _get_metrics()
+                if _metrics is not None and getattr(_metrics, "registry", None) is not None:
+                    _scanner_text = _gen_latest(_metrics.registry).decode("utf-8")
+                    if _scanner_text:
+                        body += "\n# --- scanner metrics ---\n" + _scanner_text
+            except Exception:  # noqa: BLE001 - 指标融合失败必须静默降级
+                pass
             return _Resp(content=body, media_type="text/plain; charset=utf-8")
+
+        @app.post("/api/webhook/ingest", tags=["webhook"])
+        async def api_webhook_ingest(request: Request):
+            """入站工具生态 ingest：把外部格式 finding 解析并追加到 webhook feed 缓存。
+
+            请求体：``{"format": "...", "payload": "文本" | list | dict}``。
+            返回值：``{"accepted", "skipped", "finding_count", "ref"}``。
+            """
+            if not self._auth_ok(request):
+                return JSONResponse({"error": "unauthorized"}, status_code=401)
+            try:
+                body = await request.json()
+            except Exception:
+                return JSONResponse({"error": "invalid json body"}, status_code=400)
+            if not isinstance(body, dict) or "format" not in body or "payload" not in body:
+                return JSONResponse({"error": "body 需含 format 与 payload"}, status_code=400)
+            fmt = body.get("format")
+            payload = body.get("payload")
+            text = payload if isinstance(payload, str) else json.dumps(
+                payload, ensure_ascii=False, default=str)
+            if len(text.encode("utf-8")) > _WEBHOOK_PAYLOAD_MAX:
+                return JSONResponse({"error": "payload 超过 5 MiB 上限"}, status_code=413)
+            try:
+                result = import_any(text, fmt)
+            except ValueError:
+                return JSONResponse({"error": "未知导入格式: {}".format(fmt)}, status_code=400)
+            findings = to_native_findings(result)
+            accepted = len(result)
+            ts = time.time()
+            ref = self._webhook_ref(ts, findings)
+            self._append_webhook_feed({
+                "ts": ts,
+                "format": resolve_format(fmt),
+                "accepted": accepted,
+                "skipped": int(result.skipped),
+                "finding_count": accepted,
+                "ref": ref,
+                "findings": findings,
+            })
+            return JSONResponse({
+                "accepted": accepted,
+                "skipped": int(result.skipped),
+                "finding_count": accepted,
+                "ref": ref,
+            })
 
         # --- WebSocket ---
 
@@ -248,6 +362,10 @@ class DashboardServer:
                 return
             await websocket.accept()
             self._ws_clients.add(websocket)
+            queue: asyncio.Queue = asyncio.Queue(maxsize=self._ws_queue_size)
+            self._ws_queues[websocket] = queue
+            self._ws_pumps[websocket] = asyncio.create_task(
+                self._ws_pump(websocket, queue))
             logger.info(f"🔌 [Dashboard] WebSocket 客户端连接 (total={len(self._ws_clients)})")
 
             try:
@@ -257,13 +375,50 @@ class DashboardServer:
                     if data == "ping":
                         await websocket.send_text("pong")
             except WebSocketDisconnect:
-                self._ws_clients.discard(websocket)
                 logger.info(f"🔌 [Dashboard] WebSocket 客户端断开 (total={len(self._ws_clients)})")
+            finally:
+                self._unregister_ws(websocket)
 
         return app
 
+    def _unregister_ws(self, websocket: Any) -> None:
+        """P1-14：摘除客户端并停止其后台泵（连接断开/异常统一收口）。"""
+        self._ws_clients.discard(websocket)
+        queue = self._ws_queues.pop(websocket, None)
+        pump = self._ws_pumps.pop(websocket, None)
+        if queue is not None:
+            try:
+                queue.put_nowait(None)  # 哨兵：通知泵退出
+            except Exception:  # noqa: BLE001 - 队列满/已关闭都无需处理
+                pass
+        if pump is not None and not pump.done():
+            try:  # 泵自身在 finally 里调用本方法时不自取消
+                if pump is not asyncio.current_task():
+                    pump.cancel()
+            except RuntimeError:  # 无运行事件循环（同步清理路径）
+                pass
+
+    async def _ws_pump(self, websocket: Any, queue: "asyncio.Queue") -> None:
+        """P1-14：后台泵，串行发送队列消息（发送阻塞只影响本客户端）。"""
+        try:
+            while True:
+                message = await queue.get()
+                if message is None:  # 哨兵 → 退出
+                    return
+                await websocket.send_text(message)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - 客户端异常由 _unregister_ws 收口
+            pass
+        finally:
+            self._unregister_ws(websocket)
+
     async def broadcast_update(self, data: Dict) -> None:
-        """向所有 WebSocket 客户端推送更新。
+        """向所有 WebSocket 客户端推送更新（P1-14：非阻塞 + 有界队列背压）。
+
+        只做一次序列化，然后 `put_nowait` 到每个客户端的有界队列；慢客户端
+        队列满时**丢弃该条事件**（计数到 `_dropped_events`）并断开其登记，
+        绝不把发送延迟传导到扫描主链路。
 
         Args:
             data: 要推送的数据字典。
@@ -272,16 +427,25 @@ class DashboardServer:
             return
 
         message = json.dumps(data, default=str, ensure_ascii=False)
-        disconnected = set()
+        overflowed = set()
 
-        for client in self._ws_clients:
+        for client in list(self._ws_clients):
+            queue = self._ws_queues.get(client)
+            if queue is None:
+                continue
             try:
-                await client.send_text(message)
-            except Exception:
-                disconnected.add(client)
+                queue.put_nowait(message)
+            except asyncio.QueueFull:
+                # 背压：客户端消费不过来 → 丢弃本条（保主链路），累计计数可观测
+                self._dropped_events += 1
+                overflowed.add(client)
 
-        # 清理断开的连接
-        self._ws_clients -= disconnected
+        if overflowed:
+            logger.warning(
+                f"⚠️ [Dashboard] {len(overflowed)} 个 WebSocket 客户端队列溢出，"
+                f"已丢弃事件（累计 {self._dropped_events} 条）")
+            for client in overflowed:
+                self._unregister_ws(client)
 
     async def broadcast_event(self, event_type: str, payload: Dict) -> None:
         """PGEN-EVENT: 结构化事件广播（对齐 PentAGI 事件模型）。
@@ -406,6 +570,24 @@ class DashboardServer:
         except Exception as exc:
             logger.warning(f"⚠️ [Dashboard] 报告保存失败: {exc}")
             return None
+
+    @staticmethod
+    def _webhook_ref(ts: float, findings: List[Dict]) -> str:
+        """确定性 webhook 引用：``<秒级时间戳>-<findings 内容哈希前 12 hex>``。"""
+        digest = hashlib.sha1(
+            json.dumps(findings, ensure_ascii=False, default=str, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        return "{}-{}".format(int(ts), digest[:12])
+
+    def _append_webhook_feed(self, event: Dict) -> None:
+        """把 ingest 事件追加到 ``_runtime_cache/webhook/feed.jsonl``（写失败静默降级）。"""
+        try:
+            webhook_dir = Path(PROJECT_CACHE_DIR) / "webhook"
+            webhook_dir.mkdir(parents=True, exist_ok=True)
+            with open(webhook_dir / "feed.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+        except Exception as exc:
+            logger.warning(f"⚠️ [Dashboard] webhook feed 写入失败: {exc}")
 
     async def _get_scans(self) -> List[Dict]:
         """获取扫描列表（按报告文件修改时间倒序）。"""
@@ -606,8 +788,12 @@ class DashboardServer:
 
 
 def run_dashboard(host: str = "127.0.0.1", port: int = 8080):
-    """CLI 入口：启动 Dashboard。"""
-    server = DashboardServer(host=host, port=port)
+    """CLI 入口：启动 Dashboard（fail-closed 校验失败时友好退出）。"""
+    try:
+        server = DashboardServer(host=host, port=port)
+    except RuntimeError as exc:
+        print(str(exc))
+        raise SystemExit(2)
     asyncio.run(server.start())
 
 

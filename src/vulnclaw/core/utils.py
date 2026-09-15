@@ -29,6 +29,9 @@ from typing import Dict, List, Optional, Tuple, Union
 
 MAX_RESPONSE_SIZE = settings.max_response_size_mb * 1024 * 1024
 
+# 响应体分块读取的单块大小（见 _read_capped：aiohttp read(n) 不保证读满 n）
+_READ_CHUNK = 65536
+
 _SHARED_SESSION: Optional[aiohttp.ClientSession] = None
 _SHARED_SESSION_LOCK = asyncio.Lock()
 _LAST_TARGET: Optional[str] = None
@@ -84,10 +87,83 @@ def _get_cookie_file_path(domain: str) -> Path:
     return COOKIE_DIR / f"{domain}.json"
 
 
+# ============================================================
+# Cookie 静态加密（防磁盘明文泄露；Windows DPAPI，跨平台优雅降级）
+# ============================================================
+# 落盘的登录态是高价值目标：明文 cookie 文件一旦被同机进程/备份读取即等于
+# 会话泄露。Windows 用 DPAPI（当前用户密钥，无需自管密钥）加密；非 Windows
+# 或加密失败保持明文（兼容优先），由调用方日志提示。
+_COOKIE_ENVELOPE_KEY = "__vulnclaw_encrypted__"
+
+
+def _dpapi(data: bytes, protect: bool) -> Optional[bytes]:
+    """Windows DPAPI 加/解密（当前用户范围）；非 Windows/失败返回 None。"""
+    if platform.system() != "Windows":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _BLOB(ctypes.Structure):
+            _fields_ = [("cbData", wintypes.DWORD),
+                        ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+        crypt32 = ctypes.windll.crypt32
+        kernel32 = ctypes.windll.kernel32
+        _buf = ctypes.create_string_buffer(data, len(data))
+        blob_in = _BLOB(len(data), ctypes.cast(_buf, ctypes.POINTER(ctypes.c_char)))
+        blob_out = _BLOB()
+        _fn = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
+        if not _fn(ctypes.byref(blob_in), None, None, None, None, 0,
+                   ctypes.byref(blob_out)):
+            return None
+        try:
+            return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+        finally:
+            kernel32.LocalFree(blob_out.pbData)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def encode_cookie_store(data: Dict) -> Dict:
+    """把 cookie 字典编码为落盘形态（Windows: DPAPI 密文信封；其余原样）。"""
+    try:
+        import base64
+        raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        sealed = _dpapi(raw, protect=True)
+        if sealed:
+            return {_COOKIE_ENVELOPE_KEY: base64.b64encode(sealed).decode("ascii")}
+    except Exception:  # noqa: BLE001
+        logger.debug("suppressed exception (cookie encrypt)")
+    return data
+
+
+def decode_cookie_store(data) -> Dict:
+    """解码落盘 cookie 形态：密文信封自动解密；明文（历史/非 Windows）原样返回。"""
+    if not isinstance(data, dict):
+        return {}
+    sealed = data.get(_COOKIE_ENVELOPE_KEY)
+    if not isinstance(sealed, str) or len(data) != 1:
+        return data
+    try:
+        import base64
+        raw = _dpapi(base64.b64decode(sealed), protect=False)
+        if raw is None:
+            logger.warning("⚠️ Cookie 密文解密失败（非本机/非当前用户？），忽略该文件")
+            return {}
+        parsed = json.loads(raw.decode("utf-8"))
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"⚠️ Cookie 密文解析失败: {e}")
+        return {}
+
+
 def _atomic_write_json(file_path: Path, data: Dict) -> bool:
     """原子写入 JSON 文件：先写 .tmp，再 rename；自动创建备份。"""
     try:
-        tmp_path = file_path.with_suffix('.tmp')
+        # 唯一 tmp 名（含 PID）：多进程并发写同一文件时不抢同一 tmp，
+        # 避免 Windows 上 os.replace 前 tmp 被他人占用导致 WinError 32。
+        tmp_path = file_path.with_name(f"{file_path.name}.{os.getpid()}.tmp")
         bak_path = file_path.with_suffix('.json.bak')
         # 先备份现有文件（如果存在）
         if file_path.exists():
@@ -236,7 +312,7 @@ async def _load_and_filter_cookies(session: aiohttp.ClientSession, target: Optio
                 if clean_domain == host or clean_domain.endswith('.' + host):
                     filtered[domain] = cookies
             if filtered:
-                _atomic_write_json(cookie_file, filtered)
+                _atomic_write_json(cookie_file, encode_cookie_store(filtered))
                 logger.info(f"📂 从旧文件提取了 {len(filtered)} 个匹配 {host} 的凭证")
         except Exception as e:
             logger.warning(f"提取旧 Cookie 失败: {e}")
@@ -252,6 +328,7 @@ async def _load_and_filter_cookies(session: aiohttp.ClientSession, target: Optio
                 portalocker.unlock(f)
             else:
                 data = json.load(f)
+        data = decode_cookie_store(data)  # 密文信封自动解密；明文原样返回
     except json.JSONDecodeError as e:
         logger.warning(f"⚠️ Cookie 文件损坏: {cookie_file} - {e}，尝试恢复备份...")
         backup_file = cookie_file.with_suffix('.json.bak')
@@ -264,9 +341,10 @@ async def _load_and_filter_cookies(session: aiohttp.ClientSession, target: Optio
                         portalocker.unlock(f)
                     else:
                         data = json.load(f)
+                data = decode_cookie_store(data)
                 logger.info(f"✅ 从备份恢复 Cookie: {backup_file}")
-                # 恢复主文件
-                _atomic_write_json(cookie_file, data)
+                # 恢复主文件（统一加密落盘）
+                _atomic_write_json(cookie_file, encode_cookie_store(data))
             except Exception as e2:
                 logger.warning(f"⚠️ 备份恢复失败: {e2}")
                 return
@@ -383,6 +461,34 @@ def _timeout_for_url(url: str, default: int) -> int:
     return default
 
 
+_UNSET = object()  # 哨兵：区分"未传 proxy"（沿用配置）与"显式 proxy=None"（明确直连）
+
+
+def _egress_ssrf_block_reason(url: str) -> Optional[str]:
+    """工作流8：出站白名单 + 平台级 SSRF/DNS-rebinding 统一检查（同步）。
+
+    供 aiohttp 主链路（_http_request）与 requests 兼容链路（sync_get/sync_post）复用，
+    与 httpx 路径（http_client._http2_request）同源 —— 默认
+    （EGRESS_ALLOWLIST 为空 且 SSRF_GUARD != "1"）零 import、零开销返回 None，
+    行为与旧版完全一致；命中返回拦截原因字符串，调用方据此返回 (0, 原因, {})。
+    """
+    if not (
+        getattr(settings, "egress_allowlist", "")
+        or str(getattr(settings, "ssrf_guard", "0")) == "1"
+    ):
+        return None
+    from vulnclaw.core.http_client import (
+        check_egress, check_ssrf, EgressBlockError, SSRFGuardError,
+    )
+    try:
+        check_egress(url)
+        check_ssrf(url)
+    except (EgressBlockError, SSRFGuardError) as exc:
+        logger.warning(f"🛡️ 出站安全防护拦截请求 {url}: {exc}")
+        return str(exc)
+    return None
+
+
 async def _http_request(
     method: str,
     url: str,
@@ -402,6 +508,13 @@ async def _http_request(
             raise ScopeGuardError(
                 f"E5 越界请求被 HTTP 客户端层拦截（超出 allowed_scope）: {url}"
             )
+    # 工作流8：出站白名单 + 平台级 SSRF/DNS-rebinding 防护。
+    # 与 httpx 路径（http_client._http2_request）同源检查——httpx 默认关闭，
+    # 若不在此处接线，主链路（aiohttp）默认配置下防护等于不存在。
+    # 命中拦截返回 (0, 原因, {})，与超时/网络错误同一约定；默认 off 时零开销。
+    _blocked = _egress_ssrf_block_reason(url)
+    if _blocked:
+        return 0, f"Blocked by egress/SSRF guard: {_blocked}", {}
     # 优化2：按 URL 类型分档超时（调用方显式传值时尊重调用方）
     if timeout is None:
         timeout = _timeout_for_url(url, settings.timeout)
@@ -415,7 +528,15 @@ async def _http_request(
     headers = dict(headers or {})
     headers.setdefault('User-Agent', settings.user_agent)
 
-    proxy = kwargs.pop('proxy', None) or settings.proxy or _pool_active_proxy()
+    # 代理解析：必须区分"**没传** proxy"与"**显式传 None**（明确要直连）"。
+    # 踩过的坑（2026-09-12）：旧写法 `proxy or settings.proxy or 池` 会让
+    # `async_get(url, proxy=None)` 依旧走配置代理——于是"直连重试"（phases_recon 的
+    # 兜底）实际还在用同一个坏代理重试，等于没兜底。真实目标上表现为静默零结果。
+    _sentinel = kwargs.pop('proxy', _UNSET)
+    if _sentinel is _UNSET:
+        proxy = settings.proxy or _pool_active_proxy()
+    else:
+        proxy = _sentinel or None  # 显式 None / "" → 直连
     parsed = urllib.parse.urlparse(url)
     if parsed.hostname in ['127.0.0.1', 'localhost']:
         proxy = None
@@ -469,13 +590,38 @@ async def _http_request(
     return 0, "Max retries exceeded", {}
 
 
+async def _read_capped(resp: aiohttp.ClientResponse, limit: int) -> Tuple[bytes, bool]:
+    """读满响应体（上限 limit 字节），返回 (原始字节, 是否截断)。
+
+    ⚠️ 踩过的坑（2026-09-15）：aiohttp 的 ``StreamReader.read(n)`` **只要缓冲里有
+    数据就返回**，并不保证读满 n 字节——旧写法 ``read(MAX_RESPONSE_SIZE + 1)`` 因此
+    把 1MB 响应静默截断成首个 chunk（实测 130915 字节），表现为：
+      · 大页面证据/分析不完整；
+      · 基线走完整文本、攻击响应被截断 → 长度差被误判为"响应长度异常变化"（误报）。
+    这里改为循环读到 EOF 或达到上限，内存占用上限 = limit + 一个 chunk。
+    """
+    chunks: List[bytes] = []
+    total = 0
+    truncated = False
+    while True:
+        chunk = await resp.content.read(_READ_CHUNK)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total >= limit:
+            truncated = True
+            break
+    return b"".join(chunks), truncated
+
+
 async def _read_response(resp: aiohttp.ClientResponse) -> Tuple[int, str, Dict]:
     content_length = resp.headers.get('Content-Length')
     if content_length:
         try:
             cl = int(content_length)
             if cl > MAX_RESPONSE_SIZE:
-                raw = await resp.content.read(MAX_RESPONSE_SIZE)
+                raw, _ = await _read_capped(resp, MAX_RESPONSE_SIZE)
                 text = raw.decode('utf-8', errors='ignore')
                 text += "\n... [截断: 响应体过大]"
                 return resp.status, text, dict(resp.headers)
@@ -483,8 +629,8 @@ async def _read_response(resp: aiohttp.ClientResponse) -> Tuple[int, str, Dict]:
             logger.debug("suppressed exception (core audit)")
 
     try:
-        raw = await resp.content.read(MAX_RESPONSE_SIZE + 1)
-        if len(raw) > MAX_RESPONSE_SIZE:
+        raw, truncated = await _read_capped(resp, MAX_RESPONSE_SIZE + 1)
+        if truncated or len(raw) > MAX_RESPONSE_SIZE:
             raw = raw[:MAX_RESPONSE_SIZE]
             text = raw.decode('utf-8', errors='ignore')
             text += "\n... [截断]"
@@ -551,6 +697,10 @@ def sync_get(url: str, **kwargs) -> Tuple[int, str, Dict]:
     if _proxy:
         kwargs.setdefault('proxies', {'http': _proxy, 'https': _proxy})
 
+    _blocked = _egress_ssrf_block_reason(url)
+    if _blocked:
+        return 0, f"Blocked by egress/SSRF guard: {_blocked}", {}
+
     try:
         resp = requests.get(url, **kwargs)
         return resp.status_code, resp.text, dict(resp.headers)
@@ -572,11 +722,64 @@ def sync_post(url: str, **kwargs) -> Tuple[int, str, Dict]:
     if _proxy:
         kwargs.setdefault('proxies', {'http': _proxy, 'https': _proxy})
 
+    _blocked = _egress_ssrf_block_reason(url)
+    if _blocked:
+        return 0, f"Blocked by egress/SSRF guard: {_blocked}", {}
+
     try:
         resp = requests.post(url, **kwargs)
         return resp.status_code, resp.text, dict(resp.headers)
     except Exception as e:
         return 0, str(e), {}
+
+
+# ============================================================
+# 协程安全执行（P3-12：收敛 asyncio.run 混用）
+# ============================================================
+def run_sync(coro):
+    """在同步上下文安全运行协程（P3-12，2026-09-15）。
+
+    为什么需要：`asyncio.run()` 在"已有运行中事件循环"的线程里会直接抛
+    RuntimeError（例如 async 上下文中被同步工具函数调用），是潜在崩溃点。
+    本函数统一处理两种情况：
+      · 当前线程无运行循环 → 直接 asyncio.run（等价原行为，绝大多数入口路径）；
+      · 当前线程有运行循环 → 新线程 + 独立事件循环执行并等待结果。
+
+    注意：协程若持有绑定当前 loop 的资源（如当前 loop 的 aiohttp session），
+    不可跨线程复用 —— 此类调用点（引擎内 `resp.text()`）保持原生 asyncio.run
+    并附注释说明，不在此 helper 覆盖范围。
+    """
+    import asyncio as _asyncio
+    try:
+        _asyncio.get_running_loop()
+    except RuntimeError:
+        return _asyncio.run(coro)
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(lambda: _asyncio.run(coro)).result()
+
+
+def sync_resp_text(resp) -> str:
+    """同步取响应文本（**不启动事件循环**；P3-12 收敛引擎内 asyncio.run）。
+
+    背景：引擎的同步解析函数曾用 `asyncio.run(resp.text())` —— 在事件循环内
+    调用会直接抛 RuntimeError；且 aiohttp response 绑定创建它的 loop，
+    也不能换线程跑（run_sync 不适用）。规则：
+      ① tuple（引擎惯用 (status, text, headers)）→ 取 text；
+      ② aiohttp response 且 body 已读（_body 非 None）→ 直接解码；
+      ③ 其余（body 未读/未知对象）→ 空串（宁可空串，绝不炸/阻塞）。
+    """
+    try:
+        if isinstance(resp, tuple):
+            return resp[1] if len(resp) > 1 and resp[1] else ""
+        body = getattr(resp, "_body", None)
+        if body is None:
+            return ""
+        if isinstance(body, bytes):
+            return body.decode("utf-8", errors="replace")
+        return str(body)
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 # ============================================================
@@ -1623,6 +1826,47 @@ def urlencode_payload(payload: str) -> str:
     return urllib.parse.quote(payload, safe='')
 
 
+# ============================================================
+# 平台自保护：凭据脱敏（安全审计——日志/导出中不得出现明文凭据）
+# ============================================================
+REDACT_MASK = "***REDACTED***"
+
+_REDACT_RULES: Tuple[Tuple[re.Pattern, str], ...] = (
+    # Authorization: Bearer/Basic <cred>
+    (re.compile(r"(?i)\b(authorization\s*[:=]\s*)(?:bearer|basic)\s+[A-Za-z0-9\-._~+/=]{4,}"),
+     r"\1" + REDACT_MASK),
+    # Set-Cookie / Cookie 头值
+    (re.compile(r"(?i)\b(set-?cookie\s*:\s*)([^\r\n]+)"), r"\1" + REDACT_MASK),
+    # key=value 形态凭据（api_key / token / password / client_secret ...）
+    (re.compile(r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|"
+                r"secret[_-]?key|client[_-]?secret|password|passwd|pwd)(\s*[:=]\s*)"
+                r"[\"']?([^\s\"'&,;]{4,})"), r"\1\2" + REDACT_MASK),
+    # PEM 私钥块
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
+     REDACT_MASK),
+)
+
+
+def redact_secrets(text, mask: str = REDACT_MASK) -> str:
+    """把文本中的明文凭据替换为掩码（日志/导出前调用）。
+
+    覆盖：Authorization(Bearer/Basic)、Set-Cookie、api_key/secret/password/token
+    等 key=value 形态、PEM 私钥块。
+    **fail-open**：非字符串按 str() 处理、异常返回原文——脱敏失败绝不能吞掉日志内容。
+    """
+    try:
+        if not isinstance(text, str):
+            return "" if text is None else str(text)
+        if not text:
+            return text
+        out = text
+        for pat, repl in _REDACT_RULES:
+            out = pat.sub(repl, out)
+        return out
+    except Exception:  # noqa: BLE001 - 脱敏失败必须原样放行
+        return text if isinstance(text, str) else ""
+
+
 def limit_response_size(text: str, max_len: int = 2000) -> str:
     if not text:
         return ""
@@ -1691,10 +1935,13 @@ def clean_ai_json(text: str) -> str:
     text = re.sub(r'```\s*|\s*```', '', text)
 
     # 先尝试直接解析
+    # 解析崩溃修复：深层嵌套 JSON（如 "["*5000）会让 json.loads 抛 RecursionError，
+    # 它继承自 RuntimeError 而非 JSONDecodeError，原实现只捕获后者 → 异常直接冒泡到
+    # 调用方（AI 结构化输出清洗链路）导致整条链路崩溃。这里一并兜住。
     try:
         json.loads(text)
         return text
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError):
         logger.debug("suppressed exception (core audit)")
 
     # 尝试修复尾部逗号等常见问题
@@ -1890,6 +2137,7 @@ __all__ = [
     'generate_mutated_requests',
     'build_attack_url', 'urlencode_payload',
     'limit_response_size', 'compress_http_response', 'clean_ai_json',
+    'redact_secrets', 'REDACT_MASK',
     'obfuscate_payload', 'load_cookie_file',
     'classify_severity',
     'score_asset_value',

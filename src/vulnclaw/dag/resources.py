@@ -14,7 +14,10 @@ from typing import Dict, Optional
 _RESOURCE_DEFAULTS = {
     "llm": 7,
     "http": 300,
-    "nuclei": 2,
+    # nuclei 2→4（2026-09-13）：并发任务数与请求速率是两个维度——总速率由
+    # settings.nuclei_rate_limit(-rl) 保证，任务数只决定排队等待。原值 2 明显保守，
+    # 第 3 个 nuclei 节点只能干等。目标侧压力不变（无损）。
+    "nuclei": 4,
     "ffuf": 4,
 }
 

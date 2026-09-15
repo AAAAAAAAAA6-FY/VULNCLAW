@@ -22,8 +22,10 @@ JS 深度分析模块 - 完整增强版 v2.3
 """
 
 import re
+import os
 import json
 import asyncio
+import tempfile
 import aiohttp
 import base64
 from typing import Any, Dict, List, Optional
@@ -113,6 +115,12 @@ class JSDeepAnalyzer:
         # 3. 增强分析
         self._analyze_enhanced()
 
+        # 3.5 gitleaks 密钥第二意见（增强内置正则；可选，缺失/失败静默跳过）
+        try:
+            await self._enhance_secrets_gitleaks()
+        except Exception as e:  # noqa: BLE001 - 密钥增强绝不影响主分析
+            logger.debug(f"[JS] gitleaks 密钥增强跳过: {e}")
+
         # 4. 尝试从 SourceMap 中提取更多信息
         if self.findings["source_map_url"]:
             await self._fetch_source_map()
@@ -128,6 +136,66 @@ class JSDeepAnalyzer:
         self.findings["secrets"] = list({s["value"]: s for s in self.findings["secrets"]}.values())[:20]
 
         return self.findings
+
+    async def _enhance_secrets_gitleaks(self) -> None:
+        """gitleaks 密钥发现第二意见：用其 100+ 规则 + 熵检测，补强内置正则
+        （JSDeepAnalyzer._extract_secrets_enhanced 仅 40+ 手写模式）。
+
+        仅当 gitleaks 已安装（thirdparty/gitleaks/，不在系统 PATH）才执行；
+        失败/缺失/超时一律静默跳过，绝不打断主分析。结果并入 findings['secrets']。
+
+        实测旗标（gitleaks.exe detect --help）：`-s <path>` 源、`--no-git` 当普通目录扫、
+        `--exit-code 0` 命中也不非零退出、`-f json -r <file>` 落盘、`--no-banner` 去横幅。
+        """
+        from vulnclaw.core.tool_registry import run_tool, tool_available
+        if not tool_available("gitleaks") or not self.js_content:
+            return
+
+        js_fd, js_path = tempfile.mkstemp(suffix=".js", prefix="gitleaks_js_")
+        os.write(js_fd, self.js_content.encode("utf-8", "ignore"))
+        os.close(js_fd)
+        out_fd, out_path = tempfile.mkstemp(suffix=".json", prefix="gitleaks_")
+        os.close(out_fd)
+        try:
+            result = await run_tool(
+                "gitleaks",
+                args=["detect", "--no-banner", "--no-git", "--exit-code", "0",
+                      "-s", js_path, "-f", "json", "-r", out_path],
+                timeout=60,
+            )
+            rows = []
+            if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                try:
+                    with open(out_path, "r", encoding="utf-8", errors="ignore") as f:
+                        rows = json.load(f)
+                except (OSError, json.JSONDecodeError, ValueError):
+                    rows = []
+            if not rows and not result.get("success"):
+                logger.debug(
+                    f"[JS] gitleaks 执行失败: {str(result.get('stderr') or result.get('error'))[:160]}")
+                return
+
+            existing = {s.get("value") for s in self.findings["secrets"] if isinstance(s, dict)}
+            for row in (rows if isinstance(rows, list) else []):
+                val = (row.get("Secret") or "").strip()
+                if not val or val in existing:
+                    continue
+                if val.lower() in {"your-secret-here", "xxx", "test", "example", "changeme"}:
+                    continue
+                self.findings["secrets"].append({
+                    "type": f"Gitleaks:{row.get('RuleID', 'secret')}",
+                    "value": val[:200],
+                })
+                existing.add(val)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[JS] gitleaks 调用异常: {e}")
+        finally:
+            for p in (js_path, out_path):
+                try:
+                    if os.path.exists(p):
+                        os.unlink(p)
+                except OSError:
+                    pass
 
     def _filter_api_endpoints(self, endpoints: List[str]) -> List[str]:
         """过滤静态资源，只保留 API 特征路径"""

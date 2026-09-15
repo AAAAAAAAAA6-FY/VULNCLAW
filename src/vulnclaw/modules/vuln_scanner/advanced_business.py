@@ -22,7 +22,7 @@ import os
 from urllib.parse import urlparse
 
 from vulnclaw.core.logger import logger
-from vulnclaw.core.tool_registry import run_tool
+from vulnclaw.core.tool_registry import run_tool, tool_available
 from vulnclaw.core.utils import async_get, async_post, run_cmd_async
 from typing import Dict, List, Tuple
 
@@ -370,7 +370,7 @@ async def run_all_advanced_ai_checks(target: str, session, options: Dict = None)
 # ============================================================
 async def invoke_external_tool(tool: str, args: List[str], timeout: int = 120) -> Tuple[int, str, str]:
     """通用外部工具调用（异步）- 统一走 core.tool_registry.run_tool"""
-    if not shutil.which(tool):
+    if not tool_available(tool):
         logger.warning(f"⚠️ 外部工具 {tool} 未安装，跳过调用")
         return -1, "", "Tool not found"
 

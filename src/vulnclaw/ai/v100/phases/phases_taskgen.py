@@ -38,6 +38,32 @@ def _is_static_resource_url(url: str) -> bool:
     return any(path.endswith(ext) for ext in STATIC_RESOURCE_EXTENSIONS)
 
 
+def _same_origin(scan_target: str, url: str) -> bool:
+    """参数池条目是否与本次扫描目标同源（scheme + host + 有效端口）。
+
+    param_candidates.jsonl 是**跨扫描累积**的全局池，历史目标条目会残留；
+    若不过滤，扫 A 会把池里 B 的 URL 当任务打过去（实测：8791 扫描打到 8090）。
+    fail-closed：无法判定同源即丢弃。
+    """
+    try:
+        from urllib.parse import urlparse
+
+        def _origin(u: str):
+            p = urlparse(str(u or ""))
+            scheme = (p.scheme or "").lower()
+            host = (p.hostname or "").lower()
+            if not scheme or not host:
+                return None
+            port = p.port if p.port is not None else (443 if scheme == "https" else 80)
+            return (scheme, host, port)
+
+        a = _origin(scan_target)
+        b = _origin(url)
+        return a is not None and a == b
+    except Exception:  # noqa: BLE001
+        return False
+
+
 # 凭据类参数提示词：命中即视为鉴权/密钥材料，不应进入通用注入模糊循环
 # （fuzzing API key / token 值做 SQLi/XSS 收益极低且易触发 WAF；token 类
 # 专用引擎仍可在其自身逻辑里覆盖必要场景）。
@@ -69,6 +95,10 @@ def _is_credential_param(param: str) -> bool:
 async def _scan_idor(self):
     # ---- B 方案差分线（2026-09-08）：双会话差分水平越权，单身份也自动配对匿名身份 ----
     await self._run_idor_dual_session_line()
+    await self._run_invariant_diff_line()
+    await self._run_playbook_line()
+    await self._run_symbolic_line()
+    await self._run_chain_planner_line()
     try:
         from vulnclaw.modules.vuln_scanner import scan_idor
         session_mgr = get_session_manager()
@@ -98,6 +128,182 @@ async def _scan_idor(self):
         logger.info(f"   ✅发现 {len(idor_findings)} 个IDOR漏洞")
     except Exception as e:
         logger.warning(f"⚠️ IDOR扫描失败: {e}")
+def _collect_invariant_candidates(brief, target: str = ""):
+    """B2：收集"动作语义"候选端点（reset/charge/coupon/pay 等 hint 词命中）。"""
+    from vulnclaw.engines.invariant_diff_engine import ACTION_HINTS
+
+    cands = [u for u in (brief or {}).get("crawled_endpoints", []) or [] if isinstance(u, str) and u]
+    if target and str(target).startswith(("http://", "https://")):
+        cands.insert(0, str(target))
+    out, seen = [], set()
+    for u in cands:
+        p = str(u).split("?")[0]
+        if p in seen or not p:
+            continue
+        seen.add(p)
+        if ACTION_HINTS.search(p):
+            out.append(u)
+    return out
+
+
+def _quota_log(line: str, limit: int, candidates: int, executed: int,
+              findings: int = 0, note: str = "") -> None:
+    """配额消耗遥测（观测第1步）：把'计划线预算 vs 实际候选'结构化落进 coverage 账本。
+
+    目的：为"配额动态化"供数——saturated（候选被截断→该升预算/按规模推导）、
+    wasted（配额没用满→纯浪费）。遥测失败绝不影响主流程（fail-open）。
+    ``note`` 透传给 record_quota（如 "no_candidates"），标记该线早退原因。
+    """
+    try:
+        from vulnclaw.core.coverage import get_coverage_ledger
+        get_coverage_ledger().record_quota(
+            line, limit, candidates, executed, findings=findings, note=note)
+    except Exception:  # noqa: BLE001 - 遥测永不致命
+        logger.debug("suppressed exception (core audit)")
+
+
+async def _run_invariant_diff_line(self) -> int:
+    """B2 差分不变量线：动作语义端点 → 不变量检查器 → finding。返回产出数。"""
+    if not getattr(settings, "invariant_diff_enabled", True):
+        return 0
+    try:
+        from vulnclaw.engines.invariant_diff_engine import InvariantDiffEngine
+
+        cands = _collect_invariant_candidates(self._recon_brief or {}, self.target or "")
+        if not cands:
+            logger.info("ℹ️ [INVARIANT] 无可疑动作语义端点，跳过")
+            _quota_log("invariant_diff", int(getattr(settings, "invariant_diff_max_probes", 30) or 30),
+                       0, 0, note="no_candidates")
+            return 0
+        budget = int(getattr(settings, "invariant_diff_max_probes", 30) or 30)
+        engine = InvariantDiffEngine()
+        made = 0
+        probed = 0
+        for ep in cands[:budget]:
+            probed += 1
+            try:
+                f = await engine.diagnose(ep)
+            except Exception:  # noqa: BLE001 - 单候选失败不阻断
+                continue
+            if f:
+                self._add_finding(f)
+                made += 1
+        logger.info(f"🔗 [INVARIANT] 差分不变量线：{len(cands)} 候选 → {made} 发现")
+        _quota_log("invariant_diff", budget, len(cands), probed, made)
+        return made
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"⚠️ [INVARIANT] 差分线异常: {e}")
+        return 0
+
+async def _run_playbook_line(self) -> int:
+    """B3 剧本生成器线：LLM 功能语义标注 → 结构化剧本 → 逐动作差分。返回产出数。"""
+    try:
+        if not getattr(settings, "playbook_enabled", True):
+            return 0
+        from datetime import datetime
+
+        from vulnclaw.engines.playbook_engine import PlaybookEngine
+
+        engine = PlaybookEngine()
+        books = await engine.generate_playbooks(
+            self._recon_brief or {}, self.target or "", session=self.session
+        )
+        max_books = int(getattr(settings, "playbook_max_playbooks", 10) or 10)
+        budget = float(getattr(settings, "playbook_budget_s", 120) or 120)
+        made = 0
+        for book in books[:max_books]:
+            book.generated_at = datetime.now().isoformat(timespec="seconds")
+            try:
+                f = await engine.execute(book, budget_s=budget)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"[PLAYBOOK] 执行剧本 {book.id} 失败: {exc}")
+                continue
+            if f:
+                self._add_finding(f)
+                made += 1
+        logger.info(f"🎭 [PLAYBOOK] 剧本线：{len(books[:max_books])} 剧本 → {made} 发现")
+        # B3.5 符号复核通道：剧本 → BusinessIR → A1 确定性求解。
+        # 只在 A2 未产出 IR 时填充兜底（A2 优先：它得到的 IR 更全，
+        # 含 LLM 逆向增强 + 观测交叉校验；B3 只做黑盒兜底）。
+        # 不直接 _add_finding —— 遵对面纪律（未经验证推导不入报告）。
+        try:
+            from vulnclaw.engines.playbook_ir import playbooks_to_ir
+
+            if not self._recon_brief.get("business_ir"):
+                ir = playbooks_to_ir(books[:max_books], self.target or "")
+                if ir.get("endpoints"):
+                    self._recon_brief["business_ir"] = ir
+                    logger.info(
+                        f"🧠 [PLAYBOOK] 剧本 → BusinessIR（兜底）："
+                        f"{len(ir['endpoints'])} 端点，unit_price={ir.get('unit_price')}"
+                    )
+                else:
+                    logger.debug("[PLAYBOOK] 本轮无可用 IR 端点（跳过）")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[PLAYBOOK] 符号复核通道不可用（跳过）: {exc}")
+        return made
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"⚠️ [PLAYBOOK] 剧本线异常: {exc}")
+        return 0
+
+
+async def _run_symbolic_line(self) -> int:
+    """A1 符号执行线：业务 IR → 目标谓词 → 约束求解 → 逻辑洞候选。
+
+    覆盖"无 payload 特征"的六类逻辑洞（越权 / 金额篡改 / 数量越界 / 流程跳跃 /
+    幂等破坏 / 数值溢出）。**依赖 A2 的 IR**（`brief["business_ir"]`）：
+    IR 缺失 → 引擎 fail-closed 返回空，本线静默跳过（零成本、零误报）。
+
+    安全与误报纪律：
+      * 引擎默认 **dry-run**，只做推导不发请求；
+      * 产出恒带 `needs_verification=True`，**默认不入报告**（只记日志），
+        需显式打开 `symbolic_auto_report` 才落账 —— 未经验证的推导绝不污染报告。
+    """
+    try:
+        if not getattr(settings, "symbolic_enabled", True):
+            return 0
+        brief = self._recon_brief or {}
+        if not isinstance(brief, dict):
+            return 0
+        if not brief.get("business_ir"):
+            # A2 惰性构建：只在真正需要 IR 时构建一次（建完挂回 brief，供 A3 等复用）。
+            # 失败一律跳过——IR 缺失不该影响任何其它产线。
+            try:
+                from vulnclaw.core.business_ir import attach_ir_to_brief, build_business_ir
+
+                attach_ir_to_brief(brief, await build_business_ir(brief, self.target or ""))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"🧠 [符号执行] IR 构建失败（跳过）: {exc}")
+        if not brief.get("business_ir"):
+            logger.debug("🧠 [符号执行] 无可用 IR，跳过本轮")
+            return 0
+
+        from vulnclaw.engines.symbolic_engine import SymbolicLogicEngine
+
+        findings = await SymbolicLogicEngine().scan(
+            self.target or "", self.session, recon_brief=brief)
+        if not findings:
+            return 0
+
+        auto = bool(getattr(settings, "symbolic_auto_report", False))
+        made = 0
+        for f in findings:
+            f["needs_verification"] = True
+            if auto:
+                self._add_finding(f)
+                made += 1
+            else:
+                logger.info(
+                    f"🧠 [符号执行] 候选（待验证，未入报告）: "
+                    f"{f.get('vuln_type')} {f.get('url')} payload={f.get('payload')}")
+        logger.info(f"🧠 [符号执行] 候选 {len(findings)} 条 → 入账 {made} 条（auto={auto}）")
+        return made
+    except Exception as exc:  # noqa: BLE001 - 线异常不得阻断 extras
+        logger.warning(f"⚠️ [符号执行] 线异常（fail-closed）: {exc}")
+        return 0
+
+
+
 def _collect_idor_candidates(brief, target: str = ""):
     """收集带 ID 类参数的候选端点 (url, param, value)。只使用真实观测端点（证据优先，宁缺毋滥）。"""
     from vulnclaw.engines.auth_engines import IDOREngine
@@ -119,6 +325,17 @@ def _collect_idor_candidates(brief, target: str = ""):
     return out
 
 
+async def _run_chain_planner_line(self) -> int:
+    """A3 链规划器线：业务 IR + 已有 findings → 攻击链规划（干跑自证）→ 候选 finding。
+
+    委派给 `vulnclaw.ai.v100.planning.run_chain_planner_line`，保持单一定义，
+    避免与 A2/A1 的 IR 读取逻辑重复。默认不入报告（与 A1 同纪律）。
+    """
+    from vulnclaw.ai.v100.planning import run_chain_planner_line
+
+    return await run_chain_planner_line(self)
+
+
 async def _run_idor_dual_session_line(self) -> int:
     """B 方案差分线：双会话差分水平越权，单身份也自动配对匿名身份。返回产出 finding 数。"""
     if not getattr(settings, "idor_dual_session", True):
@@ -138,15 +355,21 @@ async def _run_idor_dual_session_line(self) -> int:
         domain = _up(self.target or "").netloc or ""
         if await im.ensure_second_identity(domain) is None:
             logger.info("ℹ️ [IDOR-双会话] 无可用第二身份，跳过差分线（fail-closed，不降级猜测）")
+            _quota_log("idor_dual_session", int(getattr(settings, "idor_max_probes", 40) or 40),
+                       0, 0, note="no_second_identity")
             return 0
         oracle = DualSessionOracleEngine()
         cands = _collect_idor_candidates(self._recon_brief or {}, self.target or "")
         if not cands:
             logger.info("ℹ️ [IDOR-双会话] 无带 ID 参数的候选端点，跳过")
+            _quota_log("idor_dual_session", int(getattr(settings, "idor_max_probes", 40) or 40),
+                       0, 0, note="no_candidates")
             return 0
         budget = int(getattr(settings, "idor_max_probes", 40) or 40)
         made = 0
+        probed = 0
         for ep, param, val in cands[:budget]:
+            probed += 1
             try:
                 f = await oracle.diagnose(ep, param, val, im, session_mgr)
             except Exception:  # noqa: BLE001 - 单候选失败不阻断
@@ -159,6 +382,7 @@ async def _run_idor_dual_session_line(self) -> int:
             if made >= budget:
                 break
         logger.info(f"🔑 [IDOR-双会话] 差分线完成：{len(cands)} 候选 → {made} 发现")
+        _quota_log("idor_dual_session", budget, len(cands), probed, made)
         return made
     except Exception as e:  # noqa: BLE001
         logger.warning(f"⚠️ [IDOR-双会话] 差分线异常: {e}")
@@ -242,10 +466,14 @@ async def _run_sequence_chain_line(self) -> int:
         cands = _collect_write_candidates(self._recon_brief or {}, self.target or "")
         if not cands:
             logger.info("ℹ️ [序列链] 无非幂等写操作候选端点，跳过")
+            _quota_log("sequence_chain", int(getattr(settings, "sequence_max_probes", 3) or 3),
+                       0, 0, note="no_candidates")
             return 0
         budget = int(getattr(settings, "sequence_max_probes", 3) or 3)
         made = 0
+        probed = 0
         for url in cands[:budget]:
+            probed += 1
             try:
                 f = await engine.detect_race(url, session=None, method="POST")
             except Exception:  # noqa: BLE001 - 单候选失败不阻断
@@ -256,6 +484,7 @@ async def _run_sequence_chain_line(self) -> int:
                 self._sequence_findings = getattr(self, "_sequence_findings", 0) + 1
                 made += 1
         logger.info(f"🧩 [序列链] 完成：{len(cands)} 候选 → {made} 发现")
+        _quota_log("sequence_chain", budget, len(cands), probed, made)
         return made
     except Exception as e:  # noqa: BLE001 - 序列线异常不阻断 extras
         logger.warning(f"⚠️ [序列链] 异常（fail-closed 跳过）: {e}")
@@ -309,11 +538,15 @@ async def _run_vulnspec_line(self) -> int:
         eps = _collect_probe_endpoints(self._recon_brief or {}, self.target or "")
         if not eps:
             logger.info("ℹ️ [声明线] 无候选端点，跳过")
+            _quota_log("vulnspec", int(getattr(settings, "vulnspec_max_endpoints", 10) or 10),
+                       0, 0, note="no_candidates")
             return 0
         budget = int(getattr(settings, "vulnspec_max_endpoints", 10) or 10)
         runner = SpecRunner()
         made = 0
+        probed = 0
         for ep in eps[:budget]:
+            probed += 1
             try:
                 findings = await runner.run(spec_from_url(ep, "GET"))
             except Exception:  # noqa: BLE001 - 单端点失败不阻断
@@ -323,6 +556,7 @@ async def _run_vulnspec_line(self) -> int:
                 self._add_finding(f)
                 made += 1
         logger.info(f"📐 [声明线] 完成：{len(eps)} 候选 → {made} 发现")
+        _quota_log("vulnspec", budget, len(eps), probed, made)
         return made
     except Exception as e:  # noqa: BLE001
         logger.warning(f"⚠️ [声明线] 异常（fail-closed 跳过）: {e}")
@@ -347,11 +581,15 @@ async def _run_metamorphic_line(self) -> int:
         eps = _collect_probe_endpoints(self._recon_brief or {}, self.target or "")
         if not eps:
             logger.info("ℹ️ [元规则线] 无候选端点，跳过")
+            _quota_log("metamorphic", int(getattr(settings, "metamorphic_max_endpoints", 10) or 10),
+                       0, 0, note="no_candidates")
             return 0
         budget = int(getattr(settings, "metamorphic_max_endpoints", 10) or 10)
         engine = MetamorphicEngine()
         made = 0
+        probed = 0
         for ep in eps[:budget]:
+            probed += 1
             try:
                 findings = await engine.probe_spec(spec_from_url(ep, "GET"))
             except Exception:  # noqa: BLE001
@@ -361,6 +599,7 @@ async def _run_metamorphic_line(self) -> int:
                 self._add_finding(f)
                 made += 1
         logger.info(f"🧩 [元规则线] 完成：{len(eps)} 候选 → {made} 发现")
+        _quota_log("metamorphic", budget, len(eps), probed, made)
         return made
     except Exception as e:  # noqa: BLE001
         logger.warning(f"⚠️ [元规则线] 异常（fail-closed 跳过）: {e}")
@@ -630,6 +869,9 @@ async def _generate_tasks(self):
     # 使参数量少的站点也能在本次扫描内覆盖到尾部引擎。
     rotation_offset = 0
     self._rotation_offset = 0
+    # 覆盖兜底：记录本轮已被任务覆盖的引擎，参数循环结束后补齐未覆盖引擎
+    # （参数少时 top3+轮换轮不完尾部引擎，实测 8766 靶机 67/81 引擎 never_ran）。
+    covered_engines = set()
     # B: 业务流建模/竞争条件总开关——关闭时从引擎池移除 business_logic/race_condition
     if not getattr(settings, "business_flow_modeling", True):
         engine_priority.pop("business_logic", None)
@@ -647,6 +889,8 @@ async def _generate_tasks(self):
             continue
         is_business = any(kw in param.lower() for kw in business_param_keywords)
         engine_scores = []
+        # 先验校准：账本历史确认经验命中的引擎优先 +1（进程内缓存，零重复 I/O）
+        _boosted = _ledger_boosted_engines(list(engine_priority.keys()))
         for engine_name, base_priority in engine_priority.items():
             priority = base_priority
             if is_business and engine_name == "business_logic":
@@ -658,6 +902,8 @@ async def _generate_tasks(self):
                     priority += 2
                 if 'python' in tech_lower and engine_name == 'ssti':
                     priority += 2
+            if engine_name in _boosted:
+                priority = min(10, priority + 1)
             engine_scores.append((engine_name, priority))
         engine_scores.sort(key=lambda x: x[1], reverse=True)
         top_engines = engine_scores[:3]
@@ -677,13 +923,24 @@ async def _generate_tasks(self):
                 if _eng not in selected_engines:
                     selected_engines.append(_eng)
             rotation_offset += _k
+        covered_engines.update(selected_engines)
+        # 工作流10：模式指定的 payload 深度优先（bundle 内取各引擎最大值，绝不削弱任一引擎）
+        _prof_depth = int(getattr(self, "scan_payload_depth", 0) or 0)
+        if _prof_depth > 0:
+            _depth_map = getattr(self, "scan_payload_depth_map", {}) or {}
+            _payload_limit = max(
+                (_depth_map.get(_e, _prof_depth) for _e in selected_engines),
+                default=_prof_depth,
+            )
+        else:
+            _payload_limit = 12 if is_business else 10
         task_data = {
                 "type": "engine_bundle",
                 "engines": selected_engines,
                 "target": self.target,
                 "param": param,
                 "priority": top_engines[0][1],
-                "payload_limit": 12 if is_business else 10,
+                "payload_limit": _payload_limit,
                 "created_at": time.time(),
         }
         if not enable_engine_bundle:
@@ -700,6 +957,67 @@ async def _generate_tasks(self):
             await self.task_queue.add_task(task_data, top_engines[0][1])
             tasks_added += 1
         parameter_tasks += 1
+    # 覆盖缺口兜底：为参数循环未覆盖到的引擎补一组低优先级任务，
+    # 保证引擎池在本轮至少各执行一次（否则尾部引擎永远 ran=0，覆盖率统计长期失真）。
+    # 目标表面未变化（A3.2 增量）时同样跳过，维持"只测变化面"语义。
+    if not _a32_target_unchanged:
+        # 引擎池 = engine_priority（参数级调度池）+ 全量注册引擎。
+        # 后者是关键：idor_dual_session / metamorphic / sequence_chain / exposure_fingerprint
+        # 等引擎不进参数级轮换，却照样被 coverage 计进 never_ran（实测 8090 目标 66 个
+        # never_ran 主要来自这批池外引擎），只补 engine_priority 压根降不下来。
+        _pool = set(engine_priority)
+        try:
+            _reg = getattr(self, "engines", None) or {}
+            if isinstance(_reg, dict):
+                _pool |= {str(getattr(e, "name", "") or k) for k, e in _reg.items()}
+            else:
+                _pool |= {str(getattr(e, "name", "") or "") for e in _reg}
+        except Exception:  # noqa: BLE001
+            pass
+        _pool.discard("")
+        uncovered = [e for e in sorted(_pool) if e not in covered_engines]
+        # 默认 20：小目标上无条件补满会让请求量翻倍（保守优先，需要全量补齐时设 0）
+        _fb_max = int(getattr(settings, "coverage_fallback_max", 20) or 0)
+        if _fb_max:
+            uncovered = uncovered[:_fb_max]
+        if uncovered:
+            _fb_param = all_params[0] if all_params else "id"
+            _fb_chunk = max(1, int(getattr(settings, "coverage_fallback_chunk", 4) or 4))
+            _fb_added = 0
+            for _i in range(0, len(uncovered), _fb_chunk):
+                _grp = uncovered[_i:_i + _fb_chunk]
+                # 优先级压到最低档（≤3）：兜底语义是"队列空闲时才跑"，
+                # 不能挤占参数挖掘/核心引擎任务（实测会顶掉 param_mining 调度位）。
+                _pri = min(3, min(engine_priority.get(e, 5) for e in _grp))
+                if enable_engine_bundle:
+                    await self.task_queue.add_task({
+                        "type": "engine_bundle",
+                        "engines": _grp,
+                        "target": self.target,
+                        "param": _fb_param,
+                        "priority": _pri,
+                        "payload_limit": 8,
+                        "coverage_fallback": True,
+                        "created_at": time.time(),
+                    }, _pri)
+                else:
+                    for _e in _grp:
+                        batch_pending.append({
+                            "type": "engine_check",
+                            "engine": _e,
+                            "target": self.target,
+                            "param": _fb_param,
+                            "priority": _pri,
+                            "payload_limit": 8,
+                            "coverage_fallback": True,
+                            "created_at": time.time(),
+                        })
+                tasks_added += 1
+                _fb_added += 1
+            logger.info(
+                f"   🧩 [覆盖兜底] 补齐 {len(uncovered)} 个未覆盖引擎（{_fb_added} 个任务）: "
+                f"{uncovered[:10]}{' ...' if len(uncovered) > 10 else ''}"
+            )
     if enable_engine_bundle:
         original_count = parameter_tasks * 3
         saved = ((original_count - parameter_tasks) / original_count * 100) if original_count else 0
@@ -719,6 +1037,7 @@ async def _generate_tasks(self):
         logger.info(f"📦 [Batch] 合并 {len(batch_pending)} 个单引擎任务 → {len(merged)} 个（节省 {saved_n} 次 AI 调用）")
         logger.info(f"   ✅生成 {tasks_added} 个参数级派生任务")
     static_skipped = 0
+    _pm_foreign = 0
     for api in cap(self._recon_brief.get("apis", []), settings.max_api_endpoints):
         if _a32_target_unchanged or generic_asset_unchanged(_a32_assets, "api", api):
             self._a32_skipped += 1
@@ -905,11 +1224,22 @@ async def _generate_tasks(self):
     if getattr(settings, "scan_param_mining", True):
         _pmined = self._recon_brief.get("param_mining", []) or []
         _pm_seen = set()
-        for _item in cap(_pmined, getattr(settings, "max_param_mining", 0)):
+        # 跨靶场隔离（先过滤后截断）：池为全局累积，仅消费与本次扫描目标同源条目，
+        # 避免外域残留占满 max_param_mining 配额把真实同源条目挤掉（fail-closed）。
+        _pm_scan_tgt = getattr(self, "target", "")
+        _pm_kept = 0
+        _pm_cap = int(getattr(settings, "max_param_mining", 0) or 0)
+        for _item in _pmined:
             _pu = _item.get("url") if isinstance(_item, dict) else None
             _pp = _item.get("param") if isinstance(_item, dict) else None
             if not _pu or not _pp or _is_static_resource_url(_pu):
                 continue
+            if not _same_origin(_pm_scan_tgt, _pu):
+                _pm_foreign += 1
+                continue
+            if _pm_cap and _pm_kept >= _pm_cap:
+                break
+            _pm_kept += 1
             _pm_target = _pu.split('?')[0]
             _pm_param = str(_pp)
             if _a32_target_unchanged or crawl_asset_unchanged(_a32_assets, _pu, [_pm_param]):
@@ -942,6 +1272,8 @@ async def _generate_tasks(self):
                 break
     if static_skipped:
         logger.info(f"   🗑️ [静态资源过滤] 源头丢弃 {static_skipped} 个静态资源 URL")
+    if _pm_foreign:
+        logger.info(f"   🧭 [参数池隔离] 丢弃 {_pm_foreign} 个非本次目标（跨靶场残留）条目")
     if self._a32_skipped:
         logger.info(
             f"   🗃️ [A3.2] 增量扫描：跳过未变资产相关任务 {self._a32_skipped} 个"
@@ -956,6 +1288,7 @@ async def _generate_tasks(self):
         "password_reset", "cloud_container_exposure", "backend_component_cve",
         "open_redirect", "cors", "idor", "jwt", "oauth",  # deserialization 改由端点级 B 段 hint 承接（避免 global 空 param 噪音任务）
         "file_upload",
+        "css_exfiltration", "dns_rebinding",  # 2026-09-15 新引擎：CSS 数据外泄 / DNS rebinding TOCTOU，全局目标级调度
         "nacos_exposure", "solr_exposure", "confluence_exposure",
         "deep_chimera", "parsing_shadow", "state_chain", "llm_injection",
     ]
@@ -970,7 +1303,7 @@ async def _generate_tasks(self):
         _global_set = set(global_engines)
         # 已知"有意不独立调度"的引擎（由其它引擎内部承接能力），不算漏调度，
         # 排除在兜底之外，避免重复执行。例：graphql_introspection 由 graphql 引擎端点级内省承接。
-        _known_unscheduled = {"graphql_introspection"}
+        _known_unscheduled = {"graphql_introspection", "symbolic_logic"}
         _unreached = [n for n in _loaded_names
                       if n not in _param_set and n not in _global_set
                       and n not in _known_unscheduled]
@@ -1082,6 +1415,13 @@ async def _generate_tasks(self):
     _mem_injector = getattr(self, "_inject_task_memory_hints", None)
     if _mem_injector is not None:
         await _mem_injector()
+    # P3-8：三层 AI 决策（战略层）——默认关；开启时注入 strategic_priority
+    _tl_injector = getattr(self, "_inject_three_layer_plan", None)
+    if _tl_injector is not None:
+        try:
+            await _tl_injector()
+        except Exception:  # noqa: BLE001 - 三层规划为增强项，绝不影响任务生成
+            logger.debug("suppressed exception (three-layer audit)")
 async def _gen_cve_task(self) -> dict | None:
     """Z1.2（=D2.4）：读 CVE 索引，按指纹组件生成高危 CVE 专项任务。
 
@@ -1207,6 +1547,39 @@ _MEMORY_ENGINE_KEYWORDS = {
     "info_leak": ("info_leak", "信息泄露", "sourcemap", "源码泄露"),
     "nuclei": ("nuclei",),
 }
+
+
+# ---- 先验校准（数据飞轮接线，2026-09-14）----
+_LEDGER_BOOSTED_CACHE: Optional[set] = None
+
+
+def _ledger_boosted_engines(engines) -> set:
+    """账本先验：返回"历史确认经验命中"的引擎集合（进程内缓存，一次只读一次账本）。
+
+    依据：feedback_ledger 中 verdict=confirm 的经验按 vuln_type 聚合——某类型真实
+    打中过 → 对应引擎在后续任务生成时优先级 +1（把"越扫越准"接进调度）。
+    账本不可用/为空 → 空集合（零行为回归）。
+    """
+    global _LEDGER_BOOSTED_CACHE
+    try:
+        if _LEDGER_BOOSTED_CACHE is None:
+            from vulnclaw.growth.feedback_ledger import get_feedback_ledger
+            types_hit: set = set()
+            for r in get_feedback_ledger().rows():
+                if str(r.get("verdict") or "").lower() in (
+                        "confirm", "confirmed", "fixed", "reconfirmed"):
+                    t = str(r.get("vuln_type") or "").lower()
+                    if t:
+                        types_hit.add(t)
+            boosted: set = set()
+            for eng in (engines or []):
+                el = str(eng).lower()
+                if any(t in el or el in t for t in types_hit):
+                    boosted.add(eng)
+            _LEDGER_BOOSTED_CACHE = boosted
+        return _LEDGER_BOOSTED_CACHE
+    except Exception:  # noqa: BLE001 - 飞轮是增强项，绝不影响任务生成
+        return _LEDGER_BOOSTED_CACHE or set()
 
 
 def _normalize_engine_name(vuln_type: str) -> str:
@@ -1344,6 +1717,17 @@ async def _inject_task_memory_hints(self):
                 continue
             td["memory_hint"] = {"hint": hint_text, "confidence": round(hint_conf, 2)}
             td["memory_boost"] = round(min(1.0, max(0.0, boost)), 2)
+            # P2-④：历史有效 payload 直接喂给任务（feedback_ledger 按确认次数
+            # 排序、fp 污染剔除；与 memory_hint 同源同开关，失败静默）。
+            _vt = str(td.get("engine") or td.get("vuln_type") or "")
+            if _vt:
+                try:
+                    from vulnclaw.growth.bridges import adaptive_payloads
+                    _rec = adaptive_payloads(_vt, tech_stack=tech_stack, k=3)
+                    if _rec:
+                        td["suggested_payloads"] = _rec
+                except Exception:  # noqa: BLE001,S110
+                    pass
             injected += 1
         if injected:
             logger.info(f"   [TaskMem] 历史经验注入 {injected} 个任务（memory_hint/memory_boost）")
@@ -1351,7 +1735,34 @@ async def _inject_task_memory_hints(self):
         logger.debug(f"[TaskMem] 记忆召回/注入失败（不影响任务生成）: {exc}")
 
 
-__all__ = ['_check_default_creds', '_gen_cve_task', '_generate_tasks', '_collect_idor_candidates', '_inject_task_memory_hints', '_run_idor_dual_session_line', '_run_nuclei_community_line', '_run_sequence_chain_line', '_collect_write_candidates',
+async def _inject_three_layer_plan(self):
+    """P3-8：三层决策——战略层规划注入（默认关；开关 settings.ai_three_layer）。
+
+    战略层（LLM 可用时增强 / 否则确定性启发式）产出高价值路径 Top-N →
+    以 `strategic_priority` 字段注入队列内任务（与 memory_boost 同构，
+    消费端可渐进接入）。失败一路静默，绝不影响任务生成。
+    """
+    try:
+        from vulnclaw.ai.v100.decision_layers import (
+            inject_strategic_fields,
+            strategic_plan_llm,
+            three_layer_enabled,
+        )
+        if not three_layer_enabled():
+            return
+        brief = getattr(self, "_recon_brief", None) or {}
+        findings = getattr(self, "findings", None) or []
+        plan = await strategic_plan_llm(brief, findings if isinstance(findings, list) else [])
+        queue = getattr(self, "task_queue", None)
+        pending = getattr(queue, "_pending_tasks", None) or {}
+        n = inject_strategic_fields(list(pending.values()), plan)
+        if n:
+            logger.info(f"   [ThreeLayer] 战略层注入 {n} 个任务（source={plan.get('source')}）")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[ThreeLayer] 战略层注入失败（不影响任务生成）: {exc}")
+
+
+__all__ = ['_check_default_creds', '_gen_cve_task', '_generate_tasks', '_collect_idor_candidates', '_inject_task_memory_hints', '_run_idor_dual_session_line', '_run_invariant_diff_line', '_run_nuclei_community_line', '_run_sequence_chain_line', '_collect_write_candidates',
                  '_run_vulnspec_line', '_run_metamorphic_line', '_collect_probe_endpoints',
-                 '_scan_idor']
+                 '_run_playbook_line', '_run_symbolic_line', '_run_chain_planner_line', '_scan_idor']
 

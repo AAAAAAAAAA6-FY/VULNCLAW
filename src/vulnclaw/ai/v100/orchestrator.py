@@ -9,7 +9,7 @@ import asyncio
 import contextlib
 import gc
 import time
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 from vulnclaw.core.logger import logger
 from vulnclaw.core.context import get_scan_context
@@ -18,7 +18,7 @@ from vulnclaw.core.utils import async_get, vuln_category
 from vulnclaw.core.scanner import _load_engines
 from vulnclaw.core.oob_channel import reset_oob_breaker
 from vulnclaw.core.auth.session_manager import get_session_manager
-from vulnclaw.ai.core import get_llm_client, get_memory
+from vulnclaw.ai.core import get_memory
 from vulnclaw.ai.burp import get_burp_controller, get_burp_client
 from .rate_limiter import get_rate_limiter
 from .batch_processor import BatchProcessor
@@ -27,33 +27,61 @@ from .smart_queue import SmartTaskQueue
 from .provider_balancer import get_balancer
 from vulnclaw.engines.input_engines import BusinessLogicEngine
 
-
-def compress_prompt(prompt: str, max_len: int = 16000) -> str:
-    """P1-2: 超长 Prompt 压缩——超过 4k Token(~16000 字符)时仅保留
-    (url, param, engine) 三元组关键行与判定指令，大幅降低 Token 消耗。"""
-    if len(prompt) <= max_len:
-        return prompt
-    keys = ("url", "param", "engine", "URL", "参数", "目标", "index", "type")
-    kept = [
-        ln.strip()
-        for ln in prompt.splitlines()
-        if ln.strip() and any(k in ln for k in keys)
-    ]
-    header = "以下为压缩后的(URL,参数,引擎)三元组清单，请逐项判断是否存在漏洞：\n"
-    body = "\n".join(kept)
-    if len(body) > max_len:
-        body = body[:max_len]
-    logger.info(
-        "♻️ [LLMCache] Prompt 压缩: %s → %s 字符（保留 %s 行三元组）",
-        len(prompt), len(header + body), len(kept),
-    )
-    return header + body
 from vulnclaw.engines.auxiliary_engines import APIVersionDiffEngine, RequestSmugglingEngine, HTTP2WebSocketEngine
 from vulnclaw.engines.http_engines import CachePoisonEngine
+from .orchestrator_models import ModelRoutingMixin, compress_prompt  # noqa: F401 (向后兼容再导出)
+from .orchestrator_stream import StreamVerifyMixin
+from .orchestrator_findings import FindingEvidenceMixin
 from .phases import bind_phase_methods
 from vulnclaw.core_modules.metrics import get_metrics
 from vulnclaw.modules.live_intake import LiveIntake, drain_pending, set_live_intake
-class V100Orchestrator:
+
+
+def build_multi_role_sessions(session_mgr, role_tokens: Dict[str, Dict], domain: str = "127.0.0.1") -> int:
+    """多角色会话装载函数（供 IDOR/BOLA 多账号 E2E 与脚本直接调用）。
+
+    背景：`_init_multi_role` 只为单个 "default" 角色建会话，导致 IDOREngine
+    `scan_with_roles` 拿不到 ≥2 个角色而一直"IDOR 检测将跳过"。本函数为
+    role_tokens 中的每个角色建立独立会话（各自 Authorization / Cookie）并注入
+    session_manager，让多角色扫描链路可被真实调用。
+
+    刻意**不修改** `_init_multi_role` 的行为——单会话默认语义保持不变，
+    多角色装载由调用方显式触发（本文件内最小改动，不动架构）。
+
+    参数
+    ----
+    session_mgr: SessionManager 实例（session_manager.get_session_manager()）
+    role_tokens : {role: {"authorization" 或 "token": str, ["cookie"|"cookies"]: Dict}}
+    domain      : Cookie 域名键（本地 mock 用 127.0.0.1）
+    返回已注入角色数。
+    """
+    count = 0
+    for role, creds in (role_tokens or {}).items():
+        if not isinstance(creds, dict):
+            continue
+        token_dict: Dict[str, str] = {}
+        extra_headers: Dict[str, str] = {}
+        _auth = creds.get("authorization") or creds.get("token") or creds.get("Authorization")
+        if _auth:
+            _bearer = _auth if str(_auth).startswith(("Bearer ", "Basic ")) else f"Bearer {_auth}"
+            token_dict["Authorization"] = _bearer
+            # add_session 在构造 aiohttp.ClientSession 之后才把 token 写进 headers，
+            # 而 aiohttp 构造时已快照该 dict → token 发不出去（真实多角色会 401）。
+            # 用 extra_headers（构造前合并）确保 Authorization 进入会话默认头。
+            extra_headers["Authorization"] = _bearer
+        cookie_dict = creds.get("cookie") or creds.get("cookies")
+        session_mgr.add_session(
+            role=role,
+            cookie_dict=cookie_dict if isinstance(cookie_dict, dict) and cookie_dict else None,
+            token_dict=token_dict or None,
+            extra_headers=extra_headers or None,
+            domain=domain or "127.0.0.1",
+        )
+        count += 1
+    return count
+
+
+class V100Orchestrator(ModelRoutingMixin, StreamVerifyMixin, FindingEvidenceMixin):
     """v100 facade coordinating the scan phases."""
     _safe_params = {
         'callback', '_', 'timestamp', 'nonce', 'version', 'format',
@@ -61,11 +89,13 @@ class V100Orchestrator:
         'session', 'token', 'csrf', 'authenticity_token', 'utf8'
     }
 
-    def __init__(self, target: str, session, max_tasks: int = None, initial_qps: int = None, resume: bool = False):
+    def __init__(self, target: str, session, max_tasks: int = None, initial_qps: int = None, resume: bool = False,
+                 profile: str = "", adaptive: bool = False):
         self.target = target
         self.session = session
         self._user_max_tasks = max_tasks
         self._user_initial_qps = initial_qps
+        self.scan_adaptive = bool(adaptive)
         self.max_tasks = max_tasks if max_tasks is not None else 200
         self.context = get_scan_context()
         self.shared_knowledge = self._ensure_shared_knowledge()
@@ -98,6 +128,15 @@ class V100Orchestrator:
         self._spa_detector = spa_detector
 
         self._ensure_engines()
+        # 工作流10：扫描预算模式（空=不启用，保持全量默认行为）
+        self.scan_profile_name = str(profile or "")
+        self.scan_profile_applied = False
+        self.scan_payload_depth = 0
+        self.scan_payload_depth_map = {}
+        self.scan_concurrency = 0
+        self.scan_budget_requests = 0
+        if self.scan_profile_name:
+            self.scan_profile_applied = self._apply_scan_profile()
         logger.info(f"✅ 加载 {len(self.engines)} 个漏洞检测引擎（已配置SPA检测器）")
         self._model_pool = self._get_model_pool()
         self._ai_enabled = bool(self._model_pool)
@@ -200,6 +239,7 @@ class V100Orchestrator:
         self._direct_findings = 0
         self._burp_findings = 0
         self._burp_scan_task = None  # 步骤3：并行 Burp 扫描任务句柄
+        self._browser_passive_task = None  # 浏览器被动爬虫后台任务
         self._nuclei_findings = 0
         self._idor_findings = 0
         self._cred_findings = 0
@@ -383,7 +423,9 @@ class V100Orchestrator:
             except RuntimeError:
                 logger.debug("suppressed exception (core audit)")
 
-            self.burp_available = asyncio.run(self.burp_client.get_status())
+            # P3-12：run_sync 安全包装（在事件循环内被调用时不再抛 RuntimeError）
+            from vulnclaw.core.utils import run_sync as _run_sync_burp
+            self.burp_available = _run_sync_burp(self.burp_client.get_status())
         except Exception as e:
             logger.warning(f"⚠️ Burp 连接检测异常: {e}")
             self.burp_available = False
@@ -391,245 +433,78 @@ class V100Orchestrator:
         if self.burp_available:
             logger.info("🔌 Burp 连接成功")
         else:
-            logger.info("ℹ️ Burp 不可用，使用独立模式运行")
+            logger.info("ℹ️ Burp 不可用，将使用浏览器被动爬虫采集流量")
 
-    def _get_model_pool(self) -> List[str]:
-        """读取 AI 模型池（0~N 个）。
+    async def _run_browser_passive(self):
+        """后台被动爬虫：启动 Playwright 浏览器 → 爬取目标 → 流量回注 LiveIntake。
 
-        AI_MODELS 为空或未配置 → 返回空列表 = 纯引擎模式，
-        不调用任何 AI，扫描照常执行（AI 增强自动降级跳过）。
+        Burp 不在时自动运行，将页面请求/响应对注入引擎管线做被动分析。
+        注意：不使用 settings.proxy（可能是未启动的 Burp 地址），浏览器直连目标。
         """
         try:
-            from vulnclaw.ai.core import get_configured_ai_models
-            pool = get_configured_ai_models()
-            if not pool:
-                logger.info("ℹ️ 未配置 AI 模型（AI_MODELS 为空），进入纯引擎模式")
-            return pool
-        except Exception as e:
-            logger.warning(f"加载模型池失败: {e}，使用默认模型")
-            return getattr(settings, 'DEFAULT_AI_MODEL_CODES', ["1", "2", "4", "5"])
-
-    def _models_for_task(self, task_type: str) -> List[str]:
-        """P2-1: 任务类型 → 候选模型列表（router 推荐 ∩ 全局池）。
-
-        verify→大模型(glm-4.7)、filter→小模型(glm-4-flash)，
-        其余任务退回全局池轮询，保持既有行为。
-        """
+            from vulnclaw.core.browser_ai_agent import BrowserAIAgent, passive_pairs_to_intake
+        except ImportError:
+            logger.debug("浏览器被动爬虫模块不可用，跳过")
+            return
+        agent = BrowserAIAgent(headless=True, proxy=None)
         try:
-            from vulnclaw.ai.core import get_model_router
-            router = get_model_router()
-            preferred = router.get_models_for_task(task_type, max_models=3)
-            candidates = [m for m in preferred if m in self._model_pool]
-            if candidates:
-                return candidates
-        except Exception as e:  # noqa: BLE001
-            logger.debug(f"任务模型路由失败，使用全局池: {e}")
-        return list(self._model_pool)
-
-    async def _get_next_model(self, task_type: str = "default") -> str:
-        async with self._model_lock:
-            if not self._model_pool:
-                return ""
-
-            candidates = self._models_for_task(task_type)
-            for offset in range(len(candidates)):
-                idx = (self._model_index + offset) % len(candidates)
-                candidate = candidates[idx]
-                if self._model_failures.get(candidate, 0) <= 3:
-                    self._model_index = (idx + 1) % len(candidates)
-                    self._model_stats[candidate] = self._model_stats.get(candidate, 0) + 1
-                    return candidate
-
-            # 任务候选全失败 → 退回全局池兜底
-            for offset in range(len(self._model_pool)):
-                idx = (self._model_index + offset) % len(self._model_pool)
-                candidate = self._model_pool[idx]
-                if self._model_failures.get(candidate, 0) <= 3:
-                    self._model_index = (idx + 1) % len(self._model_pool)
-                    self._model_stats[candidate] = self._model_stats.get(candidate, 0) + 1
-                    return candidate
-
-            for m in self._model_pool:
-                self._model_failures[m] = 0
-            self._model_stats[self._model_pool[0]] = self._model_stats.get(self._model_pool[0], 0) + 1
-            return self._model_pool[0]
-
-    async def _record_model_result(self, model: str, success: bool, error_msg: str = ""):
-        async with self._model_lock:
-            if success:
-                self._model_failures[model] = max(0, self._model_failures.get(model, 0) - 1)
+            pairs = await agent.passive_crawl(self.target, timeout=30)
+            if pairs:
+                fed = passive_pairs_to_intake(pairs, source="browser_passive")
+                logger.info(f"🕵️ [被动爬虫] 收集 {len(pairs)} 条流量，回注 {fed} 个参数到引擎管线")
             else:
-                self._model_failures[model] = self._model_failures.get(model, 0) + 1
-                if self._model_failures[model] >= 5:
-                    logger.warning(f"⚠️ 模型 {model} 连续失败 {self._model_failures[model]} 次，将暂时跳过")
-        self._share_knowledge(f"model:{model}", success=success, detail=error_msg or "ok")
-
-    async def _get_model_stats(self) -> Dict:
-        async with self._model_lock:
-            return {
-                "total_calls": sum(self._model_stats.values()),
-                "per_model": dict(self._model_stats),
-                "failures": dict(self._model_failures),
-            }
-
-    async def get_rate_stats_cached(self) -> Dict:
-        now = time.time()
-        if self._rate_stats_cache is not None:
-            ts, cached = self._rate_stats_cache
-            if now - ts < self._stats_ttl:
-                return cached
-        async with self._stats_cache_lock:
-            now = time.time()
-            if self._rate_stats_cache is not None:
-                ts, cached = self._rate_stats_cache
-                if now - ts < self._stats_ttl:
-                    return cached
-            fresh = await self.rate_limiter.get_stats()
-            self._rate_stats_cache = (now, fresh)
-            return fresh
-
-    async def get_model_stats_cached(self) -> Dict:
-        now = time.time()
-        if self._model_stats_cache is not None:
-            ts, cached = self._model_stats_cache
-            if now - ts < self._stats_ttl:
-                return cached
-        async with self._stats_cache_lock:
-            now = time.time()
-            if self._model_stats_cache is not None:
-                ts, cached = self._model_stats_cache
-                if now - ts < self._stats_ttl:
-                    return cached
-            fresh = await self._get_model_stats()
-            self._model_stats_cache = (now, fresh)
-            return fresh
-
-    async def _penalize_task_models(self, task_type: str):
-        """P2-1: 连续 2 次超时 → 临时拉黑该任务主模型（failures=5 跳过），自动降级更小模型。"""
-        try:
-            from vulnclaw.ai.core import get_model_router
-            router = get_model_router()
-            primary = router.recommend_primary_model(task_type)
-            async with self._model_lock:
-                if primary and primary in self._model_failures:
-                    self._model_failures[primary] = max(self._model_failures.get(primary, 0), 5)
-                    logger.warning(f"⏱️ [P2-1] 任务 {task_type} 连续 2 次超时，临时降级主模型 {primary}")
-        except Exception as e:  # noqa: BLE001
-            logger.debug(f"超时模型降级失败: {e}")
-
-    async def _ask_ai(
-        self,
-        prompt: str,
-        system: str = "",
-        temperature: float = 0.1,
-        max_tokens: int = 2048,
-        compress: bool = False,   # P1-2: 超长 Prompt 压缩为三元组
-        use_cache: bool = False,  # P1-2: 语义缓存（1h TTL）
-        task_type: str = "default",  # P2-1: verify→大模型 / filter→小模型
-        usage_site: str = "",  # A4.4/SP8: 成本台账调用点标签
-    ) -> str:
-        """带总超时的 AI 调用入口。
-
-        修复 attack 节点挂起：底层 client.ask 无外层超时（GLM-4.7 内层超时 3600s），
-        429 退避 + 多模型 fallback 链最坏可阻塞数十分钟。这里包 90s 硬超时，
-        超时直接抛错，由调用方的任务重试/引擎跳过逻辑兜底。
-        """
-        if not getattr(self, '_ai_enabled', True):
-            raise RuntimeError("AI 未配置（纯引擎模式），跳过 AI 增强")
-        if compress:
-            prompt = compress_prompt(prompt)
-        try:
-            return await asyncio.wait_for(
-                self._ask_ai_impl(prompt, system, temperature, max_tokens, use_cache=use_cache, task_type=task_type, usage_site=usage_site),
-                timeout=float(settings.ai_router_timeout),
-            )
-        except asyncio.TimeoutError as exc:
-            # P2-1: 连续 2 次超时 → 自动降级更小模型
-            self._timeout_streaks[task_type] = self._timeout_streaks.get(task_type, 0) + 1
-            if self._timeout_streaks[task_type] >= 2:
-                self._timeout_streaks[task_type] = 0
-                await self._penalize_task_models(task_type)
-            raise RuntimeError(f"AI 调用总超时 (90s): {prompt[:60]}...") from exc
-
-    async def _ask_ai_impl(
-        self,
-        prompt: str,
-        system: str = "",
-        temperature: float = 0.1,
-        max_tokens: int = 2048,
-        use_cache: bool = False,  # P1-2
-        task_type: str = "default",  # P2-1
-        usage_site: str = "",  # A4.4/SP8: 成本台账调用点标签
-    ) -> str:
-        model = await self._get_next_model(task_type)
-        fallback_model_name = model
-
-        try:
-            client = get_llm_client(force_new=False, models=[model])
-            result = await client.ask(
-                prompt,
-                system=system,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                wrap_data=True,          # 安全加固
-                retries=2,
-                use_cache=use_cache,     # P1-2
-                usage_site=usage_site or None,  # A4.4/SP8: 成本台账调用点
-            )
-            await self._record_model_result(model, True)
-            return result
+                logger.debug("🕵️ [被动爬虫] 未捕获到有效流量")
         except Exception as e:
-            await self._record_model_result(model, False, str(e))
-            fallback_model = await self._get_next_model()
-            if fallback_model != model:
-                logger.warning(f"🔄 模型 {model} 失败，切换到 {fallback_model}")
-                try:
-                    client = get_llm_client(force_new=False, models=[fallback_model])
-                    result = await client.ask(
-                        prompt,
-                        system=system,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        wrap_data=True,
-                        retries=1,
-                        usage_site=usage_site or None,
-                    )
-                    await self._record_model_result(fallback_model, True)
-                    return result
-                except Exception as e2:
-                    await self._record_model_result(fallback_model, False, str(e2))
-                    try:
-                        client, provider_key, model_from_balancer = await self.balancer.get_client()
-                        result = await client.ask(
-                            prompt,
-                            system=system,
-                            temperature=temperature,
-                            max_tokens=max_tokens,
-                            wrap_data=True,
-                            retries=1,
-                            usage_site=usage_site or None,
-                        )
-                        await self._record_model_result(model_from_balancer, True)
-                        return result
-                    except Exception as e3:
-                        await self._record_model_result(fallback_model_name, False, str(e3))
-                        raise RuntimeError(f"所有模型调用失败（含负载均衡器）: {e3}")
+            logger.warning(f"⚠️ 被动爬虫异常: {e}")
+        finally:
             try:
-                client, provider_key, model_from_balancer = await self.balancer.get_client()
-                result = await client.ask(
-                    prompt,
-                    system=system,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    wrap_data=True,
-                    retries=1,
-                    usage_site=usage_site or None,
+                await agent.stop()
+            except Exception:
+                pass
+
+    def _apply_scan_profile(self) -> bool:
+        """工作流10：按 ScanProfile 收窄引擎集合，并落并发/payload 深度/超时/请求预算。
+
+        安全策略：模式未知、或收窄后一个引擎都不剩 → 保守回退全量并告警，
+        绝不静默清空引擎集合（宁可多扫，不可漏扫）。
+        """
+        try:
+            from vulnclaw.core.scan_profiles import get_profile
+            try:
+                prof = get_profile(self.scan_profile_name)
+            except ValueError as _verr:
+                # get_profile 对未登记模式 fail-closed 抛 ValueError，转成 warning 告警
+                logger.warning(
+                    f"未知扫描模式 {self.scan_profile_name!r}（{_verr}），忽略（保持全量引擎）"
                 )
-                await self._record_model_result(model_from_balancer, True)
-                return result
-            except Exception as e3:
-                await self._record_model_result(fallback_model_name, False, str(e3))
-                raise RuntimeError(f"所有模型调用失败（含负载均衡器）: {e3}")
+                return False
+            if prof.engines:
+                want = set(prof.engines)
+                keep = [e for e in self.engines if getattr(e, "name", "") in want]
+                if not keep:
+                    logger.warning(f"模式 {prof.name} 未匹配到已注册引擎，保守回退全量")
+                    return False
+                self.engines = keep
+                self.engine_map = {getattr(e, "name", ""): e for e in keep}
+            self.scan_payload_depth = int(prof.default_payload_depth)
+            self.scan_payload_depth_map = dict(prof.payload_depth)
+            self.scan_concurrency = int(prof.concurrency)
+            self.scan_budget_requests = int(prof.budget_requests)
+            if prof.scan_timeout_s:
+                try:
+                    from vulnclaw.config.settings import settings
+                    settings.max_scan_time = int(prof.scan_timeout_s)
+                except Exception as exc:  # noqa: BLE001 - 超时覆盖失败不阻塞
+                    logger.debug(f"模式超时应用失败（忽略）: {exc}")
+            logger.info(
+                f"🎯 扫描模式 {prof.name}: 引擎 {len(self.engines)} 个 / payload 深度 "
+                f"{prof.default_payload_depth} / 并发 {prof.concurrency} / 请求预算 "
+                f"{prof.budget_requests or '不限'}（{prof.description}）"
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001 - 模式是增强项，失败保持全量
+            logger.debug(f"扫描模式应用失败（忽略，保持全量）: {exc}")
+            return False
 
     def _ensure_engines(self):
         engine_classes = {
@@ -667,263 +542,12 @@ class V100Orchestrator:
         except Exception:
             logger.debug("suppressed exception (core audit)")
 
-    def _finding_verify_key(self, finding: Dict) -> tuple:
-        """去重 key：与 _verify_all_findings / _add_finding 口径一致。"""
-        return (
-            str(finding.get('url', '')),
-            str(finding.get('parameter', '')),
-            str(finding.get('type', '')),
-            str(finding.get('method', 'unknown')),
-            str(finding.get('source', '')),
-            # 再加一段短 evidence hash，避免"同一 param 同 engine 不同证据"被误合并去重。
-            (str(finding.get('evidence', ''))[:80]).strip(),
-        )
-
     # -------------------------------------------------------------------------
     # 流水线验证（stream-verify）：attack 节点边出 finding 边后台 verify。
     # 触发条件：(1) 新增后累计未处理 pending >= 动态预算；或 (2) 距上次触发 >= 3 秒。
     # 收尾阶段：stop(wait_pending=True) 会等所有存量 pending 跑完再返回。
     # -------------------------------------------------------------------------
-    def _stream_budget(self) -> int:
-        """P3-1: 动态批大小预算。
 
-        公式：budget = min(50, 5 + len(pending)//10)；
-        再结合 rate_limiter 令牌余量自适应——余量充足(+10) 放大批次，
-        余量不足(//2) 收窄，避免高并发时每秒频繁触发 AI 调用。
-        """
-        try:
-            pending_count = len(self._pending_verify)
-        except Exception:
-            pending_count = 0
-        base = min(50, self._stream_budget_n + pending_count // 10)
-        tokens = 50.0
-        if self.rate_limiter is not None:
-            try:
-                tokens = float(self.rate_limiter.available_tokens())
-            except Exception:
-                tokens = 50.0
-        if tokens >= 25:
-            return min(50, base + 10)
-        if tokens >= 10:
-            return base
-        return max(1, base // 2)
-
-    def _start_stream_verify(self) -> None:
-        """启动后台流式 verify 协程（幂等）。"""
-        if self._stream_started or self._stream_stopped:
-            return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            logger.debug("[StreamVerify] 当前没有运行的事件循环，跳过后台流式 verify 启动")
-            return
-        self._stream_started = True
-        self._stream_task = loop.create_task(self._stream_verify_loop())
-        logger.info(
-            "🧪 [StreamVerify] 后台启动: batch≥动态预算(min(50,5+pending//10)+令牌自适应) 或 %.1fs 触发增量验证",
-            self._stream_timeout_s,
-        )
-
-    async def _stop_stream_verify(self, wait_pending: bool = True) -> None:
-        """停止流式 verify 协程，可选择等存量 pending 刷完。"""
-        if self._stream_stopped:
-            return
-        if not self._stream_started or self._stream_task is None:
-            self._stream_stopped = True
-            if wait_pending:
-                await self._stream_flush_pending(force_all=True, final_flush=True)
-            return
-        # 先把最后一批刷掉（含 final_flush 兜底），再停后台循环。
-        if wait_pending:
-            try:
-                await asyncio.wait_for(self._stream_flush_pending(force_all=True, final_flush=True), timeout=float(settings.chain_flush_timeout))
-            except asyncio.TimeoutError:
-                logger.warning("⏰ [StreamVerify] 收尾 flush 超时（900s），强制关闭后台协程")
-            except Exception as exc:  # noqa: BLE001
-                self._stream_errors += 1
-                logger.warning("⚠️ [StreamVerify] 收尾 flush 异常: %s", exc)
-        self._stream_stopped = True
-        self._stream_event.set()  # 让 wait_for 立即退出
-        task = self._stream_task
-        self._stream_task = None
-        if task is not None and not task.done():
-            task.cancel()
-            try:
-                await asyncio.wait_for(task, timeout=settings.request_timeout)
-            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
-                logger.debug("suppressed exception (core audit)")
-        logger.info(
-            "🧪 [StreamVerify] 已停止: %s 条/%s 批处理, 去重集大小=%s, 错误=%s",
-            self._stream_processed_count,
-            self._stream_batches,
-            len(self._stream_touched_keys),
-            self._stream_errors,
-        )
-
-    async def _stream_notify_pending(self, just_added: int = 1) -> None:
-        """`_execute_engine_check` 往 _pending_verify 追加 finding 后调用：唤醒后台 loop 做阈值判断。"""
-        if not self._stream_started or self._stream_stopped:
-            return
-        # 阈值触发：当前待处理数达到动态 batch 上限 → 立即触发 flush。
-        async with self._pending_verify_lock:
-            pending_count = len(self._pending_verify)
-            if pending_count >= self._stream_budget():
-                self._stream_event.set()
-                return
-        # 否则 set event 让下一轮 sleep 可被打断；但通常 timeout 到点也会自动刷。
-        self._stream_event.set()
-
-    async def _stream_verify_loop(self) -> None:
-        """后台协程：不断等 (budget 条件 or 3s timeout) 然后刷一批增量。"""
-        try:
-            while not self._stream_stopped:
-                # 先尝试等 3 秒；如果 event 被设置，说明达到阈值或被显式唤醒。
-                try:
-                    await asyncio.wait_for(self._stream_event.wait(), timeout=self._stream_timeout_s)
-                except asyncio.TimeoutError:
-                    logger.debug("suppressed exception (core audit)")
-                except asyncio.CancelledError:
-                    raise
-                except Exception:  # pragma: no cover - 事件 wait 本身不该抛
-                    logger.debug("suppressed exception (core audit)")
-                # 清 event 后执行一次增量 flush；如果 pending 仍然不够阈值，
-                # flush 内部会按"至少取 1 条 + 已经 >= timeout_s" 的策略决定是否实际验证。
-                self._stream_event.clear()
-                if self._stream_stopped:
-                    break
-                try:
-                    await self._stream_flush_pending(force_all=False, final_flush=False)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:  # noqa: BLE001
-                    self._stream_errors += 1
-                    logger.warning("⚠️ [StreamVerify] 批次异常: %s", exc)
-        except asyncio.CancelledError:
-            logger.debug("[StreamVerify] 后台协程被 cancel")
-            raise
-
-    async def _stream_flush_pending(self, force_all: bool, final_flush: bool) -> None:
-        """把 `_pending_verify` 中尚未被 stream 处理过的条目捞出来做增量验证。
-
-        - `force_all=True` / `final_flush=True`：忽略 batch 阈值，一次性刷光当前全部 pending。
-        - `force_all=False`：仅在 pending 累积 >= batch_size 时执行（定时触发也属于"强制刷一次"）。
-        """
-        # 1) 在 lock 下收集 fresh 批次，并同步标记 touched，避免并发 flush 重复处理。
-        batch: List[Dict] = []
-        async with self._pending_verify_lock:
-            if not self._pending_verify:
-                return
-            if not force_all and not final_flush and len(self._pending_verify) < self._stream_budget():
-                return
-            for v in self._pending_verify:
-                k = self._finding_verify_key(v)
-                if k in self._stream_touched_keys:
-                    continue
-                self._stream_touched_keys.add(k)
-                batch.append(v)
-        if not batch:
-            return
-
-        self._stream_batches += 1
-        self._stream_processed_count += len(batch)
-        logger.info(
-            "🧪 [StreamVerify] 增量批次 #%s: %s 条 (force_all=%s, final=%s)",
-            self._stream_batches,
-            len(batch),
-            force_all,
-            final_flush,
-        )
-        try:
-            await self._stream_verify_batch(batch)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            self._stream_errors += 1
-            logger.warning("⚠️ [StreamVerify] 批次 #%s 失败: %s", self._stream_batches, exc)
-
-    async def _stream_verify_batch(self, batch: List[Dict]) -> None:
-        """对一小批 pending 调用现有 cross-verify 流水线：
-        直接复用 _verify_all_findings 入口，保证与收尾阶段完全一致的升级/HTTP/exploit 逻辑。
-        为避免和 stop_stream_verify 并发时互相打架，这里再临时用 batch 替换 pending 列表。
-        """
-        # 保存 & 替换：让 _verify_all_findings 只处理这批增量。
-        # 修复：_stream_flush_pending 在收集批次时就已把条目加入 _stream_touched_keys，
-        # 而 _verify_all_findings 会跳过 touched 条目 → stream 批次从未真正验证
-        # （表现为"增量批次 #N: X 条"后紧跟"收尾阶段跳过 X 条"，finding 全部丢失）。
-        # 验证前临时摘除 batch keys，验证后恢复，收尾阶段仍不会重复处理。
-        batch_keys = {self._finding_verify_key(v) for v in batch}
-        async with self._pending_verify_lock:
-            saved_pending = list(self._pending_verify)
-            self._pending_verify = list(batch)
-            self._stream_touched_keys -= batch_keys
-        _batch_ok = False
-        try:
-            await self._verify_all_findings()
-            _batch_ok = True
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001
-            raise
-        finally:
-            async with self._pending_verify_lock:
-                if _batch_ok:
-                    self._stream_touched_keys |= batch_keys
-                # 合并回：保留原始 pending 的顺序（因为我们不会从中删 touched，只是为了未来 debug 完整）。
-                # 注意：_verify_all_findings 内部不会清空 _pending_verify，因此这里简单 restore 即可。
-                # 关键修复（漏检根因）：验证期间 phases_executor 会无锁 append 新 finding 到
-                # 临时替换的 list(batch) 上，若仅重建 saved_pending 会把这些新条目静默丢弃
-                # （SQLi 在批次验证窗口排队 → finally 重建后条目标记丢失 → 不进最终报告）。
-                # 因此先取回临时 list 的当前内容，与 saved_pending / batch 合并去重。
-                transient_items = list(self._pending_verify)
-                merged: List[Dict] = list(saved_pending)
-                seen_keys = {self._finding_verify_key(v) for v in merged}
-                for v in [*batch, *transient_items]:
-                    if self._finding_verify_key(v) not in seen_keys:
-                        merged.append(v)
-                        seen_keys.add(self._finding_verify_key(v))
-                self._pending_verify = merged
-
-
-    @staticmethod
-    def _classify_finding_verdict(finding: Dict) -> str:
-        """C4-C10 三档分级：confirm / likely / suspicious。
-
-        严格低误报优先，规则保持可解释：
-        1) 硬实锤（exploited / burp_verified / cross_confirmed / OOB 回调）或
-           高置信(高/high/>=90)且 ai_verdict=真实漏洞  -> confirm；
-        2) ai_verdict=真实漏洞 且置信中等（中/medium）  -> likely（需人工复核，概率较高）；
-        3) 其余（待人工复核 / 已跳过 / 预算已满 / 低优先级 / 非漏洞 / low）-> suspicious。
-        """
-        if finding.get("verdict"):
-            return finding["verdict"]
-        if (
-            finding.get("exploited")
-            or finding.get("burp_verified")
-            or finding.get("cross_confirmed")
-            or finding.get("oob_confirmed")
-            or finding.get("collaborator_callback")
-        ):
-            return "confirm"
-        verdict = str(finding.get("ai_verdict", ""))
-        if (
-            "待人工复核" in verdict
-            or "已跳过" in verdict
-            or "预算已满" in verdict
-            or "低优先级" in verdict
-        ):
-            return "suspicious"
-        is_real = "真实漏洞" in verdict
-        conf = finding.get("confidence")
-        if isinstance(conf, int) and conf >= 90:
-            return "confirm"
-        if isinstance(conf, str):
-            base_conf = conf.split("（")[0].split(" (")[0].strip().lower()
-            if base_conf in ("高", "high"):
-                return "confirm" if is_real else "suspicious"
-            if base_conf.startswith("中") or base_conf == "medium":
-                return "likely" if is_real else "suspicious"
-            return "suspicious"
-        return "likely" if is_real else "suspicious"
     def _add_finding(self, finding: Dict):
         # 第2点：已知负样本端点拦截（2026-09-06）。命中 negative_endpoints 的 url
         # 在落库前判误报丢弃，避免 /safe 类已知安全端点污染报告（验证层补拦截）。
@@ -987,164 +611,6 @@ class V100Orchestrator:
     # ------------------------------------------------------------------
     # 轨道2 2.1: PoC 复现信息（reproduction_steps + curl_command）
     # ------------------------------------------------------------------
-    _REPRO_EXPECTATION = {
-        "sqli": "响应出现数据库报错（如 You have an error in your SQL syntax）或布尔/延时差异",
-        "nosql": "响应出现 NoSQL 报错，或条件恒真/恒假返回不同",
-        "xss": "payload 原样回显且未转义（查看页面源码确认未被编码）",
-        "cmdi": "响应中包含命令执行结果（如 uid=0(root) 或 whoami 输出）",
-        "rce": "响应中包含命令执行结果（如 uid=0(root)）",
-        "lfi": "响应中包含目标文件内容（如 /etc/passwd 的 root:x:0:0）",
-        "rfi": "远程文件内容被包含并在服务端执行",
-        "ssrf": "服务端发起对外请求（OOB/DNS 回调或内网响应回显）",
-        "xxe": "外部实体内容被解析回显或产生 OOB 回调",
-        "ssti": "模板表达式被求值（如 {{7*7}} → 49）",
-        "el_injection": "EL/SpEL 表达式被求值（如 ${7*7} → 49）",
-        "deserialization": "反序列化被触发（延时 / OOB 回调 / 命令执行迹象）",
-        "open_redirect": "响应 301/302 且 Location 指向外部域名",
-        "idor": "可访问或篡改其他用户对象的资源",
-        "file_upload": "上传文件可被访问且在服务端被解析执行",
-        "jwt": "伪造/篡改的 token 被服务端接受",
-        "oauth": "redirect_uri / state 校验被绕过",
-        "cors": "Access-Control-Allow-Origin 反射任意 Origin 且允许凭证",
-        "crlf": "响应头被注入（Set-Cookie 或自定义头）",
-        "host_header": "Host 头被反射进链接或缓存键",
-        "cache_poison": "缓存被写入恶意内容，其他用户可命中",
-        "graphql": "GraphQL 内省/注入查询返回预期数据",
-        "info_leak": "响应中包含敏感信息（路径 / 堆栈 / 密钥）",
-        "security_headers": "缺失关键安全响应头（CSP / HSTS / X-Frame-Options）",
-        "race_condition": "并发请求导致状态不一致（超额 / 重复提交）",
-        "business_logic": "业务逻辑校验被绕过（金额 / 数量 / 权限）",
-        "ldap": "LDAP 查询被注入，返回非预期条目",
-        "xpath": "XPath 表达式被注入，返回非预期节点",
-        "hpp": "同名参数被拼接，服务端行为与预期不一致",
-        "smuggling": "前后端解析不一致，请求被走私",
-    }
-
-    @staticmethod
-    def _sh_quote(value: str) -> str:
-        """shell 单引号安全转义（payload 常含引号，直接拼接会破坏命令）。"""
-        return "'" + str(value).replace("'", "'\\''") + "'"
-
-    def _expected_observation(self, finding: Dict) -> str:
-        """2.1: 按漏洞类型给出"预期现象"描述。"""
-        vtype = str(finding.get("type", "")).lower()
-        for key, expect in self._REPRO_EXPECTATION.items():
-            if key in vtype:
-                return expect
-        return "响应与正常基线出现显著差异（对比状态码 / 长度 / 内容）"
-
-    def _build_repro_url(self, finding: Dict) -> str:
-        """2.1: 构造复现 URL（GET 时把 payload 注入目标参数）。"""
-        url = str(finding.get("url") or self.target or "").strip()
-        param = finding.get("parameter") or finding.get("param") or ""
-        payload = str(finding.get("payload") or "")
-        method = str(finding.get("method") or "GET").upper()
-        if not param or not payload or method != "GET":
-            return url
-        try:
-            from vulnclaw.core.utils import build_attack_url
-
-            base, _, query = url.partition("?")
-            return build_attack_url(base, param, payload, query)
-        except Exception:  # noqa: BLE001
-            return url
-
-    def _request_cookie_header(self) -> str:
-        """2.1: 提取复现所需的 Cookie（会话 + Burp 抓取）。"""
-        cookies: Dict[str, str] = {}
-        try:
-            burp_cookies = (self._recon_brief or {}).get("burp_cookies") or {}
-            if isinstance(burp_cookies, dict):
-                cookies.update({str(k): str(v) for k, v in burp_cookies.items()})
-        except Exception:  # noqa: BLE001
-            logger.debug("suppressed exception (core audit)")
-        try:
-            if self.session is not None and getattr(self.session, "cookies", None):
-                for k, v in self.session.cookies.items():
-                    cookies.setdefault(str(k), str(v))
-        except Exception:  # noqa: BLE001
-            logger.debug("suppressed exception (core audit)")
-        return "; ".join(f"{k}={v}" for k, v in cookies.items())
-
-    def _build_curl_command(self, finding: Dict, attack_url: str) -> str:
-        """2.1: 生成可直接复制执行的 curl 复现命令。"""
-        method = str(finding.get("method") or "GET").upper()
-        if method not in ("GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"):
-            method = "GET"
-        param = finding.get("parameter") or finding.get("param") or ""
-        payload = str(finding.get("payload") or "")
-
-        parts = [f"curl -i -s -k -X {method}", self._sh_quote(attack_url)]
-
-        if method != "GET" and param and payload:
-            parts.append(f"--data-urlencode {self._sh_quote(f'{param}={payload}')}")
-        elif method != "GET":
-            parts.append(f"--data {self._sh_quote(finding.get('data', '') or '')}")
-
-        for header_key, header_val in (finding.get("headers") or {}).items():
-            if str(header_key).lower() in ("cookie", "content-length", "host"):
-                continue
-            parts.append(f"-H {self._sh_quote(f'{header_key}: {header_val}')}")
-
-        if getattr(settings, "report_include_cookie", True):
-            cookie = self._request_cookie_header()
-            if cookie:
-                parts.append(f"-H {self._sh_quote(f'Cookie: {cookie}')}")
-
-        return " ".join(p for p in parts if p)
-
-    def _enrich_finding(self, finding: Dict) -> Dict:
-        """轨道2 2.1/2.2: 为单条 finding 补齐复现信息与双源确认标记。"""
-        attack_url = self._build_repro_url(finding)
-        curl = self._build_curl_command(finding, attack_url)
-        method = str(finding.get("method") or "GET").upper()
-        param = finding.get("parameter") or finding.get("param") or ""
-        payload = str(finding.get("payload") or "")
-        expected = self._expected_observation(finding)
-
-        finding.setdefault("curl_command", curl)
-        finding.setdefault("reproduction", {
-            "method": method,
-            "url": attack_url,
-            "parameter": param,
-            "payload": payload,
-            "expected": expected,
-        })
-        finding.setdefault("reproduction_steps", [
-            f"1. 以 {method} 方法请求: {attack_url}"
-            + (f"（参数 {param} 赋值为 payload）" if param and payload else ""),
-            f"2. 注入 Payload: {payload[:300]}" if payload else "2. 无需额外 payload，直接请求目标 URL",
-            f"3. 预期现象: {expected}",
-            f"4. 复现命令（可直接复制执行）: {curl}",
-        ])
-
-        # 轨道2 2.2: 双源确认（引擎命中 + Burp 独立确认）
-        burp_ok = bool(finding.get("burp_confirmed") or finding.get("burp_verified"))
-        if burp_ok:
-            finding["cross_confirmed"] = True
-            sources = [str(s) for s in (finding.get("confirmation_sources") or [])]
-            if "burp" not in sources:
-                sources.append("burp")
-            primary = str(finding.get("engine") or finding.get("type") or "engine")
-            if primary not in sources:
-                sources.insert(0, primary)
-            finding["confirmation_sources"] = sources
-        else:
-            finding.setdefault("cross_confirmed", False)
-        return finding
-
-    def _record_engine_metric(self, name: str, elapsed: float, hit: bool, timeout: bool = False, error: bool = False) -> None:
-        m = self._engine_metrics.setdefault(
-            name, {"calls": 0, "hits": 0, "timeouts": 0, "errors": 0, "total_time": 0.0}
-        )
-        m["calls"] += 1
-        m["total_time"] += elapsed
-        if hit:
-            m["hits"] += 1
-        if timeout:
-            m["timeouts"] += 1
-        if error:
-            m["errors"] += 1
 
     async def _run_extras_block(self) -> None:
         """SH17.1：extras 阶段主体（与 Burp 并行，收尾合并）。"""
@@ -1155,7 +621,13 @@ class V100Orchestrator:
             await self._check_collaborator_callback()
 
         if self._enable_idor:
-            await self._scan_idor()
+            # 实测教训（rest.vulnweb.com 首扫）：_scan_idor 内部任一计划线缺失
+            # （如 __all__ 漏绑定）会让 AttributeError 冒泡炸掉整个 extras 块，
+            # 后续 vulnspec/metamorphic/sequence 全部不跑——与其他分支一致加隔离。
+            try:
+                await self._scan_idor()
+            except Exception:  # noqa: BLE001 - IDOR 线异常不阻断 extras 其余分支
+                logger.debug("suppressed exception (core audit)")
 
         # C 方案社区线（2026-09-08）：Nuclei 社区模板通用检测，与 extras 收尾一并执行
         if (
@@ -1209,74 +681,16 @@ class V100Orchestrator:
                 logger.warning(f"⚠️ Burp 扫描任务异常: {e}")
             finally:
                 self._burp_scan_task = None
+        if self._browser_passive_task is not None and not self._browser_passive_task.done():
+            try:
+                await self._browser_passive_task
+            except Exception as e:
+                logger.warning(f"⚠️ 浏览器被动爬虫任务异常: {e}")
+            finally:
+                self._browser_passive_task = None
 
-    async def _run_verify_block(self) -> None:
-        """SH17.1：verify 阶段主体（流式停 + 全量验证 + C9/C10 后处理）。"""
-        # 等所有流式 verify 把存量 pending 跑完；再收尾剩余未被流式 pick 的。
-        await self._stop_stream_verify(wait_pending=True)
-        _pt = time.monotonic()
-        await self._verify_all_findings()
-        # C9/C10: AI 去重 + 幻觉抑制（配置默认开启；异常则保留原始结果，绝不阻断出报告）
-        try:
-            if getattr(settings, "llm_as_judge_dedup", False) or getattr(settings, "hallucination_suppression", False):
-                from vulnclaw.ai.v100.phases.phases_verify import llm_judge_dedup, hallucination_suppress
-                self.findings = await llm_judge_dedup(self, self.findings)
-                self.findings = hallucination_suppress(self, self.findings)
-                # 后处理可能重排/裁剪 findings，重建去重索引保持一致
-                self._seen_ut = {(str(f.get("url", "")), str(f.get("type", ""))) for f in self.findings}
-        except Exception as _ce:  # noqa: BLE001
-            logger.warning(f"⚠️ C9/C10 后处理异常，保留原始 findings: {_ce}")
-        self._phase_timings['verify'] = time.monotonic() - _pt
-
-    def _apply_final_review_gate(self) -> None:
-        """终稿收敛（负向裁决）：verify 层未背书或显式存疑的 finding，若缺任一实锤证据，
-        降为 Info 并列入报告 pending_review 桶（保留 original_severity / type / evidence 可追溯）。
-        规则可解释：doubted = ai_verdict 含存疑标记，或 verdict==suspicious 且 ai_verdict 非"真实漏洞"
-        （即 verify 未背书，包括引擎裸模板/空值/预算跳过）。真漏洞经 verify 背书为"真实漏洞"或
-        带实锤字段（cross_confirmed / burp_verified / exploited / oob_confirmed）一律不动。
-        开关：settings.final_review_gate（默认 True）。幂等。
-        """
-        try:
-            if not getattr(settings, "final_review_gate", True):
-                return
-            _doubt_markers = ("待人工复核", "低优先级", "非漏洞", "预算已满",
-                              "未确认", "无回显/无响应证据", "响应异常", "LLM 降级", "LLM降级")
-            _hard_proof = ("cross_confirmed", "cross_tool_confirmed",
-                           "burp_verified", "burp_confirmed",
-                           "exploited", "oob_confirmed", "oob_callback")
-            downgraded = 0
-            for f in self.findings:
-                if f.get("verdict") == "pending_review":
-                    continue
-                av = str(f.get("ai_verdict", ""))
-                verdict = str(f.get("verdict", ""))
-                doubted = any(m in av for m in _doubt_markers)
-                if f.get("cross_tool_pending"):
-                    doubted = True  # E3: 业务逻辑单点且无差分证据 → 必须复核
-                if not doubted and verdict == "suspicious" and "真实漏洞" not in av:
-                    doubted = True  # verify 未背书（裸模板/空/跳过），宁缺毋滥
-                if not doubted:
-                    continue
-                if any(f.get(k) for k in _hard_proof) or f.get("confirmation_sources"):
-                    continue
-                sev = str(f.get("severity", "Low")).strip().capitalize()
-                f["original_severity"] = sev
-                f["severity"] = "Info"
-                f["verdict"] = "pending_review"
-                f["pending_review_reason"] = av or "验证未背书（engine 模板）"
-                self._pending_review.append({
-                    k: f.get(k) for k in ("url", "type", "parameter", "ai_verdict",
-                                          "original_severity", "payload", "evidence")
-                    if f.get(k) is not None
-                })
-                downgraded += 1
-            if downgraded:
-                logger.warning(
-                    f"⚠️ [终稿收敛] {downgraded} 条 AI/技术均未实锤的存疑发现已降级 Info "
-                    f"并列入报告 pending_review 桶（人工复核后再提升）"
-                )
-        except Exception as _ge:  # noqa: BLE001
-            logger.warning(f"终稿收敛异常（跳过，保留原样）: {_ge}")
+    # 注: _run_verify_block / _apply_final_review_gate 已迁至 phases/phases_verify.py
+    # （H 组 orchestrator 拆分），经 bind_phase_methods 绑定，此处不再保留类级副本。
 
     def _emit_metrics(self, report: Optional[Dict] = None) -> None:
         """G4 可观测性：扫描结束输出指标（落盘 _runtime_cache/metrics/ + 日志摘要）。"""
@@ -1702,6 +1116,8 @@ class V100Orchestrator:
                 self._bandit = ContextualBandit(
                     influence=int(getattr(settings, "rl_bandit_influence", 2) or 2),
                     feed_dir=str(getattr(settings, "rl_bandit_feed_dir", "") or ""),
+                    # P3-⑤：跨扫描状态持久化（默认空=不落盘，行为不变）
+                    state_path=str(getattr(settings, "rl_bandit_state_path", "") or ""),
                 )
             self.task_queue = SmartTaskQueue(max_size=2000, bandit=self._bandit)
             self._live_intake = LiveIntake()  # SP15.3 D4.2 实时补测管线（默认关）
@@ -1710,6 +1126,10 @@ class V100Orchestrator:
 
             # P5-1: 续扫——回填断点中的 findings / 已扫三元组 / agent 记忆
             self._seed_resume_state()
+
+            self._browser_passive_task = None
+            if not self.burp_available and not getattr(settings, "no_passive", False):
+                self._browser_passive_task = asyncio.create_task(self._run_browser_passive())
 
             self.balancer.init_clients(self.rate_limiter)
 
@@ -1825,10 +1245,14 @@ class V100Orchestrator:
             self._apply_final_review_gate()
             async with self._stage("report"):
                 # P5-1: 收尾前把全部 findings 落盘（双保险，_add_finding 增量已覆盖）
+                # P1-11：单事务批量写，替代 N 次 commit（收尾不再触发 N 次 fsync）
                 if self._checkpoint is not None:
                     try:
-                        for f in self.findings:
-                            self._checkpoint.add_finding(f)
+                        if hasattr(self._checkpoint, "add_findings"):
+                            self._checkpoint.add_findings(self.findings)
+                        else:  # 老接口（自定义 checkpoint）保持逐条写
+                            for f in self.findings:
+                                self._checkpoint.add_finding(f)
                     except Exception:  # noqa: BLE001
                         logger.debug("suppressed exception (core audit)")
                 _pt = time.monotonic()
@@ -1875,8 +1299,10 @@ class V100Orchestrator:
         finally:
             self._nuclei_update_task = None
 
-async def run_v100_scan(target: str, session, max_tasks: int = None, initial_qps: int = None, resume: bool = False) -> Dict:
-    system = V100Orchestrator(target, session, max_tasks, initial_qps, resume=resume)
+async def run_v100_scan(target: str, session, max_tasks: int = None, initial_qps: int = None, resume: bool = False,
+                        profile: str = "", adaptive: bool = False) -> Dict:
+    system = V100Orchestrator(target, session, max_tasks, initial_qps, resume=resume, profile=profile,
+                              adaptive=adaptive)
     return await system.run()
 
 __all__ = ['V100Orchestrator', 'run_v100_scan']

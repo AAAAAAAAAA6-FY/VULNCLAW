@@ -29,6 +29,13 @@ from vulnclaw.engines.base import BaseEngine
 
 
 class DeserializationEngine(BaseEngine):
+    """反序列化漏洞检测（CWE-502）：Java / PHP / Python 反序列化特征检测
+
+    能力边界声明（2026-09-15 评审补录）
+    - can_detect: 基于响应文本/头/Cookie/URL 中的被动特征正则识别 Java/PHP/Python 反序列化暴露（Jackson/fastjson @type、ysoserial、rO0AB、PHP O:序列、Python pickle/gASV 等）。
+    - cannot_detect: 需构造并回显 gadget 链的主动利用超出被动特征范围；序列化数据被 base64/加密包裹导致特征不可见；实际存在但无任何特征暴露的反序列化入口会漏检。
+    - 前置条件: 目标在响应或可观测位置暴露序列化数据/框架特征；请求参数需能被反序列化并产生可匹配的特征回显。
+    """
     name = "deserialization"
     description = "反序列化漏洞检测（CWE-502）：Java / PHP / Python 反序列化特征检测"
     enabled = True
@@ -95,6 +102,27 @@ class DeserializationEngine(BaseEngine):
         (r'express', 'Node.js Express 框架'),
     ]
 
+    # Gadget 指纹补强：ysoserial 标志性 gadget 链特征（被动扫描 + 栈识别共用）。
+    # 元组结构: (pattern, gadget名, 说明)；pattern 用精确正则，避免过宽误报。
+    JAVA_GADGET_FINGERPRINTS: List[Tuple[str, str, str]] = [
+        (r'URLDNS|dns/.*dns', 'URLDNS', 'URLDNS DNS 回调链（HashMap.readObject → URL.hashCode → DNS 查询）'),
+        (r'org\.apache\.commons\.collections', 'CommonsCollections', 'Apache Commons Collections gadget 库（InvokerTransformer 等）'),
+        (r'CommonsCollections1\b', 'CommonsCollections1', 'CC1 LazyMap+InvokerTransformer 链'),
+        (r'CommonsCollections2\b', 'CommonsCollections2', 'CC2 PriorityQueue+InvokerTransformer 链'),
+        (r'CommonsCollections3\b', 'CommonsCollections3', 'CC3 TrAXFilter+InstantiateTransformer 链'),
+        (r'CommonsCollections4\b', 'CommonsCollections4', 'CC4 TransformedMap+PriorityQueue 链'),
+        (r'CommonsCollections5\b', 'CommonsCollections5', 'CC5 BadAttributeValueExpException 链'),
+        (r'CommonsCollections6\b', 'CommonsCollections6', 'CC6 HashSet+HashMap 链'),
+        (r'CommonsCollections7\b', 'CommonsCollections7', 'CC7 Hashtable+TransformedMap 链'),
+        (r'CommonsBeanutils1|commons-beanutils|org\.apache\.commons\.beanutils', 'CommonsBeanutils1', 'CommonsBeanutils 链（BeanComparator/PriorityQueue）'),
+        (r'Jdk7u21|sun\.reflect\.annotation\.AnnotationInvocationHandler', 'Jdk7u21', 'JDK7u21 AnnotationInvocationHandler 链'),
+        (r'JRMPClient', 'JRMPClient', 'JRMPClient 出站 JRMP 回调链'),
+        (r'JRMPListener|sun\.rmi\.server\.ActivationGroupImpl|rmi\.server', 'JRMPListener', 'JRMPListener 入站 RMI 唤醒链'),
+        (r'JdbcRowSet|com\.sun\.rowset\.JdbcRowSetImpl', 'JdbcRowSet', 'JdbcRowSetImpl JDBC 数据源链'),
+        (r'Groovy1|org\.codehaus\.groovy', 'Groovy1', 'Groovy ConvertedClosure 链'),
+        (r'Spring1|Spring2|org\.springframework\.beans\.factory\.ObjectFactory', 'Spring', 'Spring ObjectFactory 链'),
+    ]
+
     # ---------------- 主动 Payload ----------------
     PAYLOADS: List[Tuple[str, str, str]] = [
         ('{"@type":"java.lang.Runtime","x":"x"}', 'Java Jackson @type 反序列化', 'java'),
@@ -152,7 +180,8 @@ class DeserializationEngine(BaseEngine):
         blob = (text or "") + "\n" + headers_str
         blob_lower = blob.lower()
         stacks = []
-        if any(re.search(p, blob) for p, _ in self.JAVA_INDICATORS) or 'java' in blob_lower:
+        if any(re.search(p, blob) for p, _ in self.JAVA_INDICATORS) or 'java' in blob_lower \
+                or any(re.search(p, blob) for p, _, _ in self.JAVA_GADGET_FINGERPRINTS):
             stacks.append('java')
         if any(re.search(p, blob) for p, _ in self.PHP_INDICATORS) or 'php' in blob_lower or 'x-powered-by: php' in headers_str.lower():
             stacks.append('php')
@@ -171,6 +200,9 @@ class DeserializationEngine(BaseEngine):
         for pattern, desc in self.JAVA_INDICATORS + self.PHP_INDICATORS + self.PY_INDICATORS + self.RUBY_INDICATORS + self.NODE_INDICATORS:
             if re.search(pattern, blob):
                 hits.append({"desc": desc, "source": source})
+        for pattern, gadget, _note in self.JAVA_GADGET_FINGERPRINTS:
+            if re.search(pattern, blob):
+                hits.append({"desc": f"ysoserial {gadget} 链特征", "source": source})
         return hits
 
     async def scan(self, target: str, session, **kwargs) -> List[Dict]:

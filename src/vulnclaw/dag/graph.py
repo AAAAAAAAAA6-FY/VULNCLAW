@@ -12,11 +12,26 @@ from enum import Enum
 
 class NodeStatus(Enum):
     PENDING = "pending"
+    LEASED = "leased"  # C1: 已被调度器领取（占用），尚未真正进入执行；lease 过期可被回收
     RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     SKIPPED = "skipped"
     RETRYING = "retrying"  # 调度审计C: 指数退避期间挂起态，防止重试节点被重复提交
+    CANCELLED = "cancelled"  # C1: 显式取消（自身被取消或上游取消传播），不再执行
+    TIMEOUT = "timeout"  # C1: 节点级超时被强制回收；终态，不重试
+    # C1: 死信终态标记。节点自身终态仍由 FAILED/TIMEOUT 承载（保持既有语义），
+    # 该值用于 DLQ 台账条目的 state 字段与 resume 重放视图。
+    DEAD_LETTER = "dead_letter"
+
+
+# C1: 需要重试/下游跳过的"硬失败"状态（下游依赖不满足 → SKIPPED）
+FAILURE_STATUSES = (NodeStatus.FAILED, NodeStatus.TIMEOUT)
+# C1: 终态集合（不再被调度）
+TERMINAL_STATUSES = (
+    NodeStatus.SUCCEEDED, NodeStatus.FAILED, NodeStatus.SKIPPED,
+    NodeStatus.CANCELLED, NodeStatus.TIMEOUT,
+)
 
 
 class NodeType(Enum):
@@ -52,6 +67,14 @@ class DAGNode:
     completed_at: Optional[float] = None
     retry_count: int = 0
     max_retries: int = 2
+    # C1: 节点级超时（秒）。None/<=0 = 不限时。超时 → TIMEOUT 终态（不重试）。
+    timeout: Optional[float] = None
+    # C1: 失败原因分类（timeout/network/permanent/resource/cancelled/unknown）
+    failure_reason: Optional[str] = None
+    # C1: 内存 lease（跨进程/Redis lease 属 blocked 项，见 docs/DAG_STATE_MACHINE.md）
+    lease_owner: Optional[str] = None
+    lease_expires_at: Optional[float] = None
+    lease_reclaims: int = 0
 
 
 @dataclass

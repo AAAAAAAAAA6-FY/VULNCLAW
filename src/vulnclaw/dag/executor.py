@@ -59,9 +59,13 @@ async def execute_recon_alive_node(node: DAGNode, context: DAGContext) -> Dict:
     subdomains = await context.get(_ctx_key(prefix, 'recon_subdomains'), [])
     logger.info(f"🔍 [RECON-ALIVE] 存活探测: {len(subdomains)} 个子域名")
 
-    # 项目硬约束：所有"同步侦察函数"必须用 loop.run_in_executor(None, ...) 卸载到线程池，
-    # 禁止直接用 asyncio.to_thread，避免子线程内部再调用需要 running event loop 的接口时
-    # 触发 RuntimeError: no running event loop（和 modules/recon.py 的 alive_scan 修法对齐）。
+    # 项目硬约束（两种场景，别再混用）：
+    # 1) 同步侦察函数"内部需要 running event loop"（如 modules/recon.py 的 alive_scan）
+    #    → 必须 loop.run_in_executor(None, ...) 卸载；
+    #    禁止 asyncio.to_thread：其子线程内再调用需要 running loop 的接口会触发
+    #    RuntimeError: no running event loop。
+    # 2) 纯 CPU 函数（正则/解码/JSON 解析，全程不碰 event loop）
+    #    → asyncio.to_thread 即可（H.2 热路径隔离的标准用法，见 engines/auth_engines.py 等）。
     try:
         loop = asyncio.get_running_loop()
         alive = await asyncio.wait_for(
@@ -770,6 +774,11 @@ def write_dead_letter(scan_id: str, record: Dict[str, Any]) -> str:
         with open(path, "a", encoding="utf-8") as f:
             f.write(_json.dumps(record, ensure_ascii=False, default=str) + "\n")
         logger.error(f"💀 [DLQ] 死信已入队: {path}")
+        try:
+            from vulnclaw.core_modules.metrics import get_metrics
+            get_metrics().inc_dead_letter()  # 工作流8：死信指标
+        except Exception:  # noqa: BLE001 - 指标是增强项，绝不影响 DLQ 写入
+            pass
     except Exception as e:
         logger.warning(f"💀 [DLQ] 写入死信失败: {e}")
     return path

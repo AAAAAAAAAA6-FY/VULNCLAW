@@ -1007,8 +1007,52 @@ class FileUploadEngine(BaseEngine):
             if result:
                 findings.append(result)
 
+        findings = self._collapse_access_findings(findings)
         logger.info(f"✅ 文件上传扫描完成，发现 {len(findings)} 个问题")
         return findings
+
+    def _collapse_access_findings(self, findings: List[Dict]) -> List[Dict]:
+        """降噪：把同一上传点的"可访问/可执行"逐类型条目聚合为 1 条。
+
+        实测：9 个上传点 × 27 种绕过 = 243 条 Info，占全量 vulnerabilities 约
+        75%，把真实高危（LFI / CRLF / 反序列化）淹在噪声里。
+        仅合并同 (url, parameter) 的 `文件上传-可访问/可执行(...)`：severity 取
+        最高，绕过类型全量保留在 `bypass_types`，判定依据不丢，只压缩条目数。
+        """
+        prefix = "文件上传-可访问/可执行"
+        sev_rank = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+        out: List[Dict] = []
+        groups: Dict[Tuple[str, str], List[Dict]] = {}
+        for f in findings or []:
+            if str(f.get("type") or "").startswith(prefix):
+                key = (str(f.get("url") or ""), str(f.get("parameter") or ""))
+                groups.setdefault(key, []).append(f)
+            else:
+                out.append(f)
+
+        for (_url, _param), items in groups.items():
+            types: List[str] = []
+            for f in items:
+                d = (str(f.get("type") or "")[len(prefix):].strip().strip("()")
+                     or str(f.get("file_type") or ""))
+                if d and d not in types:
+                    types.append(d)
+            best = max(items, key=lambda f: sev_rank.get(
+                str(f.get("severity") or "").lower(), 0))
+            merged = dict(best)
+            merged["type"] = prefix
+            merged["bypass_types"] = types
+            merged["bypass_count"] = len(types)
+            shown = "、".join(types[:8]) + ("等" if len(types) > 8 else "")
+            merged["evidence"] = (
+                f"{len(types)} 种绕过方式均上传成功且可访问/可执行：{shown}。"
+                f"{best.get('evidence') or ''}"
+            )
+            out.append(merged)
+
+        if findings and len(findings) != len(out):
+            logger.info(f"📎 [降噪] 上传可访问类聚合：{len(findings)} -> {len(out)} 条")
+        return out
 
 
 # ============================================================
@@ -2294,7 +2338,13 @@ BUSINESS_FLOW_STAGES = {
 
 
 class BusinessLogicEngine(BaseEngine):
-    """业务逻辑漏洞检测引擎 V3.0 - 终极整合版"""
+    """业务逻辑漏洞检测引擎 V3.0 - 终极整合版
+
+    能力边界声明（2026-09-15 评审补录）
+    - can_detect: 覆盖支付金额/数量、角色、状态、订单、优惠券等业务参数篡改检测，以及端点发现与 API 流程顺序逻辑；可启用 AI 辅助业务逻辑分析（ENABLE_BUSINESS_AI_ANALYSIS）。
+    - cannot_detect: 需多用户会话/登录态协同的复杂竞争条件与重放链条覆盖有限；后端不校验导致的等价于常规越权的场景需业务上下文判断；无法枚举的私有业务接口会漏。
+    - 前置条件: 请求参数能通过业务参数识别门禁；存在可观测的响应差异/状态流转；AI 辅助分析需对应开关开启（否则仅基础规则）。
+    """
 
     name = "business_logic"
     description = "业务逻辑漏洞检测引擎 V3.0（终极整合版）"
@@ -2757,6 +2807,7 @@ class BusinessLogicEngine(BaseEngine):
                 status, text = self._parse_response(resp)
                 if status == 200:
                     # 条件2：匿名访问确实越权（非SPA壳）
+                    from vulnclaw.core.detectors.spa_detector import SpaFingerprintDetector
                     spa_detector = SpaFingerprintDetector(session)
                     await spa_detector.detect(test_url)
                     if spa_detector.get_spa_status():
@@ -2972,17 +3023,20 @@ class BusinessLogicEngine(BaseEngine):
     def _parse_response(self, resp):
         if isinstance(resp, tuple):
             return resp[0], resp[1] if resp[1] else ""
-        return resp.status, asyncio.run(resp.text())
+        from vulnclaw.core.utils import sync_resp_text
+        return resp.status, sync_resp_text(resp)
 
     def _get_normal_text(self, normal_resp):
         if isinstance(normal_resp, tuple):
             return normal_resp[1] if len(normal_resp) > 1 else ""
-        return asyncio.run(normal_resp.text())
+        from vulnclaw.core.utils import sync_resp_text
+        return sync_resp_text(normal_resp)
 
     def _get_response_text(self, resp):
         if isinstance(resp, tuple):
             return resp[1] if len(resp) > 1 else ""
-        return asyncio.run(resp.text())
+        from vulnclaw.core.utils import sync_resp_text
+        return sync_resp_text(resp)
 
     def _extract_product_id(self, url: str) -> Optional[str]:
         parsed = urlparse(url)
@@ -3344,6 +3398,7 @@ class InfoLeakEngine(BaseEngine):
         findings = []
         base_url = target.rstrip('/')
         timeout = getattr(settings, 'timeout', 30)
+        import asyncio  # H.2 扩展：目录列表判定/敏感数据提取是全文正则（≤50 路径×N 模式），纯 CPU 挪线程池
 
         max_paths = kwargs.get('max_paths')
         if max_paths is None:
@@ -3370,7 +3425,7 @@ class InfoLeakEngine(BaseEngine):
                 if status == 404:
                     continue
 
-                if self._is_directory_listing(text):
+                if await asyncio.to_thread(self._is_directory_listing, text):
                     findings.append({
                         'url': test_url,
                         'type': f'目录列表: {path}',
@@ -3383,7 +3438,7 @@ class InfoLeakEngine(BaseEngine):
                     continue
 
                 # ===== 修复：提取敏感数据（已收紧正则） =====
-                sensitive_matches = self._extract_sensitive_data(text)
+                sensitive_matches = await asyncio.to_thread(self._extract_sensitive_data, text)
                 if sensitive_matches:
                     for label, matches in sensitive_matches.items():
                         # 跳过 aws_secret 的误报（无 aws_key 佐证且出现次数过多）

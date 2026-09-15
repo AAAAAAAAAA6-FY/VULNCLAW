@@ -117,37 +117,68 @@ class TokenBudget:
             "usage_ratio": f"{self.total_tokens_used / max(1, self.max_total_tokens) * 100:.1f}%"
         }
 
+    async def areset(self):
+        """异步重置预算（扫描边界**必须 await 本方法**）。"""
+        async with self._lock:
+            self.total_tokens_used = 0
+            self.round_count = 0
+            self.cost_estimate = 0.0
+            self._degraded_mode = False
+            self._degraded_until = 0
+
     def reset(self):
-        """重置预算（仅应在扫描开始前调用）"""
-        async def _reset():
-            async with self._lock:
-                self.total_tokens_used = 0
-                self.round_count = 0
-                self.cost_estimate = 0.0
-                self._degraded_mode = False
-                self._degraded_until = 0
+        """同步重置预算。
+
+        P0-6 修复：旧实现在运行中事件循环里 `create_task(_reset())` **不等完成**，
+        新扫描可能带着旧计数起步（预算穿透/误降级）。现在同步入口会等待真正完成：
+        有运行中 loop 时落到独立线程 loop（不打扰调用方 loop），否则 asyncio.run。
+        """
         try:
             asyncio.get_running_loop()
-            asyncio.create_task(_reset())
         except RuntimeError:
-            asyncio.run(_reset())
+            asyncio.run(self.areset())
+            return
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            ex.submit(asyncio.run, self.areset()).result()
 
 
 _TOKEN_BUDGET_SINGLETON = None
 _TOKEN_BUDGET_LOCK = asyncio.Lock()
+# P0-6：按 scan_id 隔离的预算实例（避免并发扫描互相污染计数）
+_TOKEN_BUDGET_BY_SCAN: dict = {}
 
 
 def get_token_budget(
     max_total_tokens: int = 5000000,
-    max_rounds: int = 999999
+    max_rounds: int = 999999,
+    scan_id: Optional[str] = None,
 ) -> TokenBudget:
+    """取预算实例。传 scan_id → 该扫描独占实例；不传 → 兼容旧进程级单例。"""
     global _TOKEN_BUDGET_SINGLETON
+    if scan_id:
+        budget = _TOKEN_BUDGET_BY_SCAN.get(scan_id)
+        if budget is None:
+            budget = TokenBudget(
+                max_total_tokens=max_total_tokens,
+                max_rounds=max_rounds,
+            )
+            _TOKEN_BUDGET_BY_SCAN[scan_id] = budget
+        return budget
     if _TOKEN_BUDGET_SINGLETON is None:
         _TOKEN_BUDGET_SINGLETON = TokenBudget(
             max_total_tokens=max_total_tokens,
             max_rounds=max_rounds
         )
     return _TOKEN_BUDGET_SINGLETON
+
+
+def release_token_budget(scan_id: Optional[str] = None) -> None:
+    """释放按 scan 隔离的预算实例（扫描结束时调用，防长驻内存泄漏）。"""
+    if scan_id:
+        _TOKEN_BUDGET_BY_SCAN.pop(scan_id, None)
+        return
+    _TOKEN_BUDGET_BY_SCAN.clear()
 
 
 def resolve_model_aliases(aliases: List[str]) -> List[str]:
@@ -422,14 +453,35 @@ class LLMClient:
         if system:
             system = self._clean_string(system)
 
-        # P1-2: 语义缓存查缓存（命中直接返回，省 Token / 省调用）
+        # 先解析本轮真正要用的模型列表（与下方重试轮共用同一份）：
+        # 缓存 key 必须基于**解析后**的模型集合生成——旧实现只取 models[0]，
+        # 在多模型轮询 / 熔断跳过 / 按 task_type 路由时，key 与实际参与推理的
+        # 模型档位脱节，出现"同 key 换模型"的跨档位串味。这里 resolve 后再
+        # 取 key，同 prompt 同档位结果可复用，不同档位天然分 key。
+        if models is not None:
+            models_to_use = resolve_model_aliases(models)
+        elif task_type is not None:
+            # A4.4 任务分层模型路由：按 task_type 选模型档位
+            # （便宜快模型做分类/粗筛，贵模型做验证/计划），复用 ModelRouter + settings.ai_task_allocation
+            models_to_use = ModelRouter().get_models_for_task(task_type)
+        else:
+            models_to_use = self.models.copy()
+
+        models_to_use = [m for m in models_to_use if m not in LLMClient._blocked_models]
+        if not models_to_use:
+            raise RuntimeError("没有可用的模型（所有模型均被屏蔽）")
+
+        # P1-2: 语义缓存查缓存（命中直接返回，省 Token / 省调用）。
+        # key = sha256(解析后模型集合 + system + prompt + temperature)——
+        # temperature 参与 key 防"采样档位不同缓存串味"；失效策略为 1h TTL +
+        # FIFO 超标裁剪（见写入侧），全类共享、进程内单实例。
         cache_key = None
         if use_cache:
             norm = " ".join(prompt.split())
             norm_sys = " ".join((system or "").split())
-            model_hint = models[0] if models else "default"
+            model_hint = "+".join(sorted(models_to_use)) or "default"
             cache_key = hashlib.sha256(
-                f"{model_hint}||{norm_sys}||{norm}".encode("utf-8")
+                f"{model_hint}||{norm_sys}||{norm}||t={temperature}".encode("utf-8")
             ).hexdigest()
             with LLMClient._semantic_lock:
                 now = time.time()
@@ -457,19 +509,6 @@ class LLMClient:
         final_system = system or "你是渗透测试专家。"
         if force_json:
             final_system += " 你必须只输出合法的JSON对象，不要包含任何markdown、解释或额外文字。"
-
-        if models is not None:
-            models_to_use = resolve_model_aliases(models)
-        elif task_type is not None:
-            # A4.4 任务分层模型路由：按 task_type 选模型档位
-            # （便宜快模型做分类/粗筛，贵模型做验证/计划），复用 ModelRouter + settings.ai_task_allocation
-            models_to_use = ModelRouter().get_models_for_task(task_type)
-        else:
-            models_to_use = self.models.copy()
-
-        models_to_use = [m for m in models_to_use if m not in LLMClient._blocked_models]
-        if not models_to_use:
-            raise RuntimeError("没有可用的模型（所有模型均被屏蔽）")
 
         # P5-2: 模型错误退避——全模型轮询外层加指数退避重试轮（strix 韧性）。
         # 瞬时错误（5xx/超时/连接/限流/空返回）→ 整轮退避后重试；永久错误不重试：
@@ -1362,6 +1401,10 @@ from vulnclaw.core.logger import logger
 from vulnclaw.core.settings import settings  # 修复：添加导入
 
 
+# P1-15：工具调用历史上限（只保留最近 N 条，防止长扫描内存无界增长）
+_TOOL_HISTORY_LIMIT = 500
+
+
 class AgentRuleEngine:
     """Agent 规则引擎 - 管理工具调用和可疑点生成"""
 
@@ -1445,6 +1488,9 @@ class AgentRuleEngine:
             "result_summary": self._summarize_result(result),
             "timestamp": time.time()
         })
+        # P1-15：有界化——长扫描每次工具调用都追加，不封顶会随任务数线性膨胀
+        if len(self._tool_call_history) > _TOOL_HISTORY_LIMIT:
+            del self._tool_call_history[:-_TOOL_HISTORY_LIMIT]
 
     def _summarize_result(self, result: Any) -> str:
         if isinstance(result, Exception):
@@ -1586,43 +1632,6 @@ class AgentRuleEngine:
         logger.info(f"🔍 生成 {len(unique_clues)} 条可疑线索（放松阈值模式）")
         return unique_clues
 
-    # ============================================================
-    # 上下文压缩规则
-    # ============================================================
-    def compress_response(self, text: str, max_len: int = 5000) -> str:
-        if len(text) <= max_len:
-            return text
-
-        if text.strip().startswith('{') or text.strip().startswith('['):
-            try:
-                data = json.loads(text)
-                if isinstance(data, dict):
-                    keys = list(data.keys())
-                    if len(keys) <= 10:
-                        return json.dumps({k: str(v)[:100] for k, v in data.items()}, ensure_ascii=False)
-                    return f"JSON响应，键: {keys[:10]}{'...' if len(keys) > 10 else ''}"
-                elif isinstance(data, list):
-                    return f"JSON数组，{len(data)} 条记录，首条: {json.dumps(data[0] if data else {}, ensure_ascii=False)[:200]}"
-            except BaseException:
-                logger.debug("suppressed exception (core audit)")
-
-        head = text[:min(max_len // 2, 2500)]
-        tail = text[-min(max_len // 2, 2500):]
-        key_lines = []
-        for line in text.split('\n'):
-            if re.search(r'error|exception|warning|fatal|stack|trace', line, re.I):
-                key_lines.append(line[:200])
-                if len(key_lines) >= 10:
-                    break
-        key_snippet = "\n".join(key_lines) if key_lines else ""
-
-        compressed = f"[截断] 原文 {len(text)} 字符\n"
-        if key_snippet:
-            compressed += f"[关键行]\n{key_snippet}\n\n"
-        compressed += f"[头部]\n{head}\n\n...[截断中间]...\n\n[尾部]\n{tail}"
-        return compressed[:max_len]
-
-
 # 全局单例
 _rule_engine: Optional[AgentRuleEngine] = None
 
@@ -1740,11 +1749,49 @@ def audit_memory_clean(memory=None) -> tuple:
 
 
 class _MemoryFallback:
-    """内存降级模式 - 带大小限制"""
+    """内存降级模式 - 带大小限制 + JSONL 落盘（跨扫描持久化，P2-⑤，2026-09-15）。
+
+    chromadb 不可用（未安装/Python 3.14 无 wheel/初始化失败）时兜底：
+    经验仍追加持久化到 PROJECT_CACHE_DIR/memory_fallback.jsonl，进程启动
+    时自动加载 —— "跨扫描知识库"在无 chromadb 环境同样成立。
+    磁盘读写失败一律静默（绝不影响主流程）。
+    """
+    _PERSIST_PATH = os.path.join(PROJECT_CACHE_DIR, "memory_fallback.jsonl")
+
     def __init__(self, max_entries: int = 1000):
         self._data = []
         self._fail_data = []
         self._max_entries = max_entries
+        self._load_persisted()
+
+    def _load_persisted(self) -> None:
+        """启动时加载历史经验（按 success 分拣进成功/失败池）。"""
+        try:
+            if not os.path.exists(self._PERSIST_PATH):
+                return
+            with open(self._PERSIST_PATH, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(entry, dict) or "success" not in entry:
+                        continue
+                    (self._data if entry["success"] else self._fail_data).append(entry)
+            self._data = self._data[-self._max_entries:]
+            self._fail_data = self._fail_data[-self._max_entries:]
+        except Exception:
+            logger.debug("suppressed exception (memory persist audit)")
+
+    def _persist(self, entry: dict) -> None:
+        try:
+            with open(self._PERSIST_PATH, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception:
+            logger.debug("suppressed exception (memory persist audit)")
 
     async def add_experience(self, target, vuln_type, payload, success, evidence, error_msg="", target_host="", doc_type="execution"):
         entry = {
@@ -1757,6 +1804,7 @@ class _MemoryFallback:
             "error_msg": error_msg[:200],
             "doc_type": doc_type,
         }
+        self._persist(entry)
         if success:
             self._data.append(entry)
             if len(self._data) > self._max_entries:
@@ -1797,9 +1845,11 @@ class _MemoryFallback:
             vuln_lower = entry["vuln_type"].lower()
             payload_lower = entry["payload"].lower()
             target_lower = entry["target"].lower()
-            # A3.5: 同 host 精确指纹 → 强命中（跨会话学习对同指纹目标生效）
+            # A3.5: 同 host 精确指纹 → 强命中（跨会话学习对同指纹目标生效）。
+            # P2-⑤ 提权 3→6：同 host 的历史经验必须压过泛关键词命中，
+            # 否则大量无关关键词匹配会把同 host 经验挤出 topk。
             if q_host and entry.get("target_host") == q_host:
-                score += 3
+                score += 6
             for kw in expanded_keywords:
                 if kw in vuln_lower or kw in payload_lower or kw in target_lower:
                     score += 1

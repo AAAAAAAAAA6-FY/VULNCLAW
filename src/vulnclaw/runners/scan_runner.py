@@ -215,22 +215,54 @@ def seed_cookie_for_domain(domain: str, cookie_str: str) -> bool:
         print("⚠️ --cookie 解析无有效键值对，请以 name=value; name=value 格式提供")
         return False
     cookie_file = _get_cookie_file_path(domain)
-    existing = {}
-    if cookie_file.exists():
-        try:
-            with open(cookie_file, "r", encoding="utf-8") as f:
-                existing = json.load(f)
-        except BaseException:
-            pass
-    existing.update(cookies)
+    # 跨进程互斥锁包住「读→合并→原子写」全序列：多开/并发写同一目标域时
+    # 既避免 JSON 损坏（原子 replace），也避免丢更新（读改写竞态）。
+    from vulnclaw.core.utils import (HAS_PORTALOCKER, _atomic_write_json,
+                                     decode_cookie_store, encode_cookie_store)
+    lock_fh = None
     try:
-        with open(cookie_file, "w", encoding="utf-8") as f:
-            json.dump(existing, f, indent=2, ensure_ascii=False)
-        print(f"🍪 --cookie 已按目标域 {domain} 保存 {len(cookies)} 个键（{cookie_file}）")
-        return True
+        if HAS_PORTALOCKER:
+            import portalocker
+            lock_fh = open(cookie_file.with_suffix(".lock"), "a+")
+            # Windows msvcrt 锁按字节范围生效：空文件锁不住 → 先保证有 1 字节
+            try:
+                lock_fh.seek(0, os.SEEK_END)
+                if lock_fh.tell() == 0:
+                    lock_fh.write("\0")
+                    lock_fh.flush()
+                lock_fh.seek(0)
+            except Exception:
+                pass
+            portalocker.lock(lock_fh, portalocker.LOCK_EX)
+        existing = {}
+        if cookie_file.exists():
+            try:
+                with open(cookie_file, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+                existing = decode_cookie_store(existing)  # 密文信封自动解密
+            except BaseException:
+                pass
+        existing.update(cookies)
+        ok = _atomic_write_json(cookie_file, encode_cookie_store(existing))
+        if ok:
+            print(f"🍪 --cookie 已按目标域 {domain} 保存 {len(cookies)} 个键（{cookie_file}）")
+            return True
+        print(f"⚠️ 保存 --cookie 失败（原子写入未成功）: {cookie_file}")
+        return False
     except Exception as e:  # noqa: BLE001
         print(f"⚠️ 保存 --cookie 失败: {e}")
         return False
+    finally:
+        if lock_fh is not None:
+            try:
+                import portalocker
+                portalocker.unlock(lock_fh)
+            except Exception:
+                pass
+            try:
+                lock_fh.close()
+            except Exception:
+                pass
 
 async def _try_default_login(target_url: str, domain: str) -> bool:
 
@@ -1173,6 +1205,16 @@ async def main_async(args):
     except Exception as exc:
         logger.debug(f"growth ingest 跳过: {exc}")
 
+    # 本地 OOB 回环（reproduced 闭环）：目标为本机/私网时自动启用本地监听
+    # （设置 settings.oob_base_url / oob_hits_file），让盲 SSRF/盲命令注入等
+    # OOB 声明可闭环证伪；外部目标回连不到本机 → 自动跳过（不白等）。
+    # 监听线程为 daemon，进程退出自动回收。
+    try:
+        from vulnclaw.core.oob_channel import maybe_enable_local_oob_for_target
+        maybe_enable_local_oob_for_target(str(getattr(args, "target", "") or ""))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"本地 OOB 回环跳过: {exc}")
+
     # P0-5: --metrics-port 启动 Prometheus 指标服务器
     metrics_port = getattr(args, 'metrics_port', 0) or getattr(settings, 'metrics_port', 0)
     # P0-5b: ENABLE_METRICS=true 且未显式指定端口时使用默认 9090（默认开后的接线）
@@ -1197,6 +1239,32 @@ async def main_async(args):
         await init_proxy_pool()
     except Exception as exc:
         logger.warning(f"⚠️ 代理池初始化跳过: {exc}")
+
+    # 单代理（settings.proxy，如 Burp）可用性预检 —— 死代理会让整轮扫描**静默零结果**：
+    # 请求全部失败，而失败在结果里与"目标干净"无法区分（真实目标实测踩过）。
+    # 只告警、不改路由决策，把"静默空转"变成"显性可处置"。
+    try:
+        _pxy = getattr(settings, "proxy", None)
+        if _pxy and isinstance(target, str) and target.startswith(("http://", "https://")):
+            from vulnclaw.core.utils import async_get as _ag
+            _via = await _ag(target, timeout=10, no_retry=True)
+            if not (_via and _via[0]):
+                _saved = settings.proxy
+                try:
+                    settings.proxy = None
+                    _direct = await _ag(target, timeout=10, no_retry=True)
+                finally:
+                    settings.proxy = _saved
+                if _direct and _direct[0]:
+                    logger.error(
+                        f"🚨 代理不可用：经 {_pxy} 访问 {target} 失败，但直连成功。"
+                        f"继续跑只会得到零结果（请求失败与'目标干净'不可区分）。"
+                        f"处置：① 启动 Burp/代理；② 注释掉 .env 的 PROXY；③ 用 --no-proxy 直连。"
+                    )
+                else:
+                    logger.warning(f"⚠️ 目标不可达（代理与直连均失败）：{target}")
+    except Exception as exc:  # noqa: BLE001 - 预检失败不影响扫描
+        logger.debug(f"代理预检跳过: {exc}")
 
     # P4-4: 启动 SQLMap API 守护进程（sqlmapapi），失败则自动回退 CLI 模式
     try:
@@ -2256,6 +2324,8 @@ async def main_async(args):
                 initial_qps=args.initial_qps,
 
                 resume=getattr(args, "resume_scan", False),
+                profile=getattr(args, "profile", ""),
+                adaptive=getattr(args, "adaptive", False),
 
 
 
@@ -2478,7 +2548,76 @@ async def main_async(args):
     except Exception as e:  # noqa: BLE001 - 快照是增强项，绝不影响报告落盘
         logger.debug(f"OOB 熔断快照写入失败（忽略）: {e}")
 
+    # 工作流10：扫描模式 + 成本估算入报告（增强项，绝不影响报告落盘）
+    try:
+        _pname = str(getattr(args, "profile", "") or "")
+        if isinstance(report, dict) and _pname:
+            from vulnclaw.core.cost_model import estimate_report_cost, estimate_scan_cost
+            from vulnclaw.core.scan_profiles import get_profile
+            _prof = get_profile(_pname)
+            if _prof is not None:
+                report["scan_profile"] = _prof.name
+                _cost = {}
+                _est = estimate_scan_cost(engines=_prof.engine_spec(), targets=1,
+                                          concurrency=_prof.concurrency)
+                if hasattr(_est, "as_dict"):
+                    _cost["scan"] = _est.as_dict()
+                _rep = estimate_report_cost(len(report.get("vulnerabilities") or []),
+                                            _prof.report_detail)
+                if hasattr(_rep, "as_dict"):
+                    _cost["report"] = _rep.as_dict()
+                report["cost_estimate"] = _cost
+    except Exception as e:  # noqa: BLE001 - 成本估算为增强项，绝不影响报告落盘
+        logger.debug(f"成本估算写入失败（忽略）: {e}")
+
+    # 工作流8：扫描结局指标（成功率 = success / 全部结局）
+    try:
+        from vulnclaw.core_modules.metrics import get_metrics
+        _outcome = "success"
+        if not isinstance(report, dict) or report.get("error"):
+            _outcome = "failed"
+        elif not (report.get("vulnerabilities") or report.get("alive_assets")):
+            _outcome = "partial"
+        get_metrics().inc_scan_result(_outcome)
+    except Exception as e:  # noqa: BLE001 - 指标是增强项，绝不影响报告落盘
+        logger.debug(f"扫描结局指标写入失败（忽略）: {e}")
+
     json_path = REPORT_DIR / f"report_{safe_target}_{timestamp}.json"
+
+    # 自动成长-读取端兜底（2026-09-15）：报告写盘前按账本强误报指纹再滤一遍。
+    # 引擎双端（scanner.run_engine / executor._execute_engine_check）已过滤过一轮，
+    # 此处兜底覆盖非引擎主链路的 finding 来源（规则/直连/脚本等），并记录抑制统计。
+    # 默认关零影响；失败静默，绝不影响报告落盘。
+    _growth_suppressed = 0
+    try:
+        if isinstance(report, dict) and report.get("vulnerabilities"):
+            from vulnclaw.growth.bridges import suppress_findings
+            _kept, _suppressed = suppress_findings(report["vulnerabilities"])
+            if _suppressed:
+                _growth_suppressed = len(_suppressed)
+                report["vulnerabilities"] = _kept
+                logger.info(f"growth: 报告兜底抑制 {_growth_suppressed} 条强误报指纹")
+            report["growth_stats_suppressed"] = _growth_suppressed
+    except Exception as _gs:  # noqa: BLE001 - 兜底抑制绝不影响报告落盘
+        logger.debug(f"growth 兜底抑制跳过: {_gs}")
+
+    # P3-④ 证据出证：①先落 PoC 产物（修顺序缺陷——旧代码在 HTML 阶段才生成，
+    # 导致 JSON 报告里没有 poc_file/poc_artifacts）→ ②算证据 Merkle 根入报告。
+    # 仅新增顶层字段（evidence_root / evidence_chain），不改任何既有键。
+    try:
+        from vulnclaw.core.report_generator import generate_poc_artifacts
+        from vulnclaw.core.evidence_merkle import build_evidence_chain
+        generate_poc_artifacts(report, os.path.dirname(str(json_path)))
+        _chain = build_evidence_chain(report)
+        if _chain.get("root"):
+            report["evidence_root"] = _chain["root"]
+            report["evidence_chain"] = {
+                "algo": _chain["algo"], "count": _chain["count"],
+                "created_at": _chain["created_at"], "levels": _chain["levels"],
+            }
+            logger.info(f"证据链已出证: {_chain['count']} 片叶子 root={_chain['root'][:16]}...")
+    except Exception as _e:  # noqa: BLE001 - 出证为增强项，绝不影响报告落盘
+        logger.debug(f"证据链出证失败（忽略）: {_e}")
 
 
 
@@ -2514,7 +2653,24 @@ async def main_async(args):
 
 
 
-        success = generate_html_report(report, html_path)
+        # 工作流10：模式可覆盖报告详细度（未指定模式时保持 args.report_detail）
+        _detail = args.report_detail
+        _pname = str(getattr(args, "profile", "") or "")
+        if _pname:
+            try:
+                from vulnclaw.core.scan_profiles import get_profile as _get_profile
+                _prof = _get_profile(_pname)
+                if _prof is not None and _prof.report_detail:
+                    _detail = _prof.report_detail
+            except Exception:
+                pass
+        success = generate_html_report(
+            report,
+            html_path,
+            detail=_detail,
+            max_findings=args.report_max_findings,
+            max_evidence=args.report_max_evidence,
+        )
 
 
 

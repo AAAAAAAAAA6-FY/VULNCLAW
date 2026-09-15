@@ -35,7 +35,13 @@ from typing import Dict, List, Optional, Tuple
 # ============================================================
 
 class IDOREngine(BaseEngine):
-    """IDOR 越权访问检测引擎 - v3.2 修复版"""
+    """IDOR 越权访问检测引擎 - v3.2 修复版
+
+    能力边界声明（2026-09-15 评审补录）
+    - can_detect: 遍历 ID 类参数（id/user_id/order/uuid/account 等）尝试越权访问，结合 admin/privilege 关键词路径与响应差异判定水平/垂直越权，返回候选线索供复核。
+    - cannot_detect: 未登录一律 403 无法形成基线对比的场景；UUID/随机 token 等不可枚举的标识；仅存在于 POST body 且参数探索不可达的对象；需多用户会话协同的重放/竞争条件链条。
+    - 前置条件: 存在可替换/可枚举的对象标识参数；越权场景下存在可识别的响应差异（或候选线索）；目标处于可对比的鉴权基线状态。
+    """
 
     name = "idor"
     description = "IDOR 越权访问检测引擎 v3.2"
@@ -159,6 +165,7 @@ class IDOREngine(BaseEngine):
     # 与 scan_with_roles（需多角色会话）互补：本方法不需要第二个账号即可产出 proof。
     # ============================================================
     async def scan(self, target: str, session, **kwargs) -> List[Dict]:
+        import asyncio  # H.2 扩展：_idor_other_user 是纯 CPU（正则+JSON 差分），挪线程池
         from vulnclaw.core.utils import async_get
         endpoints = kwargs.get("endpoints") or [target]
         findings: List[Dict] = []
@@ -177,7 +184,7 @@ class IDOREngine(BaseEngine):
                         continue
                     if txt.strip() == base.strip():
                         continue
-                    if self._idor_other_user(base, txt):
+                    if await asyncio.to_thread(self._idor_other_user, base, txt):
                         findings.append({
                             'url': self._idor_url(ep, param, mv),
                             'parameter': param,
@@ -909,6 +916,51 @@ class JWTEngine(BaseEngine):
                         })
                         analysis['severity'] = 'High'
 
+            # JWK 自包含嵌入（header.jwk 直接带公钥；弱库直接用其验证 → 攻击者可自签+自验）
+            jwk = header.get('jwk')
+            if isinstance(jwk, dict):
+                _jwk_kty = jwk.get('kty', '?')
+                analysis['vulnerabilities'].append({
+                    'type': 'JWK 自包含注入',
+                    'severity': 'High',
+                    'detail': f'JWT Header 内嵌 JWK（kty={_jwk_kty}），弱库会直接用其验证签名，攻击者可自签 token 并将公钥一并附在 header',
+                    'exploit': '用对应私钥签 token，在 header.jwk 放公钥；弱库会用 header.jwk 验签通过'
+                })
+                analysis['severity'] = 'High'
+                jwk_kid = jwk.get('kid')
+                if jwk_kid is not None and str(jwk_kid) == str(kid):
+                    analysis['vulnerabilities'].append({
+                        'type': 'kid 引用内嵌 JWK',
+                        'severity': 'High',
+                        'detail': f'kid={kid} 命中 header.jwk.kid，弱库会从内嵌 JWK 取密钥验签',
+                        'exploit': 'kid=jwk.kid 直接触发内嵌 JWK 验签'
+                    })
+                    analysis['severity'] = 'High'
+
+            # X5U 外部证书链 URL（应为 https 且同源；http/可疑源 → 攻击者可劫持证书）
+            x5u = header.get('x5u')
+            if isinstance(x5u, str) and x5u:
+                x5u_low = x5u.lower()
+                if x5u_low.startswith('http://') or 'localhost' in x5u_low or '127.0.0.1' in x5u_low or 'evil' in x5u_low:
+                    analysis['vulnerabilities'].append({
+                        'type': 'X5U 外部证书 URL(不安全)',
+                        'severity': 'High',
+                        'detail': f'x5u 指向非 https/可疑源: {x5u}',
+                        'exploit': '将 x5u 指向攻击者控制的证书 PEM，让服务端拉取并用其验签'
+                    })
+                    analysis['severity'] = 'High'
+
+            # X5C 自包含证书链（header.x5c 直接带证书；弱库用其内置公钥验签 → 可伪造）
+            x5c = header.get('x5c')
+            if isinstance(x5c, list) and x5c:
+                analysis['vulnerabilities'].append({
+                    'type': 'X5C 自包含证书链',
+                    'severity': 'High',
+                    'detail': f'JWT Header 内嵌证书链（x5c，{len(x5c)} 张证书），弱库会直接用其验签，攻击者可自签证书链',
+                    'exploit': '用自签证书私钥签 token，并在 header.x5c 附上证书链；弱库会校验通过'
+                })
+                analysis['severity'] = 'High'
+
             privilege_found = []
             for field in self.PRIVILEGE_FIELDS:
                 if field in payload:
@@ -1255,7 +1307,13 @@ class JWTEngine(BaseEngine):
 # ============================================================
 
 class OAuthEngine(BaseEngine):
-    """OAuth 2.0 / OpenID Connect 漏洞检测引擎"""
+    """OAuth 2.0 / OpenID Connect 漏洞检测引擎
+
+    能力边界声明（2026-09-15 评审补录）
+    - can_detect: 识别标准 OAuth2/OIDC authorize 与 token 端点，针对 redirect_uri 回调地址篡改/开放性重定向等常见配置缺陷进行探测。
+    - cannot_detect: 需强制人工浏览器登录/二次授权确认的流程无法纯探测完成；依赖真实 client_secret 或强签名绑定做深度验证的场景受限；私有/非标 OAuth 实现不在规范覆盖内。
+    - 前置条件: 目标暴露标准 /authorize、/token 端点；redirect_uri 处理逻辑可被参数探测触达且无需用户交互。
+    """
 
     name = "oauth"
     description = "OAuth 2.0 / OpenID Connect 漏洞检测引擎"
@@ -1284,6 +1342,20 @@ class OAuthEngine(BaseEngine):
         "https://evil.com/?x=", "https://evil.com#@target",
         "https://evil.com.evil.xyz", "https://evil.com%2f%2fcallback",
         "https://evil.com/%2e", "https://evil.com\u002e\u002e/",
+        # P2: redirect_uri 绕过变体增强（保留既有条目，在其后追加）
+        "https://trusted.com@evil.com/callback",   # @混淆:urlparse 取 netloc=evil.com，仅看前缀的服务器会误放行
+        "https://admin@evil.com/callback",         # @混淆(userinfo 变体)
+        "https://trusted.com@evil.com",            # 无路径 @ 变体
+        "https://evil.com%40trusted.com/",         # 编码混淆:%40=@
+        "https://evil.com%252f%252ftrusted.com/",  # 双重编码
+        "https://trusted.com.evil.com",            # 白名单后缀附加:endswith('trusted.com') 前缀匹配可绕过
+        "https://evil.com/\n/callback",            # 换行截断:读取 header 遇换行提前终止
+        "https://evil.com/\r/callback",            # 换行截断(CR)
+        "https://trusted.com/%2e%2e/evil.com",     # 路径穿越
+        "https://trusted.com/..%2fevil.com",       # 路径穿越(编码斜杠)
+        "javascript:alert(1)//trusted.com",        # 非 http scheme 混淆
+        "vbscript:msgbox(1)//trusted.com",         # 非 http scheme 混淆
+        "data:text/html,<script>location='https://evil.com'</script>",  # 非 http scheme 混淆
     ]
 
     SCOPE_PAYLOADS = [
@@ -1388,15 +1460,40 @@ class OAuthEngine(BaseEngine):
 
         return endpoints
 
+    def _classify_redirect_uri(self, payload: str) -> str:
+        """按绕过类型给 redirect_uri 变体打标签，用于 evidence 区分。"""
+        low = payload.lower()
+        if '\r' in payload or '\n' in payload:
+            return '换行截断'
+        if low.startswith(('javascript:', 'vbscript:', 'data:', 'file:')):
+            return '非http scheme混淆'
+        if '@' in payload:
+            return '@混淆'
+        if '..' in payload or '%2e' in low:
+            return '路径穿越'
+        if '%40' in low or '%252' in low or '%2f' in low:
+            return '编码/双重编码'
+        try:
+            host = urlparse(payload).hostname or ''
+        except Exception:
+            host = ''
+        # 白名单后缀附加：合法域被追加攻击者后缀（如 trusted.com.evil.com）
+        if host.endswith('.evil.com') and 'trusted.com' in host:
+            return '后缀附加'
+        return '外域跳转'
+
     async def test_redirect_uri_hijack(self, url: str, params: Dict, session) -> Optional[Dict]:
         if 'redirect_uri' not in params:
             return None
 
-        for evil_redirect in self.REDIRECT_URI_PAYLOADS[:5]:
+        parsed = urlparse(url)
+        # 基准合法域：调用方传入的是 authorize 端点 url，其 netloc 即合法域
+        legit_host = (parsed.hostname or '').lower()
+
+        for evil_redirect in self.REDIRECT_URI_PAYLOADS:
             test_params = params.copy()
             test_params['redirect_uri'] = evil_redirect
 
-            parsed = urlparse(url)
             new_query = urlencode(test_params, doseq=True)
             test_url = urlunparse((
                 parsed.scheme, parsed.netloc, parsed.path,
@@ -1407,37 +1504,65 @@ class OAuthEngine(BaseEngine):
                 resp = await async_get(test_url, session=session, timeout=10, allow_redirects=False)
                 if isinstance(resp, tuple):
                     status = resp[0]
+                    body = resp[1]
                     headers = resp[2] if len(resp) > 2 else {}
                 else:
                     status = resp.status
+                    try:
+                        body = await resp.text()
+                    except Exception:
+                        body = ""
                     headers = resp.headers
-
-                location = headers.get('Location', '')
-
-                if status in (301, 302, 303):
-                    evil_domain = evil_redirect.split('/')[2] if '://' in evil_redirect else ''
-                    if evil_domain and evil_domain in location:
-                        return {
-                            'url': url,
-                            'type': 'OAuth Redirect URI 劫持',
-                            'severity': 'Critical',
-                            'confidence': 'high',
-                            'payload': evil_redirect,
-                            'evidence': f'redirect_uri 可被篡改为 {evil_redirect}，授权码可能泄露',
-                            'recommendation': '强制校验 redirect_uri 白名单'
-                        }
-                    if 'code=' in location:
-                        return {
-                            'url': url,
-                            'type': 'OAuth Redirect URI 劫持（授权码泄露）',
-                            'severity': 'Critical',
-                            'confidence': 'high',
-                            'payload': evil_redirect,
-                            'evidence': f'redirect_uri 被篡改，响应包含授权码: {location[:100]}',
-                            'recommendation': '强制校验 redirect_uri 白名单，绑定 client_id'
-                        }
             except Exception:
                 logger.debug("suppressed exception (engine audit)")
+                continue
+
+            location = ""
+            for _k, _v in (headers or {}).items():
+                if str(_k).lower() == "location":
+                    location = str(_v)
+                    break
+
+            bypass_type = self._classify_redirect_uri(evil_redirect)
+            loc_host = (urlparse(location).hostname or '').lower()
+            combined = f"{location} {body}"
+            has_authcode = ('code=' in combined) or ('token=' in combined)
+
+            high_types = ('@混淆', '外域跳转')
+
+            # 结构化判定：授权码被发往非授权域（Location/响应 host ≠ 基准 host）
+            if has_authcode and loc_host and legit_host and loc_host != legit_host:
+                return {
+                    'url': url,
+                    'type': f'OAuth Redirect URI 绕过({bypass_type})',
+                    'severity': 'Critical',
+                    'confidence': 'high' if bypass_type in high_types else 'medium',
+                    'payload': evil_redirect,
+                    'evidence': (f'redirect_uri 变体 {evil_redirect} 被接受，授权码被发往非授权域 '
+                                 f'{loc_host}（基准域 {legit_host or parsed.netloc}），可能造成授权码泄露'),
+                    'recommendation': '严格按白名单校验 redirect_uri，禁止子串/前缀/后缀匹配，'
+                                      '对 @、编码、换行等混淆须先规范化再比对',
+                    'method': 'redirect_uri_bypass',
+                }
+
+            # 兜底（低风险）：服务端将攻击者 host 反射进 Location 头且跳往外域（含无 code 场景）
+            evil_host = (urlparse(evil_redirect).hostname or '').lower()
+            if (
+                status in (301, 302, 303)
+                and loc_host and legit_host
+                and loc_host != legit_host
+                and evil_host and loc_host.endswith(evil_host)
+            ):
+                return {
+                    'url': url,
+                    'type': f'OAuth Redirect URI 外域反射({bypass_type})',
+                    'severity': 'Low',
+                    'confidence': 'low',
+                    'payload': evil_redirect,
+                    'evidence': f'服务端将 redirect_uri {evil_redirect} 反射进 Location {location}（外域 {loc_host}）',
+                    'recommendation': '强制校验 redirect_uri 白名单并绑定 client_id',
+                    'method': 'redirect_uri_reflection',
+                }
         return None
 
     async def test_state_missing(self, url: str, params: Dict) -> Optional[Dict]:
@@ -1934,6 +2059,11 @@ class WeakCredentialEngine(BaseEngine):
     - 仅对明确识别出的登录端点尝试，端点数量硬上限 MAX_ENDPOINTS；
     - 字典仅含常见默认凭据与极弱口令，不是大字典暴力破解；
     - 命中即停止该端点的后续尝试，不再继续尝试其它口令。
+
+    能力边界声明（2026-09-15 评审补录）
+    - can_detect: 仅对明确识别出的登录端点（/login、/admin/login 等 LOGIN_PATHS 覆盖）尝试常见默认凭据与极弱口令（DEFAULT_CREDENTIALS 小字典，非大爆破）；命中即停。
+    - cannot_detect: 需验证码/滑块/人机交互的登录；不在字典内的非默认凭据或企业专有口令；启用多因素认证的端点；路径不在 LOGIN_PATHS 覆盖范围的自定义登录接口。
+    - 前置条件: 目标存在可提交的表单/API 登录端点；无需复杂人机验证即可提交；成功与失败响应可区分。
     """
 
     name = "weak_credential"
@@ -2217,6 +2347,18 @@ class PasswordResetEngine(BaseEngine):
                 except Exception:
                     continue
         return found
+
+    async def check(
+        self,
+        url: str,
+        param: str,
+        normal_resp: Tuple[int, str, Dict],
+        parsed_query: str,
+        session,
+        **kwargs
+    ) -> Optional[Dict]:
+        """参数级入口：密码重置为端点发现型全局扫描，统一走 scan()。"""
+        return None
 
     async def scan(self, target: str, session, **kwargs) -> List[Dict]:
         from vulnclaw.config.settings import settings as _st

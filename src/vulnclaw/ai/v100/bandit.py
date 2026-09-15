@@ -26,6 +26,7 @@ SP16.1 上下文多臂老虎机（轻量在线 RL 决策层）
 纪律：无 emoji、轻量、异常优雅降级（B heap 规则同源）。
 """
 import json
+import os
 import random
 import threading
 import time
@@ -39,14 +40,37 @@ def bandit_key(target: str = "", param: str = "", engine: str = "") -> str:
     return "|".join([str(target or ""), str(param or ""), str(engine or "")])
 
 
-def key_from_task(task_data: dict) -> str:
-    """从任务 data 提取组合键（engine_bundle 取 engines 首项 / 单引擎取 engine 字段）。"""
+def bandit_key_v2(tech: str = "", param: str = "", engine: str = "", family: str = "") -> str:
+    """P3-⑤ 跨目标可迁移组合键：v2|tech|param|engine|payload_family。
+
+    为什么需要 v2：v1 键含 target → 每个新目标都是冷启动，学到的经验
+    **永不迁移**（跨扫描记忆实质是断的）。v2 去掉 target、换成技术栈与
+    payload 族，让"PHP 站点的 sqli 参数用什么 payload 出货"这类知识可复用。
+    v1 键与既有统计/策略文件完全不动，二者由调用方按 v2 开关选择。
+    """
+    return "|".join([
+        "v2", str(tech or ""), str(param or ""), str(engine or ""), str(family or ""),
+    ])
+
+
+def key_from_task(task_data: dict, v2: bool = False) -> str:
+    """从任务 data 提取组合键（engine_bundle 取 engines 首项 / 单引擎取 engine 字段）。
+
+    v2=True 时用可迁移键（tech_stack + payload_family 代替 target）；
+    缺省 False 保持 v1 行为（零回归）。
+    """
     if not isinstance(task_data, dict):
         return ""
-    target = task_data.get("target") or task_data.get("url") or ""
     param = task_data.get("param") or ""
     engines = task_data.get("engines")
     engine = engines[0] if isinstance(engines, list) and engines else (task_data.get("engine") or "")
+    if v2:
+        tech = task_data.get("tech") or task_data.get("tech_stack") or ""
+        if isinstance(tech, (list, tuple)):
+            tech = tech[0] if tech else ""
+        return bandit_key_v2(tech=str(tech or ""), param=param, engine=engine,
+                             family=str(task_data.get("payload_family") or ""))
+    target = task_data.get("target") or task_data.get("url") or ""
     return bandit_key(target=target, param=param, engine=engine)
 
 
@@ -63,14 +87,18 @@ def key_from_finding(finding: dict) -> str:
 class ContextualBandit:
     """上下文多臂老虎机：按组合命中史调整任务优先级（线程安全）。"""
 
-    def __init__(self, influence: int = 2, feed_dir: str = "", enabled: bool = True):
+    def __init__(self, influence: int = 2, feed_dir: str = "", enabled: bool = True,
+                 state_path: str = ""):
         self._influence = max(1, int(influence))
         self._feed_dir = str(feed_dir or "")
         self.enabled = enabled
+        self._state_path = str(state_path or "")
         self._stats: dict[str, dict[str, int]] = {}
         self._policy_combos: dict[str, str] = {}  # key -> boost|penalty|hold
         self._policy_influence: int = self._influence
         self._lock = threading.Lock()
+        if self._state_path:
+            self.load_state()
 
     # ---------- 策略加载（SP17.1 可选） ----------
     @classmethod
@@ -139,6 +167,8 @@ class ContextualBandit:
             st = self._stats.setdefault(key, {"hits": 0, "fails": 0})
             st[field] = int(st.get(field, 0)) + 1
         self._write_feed(key, hit)
+        if self._state_path:
+            self.save_state()
 
     def _write_feed(self, key: str, hit: bool) -> None:
         """反馈飞轮：JSONL 逐条追加（可选；写失败仅 debug，不阻塞）。"""
@@ -156,6 +186,44 @@ class ContextualBandit:
                 }, ensure_ascii=False) + "\n")
         except Exception:  # noqa: BLE001
             logger.debug("[SP16.1] bandit 反馈落盘失败，跳过", exc_info=True)
+
+    # ---------- 状态持久化（P3-⑤） ----------
+    def load_state(self) -> bool:
+        """加载跨扫描状态（bandit 统计落盘文件）。失败返回 False（等同冷启动）。"""
+        if not self._state_path:
+            return False
+        try:
+            data = json.loads(Path(self._state_path).read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            logger.debug("[P3-⑤] bandit 状态加载失败，按冷启动处理")
+            return False
+        stats = data.get("stats") or {}
+        with self._lock:
+            for k, v in stats.items():
+                if isinstance(v, dict):
+                    self._stats[str(k)] = {
+                        "hits": int(v.get("hits", 0)),
+                        "fails": int(v.get("fails", 0)),
+                    }
+        return True
+
+    def save_state(self) -> bool:
+        """原子写状态（tmp + os.replace，避免半截文件）。"""
+        if not self._state_path:
+            return False
+        try:
+            p = Path(self._state_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(p.suffix + ".tmp")
+            tmp.write_text(json.dumps({
+                "ts": round(time.time(), 3),
+                "stats": self.stats(),
+            }, ensure_ascii=False), encoding="utf-8")
+            os.replace(str(tmp), str(p))
+            return True
+        except Exception:  # noqa: BLE001
+            logger.debug("[P3-⑤] bandit 状态落盘失败，跳过", exc_info=True)
+            return False
 
     # ---------- 诊断 ----------
     def stats(self) -> dict:

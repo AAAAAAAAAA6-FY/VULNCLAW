@@ -73,15 +73,26 @@ def run_health_check() -> int:
 
 
 
-    print("\n[1/5] 运行环境")
-
-
-
+    print("\n[1/6] 运行环境")
     print(f"   Python: {sys.version.split()[0]} ({sys.platform})")
-
-
-
     print(f"   项目 {_PROJECT_ROOT_DIR}")
+    try:
+        from vulnclaw.core.scanner import get_engine_inventory
+
+        inventory = get_engine_inventory()
+        print(
+            "   引擎: "
+            f"发现 {inventory.get('discovered', 0)} / "
+            f"实例化 {inventory.get('instantiated', 0)} / "
+            f"启用 {inventory.get('enabled', 0)} / "
+            f"抽象 {len(inventory.get('abstract') or [])} / "
+            f"失败 {len(inventory.get('failed') or [])}"
+        )
+        if inventory.get("failed"):
+            issues.append("存在引擎实例化失败")
+    except Exception as exc:
+        issues.append(f"引擎能力统计失败: {exc}")
+        print(f"   引擎统计失败: {exc}")
 
 
 
@@ -93,7 +104,7 @@ def run_health_check() -> int:
 
 
 
-    print("\n[2/5] 第三方工具（缺失自动降级，非阻断")
+    print("\n[2/6] 第三方工具（缺失自动降级，非阻断")
 
 
 
@@ -162,11 +173,35 @@ def run_health_check() -> int:
 
 
 
-    # ---------- 3. AI Provider 配置 ----------
+    # ---------- 3. OOB / interactsh 配置（离线诊断，不验证真实回调） ----------
+
+    print("\n[3/6] OOB / interactsh（仅离线配置检查）")
+    try:
+        from vulnclaw.core.oob_channel import get_oob_diagnostics
+
+        oob = get_oob_diagnostics()
+        if not oob["valid"]:
+            issues.append(f"OOB_INTERACTSH_SERVER 无效: {oob['error']}")
+            print(f"   ⚠️ OOB_INTERACTSH_SERVER: {oob['error']}")
+        elif oob["configured"]:
+            print(f"   自部署服务: {oob['server']}")
+        else:
+            print("   未配置自部署服务（将按现有策略使用公共/备用通道）")
+        if oob["client_available"]:
+            print(f"   interactsh-client: {oob['client_path']}")
+        else:
+            optional_missing.append("interactsh-client（OOB 回调验证）")
+            print("   ⚠️ interactsh-client: 未找到（OOB 能力将跳过/降级）")
+        print("   网络可达性/真实回调: 未检查（不会伪造 OOB 成功）")
+    except Exception as exc:
+        issues.append(f"OOB 配置诊断失败: {exc}")
+        print(f"   OOB 配置诊断失败: {exc}")
+
+    # ---------- 4. AI Provider 配置 ----------
 
 
 
-    print("\n[3/5] AI Provider（关键项")
+    print("\n[4/6] AI Provider（关键项")
 
 
 
@@ -272,7 +307,7 @@ def run_health_check() -> int:
 
 
 
-    print("\n[4/5] Nuclei 模板（缺失时 CVE 扫描降级")
+    print("\n[5/6] Nuclei 模板（缺失时 CVE 扫描降级")
 
 
 
@@ -320,11 +355,11 @@ def run_health_check() -> int:
 
 
 
-    # ---------- 5. 缓存目录 ----------
+    # ---------- 6. 缓存目录 ----------
 
 
 
-    print("\n[5/5] 运行时缓存目")
+    print("\n[6/6] 运行时缓存目")
 
 
 

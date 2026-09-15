@@ -69,6 +69,15 @@ def _get_manifest_path() -> Path:
     return _get_plugins_dir() / "plugins_manifest.json"
 
 
+def _get_signature_manifest_path() -> Path:
+    """获取本地加载型插件的签名清单路径（plugin_signatures.json）。"""
+    return _get_plugins_dir() / "plugin_signatures.json"
+
+
+# 签名清单不存在的"一次性"warning 标记（避免每条插件加载都刷屏）
+_SIGNATURE_WARNED: list = []
+
+
 # --- PluginManager ---
 
 class PluginManager:
@@ -217,6 +226,44 @@ def _verify_sha256(zip_path: str, expected_sha256: str) -> bool:
     return True
 
 
+def _check_local_plugin_signature(plugin_name: str, entry_path: Path) -> bool:
+    """本地加载型插件的签名清单校验（fail-closed）。
+
+    清单 ``<plugins_dir>/plugin_signatures.json`` 形如 {"<name>": "<sha256>"}：
+      - 存在且含该插件 → 哈希不匹配直接拒绝加载（记 error）；匹配则放行。
+      - 存在但不含该插件 → warning 并继续（兼容旧插件）。
+      - 缺失 → 一次性 warning（提示可生成清单）并继续。
+    返回 True 表示放行；fail-closed 时抛出 PluginLoadError。
+    """
+    sig_path = _get_signature_manifest_path()
+    if not sig_path.exists():
+        global _SIGNATURE_WARNED
+        if not _SIGNATURE_WARNED:
+            _SIGNATURE_WARNED = True
+            logger.warning(
+                f"⚠️ 未找到插件签名清单 {sig_path}，跳过本地签名校验（可用构建脚本生成）"
+            )
+        return True
+    try:
+        sigs = json.loads(sig_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning(f"⚠️ 插件签名清单解析失败，跳过校验: {exc}")
+        return True
+    if plugin_name not in sigs:
+        logger.warning(f"⚠️ 插件 {plugin_name} 不在签名清单中，跳过校验（兼容旧插件）")
+        return True
+    expected = str(sigs.get(plugin_name) or "").strip()
+    if not expected:
+        logger.warning(f"⚠️ 插件 {plugin_name} 签名为空，跳过校验")
+        return True
+    if not _verify_sha256(str(entry_path), expected):
+        logger.error(f"🚫 插件 {plugin_name} 本地签名校验失败（fail-closed），拒绝加载")
+        raise PluginLoadError(
+            f"插件 {plugin_name} 签名校验失败：请重新安装或更新 plugin_signatures.json。"
+        )
+    return True
+
+
 def _extract_plugin(zip_path: str, plugin_dir: Path) -> Path:
     """解压 zip 到插件目录。
 
@@ -263,6 +310,9 @@ def _register_plugin_hooks(plugin_name: str, manifest: Dict) -> bool:
     plugin_dir = Path(manifest.get("_plugin_dir", ""))
     entry = manifest.get("entry", "main.py")
     entry_path = plugin_dir / entry
+
+    # 本地加载型插件：签名清单校验（fail-closed；缺失/不在清单即警告放行，不破坏下载校验）
+    _check_local_plugin_signature(plugin_name, entry_path)
 
     spec = importlib.util.spec_from_file_location(f"plugin_{plugin_name}", entry_path)
     if spec is None or spec.loader is None:

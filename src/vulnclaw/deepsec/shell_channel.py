@@ -20,6 +20,10 @@ from vulnclaw.core.scanner import safe_request
 from typing import Dict, List, Optional
 
 
+# P1-15：命令历史上限（只保留最近 N 条）
+_COMMAND_HISTORY_LIMIT = 200
+
+
 async def _send_payload(url: str, session, method: str, parameter: str, payload: str):
     """按 safe_request 的真实签名 (url, session, method=...) 发送注入请求。
 
@@ -147,6 +151,9 @@ class ShellChannel:
                 "status": resp.get("status_code", 0),
                 "output_length": len(output),
             })
+            # P1-15：有界化（只保留最近 N 条，避免长会话无限堆积）
+            if len(self._command_history) > _COMMAND_HISTORY_LIMIT:
+                del self._command_history[:-_COMMAND_HISTORY_LIMIT]
 
             return output
 

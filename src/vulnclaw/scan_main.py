@@ -544,7 +544,9 @@ def run_resume(scan_id: str) -> int:
             if executor is None:
                 _logger.warning(f"💀 [RESUME] 无执行器，跳过: {nt}")
                 continue
-            result = _asyncio.run(executor(node, context))
+            # P3-12：run_sync 安全包装（事件循环内调用不再炸）
+            from vulnclaw.core.utils import run_sync as _run_sync_resume
+            result = _run_sync_resume(executor(node, context))
             succeeded += 1
             _logger.info(f"✅ [RESUME] 重放成功: {node.node_id} → {str(result)[:120]}")
         except Exception as e:
@@ -590,10 +592,19 @@ def main():
 
 
     parser.add_argument('--initial-qps', type=int, default=3, help='初始QPS')
+    parser.add_argument('--profile', default='',
+                        help='扫描预算模式（fast/standard/deep/low-noise/oob/api）：收窄引擎集合与 payload 深度、'
+                             '设定并发/超时/报告详细度；空=不启用（保持默认全量行为）')
+    parser.add_argument('--adaptive', action='store_true',
+                        help='启用自适应并发（按目标 RTT/错误率动态调节；默认关闭）')
 
 
 
     parser.add_argument('--proxy', help='HTTP代理')
+    parser.add_argument('--no-proxy', dest='no_proxy', action='store_true',
+                        help='本次直连（忽略 .env 的 PROXY；.env 里配了未启动的 Burp 代理时用）')
+    parser.add_argument('--no-passive', dest='no_passive', action='store_true',
+                        help='禁用浏览器被动爬虫（Burp 不可用时不自动启动 Playwright 采集流量）')
 
 
 
@@ -632,6 +643,24 @@ def main():
     parser.add_argument('--metrics-port', type=int, default=0, help='启动 Prometheus 指标服务器端口（0=禁用）')
 
     parser.add_argument('--http2', action='store_true', help='启用 HTTP/2（需 httpx[http2]，默认关闭）')
+    parser.add_argument(
+        '--report-detail',
+        choices=['full', 'summary', 'compact'],
+        default='full',
+        help='HTML 报告详细度：full、summary 或 compact（默认 full）',
+    )
+    parser.add_argument(
+        '--report-max-findings',
+        type=int,
+        default=50,
+        help='HTML 报告最多保留的漏洞条数（默认 50）',
+    )
+    parser.add_argument(
+        '--report-max-evidence',
+        type=int,
+        default=5000,
+        help='HTML 报告每条 evidence 的最大字符数（默认 5000）',
+    )
     parser.add_argument('--instruction', default=None,
                         help='SP27: 内联扫描指令（可直接写账号密码，如 "Login with email: admin@x.com, password: Pass123"）')
     parser.add_argument('--instruction-file', dest='instruction_file', default=None,
@@ -752,9 +781,9 @@ def main():
     # 或 DANGEROUS_CONFIRM=1）才真正 allow，否则停留 deny 并打印警告，防止无人值守
     # 脚本误带 --dangerous 真实攻击目标（安全红线）。
     if args.dangerous:
-        import os
-        import sys
-
+        # 注意：此处绝不能 import os / sys —— 模块顶部已全局导入；
+        # 函数内 import 会把 os/sys 标记为局部变量，导致本函数后续
+        # （如 sys.exit(run_health_check())）抛 UnboundLocalError。
         from vulnclaw.core.danger_guard import guard
 
         interactive = bool(sys.stdin and sys.stdin.isatty())
@@ -1060,7 +1089,7 @@ def main():
                 _hits, _age = set(), 99.0
             if _targ and not _hits:
                 if _age > 3:
-                    _plugin = Path(PROJECT_ROOT) / "thirdparty" / "extensions" / "BurpExtender.py"
+                    _plugin = Path(_PROJECT_ROOT) / "thirdparty" / "extensions" / "BurpExtender.py"
                     if not _plugin.exists():
                         print(f"⚠️ burp_cookies.json 已 {_age:.0f} 天未更新，且 Burp 插件尚未生成："
                               f"先运行  python scan.py setup  生成 thirdparty/extensions/BurpExtender.py，"
@@ -1102,11 +1131,16 @@ def main():
 
 
 
-    if args.proxy:
-
-
-
+    if getattr(args, 'no_proxy', False):
+        settings.proxy = None
+        settings.proxy_list = []
+        print("🌐 已按 --no-proxy 关闭代理（本次直连）")
+    elif args.proxy:
         settings.proxy = args.proxy
+
+    if getattr(args, 'no_passive', False):
+        settings.no_passive = True
+        print("🕵️ 已按 --no-passive 禁用浏览器被动爬虫")
 
 
 

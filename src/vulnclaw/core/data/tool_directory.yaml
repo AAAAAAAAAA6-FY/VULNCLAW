@@ -88,9 +88,22 @@ tools:
   curl:
     capability: web_probe
     danger: safe
+  EHole:
+    capability: fingerprint
+    danger: safe
 
 # 能力级降级链：candidates 按序尝试（缺失/不健康自动跳过）；
 # 全部不可用时落 builtin_fallback（纯内置实现，永远在线）。
+#
+# ⚠️ 声明 ≠ 接线（大写纪律，源于实测事故 2026-09-11）：
+#   `param_discovery: candidates: [arjun]` 曾长期"已声明但全程空转"——arjun 实际
+#   一次都没执行过，由 5 处串联缺陷造成（shutil.which 误判门禁 / --timeout 非法旗标 /
+#   default_args 里 --silent 非法 / run_tool 按裸可执行名解析不到子目录 / 结果 JSON 键名
+#   认错）。教训：把某工具写进本文件后，必须同时确认
+#     ① 可用性判定走 core.tool_registry.tool_available（禁止 shutil.which）
+#     ② 调用旗标与该工具 `-h` 实际输出一致
+#     ③ 结果解析对得上该工具真实输出结构
+#   回归测试见 tests/test_tool_wiring_regressions.py。
 capabilities:
   endpoint_discovery:
     candidates: [waybackurls, gau, gospider, katana]
@@ -128,3 +141,6 @@ capabilities:
   sast:
     candidates: [trivy]
     builtin_fallback: none
+  fingerprint:
+    candidates: [EHole]
+    builtin_fallback: builtin_fingerprints    # modules/recon 内置 FINGERPRINTS 中间件指纹

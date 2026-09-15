@@ -46,32 +46,55 @@ SBOX_MAX_OUTPUT = int(os.getenv("VULNCLAW_SBOX_MAX_OUTPUT", "8192"))
 # 判定时忽略平台扩展名（python.exe / py.exe 与 python 等同）。
 _ALLOWED_SCRIPT_BINS = {"python", "python3", "py", "pythonw", "bash", "sh", "node", "php", "perl", "ruby"}
 
-_docker_cache: Dict[str, Optional[bool]] = {"checked": False, "ok": None}
+_docker_cache: Dict[str, Any] = {"checked": False, "ok": None, "ts": 0.0}
+_DOCKER_CACHE_TTL = 60.0
+
+
+async def _probe_docker_async(docker_bin: str, timeout: int) -> bool:
+    """单一事件循环内完成 create + communicate（P0-5：不再跨 loop 使用 transport）。"""
+    proc = await asyncio.create_subprocess_exec(
+        docker_bin, "version", "--format", "{{.Server.Version}}",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        out, _err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return False
+    return proc.returncode == 0 and bool(out and out.strip())
 
 
 def docker_available(timeout: int = 5) -> bool:
-    """探测本机 Docker 是否可用（结果缓存 60s；探测失败视为不可用）。"""
-    if _docker_cache["checked"]:
+    """探测本机 Docker 是否可用（TTL 缓存 60s；探测失败视为不可用）。
+
+    P0-5 修复：旧实现用**两个** `new_event_loop()`——先在一个 loop 建子进程、
+    再在另一个 loop 调 `communicate()`，transport 与 loop 不一致必然抛错被吞，
+    导致"Docker 装了也永远判不可用"，且两个 loop 从不关闭。现在统一为
+    单个 `asyncio.run`；已在事件循环内时落到独立线程 loop 并完整关闭。
+    """
+    now = time.time()
+    if _docker_cache["checked"] and (now - float(_docker_cache.get("ts") or 0.0)) < _DOCKER_CACHE_TTL:
         return bool(_docker_cache["ok"])
-    import shutil as _sh
-    docker_bin = _sh.which("docker")
+    docker_bin = shutil.which("docker")
     ok = False
     if docker_bin:
         try:
-            proc = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
-                asyncio.create_subprocess_exec(
-                    docker_bin, "version", "--format", "{{.Server.Version}}",
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-                )
-            )
-            out, _err = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
-                asyncio.wait_for(proc.communicate(), timeout=timeout)
-            )
-            ok = proc.returncode == 0 and bool(out and out.strip())
-        except Exception:  # noqa: BLE001
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                ok = asyncio.run(_probe_docker_async(docker_bin, timeout))
+            else:
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                    ok = bool(ex.submit(
+                        asyncio.run, _probe_docker_async(docker_bin, timeout)).result())
+        except Exception as exc:  # noqa: BLE001 - 探测失败一律"不可用"，不进主流程
+            logger.debug(f"Docker 探测失败（视为不可用）: {exc}")
             ok = False
     _docker_cache["checked"] = True
     _docker_cache["ok"] = ok
+    _docker_cache["ts"] = now
     return ok
 
 
@@ -86,15 +109,26 @@ def sandbox_policy_for(verdict: str) -> Dict[str, Any]:
 
 
 def _target_in_scope(url: str) -> bool:
-    """复用 E5.1 出口白名单：allowed_scope 未配置-> 默认放行；配置后越界拒绝。"""
+    """复用 E5.1 出口白名单：allowed_scope 未配置 → 放行；配置后越界拒绝。
+
+    P0-4 修复：旧实现把"校验异常"也 `return True`，等于**安全边界反向默认**——
+    白名单解析器/DNS/配置一异常就全放行越界 PoC。现在严格区分：
+      - 未配置 allowed_scope   → True（边界未启用，显式语义）
+      - 校验抛异常/解析失败    → **False（fail-closed）** 并留可诊断日志
+    """
     from vulnclaw.config.settings import settings
-    if not getattr(settings, "allowed_scope", ""):
+    scope = getattr(settings, "allowed_scope", "")
+    if not scope:
         return True
     try:
         from vulnclaw.core.http_client import url_in_scope
-        return url_in_scope(url)  # 支持域名/子域/通配/CIDR/IP
-    except Exception:  # noqa: BLE001
-        return True
+        return bool(url_in_scope(url))  # 支持域名/子域/通配/CIDR/IP
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            f"🚫 [Sandbox] allowed_scope 校验异常 → fail-closed 拒绝执行: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return False
 
 
 def _sanitized_env(cwd: str) -> Dict[str, str]:

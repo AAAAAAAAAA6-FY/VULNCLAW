@@ -1196,6 +1196,7 @@ class MCPJsonRpcHandler:
         # run_code_audit 会 print 大量进度到 stdout，必须隔离以免污染 JSON-RPC 流
         await _run_quietly(run_code_audit(Namespace(code=repo, repo=repo, lang=lang)))
 
+        from pathlib import Path
         summary_path = Path(PROJECT_CACHE_DIR) / "reports" / "code_audit_summary.json"
         summary: dict = {}
         if summary_path.is_file():

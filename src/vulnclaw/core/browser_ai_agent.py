@@ -67,6 +67,7 @@ class BrowserAIAgent:
         self.page: Optional[Page] = None
         self.playwright = None
         self.captured_requests: List[Dict] = []
+        self.captured_pairs: List[Dict] = []
         self.console_logs: List[Dict] = []
         self.max_actions = _get_max_actions()
         self.actions_taken = 0
@@ -112,6 +113,7 @@ class BrowserAIAgent:
 
         await self.page.route("**/*", self._capture_request)
         self.page.on("console", self._capture_console)
+        self.page.on("response", self._capture_response)
         self._started = True
         logger.info("🌐 浏览器代理已启动")
 
@@ -158,6 +160,109 @@ class BrowserAIAgent:
 
     def _capture_console(self, msg):
         self.console_logs.append({"type": msg.type, "text": msg.text})
+
+    async def _capture_response(self, response):
+        try:
+            url = response.url
+            status = response.status
+            req = response.request
+            if req is None:
+                return
+            body = ""
+            try:
+                content_type = response.headers.get("content-type", "")
+                if any(t in content_type for t in ("text/html", "text/plain", "application/json",
+                                                     "application/xml", "text/xml", "text/css",
+                                                     "application/javascript", "text/javascript")):
+                    body = await response.text()
+            except Exception:
+                body = ""
+            pair = {
+                "url": url,
+                "method": req.method,
+                "request_headers": dict(req.headers) if req.headers else {},
+                "post_data": req.post_data,
+                "status": status,
+                "response_headers": dict(response.headers) if response.headers else {},
+                "body": body[:32768] if body else "",
+            }
+            self.captured_pairs.append(pair)
+            if len(self.captured_pairs) > 1000:
+                self.captured_pairs = self.captured_pairs[-1000:]
+        except BaseException:
+            logger.debug("suppressed exception (core audit)")
+
+    async def passive_crawl(self, start_url: str, timeout: int = 30) -> List[Dict]:
+        """轻量被动爬虫：启动浏览器 → 导航目标 → 等待网络空闲 → 收集请求/响应对。
+
+        不依赖 Burp，不依赖外部代理。返回 captured_pairs 列表供 LiveIntake 回注。
+        """
+        logger.info(f"🕵️ [PassiveCrawl] 开始被动爬取: {start_url}")
+        self.captured_pairs.clear()
+        self.captured_requests.clear()
+        try:
+            if not self._started:
+                await self.start()
+            try:
+                await self.page.goto(start_url, wait_until="networkidle",
+                                     timeout=min(timeout * 1000, 60000))
+            except Exception:
+                try:
+                    await self.page.goto(start_url, wait_until="load",
+                                         timeout=min(timeout * 1000, 60000))
+                except Exception as e:
+                    logger.warning(f"⚠️ [PassiveCrawl] 页面加载超时/失败: {e}")
+            await asyncio.sleep(3)
+            try:
+                await self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await asyncio.sleep(2)
+                await self.page.evaluate("window.scrollTo(0, 0)")
+                await asyncio.sleep(1)
+            except Exception:
+                pass
+            try:
+                current_url = self.page.url
+                links = await self.page.evaluate(
+                    """() => {
+                        const anchors = document.querySelectorAll('a[href]');
+                        const urls = new Set();
+                        anchors.forEach(a => {
+                            try {
+                                const abs = new URL(a.href, document.baseURI).href;
+                                urls.add(abs);
+                            } catch(e) {}
+                        });
+                        return [...urls];
+                    }"""
+                )
+                visited = 0
+                for link in links[:15]:
+                    if visited >= 8:
+                        break
+                    try:
+                        base = start_url.split("/")[2] if "://" in start_url else ""
+                        if base and base not in link:
+                            continue
+                        await self.page.goto(link, wait_until="networkidle",
+                                             timeout=min(timeout * 500, 15000))
+                        visited += 1
+                        await asyncio.sleep(2)
+                    except Exception:
+                        pass
+                if current_url != start_url:
+                    try:
+                        await self.page.goto(start_url, wait_until="networkidle",
+                                             timeout=min(timeout * 500, 15000))
+                    except Exception:
+                        pass
+            except Exception:
+                logger.debug("suppressed exception (core audit)")
+            pairs = list(self.captured_pairs)
+            logger.info(f"🕵️ [PassiveCrawl] 完成: {len(pairs)} 个请求/响应对, "
+                        f"{len(self.captured_requests)} 个路由截获")
+            return pairs
+        finally:
+            pass
 
     async def analyze_page(self) -> Dict:
         try:
@@ -333,4 +438,40 @@ async def create_browser_agent(headless: bool = False, proxy: str = None):
     return agent
 
 
-__all__ = ['BrowserAIAgent', 'create_browser_agent', 'HAS_PLAYWRIGHT']
+def passive_pairs_to_intake(pairs: List[Dict], source: str = "browser_passive") -> int:
+    """把 passive_crawl 捕获的请求/响应对 → LiveIntake 回注。
+
+    返回成功入队的参数数量。
+    """
+    if not pairs:
+        return 0
+    try:
+        from vulnclaw.modules.live_intake import feed_live
+    except ImportError:
+        return 0
+    fed = 0
+    for pair in pairs:
+        url = pair.get("url", "")
+        method = pair.get("method", "GET")
+        params: dict[str, str] = {}
+        if "?" in url:
+            from urllib.parse import parse_qs
+            qs = url.split("?", 1)[1]
+            for k, v in parse_qs(qs).items():
+                params[k] = v[0] if v else ""
+        post_data = pair.get("post_data")
+        if post_data and isinstance(post_data, str):
+            if "=" in post_data and "{" not in post_data:
+                for part in post_data.split("&"):
+                    if "=" in part:
+                        k, v = part.split("=", 1)
+                        params[k] = v
+        if params:
+            feed_live(url, method=method, params=params, source=source)
+            fed += 1
+    if fed:
+        logger.info(f"🕵️ [PassiveCrawl] 回注 {fed}/{len(pairs)} 个请求到 LiveIntake")
+    return fed
+
+
+__all__ = ['BrowserAIAgent', 'create_browser_agent', 'passive_pairs_to_intake', 'HAS_PLAYWRIGHT']

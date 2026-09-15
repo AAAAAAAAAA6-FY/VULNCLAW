@@ -25,6 +25,8 @@
 边属性：weight（利用代价，severity 折算）、prob（成功率，来自 confidence）、label。
 """
 
+import json
+import re
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional
 
@@ -82,6 +84,47 @@ def _confidence_prob(confidence: Any) -> float:
     if s in ("低", "low"):
         return 0.35
     return 0.5
+
+
+# ---- 级联边概率校准（数据飞轮接线，2026-09-14）----
+_LEDGER_TYPE_STAT: Optional[Dict[str, Dict[str, int]]] = None
+
+
+def _cascade_observed_prob(src_kw: str, default: float = 0.5) -> float:
+    """级联边概率校准：用经验账本里同源类型的观察命中率修正硬编码概率。
+
+    依据：feedback_ledger 中 verdict=confirm 的经验 = "该类型 payload 真实打中过"；
+    源类型命中率越高，其级联边成功概率越应上调（0.7*base + 0.3*observed）。
+    样本不足（<10）或账本不可用 → 原样返回 default（零行为回归）。
+    """
+    global _LEDGER_TYPE_STAT
+    try:
+        if _LEDGER_TYPE_STAT is None:
+            from vulnclaw.growth.feedback_ledger import get_feedback_ledger
+            stat: Dict[str, Dict[str, int]] = {}
+            for r in get_feedback_ledger().rows():
+                if str(r.get("kind")) != "finding":
+                    continue
+                t = str(r.get("vuln_type") or "").lower()
+                if not t:
+                    continue
+                d = stat.setdefault(t, {"n": 0, "c": 0})
+                d["n"] += 1
+                if str(r.get("verdict") or "").lower() in (
+                        "confirm", "confirmed", "fixed", "reconfirmed"):
+                    d["c"] += 1
+            _LEDGER_TYPE_STAT = stat
+        n = c = 0
+        for t, d in _LEDGER_TYPE_STAT.items():
+            if src_kw in t:
+                n += d["n"]
+                c += d["c"]
+        if n >= 10:
+            observed = c / n
+            return round(min(0.95, max(0.05, 0.7 * default + 0.3 * observed)), 4)
+    except Exception:  # noqa: BLE001 - 校准是增强项，绝不影响图构建
+        logger.debug("suppressed exception (cascade calibration)")
+    return default
 
 
 def _severity_weight(severity: Any) -> int:
@@ -179,10 +222,12 @@ class AttackGraph:
                 if _host_of(meta_a.get("url", "")) != _host_of(self._g.nodes[node_b].get("url", "")):
                     continue
                 for src_kw, dst_kws in _CASCADE_RULES:
+                    # 概率由经验账本校准（同源类型观察命中率），账本不可用时退回 0.5
+                    _p = _cascade_observed_prob(src_kw)
                     if src_kw in type_a and any(k in type_b for k in dst_kws):
-                        self.add_edge(node_a, node_b, label="cascade", prob=0.5)
+                        self.add_edge(node_a, node_b, label="cascade", prob=_p)
                     if src_kw in type_b and any(k in type_a for k in dst_kws):
-                        self.add_edge(node_b, node_a, label="cascade", prob=0.5)
+                        self.add_edge(node_b, node_a, label="cascade", prob=_p)
 
     def build_from_report(self, report: Dict) -> "AttackGraph":
         """从扫描报告构建攻击图（E1.1 主入口）。"""
@@ -202,57 +247,157 @@ class AttackGraph:
         top_k: int = 5,
         min_prob: float = 0.0,
         max_depth: int = 6,
+        strategy: str = "dijkstra",
+        use_llm: bool = False,
     ) -> List[Dict]:
         """计算 TOP 攻击路径：外部面资产 -> RCE/数据类终点。
 
-        使用加权最短路（dijkstra，权重=severity 代价），路径概率 = 各边概率连乘
-        （保守估计：链路需逐跳成功），按 (路径条数, 总权重, 概率) 排序截取 top_k。
+        strategy:
+          - "dijkstra"（默认）：加权最短路（权重=severity 代价），零行为变化；
+          - "mcts"：在 dijkstra 结果之外，用图上 MCTS（UCB1 + 随机 rollout）
+            再产出若干候选，合并去重后**用同一套排序键**统一排序 ——
+            dijkstra 的"单条最短路"局限（每个起终点对只出一条）由此补齐。
+
+        use_llm: 仅对 mcts 生效 —— LLM 启发式给探索顺序做先验（不可用自动回退）。
+
+        路径概率 = 各边概率连乘（保守估计：链路需逐跳成功），
+        排序键 (路径条数, 总权重, 概率) 两种策略一致。
         """
         if self._g.number_of_nodes() == 0:
             return []
-        termini = [n for n, d in self._g.nodes(data=True) if d.get("kind") == "vuln" and _is_target_vuln(str(d.get("type", "")))]
+        starts, termini = self._starts_termini(self._g)
         if not termini:
             return []
-        starts = [n for n, d in self._g.nodes(data=True) if d.get("kind") == "asset" and self._g.in_degree(n) == 0] or \
-                 [n for n, d in self._g.nodes(data=True) if d.get("kind") == "asset"]
+        results = self._paths_on_graph(
+            self._g, starts, termini, min_prob=min_prob, max_depth=max_depth)
 
-        results: List[Dict] = []
-        for start in starts:
-            for sink in termini:
-                if start == sink:
-                    continue
-                try:
-                    path = nx.shortest_path(self._g, start, sink, weight="weight")
-                except (nx.NetworkXNoPath, nx.NetworkXNoCycle):
-                    continue
-                if len(path) - 1 > max_depth:
-                    continue
-                prob = 1.0
-                total_weight = 0
-                for i in range(len(path) - 1):
-                    if i == 0 and self._g.nodes[path[i]]["kind"] == "asset":
-                        edge_w = self._g.edges[path[i], path[i + 1]].get("weight") or 0
-                        edge_p = self._g.edges[path[i], path[i + 1]].get("prob") or 0.5
+        if str(strategy).lower() == "mcts":
+            try:
+                results.extend(self._mcts_paths(
+                    starts, termini, max_depth=max_depth, use_llm=use_llm))
+            except Exception as _e:  # noqa: BLE001 - MCTS 为增强项，失败退回 dijkstra 结果
+                logger.debug(f"[MCTS] 攻击路径搜索失败（忽略）: {_e}")
+
+        # 去重（按路径元组）后统一排序 —— 保证 mcts 与 dijkstra 结果同口径竞争
+        seen = set()
+        uniq: List[Dict] = []
+        for r in results:
+            k = tuple(r["path"])
+            if k in seen:
+                continue
+            seen.add(k)
+            uniq.append(r)
+        uniq.sort(key=lambda r: (len(r["path"]), r["total_weight"], -r["probability"]))
+        return uniq[:top_k]
+
+    def _mcts_paths(
+        self,
+        starts: List[str],
+        termini: List[str],
+        max_depth: int = 6,
+        simulations: int = 300,
+        seed: int = 1337,
+        top_n: int = 8,
+        use_llm: bool = False,
+    ) -> List[Dict]:
+        """图上 MCTS（P3-②）：节点=图节点、动作=出边，UCB1 选择 + 随机 rollout + 收益回传。
+
+        收益 = 路径概率连乘 × 终点严重度权重 / (1 + 总代价)，与 dijkstra 的
+        "代价越低、概率越高越好"语义对齐。
+
+        环防护（必须）：link_cascades 双向加边会造环，故每轮 rollout 带
+        visited 集合 + max_depth 截断；固定 seed 保证结果可复现。
+
+        use_llm（P3-② LLM 融合）：多个"未访问边"之间的探索顺序由 LLM 启发式
+        先验决定（而非取图顺序第一个）—— 同样仿真预算下更快收敛到高价值路径。
+        LLM 不可用（无 key/事件循环内/调用失败）自动回退纯 UCB1，行为与不启用一致。
+        """
+        import math
+        import random as _random
+
+        rng = _random.Random(seed)
+        termini_set = set(termini)
+        if not starts or not termini_set:
+            return []
+
+        visits: Dict[tuple, int] = {}
+        rewards: Dict[tuple, float] = {}
+        found: Dict[tuple, float] = {}
+        c_ucb = 1.4
+        llm_budget = {"used": 0, "max": 3}
+
+        for _ in range(max(1, int(simulations))):
+            cur = rng.choice(starts)
+            path = [cur]
+            visited = {cur}
+            for _d in range(max(1, int(max_depth))):
+                nbrs = [n for n in self._g.successors(cur) if n not in visited]
+                if not nbrs:
+                    break
+                untried = [n for n in nbrs if visits.get((cur, n), 0) == 0]
+                if untried:
+                    # 未访问边优先探索；多个候选时用 LLM 先验排序（可用时；
+                    # 不可用则取图顺序第一个 = 与原行为一致）
+                    llm_scores = None
+                    if use_llm:
+                        llm_scores = self._llm_edge_scores(cur, untried, llm_budget)
+                    _scores = llm_scores or {}
+                    if _scores:
+                        best = max(untried, key=lambda n: float(_scores.get(n, 0.0)))
                     else:
-                        edge_w = self._g.edges[path[i], path[i + 1]].get("weight") or 5
-                        edge_p = self._g.edges[path[i], path[i + 1]].get("prob") or 0.5
-                    total_weight += int(edge_w)
-                    prob *= float(edge_p)
-                if prob < min_prob:
-                    continue
-                sink_meta = self._g.nodes[sink]
-                results.append({
-                    "path": path,
-                    "nodes": [{"id": n, "kind": self._g.nodes[n].get("kind"), "label": self._label_of(n)} for n in path],
-                    "total_weight": total_weight,
-                    "probability": round(prob, 4),
-                    "severity": self._g.nodes[sink].get("severity", ""),
-                    "end_type": sink_meta.get("type", ""),
-                    "end_url": sink_meta.get("url", ""),
-                })
+                        best = untried[0]
+                else:
+                    best, best_ucb = None, -1.0
+                    total = max(1, sum(visits.values()))
+                    for n in nbrs:
+                        key = (cur, n)
+                        n_i = visits.get(key, 0)
+                        ucb = rewards.get(key, 0.0) / n_i + c_ucb * math.sqrt(math.log(1 + total) / n_i)
+                        if ucb > best_ucb:
+                            best, best_ucb = n, ucb
+                if best is None:
+                    break
+                cur = best
+                path.append(cur)
+                visited.add(cur)
+                if cur in termini_set:
+                    break
+            if len(path) < 2 or path[-1] not in termini_set:
+                continue
+            prob, weight = 1.0, 0
+            for i in range(len(path) - 1):
+                e = self._g.edges[path[i], path[i + 1]]
+                weight += int(e.get("weight") or 5)
+                prob *= float(e.get("prob") or 0.5)
+            sev_w = float(_SEVERITY_WEIGHT.get(
+                str(self._g.nodes[path[-1]].get("severity", "")).title(), 5))
+            reward = prob * sev_w / (1.0 + weight)
+            found.setdefault(tuple(path), reward)
+            for i in range(len(path) - 1):
+                key = (path[i], path[i + 1])
+                visits[key] = visits.get(key, 0) + 1
+                rewards[key] = rewards.get(key, 0.0) + reward
 
-        results.sort(key=lambda r: (len(r["path"]), r["total_weight"], -r["probability"]))
-        return results[:top_k]
+        out: List[Dict] = []
+        for path, _reward in sorted(found.items(), key=lambda kv: -kv[1])[:max(1, int(top_n))]:
+            prob, total_weight = 1.0, 0
+            for i in range(len(path) - 1):
+                e = self._g.edges[path[i], path[i + 1]]
+                total_weight += int(e.get("weight") or 5)
+                prob *= float(e.get("prob") or 0.5)
+            sink = path[-1]
+            sink_meta = self._g.nodes[sink]
+            out.append({
+                "path": list(path),
+                "nodes": [{"id": n, "kind": self._g.nodes[n].get("kind"), "label": self._label_of(n)} for n in path],
+                "total_weight": total_weight,
+                "probability": round(prob, 4),
+                "severity": sink_meta.get("severity", ""),
+                "end_type": sink_meta.get("type", ""),
+                "end_url": sink_meta.get("url", ""),
+                "source": "mcts",
+            })
+        return out
 
     def _label_of(self, node_id: str) -> str:
         d = self._g.nodes[node_id]
@@ -262,6 +407,173 @@ class AttackGraph:
             vtype = str(d.get("type", ""))
             return f"{vtype}" if d.get("url") else vtype
         return str(d.get("label", node_id))
+
+    # ---------- 内部：起终点与图副本路径枚举（供反事实分析复用） ----------
+    def _starts_termini(self, g) -> tuple:
+        termini = [n for n, d in g.nodes(data=True)
+                   if d.get("kind") == "vuln" and _is_target_vuln(str(d.get("type", "")))]
+        starts = [n for n, d in g.nodes(data=True)
+                  if d.get("kind") == "asset" and g.in_degree(n) == 0] or \
+                 [n for n, d in g.nodes(data=True) if d.get("kind") == "asset"]
+        return starts, termini
+
+    def _label_of_g(self, g, node_id: str) -> str:
+        d = g.nodes[node_id]
+        if d.get("kind") == "asset":
+            return node_id
+        if d.get("kind") == "vuln":
+            vtype = str(d.get("type", ""))
+            return f"{vtype}" if d.get("url") else vtype
+        return str(d.get("label", node_id))
+
+    def _paths_on_graph(
+        self, g, starts: List[str], termini: List[str],
+        min_prob: float = 0.0, max_depth: int = 6,
+    ) -> List[Dict]:
+        """在给定图（可为副本）上枚举 dijkstra 攻击路径（top_attack_paths 主体）。"""
+        results: List[Dict] = []
+        for start in starts:
+            for sink in termini:
+                if start == sink:
+                    continue
+                try:
+                    path = nx.shortest_path(g, start, sink, weight="weight")
+                except (nx.NetworkXNoPath, nx.NetworkXNoCycle):
+                    continue
+                if len(path) - 1 > max_depth:
+                    continue
+                prob = 1.0
+                total_weight = 0
+                for i in range(len(path) - 1):
+                    e = g.edges[path[i], path[i + 1]]
+                    edge_w = (e.get("weight") or 0) if (i == 0 and g.nodes[path[i]]["kind"] == "asset") \
+                        else (e.get("weight") or 5)
+                    edge_p = e.get("prob") or 0.5
+                    total_weight += int(edge_w)
+                    prob *= float(edge_p)
+                if prob < min_prob:
+                    continue
+                sink_meta = g.nodes[sink]
+                results.append({
+                    "path": path,
+                    "nodes": [{"id": n, "kind": g.nodes[n].get("kind"),
+                               "label": self._label_of_g(g, n)} for n in path],
+                    "total_weight": total_weight,
+                    "probability": round(prob, 4),
+                    "severity": sink_meta.get("severity", ""),
+                    "end_type": sink_meta.get("type", ""),
+                    "end_url": sink_meta.get("url", ""),
+                })
+        return results
+
+    # ---------- P3-③ 反事实分析 ----------
+    def counterfactual_impact(self, node_id: str, max_depth: int = 6) -> Dict:
+        """反事实分析：移除某节点后攻击面如何变化（"修掉 X 能断掉哪些链"）。
+
+        对图做**副本**（不改原图）后重新枚举路径，对比修复前后：
+        - removed_chains：修复前可达、修复后不可达的路径（含完整路径样例）
+        - risk_reduction：概率加权的风险降幅（1 - after/before）
+        - critical：剩余风险 < 50% 即视为"关键节点"（单点修复大幅收缩攻击面）
+
+        纯图算法、确定性输出、零 LLM 依赖 —— 报告侧可直接给出"修补优先级"。
+        """
+        out: Dict[str, Any] = {
+            "removed_node": node_id, "found": False,
+            "before_chains": 0, "after_chains": 0,
+            "before_total_prob": 0.0, "after_total_prob": 0.0,
+            "removed_chains": [], "risk_reduction": 0.0, "critical": False,
+        }
+        if self._g.number_of_nodes() == 0 or not self._g.has_node(node_id):
+            return out
+        starts, termini = self._starts_termini(self._g)
+        if not termini:
+            return out
+        before = self._paths_on_graph(self._g, starts, termini, max_depth=max_depth)
+        g2 = self._g.copy()
+        try:
+            g2.remove_node(node_id)
+        except Exception:  # noqa: BLE001
+            return out
+        starts2, termini2 = self._starts_termini(g2)
+        after = self._paths_on_graph(g2, starts2, termini2, max_depth=max_depth) if termini2 else []
+
+        after_keys = {tuple(r["path"]) for r in after}
+        before_map = {tuple(r["path"]): r for r in before}
+        removed = [r for k, r in before_map.items() if k not in after_keys]
+        before_total = sum(float(r["probability"]) for r in before_map.values())
+        after_total = sum(float(r["probability"]) for r in after)
+        out.update({
+            "found": True,
+            "before_chains": len(before_map), "after_chains": len(after),
+            "before_total_prob": round(before_total, 4),
+            "after_total_prob": round(after_total, 4),
+            "removed_chains": removed[:20],
+            "risk_reduction": round(1.0 - (after_total / before_total), 4) if before_total > 0 else 0.0,
+        })
+        out["critical"] = bool(removed) and before_total > 0 and (after_total / before_total) < 0.5
+        return out
+
+    # ---------- P3-② LLM 启发式（MCTS 先验） ----------
+    def _llm_edge_scores(self, node_id: str, candidates: List[str], budget: Dict) -> Optional[Dict[str, float]]:
+        """LLM 给"从 node 出发的候选边"打 0-1 先验分（引导 MCTS 探索顺序）。
+
+        安全边界（任一不满足即返回 None，调用方回退纯 UCB1）：
+        ① 事件循环内不调用（防 asyncio 嵌套）；② 每次搜索调用上限 budget["max"]；
+        ③ 结果按 node 缓存；④ 解析失败/无客户端 → None。**永不抛异常**。
+        """
+        cache = getattr(self, "_llm_edge_cache", None)
+        if cache is None:
+            cache = self._llm_edge_cache = {}
+        if node_id in cache:
+            return cache[node_id]
+        if int(budget.get("used", 0)) >= int(budget.get("max", 3)):
+            return None
+        try:
+            import asyncio as _aio
+            try:
+                _aio.get_running_loop()
+                return None  # 事件循环中：跳过（防 asyncio 嵌套）
+            except RuntimeError:
+                pass
+            from vulnclaw.ai.core import get_llm_client
+            client = get_llm_client()
+            if client is None or not hasattr(client, "ask"):
+                return None
+            lines = []
+            for n in candidates[:8]:
+                d = self._g.nodes[n]
+                lines.append(
+                    f"- {n}: kind={d.get('kind')} type={d.get('type', '')} "
+                    f"severity={d.get('severity', '')} url={str(d.get('url', ''))[:60]}")
+            prompt = (
+                "以下是攻击图中的一个节点及其出边候选。请给每个候选打 0-1 分"
+                "（越高 = 越可能通向 RCE/数据泄露等高危终点），"
+                "只输出 JSON 对象 {节点id: 分数}。\n"
+                f"当前节点: {node_id}\n" + "\n".join(lines)
+            )
+            budget["used"] = int(budget.get("used", 0)) + 1
+            resp = client.ask(
+                prompt, system="你是攻击路径评估助手，只输出 JSON。",
+                temperature=0.1, max_tokens=128, retries=1,
+                usage_site="mcts-heuristic",
+            )
+            if isinstance(resp, dict):
+                resp = resp.get("text") or resp.get("content") or resp.get("answer") or ""
+            m = re.search(r"\{.*\}", str(resp or ""), re.S)
+            if not m:
+                return None
+            raw = json.loads(m.group(0))
+            scores = {
+                str(k): max(0.0, min(1.0, float(v)))
+                for k, v in (raw or {}).items()
+                if isinstance(v, (int, float))
+            }
+            if not scores:
+                return None
+            cache[node_id] = scores
+            return scores
+        except Exception:  # noqa: BLE001
+            return None
 
     # ---------- E1.4 ExploitChain 双端消费 ----------
     @classmethod

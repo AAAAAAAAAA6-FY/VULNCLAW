@@ -201,6 +201,67 @@ def _run_tools(args) -> int:
     return 0
 
 
+def _run_interop(args) -> int:
+    """interop 子命令分发：formats / import / export。
+
+    全部离线确定性；stdout 只承载数据（供管道消费），人读摘要走 stderr。
+    输入文件不存在 / 未知格式 → 退出码 2。
+    """
+    from vulnclaw.core import interop as _iop
+
+    action = getattr(args, "interop_command", "formats")
+
+    def _read(path: str) -> str:
+        if path == "-":
+            return sys.stdin.read()
+        if not os.path.isfile(path):
+            print("输入文件不存在: {}".format(path), file=sys.stderr)
+            sys.exit(2)
+        with open(path, "r", encoding="utf-8") as _fh:
+            return _fh.read()
+
+    if action == "formats":
+        matrix = _iop.supported_formats()
+        for fmt in sorted(matrix):
+            flags = [fl for fl in ("import", "export") if matrix[fmt].get(fl)]
+            print("{:<16}{}".format(fmt, ", ".join(flags)))
+        return 0
+
+    if action == "import":
+        try:
+            text = _read(args.file)
+        except SystemExit:
+            raise
+        try:
+            res = _iop.import_any(text, args.fmt)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print("imported {}, skipped {}".format(len(res), res.skipped), file=sys.stderr)
+        if len(res) > 0:
+            if getattr(args, "export_fmt", ""):
+                sys.stdout.write(_iop.export_any(_iop.to_unified_dicts(res), args.export_fmt))
+            else:
+                sys.stdout.write(_iop.export_jsonl(res))
+        return 0
+
+    if action == "export":
+        try:
+            text = _read(args.file)
+        except SystemExit:
+            raise
+        try:
+            res = _iop.import_any(text, "jsonl")
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print("exported {}, skipped {}".format(len(res), res.skipped), file=sys.stderr)
+        if len(res) > 0:
+            sys.stdout.write(_iop.export_any(_iop.to_unified_dicts(res), args.fmt))
+        return 0
+    return 2
+
+
 def main(argv: list[str] | None = None) -> None:
     argv = list(sys.argv[1:] if argv is None else argv)
 
@@ -211,7 +272,7 @@ def main(argv: list[str] | None = None) -> None:
         # P1-3: python scan.py resume --scan-id xxx -> 转发为 --resume --scan-id xxx
         _run_scan_main(["--resume", *argv[1:]])
         return
-    elif argv[0] not in ("scan", "code", "health", "mcp", "setup", "verify", "tools", "bandit-report", "bandit-train", "archive", "flywheel"):
+    elif argv[0] not in ("scan", "code", "health", "mcp", "setup", "verify", "tools", "bandit-report", "bandit-train", "archive", "flywheel", "baseline", "interop"):
         # 兼容模式：非子命令 -> 旧 scan.py 风格直接转发（保留全量旧参数行为）
         _run_scan_main(argv)
         return
@@ -243,6 +304,17 @@ def main(argv: list[str] | None = None) -> None:
         type=int,
         default=200,
         help="最大并发任务数，默认 200。增大可提升速度但增加目标负载。",
+    )
+    scan_parser.add_argument(
+        "--profile",
+        default="",
+        help="扫描预算模式（fast/standard/deep/low-noise/oob/api）：收窄引擎集合与 payload 深度、"
+             "设定并发/超时/报告详细度；空=不启用（保持默认全量行为）。",
+    )
+    scan_parser.add_argument(
+        "--adaptive",
+        action="store_true",
+        help="启用自适应并发（按目标 RTT/错误率动态调节；默认关闭）。",
     )
     scan_parser.add_argument(
         "--dag",
@@ -286,6 +358,12 @@ def main(argv: list[str] | None = None) -> None:
         help="HTTP/HTTPS 代理地址，例如 http://127.0.0.1:8080 （用于通过 Burp 等工具转发流量）。",
     )
     scan_parser.add_argument(
+        "--no-proxy",
+        dest="no_proxy",
+        action="store_true",
+        help="本次直连：忽略 .env 里配置的 PROXY。",
+    )
+    scan_parser.add_argument(
         "--metrics-port",
         type=int,
         default=0,
@@ -295,6 +373,24 @@ def main(argv: list[str] | None = None) -> None:
         "--http2",
         action="store_true",
         help="启用 HTTP/2 多路复用（需目标支持，默认关闭）。可减少连接开销。",
+    )
+    scan_parser.add_argument(
+        "--report-detail",
+        choices=["full", "summary", "compact"],
+        default="full",
+        help="HTML 报告详细度：full、summary 或 compact（默认 full）。",
+    )
+    scan_parser.add_argument(
+        "--report-max-findings",
+        type=int,
+        default=50,
+        help="HTML 报告最多保留的漏洞条数（默认 50）。",
+    )
+    scan_parser.add_argument(
+        "--report-max-evidence",
+        type=int,
+        default=5000,
+        help="HTML 报告每条 evidence 的最大字符数（默认 5000）。",
     )
     scan_parser.add_argument(
         "--download-thirdparty",
@@ -586,12 +682,55 @@ def main(argv: list[str] | None = None) -> None:
     autofix_parser.add_argument("--repo", default="", help="源码仓库根目录（用于 --apply 落盘定位）")
     autofix_parser.add_argument("--apply", action="store_true", help="实际应用到源码（默认 dry-run 只统计）")
 
+    baseline_parser = subparsers.add_parser(
+        "baseline",
+        help="C3 增量基线：保存/比对扫描指纹（fail-closed，退出码 1=有变化 0=一致）",
+        description="save 落盘当前扫描指纹；diff 比对当前 vs 基线，输出新增/修复候选/重开，"
+                    "基线缺失时保守地把 current 全量视为新增（宁多报不漏报）。",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    baseline_sub = baseline_parser.add_subparsers(dest="baseline_command", required=True)
+    bs_save = baseline_sub.add_parser("save", help="保存当前扫描为基线")
+    bs_save.add_argument("--target", default="", help="目标标识（用于默认路径/指纹 target）")
+    bs_save.add_argument("--report", required=True, help="当前扫描报告 JSON 路径")
+    bs_save.add_argument("--out", default="", help="输出基线路径（默认 _runtime_cache/baselines/<target>.json）")
+    bs_diff = baseline_sub.add_parser("diff", help="比对当前 vs 基线")
+    bs_diff.add_argument("--current", required=True, help="当前扫描报告 JSON 路径（- 表 stdin）")
+    bs_diff.add_argument("--baseline", default="", help="基线 JSON 路径（缺省=无基线，全量视为新增）")
+    bs_diff.add_argument("--json", action="store_true", help="输出完整 diff JSON 而非人读摘要")
+
+    interop_parser = subparsers.add_parser(
+        "interop",
+        help="SP7 工具生态互导：多格式导入/导出（formats/import/export）",
+        description="把外部生态 finding（Nuclei/Burp/ZAP/SARIF/CSV/原始 HTTP/JSON）导入为统一模型，"
+                    "并链式导出为其它格式；全程离线、确定性、fail-closed。",
+        epilog="示例:\n  vulnclaw interop formats\n"
+               "  vulnclaw interop import nuclei_jsonl out.jsonl --export sarif\n"
+               "  cat findings.jsonl | vulnclaw interop import jsonl - > unified.jsonl\n"
+               "  vulnclaw interop export csv unified.jsonl",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    interop_sub = interop_parser.add_subparsers(dest="interop_command", required=True)
+    iop_formats = interop_sub.add_parser("formats", help="打印支持矩阵（import/export 能力）")
+    iop_import = interop_sub.add_parser("import", help="把外部格式导入为统一 JSONL 或链式导出")
+    iop_import.add_argument("fmt", help="输入格式（nuclei_jsonl/jsonl/vulnclaw_json/burp_xml/zap_json/sarif/csv/raw_http）")
+    iop_import.add_argument("file", help="输入文件路径（- 表 stdin）")
+    iop_import.add_argument("--export", dest="export_fmt", default="",
+                            help="链式导出格式（默认输出统一 JSONL）")
+    iop_export = interop_sub.add_parser("export", help="把统一 JSONL 导出为指定格式（stdout）")
+    iop_export.add_argument("fmt", help="输出格式（jsonl/vulnclaw_json/csv/sarif/nuclei_jsonl/burp_xml/markdown）")
+    iop_export.add_argument("file", help="输入统一 JSONL 文件路径（- 表 stdin）")
+
     args = parser.parse_args(argv)
 
     if args.command == "scan":
         fwd = ["-t", args.target,
                "--initial-qps", str(args.initial_qps),
                "--max-tasks", str(args.max_tasks)]
+        if getattr(args, "profile", ""):
+            fwd += ["--profile", args.profile]
+        if getattr(args, "adaptive", False):
+            fwd += ["--adaptive"]
         if args.dag:
             fwd += ["--dag", "--agents", str(args.agents)]
         if args.deep:
@@ -606,12 +745,19 @@ def main(argv: list[str] | None = None) -> None:
             fwd += ["--diff"]
         if getattr(args, "cookie", None):
             fwd += ["--cookie", args.cookie]
+        if getattr(args, "no_proxy", False):
+            fwd += ["--no-proxy"]
         if args.proxy:
             fwd += ["--proxy", args.proxy]
         if args.metrics_port:
             fwd += ["--metrics-port", str(args.metrics_port)]
         if args.http2:
             fwd += ["--http2"]
+        fwd += [
+            "--report-detail", args.report_detail,
+            "--report-max-findings", str(args.report_max_findings),
+            "--report-max-evidence", str(args.report_max_evidence),
+        ]
         # SP27: 指令层转发（内联文本或指令文件，二选一）
         if args.instruction:
             fwd += ["--instruction", args.instruction]
@@ -708,3 +854,34 @@ def main(argv: list[str] | None = None) -> None:
         _extra = ["--apply"] if getattr(args, "apply", False) else []
         sys.exit(autofix_main(["--report", args.report, "--out-dir", args.out_dir,
                                "--repo", args.repo] + _extra) or 0)
+    elif args.command == "baseline":
+        import json
+
+        from vulnclaw.core import baseline as _bl
+        if args.baseline_command == "save":
+            with open(args.report, "r", encoding="utf-8") as _fh:
+                _data = json.load(_fh)
+            _out = _bl.save_baseline(_data, args.out)
+            print("baseline saved:", _out)
+            sys.exit(0)
+        # diff
+        if args.current == "-":
+            _cur = json.load(sys.stdin)
+        else:
+            with open(args.current, "r", encoding="utf-8") as _fh:
+                _cur = json.load(_fh)
+        _base = None
+        if args.baseline:
+            if not os.path.isfile(args.baseline):
+                print(f"基线文件不存在: {args.baseline}", file=sys.stderr)
+                sys.exit(2)
+            with open(args.baseline, "r", encoding="utf-8") as _fh:
+                _base = json.load(_fh)
+        _diff = _bl.compare_with_baseline(_cur, _base)
+        if args.json:
+            print(json.dumps(_diff, ensure_ascii=False, indent=2))
+        else:
+            print(_bl.diff_summary_text(_diff))
+        sys.exit(1 if _bl.diff_has_changes(_diff) else 0)
+    elif args.command == "interop":
+        sys.exit(_run_interop(args))

@@ -14,7 +14,7 @@ import random
 from vulnclaw.core.logger import logger
 
 try:
-    from prometheus_client import Counter, Gauge, Histogram, start_http_server, CollectorRegistry, REGISTRY  # noqa: F401  (可用性探测)
+    from prometheus_client import Counter, Gauge, Histogram, Summary, start_http_server, CollectorRegistry, REGISTRY  # noqa: F401  (可用性探测)
     PROMETHEUS_AVAILABLE = True
 except ImportError:
     PROMETHEUS_AVAILABLE = False
@@ -43,6 +43,22 @@ class DummyHistogram(DummyMetric):
     pass
 
 
+class DummySummary(DummyMetric):
+    """无 prometheus_client 时的 Summary 垫片（兼容 observe / quantiles 语义）。
+
+    含 ``quantiles`` 属性以对齐 prometheus Summary 的构造签名；无任何真实采样。
+    """
+
+    def __init__(self, name="", documentation="", labelnames=(), quantiles=(),
+                 registry=None, **kwargs):
+        super().__init__()
+        self.quantiles = list(quantiles)
+        self._name = name
+
+    def observe(self, value):
+        pass
+
+
 class Metrics:
     """指标收集器"""
 
@@ -56,10 +72,20 @@ class Metrics:
             self.scan_progress = DummyGauge()
             self.ai_calls = DummyCounter()
             self.response_time = DummyHistogram()
+            self.response_latency = DummySummary(
+                quantiles=(0.5, 0.9, 0.95, 0.99, 0.999)
+            )
             self.current_concurrency = DummyGauge()
             self.scanned_urls = DummyGauge()
             self.tokens_used = DummyGauge()
             self.engine_failures = DummyCounter()
+            # 工作流8：可观测性补齐（扫描成功率/OOB/队列/worker/死信/引擎耗时）
+            self.scan_results = DummyCounter()
+            self.oob_events = DummyCounter()
+            self.queue_length = DummyGauge()
+            self.worker_utilization = DummyGauge()
+            self.dead_letters = DummyCounter()
+            self.engine_duration = DummyHistogram()
             self.registry = None
             return
 
@@ -95,6 +121,22 @@ class Metrics:
             buckets=[0.1, 0.5, 1, 2, 5, 10, 30, 60],
             registry=self.registry
         )
+        # 部分 prometheus_client 版本移除/不支持 Summary quantiles —— 尝试带分位数创建，
+        # 失败则稳健降级（保留 count/sum，import/调用不炸）。
+        try:
+            self.response_latency = Summary(
+                'scanner_response_latency_seconds',
+                'HTTP response latency (P50/P90/P95/P99/P99.9)',
+                quantiles=(0.5, 0.9, 0.95, 0.99, 0.999),
+                registry=self.registry,
+            )
+        except TypeError:  # noqa: BLE001 - 该版本不支持 quantiles，回退纯 count/sum
+            logger.warning("⚠️ prometheus_client 不支持 Summary quantiles，降级为 count/sum")
+            self.response_latency = Summary(
+                'scanner_response_latency_seconds',
+                'HTTP response latency',
+                registry=self.registry,
+            )
         self.current_concurrency = Gauge(
             'scanner_current_concurrency',
             'Current concurrent requests',
@@ -114,6 +156,41 @@ class Metrics:
             'scanner_engine_failures_total',
             'Total engine execution failures',
             ['engine'],
+            registry=self.registry
+        )
+        # ===== 工作流8：可观测性补齐 =====
+        self.scan_results = Counter(
+            'scanner_scan_results_total',
+            'Scan outcomes (success/failed/timeout/partial) — 扫描成功率',
+            ['result'],
+            registry=self.registry
+        )
+        self.oob_events = Counter(
+            'scanner_oob_events_total',
+            'OOB callback outcomes (hit/miss/blocked) — 带外交互成功率',
+            ['result'],
+            registry=self.registry
+        )
+        self.queue_length = Gauge(
+            'scanner_queue_length',
+            'Pending task queue length — Redis/内存队列积压',
+            registry=self.registry
+        )
+        self.worker_utilization = Gauge(
+            'scanner_worker_utilization',
+            'Worker utilization ratio (0~1)',
+            registry=self.registry
+        )
+        self.dead_letters = Counter(
+            'scanner_dead_letters_total',
+            'Tasks moved to dead-letter queue',
+            registry=self.registry
+        )
+        self.engine_duration = Histogram(
+            'scanner_engine_seconds',
+            'Per-engine execution time (P95/P99 由 histogram_quantile 计算)',
+            ['engine'],
+            buckets=[0.1, 0.5, 1, 2, 5, 10, 30, 60, 120],
             registry=self.registry
         )
 
@@ -150,6 +227,7 @@ class Metrics:
     def observe_response_time(self, seconds: float):
         if self._enabled:
             self.response_time.observe(seconds)
+            self.response_latency.observe(seconds)
 
     def set_progress(self, percent: float):
         if self._enabled:
@@ -166,6 +244,40 @@ class Metrics:
     def set_tokens_used(self, tokens: int):
         if self._enabled:
             self.tokens_used.set(tokens)
+
+    # ===== 工作流8：可观测性补齐（未启用时全部 no-op）=====
+    def inc_scan_result(self, result: str):
+        """扫描结局计数：success / failed / timeout / partial（成功率 = success / total）。"""
+        if self._enabled:
+            self.scan_results.labels(result=str(result or "unknown")).inc()
+
+    def inc_oob_event(self, result: str):
+        """OOB 事件计数：hit / miss / blocked（命中率 = hit / total）。"""
+        if self._enabled:
+            self.oob_events.labels(result=str(result or "unknown")).inc()
+
+    def set_queue_length(self, count: int):
+        if self._enabled:
+            self.queue_length.set(int(count or 0))
+
+    def set_worker_utilization(self, ratio: float):
+        """worker 利用率（0~1）；越界值自动夹紧，避免脏数据污染面板。"""
+        if self._enabled:
+            try:
+                self.worker_utilization.set(max(0.0, min(1.0, float(ratio or 0.0))))
+            except (TypeError, ValueError):
+                pass
+
+    def inc_dead_letter(self):
+        if self._enabled:
+            self.dead_letters.inc()
+
+    def observe_engine_duration(self, engine: str, seconds: float):
+        if self._enabled:
+            try:
+                self.engine_duration.labels(engine=str(engine or "unknown")).observe(float(seconds or 0.0))
+            except (TypeError, ValueError):
+                pass
 
 
 _metrics = None

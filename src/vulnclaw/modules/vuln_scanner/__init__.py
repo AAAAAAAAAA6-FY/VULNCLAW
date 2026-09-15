@@ -23,6 +23,7 @@ from .verify_ai import (
 from .cve_nuclei import (
     run_arjun,
     run_nuclei_async,
+    run_nikto,
     nuclei_template_health,
     collect_line_targets,
     run_nuclei_community_line,
@@ -57,6 +58,7 @@ __all__ = [
     "clear_pending_retry",
     "run_arjun",
     "run_nuclei_async",
+    "run_nikto",
     "nuclei_template_health",
     "collect_line_targets",
     "run_nuclei_community_line",

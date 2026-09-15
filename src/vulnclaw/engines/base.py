@@ -27,6 +27,15 @@ from vulnclaw.core.detectors.spa_detector import SpaFingerprintDetector
 from vulnclaw.core.reflective_validator import ReflectiveValidator
 
 
+# P1-15b：WAF 绕过失败记忆的有效期（秒）——超时后允许再试（目标/策略可能已变）
+_WAF_BYPASS_FAILED_TTL = 900.0
+# P1-15c：字符级 difflib 的单侧长度上限（difflib 为 O(n·m)，
+# "1MB 基线 vs 短响应" 会把扫描挂死；超长时退化为词集合 Jaccard）
+_DIFFLIB_MAX_CHARS = 20000
+# P1-15c：响应归一化（`_normalize_response`）的体积上限——超过直接跳过归一化
+_NORMALIZE_MAX_CHARS = 100_000
+
+
 def build_curl_command(url: str, method: str = "GET", data=None, headers: Optional[Dict] = None) -> str:
     """P2-5: 生成可执行的 curl 复现命令（供各引擎 findings 使用）。"""
     from urllib.parse import urlencode
@@ -250,6 +259,12 @@ class BaseEngine(ABC):
     def _normalize_response(self, text: str) -> str:
         if not text:
             return ""
+        # P1-15c：超大响应直接跳过归一化。这里多条正则含"无界量词 + 后续字面量"
+        # （如 `[a-zA-Z0-9-_]+\.(css|js)\?v=`），在 MB 级文本上是 O(n²) 回溯
+        # ——实测 1MB 纯填充响应把扫描挂死数分钟（test_nosql_no_fp_on_1mb_padding）。
+        # 动态 token 只影响中小页面差异判定，大页直接跳过（后续词集合 Jaccard 仍生效）。
+        if len(text) > _NORMALIZE_MAX_CHARS:
+            return text
         text = re.sub(r'["\']csrf_token["\']?\s*[:=]\s*["\'][a-zA-Z0-9]{16,}["\']', '', text)
         text = re.sub(r'["\']_token["\']?\s*[:=]\s*["\'][a-zA-Z0-9]{16,}["\']', '', text)
         text = re.sub(r'["\']authenticity_token["\']?\s*[:=]\s*["\'][a-zA-Z0-9]{16,}["\']', '', text)
@@ -266,8 +281,12 @@ class BaseEngine(ABC):
         text = re.sub(r'"expires_at":\s*\d{13,}', '', text)
         text = re.sub(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', '', text, flags=re.I)
         text = re.sub(r'\b[a-f0-9]{32,64}\b', '', text, flags=re.I)
-        text = re.sub(r'[a-zA-Z0-9-_]+\.(css|js)\?v=[a-zA-Z0-9]+', '', text)
-        text = re.sub(r'[a-zA-Z0-9-_]+\.(css|js)\?ver=[a-zA-Z0-9]+', '', text)
+        # P1-15c：这两条原本是 `[a-zA-Z0-9-_]+`（无界）→ MB 级文本 O(n²) 回溯。
+        # 双重防护：①字面量前置快检（无 ".css?v=/".js?v=" 直接跳过）②量词设上界。
+        if ".css?v=" in text or ".js?v=" in text:
+            text = re.sub(r'[a-zA-Z0-9-_]{1,200}\.(css|js)\?v=[a-zA-Z0-9]+', '', text)
+        if ".css?ver=" in text or ".js?ver=" in text:
+            text = re.sub(r'[a-zA-Z0-9-_]{1,200}\.(css|js)\?ver=[a-zA-Z0-9]+', '', text)
         text = re.sub(r'\b_=\d{10,}', '', text)
         text = re.sub(r'\bnonce=\d{10,}', '', text)
         text = re.sub(r'\brandom=\d{10,}', '', text)
@@ -286,11 +305,29 @@ class BaseEngine(ABC):
         for p in payloads:
             if not p:
                 continue
-            cleaned = cleaned.replace(p, "")
             try:
+                from html import escape as _html_escape
                 from urllib.parse import quote, unquote
-                cleaned = cleaned.replace(quote(p, safe=""), "")
-                cleaned = cleaned.replace(unquote(p), "")
+
+                # 回显形态穷举（漏一种就残留一份"天然差异"→ 幻影 diff 误报）：
+                #   原文 / URL 编码 / 双重 URL 编码 / URL 解码 / HTML 实体转义
+                # HTML 实体转义：绝大多数服务端渲染会把 <、>、'、"、& 转义后回显，
+                # 原实现只剥原文与 URL 两种形态，转义回显会整体残留 → 回显型目标误报。
+                # 长形态优先剥离，避免短形态先命中导致长形态残留。
+                forms = [
+                    quote(quote(p, safe=""), safe=""),
+                    _html_escape(p, quote=True),
+                    _html_escape(p, quote=False),
+                    quote(p, safe=""),
+                    unquote(p),
+                    p,
+                ]
+                seen_forms = set()
+                for form in forms:
+                    if not form or form in seen_forms:
+                        continue
+                    seen_forms.add(form)
+                    cleaned = cleaned.replace(form, "")
             except Exception:
                 logger.debug("suppressed exception (engine audit)")
         return cleaned
@@ -310,6 +347,13 @@ class BaseEngine(ABC):
 
         normal_status, normal_text = normal_resp[0], normal_resp[1]
         attack_status, attack_text = attack_resp[0], attack_resp[1]
+
+        # 双方文本全空且状态码相同：无任何可比内容，直接判无差异。
+        # （下方特例只覆盖 normal_status==200；302/500 等空响应组合会落入
+        #   length_diff = 0/max(1,0) = 1.0 的假差异，导致 CMDi/NoSQL 等引擎
+        #   对"端点本就返回空/重定向"的响应误报疑似。）
+        if len(normal_text) == 0 and len(attack_text) == 0 and normal_status == attack_status:
+            return False, 0.0
 
         if normal_status == 200 and len(normal_text) == 0:
             if len(attack_text) == 0:
@@ -349,8 +393,20 @@ class BaseEngine(ABC):
                 # 短响应/长度悬殊：词集合 Jaccard 不可靠（短文本词少、易误判无差异），
                 # 改用字符级 difflib 相似度，否则 "1 row: id=1" vs "2 rows returned"
                 # 这类短差异会被漏判为无变化 → 布尔/报错型注入漏检。
-                ratio = difflib.SequenceMatcher(None, normal_clean, attack_clean).ratio()
-                content_diff = 1.0 - ratio
+                # P1-15c：difflib 是 O(n·m)，"1MB 基线 vs 短响应"会把扫描挂死
+                # （对抗用例 test_nosql_no_fp_on_1mb_padding 实测无限挂起）→ 超长退化为词集合。
+                if (len(normal_clean) > _DIFFLIB_MAX_CHARS
+                        or len(attack_clean) > _DIFFLIB_MAX_CHARS):
+                    _nw = set(normal_clean.split())
+                    _aw = set(attack_clean.split())
+                    _union = _nw | _aw
+                    content_diff = (
+                        1 - len(_nw & _aw) / len(_union) if _union else 0.0
+                    )
+                else:
+                    ratio = difflib.SequenceMatcher(
+                        None, normal_clean, attack_clean).ratio()
+                    content_diff = 1.0 - ratio
 
         status_bonus = 0.05 if normal_status != attack_status else 0.0
         total_diff = min(1.0, length_diff * 0.35 + content_diff * 0.6 + status_bonus)
@@ -580,6 +636,41 @@ class BaseEngine(ABC):
         waf_type: str,
         normal_resp: Tuple[int, str, Dict]
     ) -> Optional[Dict]:
+        """P1-15b：同参数只真正尝试一次绕过（失败结果按 TTL 记忆）。
+
+        引擎在 payload 循环里逐条调用本方法；若每次都跑完整绕过链，
+        "一律 403"的硬拦截目标会把请求量放大一个数量级（实测单参数 135+ 请求）。
+        这里对 (url, param) 记忆失败结果：重复调用零请求直接返回 None。
+        """
+        failed = getattr(self, "_waf_bypass_failed", None)
+        if failed is None:
+            failed = self._waf_bypass_failed = {}
+        _key = (url, param)
+        _ts = failed.get(_key)
+        if _ts is not None and (time.time() - _ts) < _WAF_BYPASS_FAILED_TTL:
+            logger.debug(f"[WAF] {param} 绕过已在 {(time.time()-_ts):.0f}s 前失败，跳过重复尝试")
+            return None
+
+        result = await self._try_waf_bypass_inner(
+            url, param, original_payload, parsed_query, session, waf_type, normal_resp)
+        if result is None:
+            failed[_key] = time.time()
+            # 防无界增长：条目过多时清掉最老的一半（字典保序）
+            if len(failed) > 512:
+                for _k in list(failed)[:256]:
+                    failed.pop(_k, None)
+        return result
+
+    async def _try_waf_bypass_inner(
+        self,
+        url: str,
+        param: str,
+        original_payload: str,
+        parsed_query: str,
+        session,
+        waf_type: str,
+        normal_resp: Tuple[int, str, Dict]
+    ) -> Optional[Dict]:
         # 全局 WAF 绕过开关
         if not getattr(settings, 'enable_waf_bypass', True):
             return None
@@ -589,6 +680,23 @@ class BaseEngine(ABC):
 
         if self._waf_bypass_tool is None:
             self._waf_bypass_tool = WAFBypass()
+
+        # P1-15b：WAF 绕过必须有界（请求数 + 墙钟）。
+        # 绕过链是「经典签名确认 → 静态绕过 → 本地变异 → AI 生成」四段，
+        # 每段都可能发十几个请求；对"一律 403 的硬拦截目标"会退化为无界放大
+        # （对抗性测试请求预算被击穿，且 AI 段无网络时会长时间挂起）。
+        budget_left = int(getattr(settings, "waf_bypass_max_requests", 8) or 8)
+        deadline = time.monotonic() + float(
+            getattr(settings, "waf_bypass_max_seconds", 15) or 15)
+        # 子步骤（_verify_waf_bypass_success）通过 _waf_bypass_take() 共用这份预算
+        self._waf_bypass_budget = {"left": budget_left, "deadline": deadline}
+
+        def _exhausted() -> bool:
+            b = self._waf_bypass_budget
+            return b["left"] <= 0 or time.monotonic() >= b["deadline"]
+
+        def _spend() -> None:
+            self._waf_bypass_budget["left"] -= 1
 
         # 第一阶段：测试经典签名payload是否被拦截
         classic_payloads = [
@@ -605,11 +713,22 @@ class BaseEngine(ABC):
         ]
         
         waf_blocked = False
+        _no_resp = 0
         for classic_payload in classic_payloads:
+            if _exhausted():
+                logger.info("🧠 WAF 绕过终止：预算耗尽（第一阶段未完成）")
+                return None
             try:
+                _spend()
                 test_url = build_attack_url(url, param, classic_payload, parsed_query)
-                resp = await safe_request(test_url, session, method="GET", timeout=30)
+                resp = await safe_request(test_url, session, method="GET", timeout=30, no_retry=True)
                 if resp is None:
+                    # P1-15b：拿不到响应（被限流/封禁/连接失败）→ 无法判定是否被 WAF
+                    # 拦截；连续两次即放弃，不再把预算耗在空转上。
+                    _no_resp += 1
+                    if _no_resp >= 2:
+                        logger.debug("WAF 绕过放弃：目标无响应（限流/封禁），跳过绕过")
+                        return None
                     continue
                 
                 attack_status, attack_text = resp[0], resp[1]
@@ -635,9 +754,13 @@ class BaseEngine(ABC):
         timeout = getattr(settings, 'timeout', 30)
 
         for bypass_payload in bypass_payloads[:15]:
+            if _exhausted():
+                logger.info("🧠 WAF 绕过终止：预算耗尽（静态绕过阶段）")
+                return None
             try:
+                _spend()
                 test_url = build_attack_url(url, param, bypass_payload, parsed_query)
-                resp = await safe_request(test_url, session, method="GET", timeout=timeout)
+                resp = await safe_request(test_url, session, method="GET", timeout=timeout, no_retry=True)
                 if resp is None:
                     continue
 
@@ -689,9 +812,13 @@ class BaseEngine(ABC):
             logger.info(f"🧠 本地规则变异生成 {len(local_variants)} 个变体")
 
             for local_payload in local_variants:
+                if _exhausted():
+                    logger.info("🧠 WAF 绕过终止：预算耗尽（本地变异阶段）")
+                    return None
                 try:
+                    _spend()
                     test_url = build_attack_url(url, param, local_payload, parsed_query)
-                    resp = await safe_request(test_url, session, method="GET", timeout=timeout)
+                    resp = await safe_request(test_url, session, method="GET", timeout=timeout, no_retry=True)
                     if resp is None:
                         continue
 
@@ -727,16 +854,36 @@ class BaseEngine(ABC):
         except Exception as exc:
             logger.debug(f"本地规则变异不可用: {exc}")
 
+        if _exhausted():
+            logger.info("🧠 WAF 绕过终止：预算耗尽，跳过 AI 动态生成")
+            return None
+
         logger.info("🧠 本地规则变异未绕过，尝试 AI 动态生成...")
         error_msg = f"WAF {waf_type} 拦截了 Payload: {original_payload}"
-        ai_payloads = await self._ai_mutate_payload(error_msg, original_payload, param, waf_type)
+        # P1-15b：AI 段必须限时——无网络/模型不可达时不得把整条扫描挂死
+        _ai_timeout = max(1.0, min(5.0, deadline - time.monotonic()))
+        try:
+            ai_payloads = await asyncio.wait_for(
+                self._ai_mutate_payload(error_msg, original_payload, param, waf_type),
+                timeout=_ai_timeout,
+            )
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            logger.info(f"🧠 AI 绕过生成超时（{_ai_timeout:.0f}s），放弃本轮绕过")
+            return None
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"AI 绕过生成失败: {exc}")
+            return None
 
-        for ai_payload in ai_payloads:
+        for ai_payload in ai_payloads or []:
             if ai_payload == original_payload:
                 continue
+            if _exhausted():
+                logger.info("🧠 WAF 绕过终止：预算耗尽（AI payload 验证阶段）")
+                return None
             try:
+                _spend()
                 test_url = build_attack_url(url, param, ai_payload, parsed_query)
-                resp = await safe_request(test_url, session, method="GET", timeout=timeout)
+                resp = await safe_request(test_url, session, method="GET", timeout=timeout, no_retry=True)
                 if resp is None:
                     continue
 
@@ -771,6 +918,33 @@ class BaseEngine(ABC):
                 logger.debug(f"AI Payload 测试失败: {e}")
 
         return None
+
+    def _waf_bypass_take(self) -> bool:
+        """消耗一次 WAF 绕过预算（含子步骤 _verify_waf_bypass_success）。
+
+        仅在 `try_waf_bypass` 执行期间有效（预算对象存在）；否则恒返回 True
+        （不影响其它调用方）。预算耗尽或超墙钟 → False，调用方应停止发请求。
+        """
+        budget = getattr(self, "_waf_bypass_budget", None)
+        if not budget:
+            return True
+        if budget.get("left", 0) <= 0 or time.monotonic() >= budget.get("deadline", 0):
+            return False
+        budget["left"] -= 1
+        return True
+
+    def _note_waf_block(self, url: str, param: str) -> int:
+        """记录一次 WAF 阻断（403/406），返回该参数累计被拦次数。
+
+        P1-15b：配合 `try_waf_bypass` 的一次性记忆——绕过失败且连续被拦，
+        说明后续 payload 大概率同样被拦，继续全量检测只是放大请求量。
+        """
+        counter = getattr(self, "_waf_blocked_count", None)
+        if counter is None:
+            counter = self._waf_blocked_count = {}
+        key = (url, param)
+        counter[key] = counter.get(key, 0) + 1
+        return counter[key]
 
     async def _is_waf_block_page(self, response_text: str) -> bool:
         """检测响应是否为WAF拦截页面"""
@@ -809,6 +983,11 @@ class BaseEngine(ABC):
         2. 剥离基线后确认token在响应中新出现（反射）
         3. 或出现SQL报错签名，或A/B延时稳定可复现
         """
+        # P1-15b：本方法是 try_waf_bypass 的子步骤，必须共用同一份预算，
+        # 否则"每个绕过 payload × 4 次验证请求"会把总请求量放大 4 倍。
+        if not self._waf_bypass_take():
+            return False
+
         # 复用统一反射验证器（12位token + 剥离基线 + body/头/JS 三处检查）
         reflected, _evidence = await self.reflective_validator.validate_reflection(
             url, param, payload, parsed_query, session,
@@ -818,8 +997,13 @@ class BaseEngine(ABC):
         if reflected:
             return True
 
+        # safe_request 需按需局部导入（与本文件其他分支一致）；此前遗漏导致下方
+        # 843/861/867 抛 NameError 被 except Exception 吞掉 → 报错签名/延时二次确认静默失效。
+        from vulnclaw.core.scanner import safe_request
         try:
             # 报错签名二次确认（反射缺失但出现数据库错误 = 注入仍成功）
+            if not self._waf_bypass_take():
+                return False
             test_payload = f"{payload} AND 1=2 AND '1'='"
             test_url = build_attack_url(url, param, test_payload, parsed_query)
             resp = await safe_request(test_url, session, method="GET", timeout=30)
@@ -839,12 +1023,16 @@ class BaseEngine(ABC):
                     return True
 
             # A-B延时验证：稳定可复现的延时也算绕过成功
+            if not self._waf_bypass_take():
+                return False
             start_time = time.time()
             resp = await safe_request(test_url, session, method="GET", timeout=30)
             if resp is None:
                 return False
             elapsed_1 = time.time() - start_time
 
+            if not self._waf_bypass_take():
+                return False
             start_time = time.time()
             resp = await safe_request(test_url, session, method="GET", timeout=30)
             if resp is None:

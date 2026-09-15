@@ -24,6 +24,7 @@ import time
 from typing import Dict, List, Optional
 
 from vulnclaw.core.logger import logger
+from vulnclaw.distributed import PROTOCOL_VERSION, validate_envelope
 
 
 class DistributedMaster:
@@ -104,18 +105,28 @@ class DistributedMaster:
         task["task_id"] = task_id
         task["submitted_at"] = time.time()
         task["status"] = "pending"
+
+        # P2-19 编排端口协议：投递前校验信封。
+        # 只告警不阻断 —— 新字段/新版本节点接入时老 Master 不应直接拒收，
+        # 是否 reject 由调用方决定（本处选择"可观测地放行"）。
+        ok, errs = validate_envelope(
+            "task", task, task.get("protocol_version", PROTOCOL_VERSION))
+        if not ok:
+            logger.warning(f"⚠️ [Master] 任务信封不合规（仍投递）: {errs}")
         # P3-3: 任务 TTL（默认 单任务超时 + 60s 余量）
         if "ttl" not in task:
             task["ttl"] = self.TASK_TIMEOUT + 60
 
-        # 存入任务状态
-        self._task_status[task_id] = {
+        # 存入任务状态（P0-9：同时写 Redis，Master 重启后仍可查到已提交任务）
+        status = {
             "status": "pending",
             "submitted_at": task["submitted_at"],
             "assigned_to": None,
             "completed_at": None,
             "result": None,
         }
+        self._task_status[task_id] = status
+        await self._persist_task_status(task_id, status)
 
         # 推入 Stream 队列（多 worker 消费组公平分发）
         await self._ensure_stream()
@@ -136,6 +147,40 @@ class DistributedMaster:
         logger.info(f"📋 [Master] 批量提交 {len(task_ids)} 个任务")
         return task_ids
 
+    async def _persist_task_status(self, task_id: str, status: Dict) -> None:
+        """P0-9：任务状态落 Redis（hash），Master 重启后可恢复。失败不阻断主流程。"""
+        try:
+            await self._redis.hset(
+                f"{self._prefix}:taskstatus", task_id, json.dumps(status, default=str))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[Master] 任务状态持久化失败: {exc}")
+
+    async def _scan_keys(self, pattern: str, count: int = 500) -> list:
+        """SCAN 增量迭代取键（替代阻塞式 KEYS）。不支持时回退 KEYS 并告警。"""
+        keys: list = []
+        try:
+            cursor = 0
+            while True:
+                cursor, batch = await self._redis.scan(
+                    cursor=cursor, match=pattern, count=count)
+                keys.extend(batch or [])
+                if not cursor or cursor == "0":
+                    break
+        except Exception as exc:  # noqa: BLE001 - 老服务端无 SCAN → 回退
+            logger.warning(f"⚠️ [Master] SCAN 不可用，回退 KEYS: {exc}")
+            keys = await self._redis.keys(pattern)
+        return keys
+
+    async def _load_task_status(self, task_id: str) -> Dict:
+        """P0-9：从 Redis 读回任务状态（本地 dict 缺失时，如重启后）。"""
+        try:
+            raw = await self._redis.hget(f"{self._prefix}:taskstatus", task_id)
+            if raw:
+                return json.loads(raw)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[Master] 任务状态读取失败: {exc}")
+        return {}
+
     async def get_result(self, task_id: str, timeout: float = 600) -> Optional[Dict]:
         """等待并获取任务结果。
 
@@ -150,7 +195,8 @@ class DistributedMaster:
 
         start = time.time()
         while time.time() - start < timeout:
-            status = self._task_status.get(task_id, {})
+            # P0-9：本地没有（Master 重启过）→ 回源 Redis 持久状态
+            status = self._task_status.get(task_id) or await self._load_task_status(task_id)
             if status.get("status") == "completed":
                 return status.get("result")
             if status.get("status") == "failed":
@@ -161,9 +207,10 @@ class DistributedMaster:
             result_data = await self._redis.get(result_key)
             if result_data:
                 result = json.loads(result_data)
-                self._task_status[task_id]["status"] = "completed"
-                self._task_status[task_id]["result"] = result
-                self._task_status[task_id]["completed_at"] = time.time()
+                entry = self._task_status.setdefault(task_id, {})
+                entry.update({"status": "completed", "result": result,
+                              "completed_at": time.time()})
+                await self._persist_task_status(task_id, entry)
                 return result
 
             await asyncio.sleep(1)
@@ -254,6 +301,24 @@ class DistributedMaster:
 
         return {"alive": alive, "dead": dead}
 
+    @staticmethod
+    def _task_id_of_message(data) -> Optional[str]:
+        """从 XRANGE 返回的条目里解析 task_id（解析不出返回 None）。
+
+        用于 P0-10 去重：PEL 里的消息与 assigned 记录可能是同一任务。
+        """
+        if not data:
+            return None
+        try:
+            fields = data[0][1]
+            raw = fields.get("task") if isinstance(fields, dict) else None
+            if not raw:
+                return None
+            task = json.loads(raw)
+            return task.get("task_id") if isinstance(task, dict) else None
+        except Exception:  # noqa: BLE001 - 非 JSON / 结构异常 → 视为未知，走 msg_id 去重
+            return None
+
     async def handle_dead_worker(self, worker_id: str) -> int:
         """处理离线 Worker 的故障转移。
 
@@ -268,14 +333,24 @@ class DistributedMaster:
         await self._connect()
 
         # 查找该 worker 正在执行的任务
+        # P1-13：`KEYS` 会阻塞 Redis 主线程 → 改 SCAN 增量迭代（大集群恢复不再拖垮 Redis）
         pattern = f"{self._prefix}:assigned:{worker_id}:*"
-        keys = await self._redis.keys(pattern)
+        keys = await self._scan_keys(pattern)
 
+        # P0-10：同一任务可能同时出现在「分配记录」与「消费组 PEL」两处
+        # （worker 拉取后写了 assigned 记录，却在 XACK 前崩溃）。两条路径都重投递
+        # 会造成重复执行，因此按 task_id 全局去重，只投递一次。
         requeued = 0
+        delivered: set = set()
         for key in keys:
             task_data = await self._redis.get(key)
             if task_data:
                 task = json.loads(task_data)
+                task_id = task.get("task_id") or key.rsplit(":", 1)[-1]
+                if task_id in delivered:
+                    # 同批次重复记录（同 task_id 多键）→ 只清理不重投
+                    await self._redis.delete(key)
+                    continue
                 task["status"] = "pending"
                 task["requeued_from"] = worker_id
                 task["requeued_at"] = time.time()
@@ -287,6 +362,7 @@ class DistributedMaster:
                 )
                 # 删除原分配记录
                 await self._redis.delete(key)
+                delivered.add(task_id)
                 requeued += 1
 
         # P3-3: 消费组 pending 重分配（worker 崩溃未 XACK 的消息）
@@ -306,11 +382,17 @@ class DistributedMaster:
                 data = await self._redis.xrange(stream_key, min=msg_id, max=msg_id)
             except Exception:  # noqa: BLE001
                 data = []
+            task_id = self._task_id_of_message(data)
+            dedupe_key = task_id or f"msg:{msg_id}"
             # 取回后 ACK 再从队尾重新投递，避免消息卡死在死 worker 名下
             await self._redis.xack(stream_key, group_name, msg_id)
+            if dedupe_key in delivered:
+                # 已由分配记录路径重投递 → 仅 ACK，避免二次投递
+                continue
             if data:
                 fields = data[0][1]
                 await self._redis.xadd(stream_key, fields)
+                delivered.add(dedupe_key)
                 requeued += 1
 
         # 从 workers 集合移除

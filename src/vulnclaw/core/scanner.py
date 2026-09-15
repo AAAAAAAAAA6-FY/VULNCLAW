@@ -20,6 +20,7 @@ import traceback
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 from vulnclaw.core.settings import settings
 from vulnclaw.core.logger import logger
@@ -56,16 +57,20 @@ HIGH_RISK_PATHS = [
 # ============================================================
 _ENGINES = None
 _ENGINE_MAP = None
+_ENGINE_INVENTORY = None
 _ENGINES_LOCK = asyncio.Lock()        # P3-2: asyncio 环境并发安全
 _ENGINES_THREAD_LOCK = threading.Lock()  # P3-2: 同步/线程池环境并发安全
 
 
 def _do_load_engines():
     """实际扫描并加载 engines 目录下的引擎插件（调用方须持有锁）。"""
-    global _ENGINES, _ENGINE_MAP
+    global _ENGINES, _ENGINE_MAP, _ENGINE_INVENTORY
     from vulnclaw.engines.base import BaseEngine
     engines_dir = Path(__file__).parent.parent / "engines"
     engines = []
+    discovered = []
+    failed = []
+    abstract = []
 
     for module_path in sorted(engines_dir.glob("*.py")):
         if module_path.name in {"__init__.py", "base.py"}:
@@ -90,11 +95,17 @@ def _do_load_engines():
                 continue
             if not hasattr(engine_class, "name"):
                 continue
+            name = str(getattr(engine_class, "name", engine_class.__name__))
+            discovered.append(name)
+            if inspect.isabstract(engine_class):
+                abstract.append({"name": name, "class": engine_class.__name__})
+                continue
 
             try:
                 engine = engine_class()
             except Exception as exc:
                 logger.warning(f"⚠️ 引擎实例化失败 {engine_class.__name__}: {exc}")
+                failed.append({"name": name, "class": engine_class.__name__, "error": str(exc)})
                 continue
             if getattr(engine, "enabled", True) is False:
                 continue
@@ -108,6 +119,14 @@ def _do_load_engines():
 
     _ENGINES = engines
     _ENGINE_MAP = {e.name: e for e in engines}
+    _ENGINE_INVENTORY = {
+        "discovered": len(discovered),
+        "instantiated": len(engines),
+        "enabled": len(engines),
+        "failed": failed,
+        "abstract": abstract,
+        "names": sorted(str(e.name) for e in engines),
+    }
     logger.info(f"✅ 加载 {len(engines)} 个漏洞检测引擎")
 
 
@@ -157,6 +176,12 @@ def get_all_engines():
     """获取所有引擎列表"""
     engines, _ = _load_engines()
     return engines
+
+
+def get_engine_inventory() -> Dict:
+    """返回单一事实源的引擎发现/实例化统计，供 health、报告和 CI 使用。"""
+    _load_engines()
+    return dict(_ENGINE_INVENTORY or {})
 
 
 def engine_capability(engine) -> tuple:
@@ -298,6 +323,17 @@ async def run_engine(engine_name, target=None, url=None, param=None, session=Non
                                    findings=len(_out) if isinstance(_out, list) else 0)
             except Exception:
                 pass
+        # 自动成长-读取端（2026-09-15）：账本强误报指纹过滤（默认关零影响）。
+        # 命中 (vuln_type, 归一化参数) 强误报签名的 finding 不进主链路；
+        # 过滤失败静默放行，绝不因账本问题丢/改引擎原始检出。
+        try:
+            from vulnclaw.growth.bridges import suppress_findings
+            _kept, _suppressed = suppress_findings(_out)
+            if _suppressed:
+                logger.info(f"growth: 抑制 {len(_suppressed)} 条强误报指纹 (engine={engine_name})")
+                _out = _kept
+        except Exception:  # noqa: BLE001
+            pass
         return _out
     except Exception as e:
         if _ledger is not None and not isinstance(e, ValueError):
@@ -391,6 +427,20 @@ def _impersonate_request_api():
 _HONEYPOT_SLUMP: Dict[str, int] = {}
 
 
+def _is_local_target(url: str) -> bool:
+    """Keep local test/lab targets on the native aiohttp path.
+
+    HTTP/2 and TLS impersonation clients are useful for remote targets, but
+    they can route localhost requests through an incompatible transport or
+    proxy. Local targets must remain deterministic for tests and local labs.
+    """
+    try:
+        hostname = (urlparse(str(url)).hostname or "").lower()
+    except ValueError:
+        return False
+    return hostname in {"localhost", "127.0.0.1", "::1"}
+
+
 async def safe_request(
     url: str,
     session,
@@ -416,23 +466,24 @@ async def safe_request(
     start_ts = time.monotonic()
     retry_count = 0
     max_retries = 3
+    local_target = _is_local_target(url)
 
     while retry_count <= max_retries:
         try:
             if method.upper() == "GET":
-                if _impersonate_available():
+                if not local_target and _impersonate_available():
                     _imp_get, _ = _impersonate_request_api()
                     resp = await _imp_get(url, session=session, timeout=timeout, **kwargs, allow_redirects=False)
-                elif _http2_available():
+                elif not local_target and _http2_available():
                     _http2_get, _ = _http2_request_api()
                     resp = await _http2_get(url, session=session, timeout=timeout, **kwargs, allow_redirects=False)
                 else:
                     resp = await async_get(url, session=session, timeout=timeout, no_retry=True, **kwargs, allow_redirects=False)
             elif method.upper() == "POST":
-                if _impersonate_available():
+                if not local_target and _impersonate_available():
                     _, _imp_post = _impersonate_request_api()
                     resp = await _imp_post(url, session=session, timeout=timeout, **kwargs)
-                elif _http2_available():
+                elif not local_target and _http2_available():
                     _, _http2_post = _http2_request_api()
                     resp = await _http2_post(url, session=session, timeout=timeout, **kwargs)
                 else:
@@ -699,6 +750,7 @@ def score_asset_enhanced(
 __all__ = [
     'get_engine_by_name',
     'get_all_engines',
+    'get_engine_inventory',
     'get_engine_by_vuln_type',
     'get_engine_payloads',
     'get_error_collector',

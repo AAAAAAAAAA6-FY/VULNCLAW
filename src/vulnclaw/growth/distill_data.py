@@ -23,7 +23,10 @@ from typing import Any, Dict, List, Optional
 
 from vulnclaw.core.logger import logger
 
-_DEFAULT_LEDGER = os.path.join("_runtime_cache", "growth", "feedback_ledger.jsonl")
+# 账本文件名必须与 FeedbackLedger 实际写入一致（growth/feedback_ledger._default_path
+# 写的是 "feedback.jsonl"）。历史值 "feedback_ledger.jsonl" 与生产者不一致，
+# 导致蒸馏管线永远 FileNotFoundError（断链修复 2026-09-14）。
+_DEFAULT_LEDGER = os.path.join("_runtime_cache", "growth", "feedback.jsonl")
 _VERDICT_OK = {"confirm", "confirmed", "fixed", "reconfirmed"}
 _CONFIDENCE_OK = {"high", "confirmed", "verify", "true"}
 

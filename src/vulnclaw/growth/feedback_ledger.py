@@ -126,7 +126,12 @@ class FeedbackLedger:
             elif f.get("verified") is False or f.get("confirmed") is False:
                 v = "fp"
             else:
-                v = "confirm" if f.get("confidence", 0) in (1, "high") else "miss"
+                # 中文 confidence（"高/中/低"）此前不匹配 ("high", 1) → 真实报告
+                # 全被判成 miss（弱证据），飞轮只能收废料。补齐中英口径。
+                _conf = str(f.get("confidence") or "").strip().lower()
+                v = ("confirm" if (f.get("confidence") in (1,)
+                                   or _conf in ("high", "confirmed", "verify", "true", "高", "确信"))
+                     else "miss")
             self.absorb_finding(f, tech_stack=tech_stack, verdict=v, target=target)
             n += 1
         return n
