@@ -207,9 +207,15 @@ class DistributedMaster:
             result_data = await self._redis.get(result_key)
             if result_data:
                 result = json.loads(result_data)
-                entry = self._task_status.setdefault(task_id, {})
+                # T14 修复：本地为空（master 重启）时先回源 Redis 再合并。
+                # 旧写法 `setdefault(task_id, {})` 会用"只有 completed 字段"的
+                # 残缺状态**覆写** Redis 里带 submitted_at/assigned_to 的完整状态
+                # —— 状态退化后无法回答"这个任务是谁在什么时候领走的"。
+                entry = self._task_status.get(task_id) \
+                    or await self._load_task_status(task_id) or {}
                 entry.update({"status": "completed", "result": result,
                               "completed_at": time.time()})
+                self._task_status[task_id] = entry
                 await self._persist_task_status(task_id, entry)
                 return result
 
