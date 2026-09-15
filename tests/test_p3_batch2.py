@@ -342,3 +342,72 @@ class TestPromptRegistry:
         assert "S" in d and "重复报告" in d
         s = render("strategic.plan_llm", tech="T", ports="P", vulns="V")
         assert "技术栈: T" in s and "端口: P" in s and "已发现漏洞: V" in s
+
+
+# ============================================================
+# T15 异常协议第 1 批：被吞异常的结构化审计
+# ============================================================
+class TestAuditSuppressed:
+    """原写法 `logger.debug("suppressed exception (core audit)")` 只有一行固定文本，
+    异常对象完全丢失（不知吞了什么）。审计函数用 sys.exc_info() 取回异常并落盘。
+    """
+
+    @staticmethod
+    def _patch_path(monkeypatch, tmp_path):
+        import vulnclaw.core.logger as L
+        monkeypatch.setattr(
+            L, "_SUPPRESSED_AUDIT_PATH", str(tmp_path / "sup_audit.jsonl"))
+        return L
+
+    def test_captures_exception_type_and_message(self, tmp_path, monkeypatch):
+        L = self._patch_path(monkeypatch, tmp_path)
+        try:
+            raise ValueError("boom-123")
+        except ValueError:
+            site = L.audit_suppressed("unit.test")
+
+        assert site == "unit.test"
+        rows = L.read_suppressed_audit()
+        assert len(rows) == 1
+        ev = rows[0]
+        assert ev["kind"] == "suppressed_exception"
+        assert ev["type"] == "ValueError"
+        assert "boom-123" in ev["message"]
+        assert ev["site"] == "unit.test"
+
+    def test_auto_caller_when_site_empty(self, tmp_path, monkeypatch):
+        """site 留空 -> 自动补调用点 文件名:行号（异常路径低频，开销可接受）。"""
+        L = self._patch_path(monkeypatch, tmp_path)
+        try:
+            raise KeyError("k")
+        except KeyError:
+            L.audit_suppressed()
+
+        ev = L.read_suppressed_audit()[0]
+        assert ev["caller"] and ":" in ev["caller"]
+        assert "test_p3_batch2" in ev["caller"]
+
+    def test_extra_fields_recorded(self, tmp_path, monkeypatch):
+        L = self._patch_path(monkeypatch, tmp_path)
+        try:
+            raise RuntimeError("r")
+        except RuntimeError:
+            L.audit_suppressed("orch.gc", phase="teardown")
+
+        ev = L.read_suppressed_audit()[0]
+        assert ev["phase"] == "teardown"
+
+    def test_never_raises_outside_except_block(self, tmp_path, monkeypatch):
+        """异常块外调用不得抛（fail-open），type 为空但仍留审计。"""
+        L = self._patch_path(monkeypatch, tmp_path)
+        L.audit_suppressed("outside.except")
+        ev = L.read_suppressed_audit()[0]
+        assert ev["type"] == ""
+
+    def test_read_back_skips_corrupt_lines(self, tmp_path, monkeypatch):
+        L = self._patch_path(monkeypatch, tmp_path)
+        with open(L._SUPPRESSED_AUDIT_PATH, "w", encoding="utf-8") as fh:
+            fh.write('{"kind": "suppressed_exception", "site": "ok"}\n')
+            fh.write("{ half line\n")
+        rows = L.read_suppressed_audit()
+        assert len(rows) == 1 and rows[0]["site"] == "ok"
