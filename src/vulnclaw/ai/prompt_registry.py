@@ -68,6 +68,91 @@ _PROMPTS: Dict[str, Dict[str, Any]] = {
             },
         ],
     },
+    "verify.single_evidence": {
+        "version": 1,
+        "description": "单条候选的证据型裁决（phases_verify：证据包 + probe 观测）",
+        "system": "",
+        "params": {},
+        "template": (
+            "你是 Web 漏洞证据型验证官。你的唯一职责：基于下方【证据包】与【probe 观测结果】做客观裁决。\n"
+            "\n"
+            "【裁决规则】\n"
+            "1. 反射/XSS 回显类漏洞：只有观测到载荷回显（reflect=true）或明确的"
+            "状态/长度/内容差分才允许 confirm；\n"
+            "2. 无任何客观证据，或 probe 观测缺失/失败（ok=false）：一律判\"证据不足\"，不得 confirm；\n"
+            "3. 绝不猜测、绝不脑补；宁可\"证据不足\"也不误判。\n"
+            "\n"
+            "【证据包】\n{evidence_pack}\n"
+            "\n"
+            "【probe 观测结果】\n{probe_summary}\n"
+            "\n"
+            "请只回答问题并**仅输出一个 JSON 对象**（不要 markdown 代码块、不要额外文字）：\n"
+            '{"confirmed": "是|否|证据不足", "confidence": "high|medium|low", '
+            '"reason": "一条最有力的证据行", "evidence_ref": ["证据1", "证据2"], '
+            '"curl_poc": "复现该判定的 curl 命令（单行可直接执行）"}\n'
+            "规则：证据不足/无法构造 curl 时对应字段给空字符串或空数组，绝不编造。"
+        ),
+        "samples": [
+            {
+                "name": "证据包与 probe 两段都要注入，且保留 fail-closed 措辞",
+                "vars": {"evidence_pack": "PACK_X", "probe_summary": "PROBE_X"},
+                "expect_contains": [
+                    "【证据包】\nPACK_X",
+                    "【probe 观测结果】\nPROBE_X",
+                    "ok=false",
+                    "绝不猜测、绝不脑补",
+                ],
+            },
+        ],
+    },
+    "verify.dedupe": {
+        "version": 1,
+        "description": "同类型+同 URL、仅参数不同的重复报告判定（phases_verify 去重）",
+        "system": "",
+        "params": {},
+        "template": (
+            "以下多条漏洞类型与 URL 相同、仅参数不同，请判断是否为同一个底层漏洞的重复报告。"
+            "若是，返回需保留的唯一条目下标 JSON 数组（如 [0]）；若不是同一漏洞返回 []。\n"
+            "{summary}"
+        ),
+        "samples": [
+            {
+                "name": "条目摘要必须注入，且保留下标数组的输出格式约束",
+                "vars": {"summary": "[0] param=id sev=High"},
+                "expect_contains": [
+                    "重复报告",
+                    "[0] param=id sev=High",
+                    "返回 []",
+                ],
+            },
+        ],
+    },
+    "strategic.plan_llm": {
+        "version": 1,
+        "description": "战略层 LLM 增强：按侦察情报产出高价值路径 Top-N"
+                       "（decision_layers.strategic_plan_llm）",
+        "system": "只输出 JSON。",
+        "params": {"temperature": 0.1, "max_tokens": 500},
+        "template": (
+            "你是渗透测试战略规划器。根据侦察信息，给出下一步最值得优先测试的"
+            "路径列表（最多 10 条，按价值排序）。\n"
+            "技术栈: {tech}\n端口: {ports}\n已发现漏洞: {vulns}\n"
+            "只输出 JSON：{\"targets\": [{\"path\": \"/xxx\", \"reason\": \"...\"}]}"
+        ),
+        "samples": [
+            {
+                "name": "技术栈/端口/已发现漏洞三段都要注入，且保留 JSON 输出约束",
+                "vars": {"tech": "PHP/7.4", "ports": "80,443", "vulns": "sqli@http://x/a"},
+                "expect_contains": [
+                    "技术栈: PHP/7.4",
+                    "端口: 80,443",
+                    "已发现漏洞: sqli@http://x/a",
+                    "只输出 JSON",
+                    "最多 10 条",
+                ],
+            },
+        ],
+    },
 }
 
 

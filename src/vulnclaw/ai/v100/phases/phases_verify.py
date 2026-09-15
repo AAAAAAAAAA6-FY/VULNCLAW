@@ -813,25 +813,36 @@ async def _verify_cross(
             )
         # probe 缺失时保持 None：_probe_summary(None) 诚实输出「缺失/失败」（fail-closed），
         # 避免伪造 ok=True 让 AI 误以为「已探测且无信号」。
-        prompt = (
-            "你是 Web 漏洞证据型验证官。你的唯一职责：基于下方【证据包】与【probe 观测结果】做客观裁决。\n"
-            "\n"
-            "【裁决规则】\n"
-            "1. 反射/XSS 回显类漏洞：只有观测到载荷回显（reflect=true）或明确的"
-            "状态/长度/内容差分才允许 confirm；\n"
-            "2. 无任何客观证据，或 probe 观测缺失/失败（ok=false）：一律判\"证据不足\"，不得 confirm；\n"
-            "3. 绝不猜测、绝不脑补；宁可\"证据不足\"也不误判。\n"
-            "\n"
-            f"【证据包】\n{evidence_pack}\n"
-            "\n"
-            f"【probe 观测结果】\n{_probe_summary(probe)}\n"
-            "\n"
-            "请只回答问题并**仅输出一个 JSON 对象**（不要 markdown 代码块、不要额外文字）：\n"
-            '{"confirmed": "是|否|证据不足", "confidence": "high|medium|low", '
-            '"reason": "一条最有力的证据行", "evidence_ref": ["证据1", "证据2"], '
-            '"curl_poc": "复现该判定的 curl 命令（单行可直接执行）"}\n'
-            "规则：证据不足/无法构造 curl 时对应字段给空字符串或空数组，绝不编造。"
-        )
+        # T12：prompt 收口到统一注册表（逐字一致，只换引用）；异常 → 回退内嵌原文。
+        try:
+            from vulnclaw.ai.prompt_registry import render as _render_prompt
+            prompt = _render_prompt(
+                "verify.single_evidence",
+                evidence_pack=evidence_pack,
+                probe_summary=_probe_summary(probe),
+            )
+        except Exception:  # noqa: BLE001
+            prompt = ""
+        if not prompt:
+            prompt = (
+                "你是 Web 漏洞证据型验证官。你的唯一职责：基于下方【证据包】与【probe 观测结果】做客观裁决。\n"
+                "\n"
+                "【裁决规则】\n"
+                "1. 反射/XSS 回显类漏洞：只有观测到载荷回显（reflect=true）或明确的"
+                "状态/长度/内容差分才允许 confirm；\n"
+                "2. 无任何客观证据，或 probe 观测缺失/失败（ok=false）：一律判\"证据不足\"，不得 confirm；\n"
+                "3. 绝不猜测、绝不脑补；宁可\"证据不足\"也不误判。\n"
+                "\n"
+                f"【证据包】\n{evidence_pack}\n"
+                "\n"
+                f"【probe 观测结果】\n{_probe_summary(probe)}\n"
+                "\n"
+                "请只回答问题并**仅输出一个 JSON 对象**（不要 markdown 代码块、不要额外文字）：\n"
+                '{"confirmed": "是|否|证据不足", "confidence": "high|medium|low", '
+                '"reason": "一条最有力的证据行", "evidence_ref": ["证据1", "证据2"], '
+                '"curl_poc": "复现该判定的 curl 命令（单行可直接执行）"}\n'
+                "规则：证据不足/无法构造 curl 时对应字段给空字符串或空数组，绝不编造。"
+            )
         # P2-1: verify 复杂推理优先使用大模型（glm-4.7），提高判定质量
         available_models = []
         try:
@@ -1139,8 +1150,15 @@ async def llm_judge_dedup(orch, findings: list) -> list:
                 f"[{i}] param={findings[i].get('parameter', '')} sev={findings[i].get('severity', '')} "
                 f"evidence={str(findings[i].get('evidence', ''))[:100]}"
                 for i in idxs)
-            prompt = ("以下多条漏洞类型与 URL 相同、仅参数不同，请判断是否为同一个底层漏洞的重复报告。"
-                      "若是，返回需保留的唯一条目下标 JSON 数组（如 [0]）；若不是同一漏洞返回 []。\n" + summary)
+            # T12：prompt 收口到统一注册表（逐字一致，只换引用）；异常 → 回退内嵌原文。
+            try:
+                from vulnclaw.ai.prompt_registry import render as _render_prompt
+                prompt = _render_prompt("verify.dedupe", summary=summary)
+            except Exception:  # noqa: BLE001
+                prompt = ""
+            if not prompt:
+                prompt = ("以下多条漏洞类型与 URL 相同、仅参数不同，请判断是否为同一个底层漏洞的重复报告。"
+                          "若是，返回需保留的唯一条目下标 JSON 数组（如 [0]）；若不是同一漏洞返回 []。\n" + summary)
             resp = await orch._ask_ai(prompt, compress=True, task_type="verify")
             import json as _json
             try:

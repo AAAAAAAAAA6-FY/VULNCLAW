@@ -89,12 +89,23 @@ async def strategic_plan_llm(brief: Optional[Dict], findings: Optional[List[Dict
         vulns = ", ".join(
             f"{f.get('type')}@{f.get('url', '')}" for f in (findings or [])[:5]
         )
-        prompt = (
-            "你是渗透测试战略规划器。根据侦察信息，给出下一步最值得优先测试的"
-            "路径列表（最多 10 条，按价值排序）。\n"
-            f"技术栈: {tech or '未知'}\n端口: {ports or '未知'}\n已发现漏洞: {vulns or '无'}\n"
-            "只输出 JSON：{\"targets\": [{\"path\": \"/xxx\", \"reason\": \"...\"}]}"
-        )
+        # T12：prompt 收口到统一注册表（ai/prompt_registry），带版本号与样例回归集。
+        # 模板文本与内嵌原文逐字一致，只换引用；注册表缺失/异常 → 回退，绝不打断。
+        try:
+            from vulnclaw.ai.prompt_registry import render as _render_prompt
+            prompt = _render_prompt(
+                "strategic.plan_llm",
+                tech=(tech or "未知"), ports=(ports or "未知"), vulns=(vulns or "无"),
+            )
+        except Exception:  # noqa: BLE001
+            prompt = ""
+        if not prompt:
+            prompt = (
+                "你是渗透测试战略规划器。根据侦察信息，给出下一步最值得优先测试的"
+                "路径列表（最多 10 条，按价值排序）。\n"
+                f"技术栈: {tech or '未知'}\n端口: {ports or '未知'}\n已发现漏洞: {vulns or '无'}\n"
+                "只输出 JSON：{\"targets\": [{\"path\": \"/xxx\", \"reason\": \"...\"}]}"
+            )
         import re as _re
         import json as _json
 
