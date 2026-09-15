@@ -11,7 +11,7 @@ import gc
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
-from vulnclaw.core.logger import logger
+from vulnclaw.core.logger import logger, audit_suppressed
 from vulnclaw.core.context import get_scan_context
 from vulnclaw.core.settings import settings
 from vulnclaw.core.utils import async_get, vuln_category
@@ -189,7 +189,7 @@ class V100Orchestrator(ModelRoutingMixin, StreamVerifyMixin, FindingEvidenceMixi
                         if isinstance(_k, (list, tuple)) and len(_k) == 3:
                             self._incremental_scanned.add(tuple(_k))
         except Exception:
-            logger.debug("suppressed exception (core audit)")
+            audit_suppressed()
         # P5-1: SQLite 断点续扫存储（A4.6 落地）
         # 每个 target 一个确定性 DB：PROJECT_CACHE_DIR/persistence/<safe_target>.db
         self._resume = bool(resume)
@@ -421,7 +421,7 @@ class V100Orchestrator(ModelRoutingMixin, StreamVerifyMixin, FindingEvidenceMixi
                     logger.info("🔌 Burp 将在首次 API 调用时自动检测")
                     return
             except RuntimeError:
-                logger.debug("suppressed exception (core audit)")
+                audit_suppressed()
 
             # P3-12：run_sync 安全包装（在事件循环内被调用时不再抛 RuntimeError）
             from vulnclaw.core.utils import run_sync as _run_sync_burp
@@ -540,7 +540,7 @@ class V100Orchestrator(ModelRoutingMixin, StreamVerifyMixin, FindingEvidenceMixi
                 return
             logger.info("ℹ️ 未检测到多角色会话，IDOR检测将跳过")
         except Exception:
-            logger.debug("suppressed exception (core audit)")
+            audit_suppressed()
 
     # -------------------------------------------------------------------------
     # 流水线验证（stream-verify）：attack 节点边出 finding 边后台 verify。
@@ -589,7 +589,7 @@ class V100Orchestrator(ModelRoutingMixin, StreamVerifyMixin, FindingEvidenceMixi
                 try:
                     self._checkpoint.add_finding(finding)
                 except Exception:  # noqa: BLE001
-                    logger.debug("suppressed exception (core audit)")
+                    audit_suppressed()
             # E4: 记录已确认高危/严重漏洞的参数（按大类），供早停跳过“同类”剩余引擎
             try:
                 if str(finding.get('severity', '')).lower() in ('high', 'critical'):
@@ -599,14 +599,14 @@ class V100Orchestrator(ModelRoutingMixin, StreamVerifyMixin, FindingEvidenceMixi
                         vuln_category(finding.get('type', '') or finding.get('engine', ''))
                     )
             except Exception:
-                logger.debug("suppressed exception (core audit)")
+                audit_suppressed()
             try:
                 get_metrics().inc_vuln(
                     str(finding.get('severity', 'unknown')) or 'unknown',
                     str(finding.get('type', 'unknown')) or 'unknown',
                 )
             except Exception:
-                logger.debug("suppressed exception (core audit)")
+                audit_suppressed()
 
     # ------------------------------------------------------------------
     # 轨道2 2.1: PoC 复现信息（reproduction_steps + curl_command）
@@ -627,7 +627,7 @@ class V100Orchestrator(ModelRoutingMixin, StreamVerifyMixin, FindingEvidenceMixi
             try:
                 await self._scan_idor()
             except Exception:  # noqa: BLE001 - IDOR 线异常不阻断 extras 其余分支
-                logger.debug("suppressed exception (core audit)")
+                audit_suppressed()
 
         # C 方案社区线（2026-09-08）：Nuclei 社区模板通用检测，与 extras 收尾一并执行
         if (
@@ -637,7 +637,7 @@ class V100Orchestrator(ModelRoutingMixin, StreamVerifyMixin, FindingEvidenceMixi
             try:
                 await self._run_nuclei_community_line()
             except Exception:  # noqa: BLE001 - 社区线异常不阻断 extras
-                logger.debug("suppressed exception (core audit)")
+                audit_suppressed()
 
         if self._enable_default_creds:
             await self._check_default_creds()
@@ -647,21 +647,21 @@ class V100Orchestrator(ModelRoutingMixin, StreamVerifyMixin, FindingEvidenceMixi
             try:
                 await self._run_sequence_chain_line()
             except Exception:  # noqa: BLE001 - 序列线异常不阻断 extras
-                logger.debug("suppressed exception (core audit)")
+                audit_suppressed()
 
         # 声明驱动产线（2026-09-10）：声明集覆盖老引擎够不到的注入位置
         if getattr(settings, "vulnspec_line_enabled", True):
             try:
                 await self._run_vulnspec_line()
             except Exception:  # noqa: BLE001 - 声明线异常不阻断 extras
-                logger.debug("suppressed exception (core audit)")
+                audit_suppressed()
 
         # 元orphic 不变量产线（ID 越权候选为只读，零副作用）
         if getattr(settings, "metamorphic_line_enabled", True):
             try:
                 await self._run_metamorphic_line()
             except Exception:  # noqa: BLE001
-                logger.debug("suppressed exception (core audit)")
+                audit_suppressed()
 
         if self._enable_business_logic:
             await self._run_business_logic_scan()
@@ -919,7 +919,7 @@ class V100Orchestrator(ModelRoutingMixin, StreamVerifyMixin, FindingEvidenceMixi
             try:
                 self._checkpoint.save_stage_start(idx, name)
             except Exception:  # noqa: BLE001
-                logger.debug("suppressed exception (core audit)")
+                audit_suppressed()
         try:
             yield True
         finally:
@@ -927,7 +927,7 @@ class V100Orchestrator(ModelRoutingMixin, StreamVerifyMixin, FindingEvidenceMixi
                 try:
                     self._checkpoint.save_stage_done(idx, name)
                 except Exception:  # noqa: BLE001
-                    logger.debug("suppressed exception (core audit)")
+                    audit_suppressed()
 
     async def _run_phase_timeboxed(self, name: str, coro):
         """SH17.1 阶段预算：单阶段 wall-clock 超时只中断本阶段，跳过继续（不整扫报废）。
@@ -1084,7 +1084,7 @@ class V100Orchestrator(ModelRoutingMixin, StreamVerifyMixin, FindingEvidenceMixi
                     "误报率风险偏高，建议配置 AI_MODELS/AI_API_KEY 后再扫"
                 )
         except Exception:  # noqa: BLE001
-            logger.debug("suppressed exception (core audit)")
+            audit_suppressed()
 
         # P4-3: 后台更新 Nuclei 模板（不阻塞扫描启动，收尾时回收）
         self._nuclei_update_task = None
@@ -1241,7 +1241,7 @@ class V100Orchestrator(ModelRoutingMixin, StreamVerifyMixin, FindingEvidenceMixi
                 try:
                     self._checkpoint.save_agent_memory("shared_knowledge", self._ensure_shared_knowledge())
                 except Exception:  # noqa: BLE001
-                    logger.debug("suppressed exception (core audit)")
+                    audit_suppressed()
             self._apply_final_review_gate()
             async with self._stage("report"):
                 # P5-1: 收尾前把全部 findings 落盘（双保险，_add_finding 增量已覆盖）
@@ -1254,7 +1254,7 @@ class V100Orchestrator(ModelRoutingMixin, StreamVerifyMixin, FindingEvidenceMixi
                             for f in self.findings:
                                 self._checkpoint.add_finding(f)
                     except Exception:  # noqa: BLE001
-                        logger.debug("suppressed exception (core audit)")
+                        audit_suppressed()
                 _pt = time.monotonic()
                 report = await self._run_phase_timeboxed("report", self._generate_report())
                 self._phase_timings['report'] = time.monotonic() - _pt
@@ -1268,7 +1268,7 @@ class V100Orchestrator(ModelRoutingMixin, StreamVerifyMixin, FindingEvidenceMixi
                 try:
                     self._checkpoint.mark_finished()
                 except Exception:  # noqa: BLE001
-                    logger.debug("suppressed exception (core audit)")
+                    audit_suppressed()
             return report
         except Exception as e:
             logger.error(f"扫描过程中发生错误: {e}")
@@ -1282,7 +1282,7 @@ class V100Orchestrator(ModelRoutingMixin, StreamVerifyMixin, FindingEvidenceMixi
             try:
                 self._emit_metrics()
             except Exception:
-                logger.debug("suppressed exception (core audit)")
+                audit_suppressed()
             self._apply_final_review_gate()
             return await self._generate_report()
 
@@ -1306,3 +1306,9 @@ async def run_v100_scan(target: str, session, max_tasks: int = None, initial_qps
     return await system.run()
 
 __all__ = ['V100Orchestrator', 'run_v100_scan']
+1	JWT kid/JWK 注入	engines/auth_engines.py	中	从 2 个 fixture → 6+，覆盖真实 CVE
+2	GraphQL alias 批量攻击	engines/net_engines.py	中	graphql 引擎当前只有 introspection + 基础注入
+3	Prototype Pollution gadget 提示	engines/web_advanced_engines.py	小	加一个 gadget fingerprints 库，现有引擎直接引用
+4	sqli fixture 深度化	tests/fixtures/engines/sqli.yaml	小	从~4 个 case → 12+（WAF 绕过、盲注、堆叠）
+5	xss fixture 深度化	tests/fixtures/engines/xss.yaml	小	补 attribute/JS context/SVG/mutation XSS
+6	ssrf fixture 补盲	tests/fixtures/engines/ssrf.yaml	小	补 gopher/302 跳转/DNS rebind 基础 case

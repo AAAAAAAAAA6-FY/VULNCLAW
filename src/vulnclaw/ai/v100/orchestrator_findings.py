@@ -11,7 +11,7 @@
 """
 from typing import Dict
 
-from vulnclaw.core.logger import logger
+from vulnclaw.core.logger import logger, audit_suppressed
 from vulnclaw.core.settings import settings
 
 
@@ -58,13 +58,13 @@ class FindingEvidenceMixin:
             if isinstance(burp_cookies, dict):
                 cookies.update({str(k): str(v) for k, v in burp_cookies.items()})
         except Exception:  # noqa: BLE001
-            logger.debug("suppressed exception (core audit)")
+            audit_suppressed()
         try:
             if self.session is not None and getattr(self.session, "cookies", None):
                 for k, v in self.session.cookies.items():
                     cookies.setdefault(str(k), str(v))
         except Exception:  # noqa: BLE001
-            logger.debug("suppressed exception (core audit)")
+            audit_suppressed()
         return "; ".join(f"{k}={v}" for k, v in cookies.items())
 
 
@@ -128,7 +128,7 @@ class FindingEvidenceMixin:
             from vulnclaw.core.models import apply_evidence_schema
             apply_evidence_schema(finding)
         except Exception:  # noqa: BLE001 - 规范层缺席不阻断 finding 落库
-            logger.debug("suppressed exception (core audit)")
+            audit_suppressed()
 
         # 轨道2 2.2: 双源确认（引擎命中 + Burp 独立确认）
         burp_ok = bool(finding.get("burp_confirmed") or finding.get("burp_verified"))

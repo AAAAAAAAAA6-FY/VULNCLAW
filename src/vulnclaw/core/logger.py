@@ -184,5 +184,108 @@ try:
 except Exception:  # noqa: BLE001 - 容器不可用时不影响日志模块本身
     pass
 
+# ============================================================
+# T15 异常协议第 1 批：统一"被吞异常"审计
+# ============================================================
+# 背景：全项目有 300+ 处 `logger.debug("suppressed exception (core audit)")`，
+# 只有一行固定文本 —— **异常对象完全丢失**（连 type/message 都没有），
+# 排查时只知道"这里吞了异常"，不知道吞了什么、在哪吞的。
+#
+# 本函数把这些点升级为**结构化审计事件**，且**不改 except 绑定**：
+# 用 sys.exc_info() 在 except 块内取回正在处理的异常 —— 因此调用点只需
+# 把原来的字面量 debug 换成 `audit_suppressed()`，零结构性改动。
+#
+# 三件事：
+#   1. 主日志：DEBUG 级输出 [类型] 位置: 消息（控制台不污染，文件日志可查）
+#   2. 结构化落盘：_runtime_cache/logs/suppressed_exceptions.jsonl
+#      （kind/site/caller/type/message/trace_id），供离线统计"哪段代码在吞什么"
+#   3. 绝不抛异常 —— 审计自身失败也 fail-open，不得反过来影响业务
+_SUPPRESSED_AUDIT_PATH = os.path.join(LOG_DIR, "suppressed_exceptions.jsonl")
+_SUPPRESSED_AUDIT_LOCK = threading.Lock()
+
+
+def audit_suppressed(site: str = "", **extra) -> str:
+    """记录一个被吞掉的异常（结构化 + 落盘）。
+
+    **必须在 except 块内调用**（依赖 ``sys.exc_info()`` 取当前异常）；
+    在 except 块外调用不会报错，但 type/message 为空。
+
+    Args:
+        site: 语义位置标签（如 ``"orchestrator.gc"``）；留空则自动用
+              调用点 ``文件名:行号``（异常路径低频，inspect 开销可接受）。
+        **extra: 附加结构化字段（如 ``phase="verify"``）。
+
+    Returns:
+        实际使用的 site 字符串（失败返回空串）。
+    """
+    try:
+        exc = sys.exc_info()[1]
+        exc_type = type(exc).__name__ if exc is not None else ""
+        exc_msg = str(exc)[:300] if exc is not None else ""
+
+        caller = ""
+        try:
+            frame = sys._getframe(1)
+            caller = f"{os.path.basename(frame.f_code.co_filename)}:{frame.f_lineno}"
+        except Exception:  # noqa: BLE001 - 取不到调用点不影响审计语义
+            caller = ""
+
+        resolved_site = site or caller
+        event = {
+            "kind": "suppressed_exception",
+            "ts": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            "site": resolved_site,
+            "caller": caller,
+            "type": exc_type,
+            "message": exc_msg,
+            "trace_id": get_trace_context(),
+        }
+        for k, v in extra.items():
+            event[str(k)] = v
+
+        # 1) 主日志（DEBUG 级，但信息量远超旧的固定文本）
+        logger.debug(
+            f"suppressed exception [{exc_type or '?'}] {resolved_site}: {exc_msg}")
+
+        # 2) 结构化审计落盘（追加 JSONL；失败静默，不影响业务）
+        try:
+            with _SUPPRESSED_AUDIT_LOCK:
+                with open(_SUPPRESSED_AUDIT_PATH, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(event, ensure_ascii=False) + "\n")
+        except Exception:  # noqa: BLE001 - 审计落盘失败绝不影响主流程
+            pass
+        return resolved_site
+    except Exception:  # noqa: BLE001 - 审计自身也 fail-open
+        return ""
+
+
+def read_suppressed_audit(limit: int = 0) -> list:
+    """读回被吞异常审计（离线排查/统计用）。
+
+    Args:
+        limit: 最多返回最近 N 条；0 表示全量。
+
+    Returns:
+        结构化事件列表（文件缺失/损坏返回已解析部分，不抛异常）。
+    """
+    out: list = []
+    try:
+        if not os.path.exists(_SUPPRESSED_AUDIT_PATH):
+            return out
+        with open(_SUPPRESSED_AUDIT_PATH, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except Exception:  # noqa: BLE001
+        return out
+    return out[-limit:] if limit and limit > 0 else out
+
+
 # ===== 导出 =====
-__all__ = ['logger', 'LOG_DIR', 'LOG_FILE', 'set_trace_context', 'get_trace_context', 'new_trace_id']
+__all__ = ['logger', 'LOG_DIR', 'LOG_FILE', 'set_trace_context', 'get_trace_context', 'new_trace_id',
+           'audit_suppressed', 'read_suppressed_audit']

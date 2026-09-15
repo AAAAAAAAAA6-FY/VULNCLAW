@@ -23,7 +23,7 @@ from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from vulnclaw.core.settings import settings
-from vulnclaw.core.logger import logger
+from vulnclaw.core.logger import logger, audit_suppressed
 from vulnclaw.core_modules.cache import cache
 from vulnclaw.core_modules.metrics import get_metrics
 from vulnclaw.core.utils import (
@@ -514,7 +514,7 @@ async def safe_request(
                 get_metrics().inc_request(method.upper(), int(status) if status is not None else 0)
                 get_metrics().observe_response_time(time.monotonic() - start_ts)
             except Exception:
-                logger.debug("suppressed exception (core audit)")
+                audit_suppressed()
 
             # ===== 反制检测（警告模式） =====
             anti_result = AntiScanDetector.analyze_response(text, status, headers)
@@ -580,7 +580,7 @@ async def safe_request(
                 try:
                     cache.set(cache_key, (status, text, headers), ttl=300)
                 except Exception:
-                    logger.debug("suppressed exception (core audit)")
+                    audit_suppressed()
 
             # 成功返回
             return status, text, headers
@@ -595,7 +595,7 @@ async def safe_request(
             try:
                 get_metrics().inc_engine_failure("http")
             except Exception:
-                logger.debug("suppressed exception (core audit)")
+                audit_suppressed()
             return None
         except aiohttp.ClientError as e:
             logger.debug(f"安全请求客户端错误 {url}: {e} (尝试 {retry_count + 1}/{max_retries + 1})")
@@ -606,7 +606,7 @@ async def safe_request(
             try:
                 get_metrics().inc_engine_failure("http")
             except Exception:
-                logger.debug("suppressed exception (core audit)")
+                audit_suppressed()
             return None
         except Exception as e:
             logger.debug(f"安全请求失败 {url}: {e}")
@@ -617,7 +617,7 @@ async def safe_request(
             try:
                 get_metrics().inc_engine_failure("http")
             except Exception:
-                logger.debug("suppressed exception (core audit)")
+                audit_suppressed()
             return None
 
     return None
