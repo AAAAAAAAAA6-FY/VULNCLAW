@@ -12,7 +12,7 @@
 import asyncio
 from typing import Dict, List
 
-from vulnclaw.core.logger import logger
+from vulnclaw.core.logger import logger, audit_suppressed
 from vulnclaw.core.settings import settings
 
 
@@ -101,7 +101,7 @@ class StreamVerifyMixin:
             try:
                 await asyncio.wait_for(task, timeout=settings.request_timeout)
             except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
-                logger.debug("suppressed exception (core audit)")
+                audit_suppressed()
         logger.info(
             "🧪 [StreamVerify] 已停止: %s 条/%s 批处理, 去重集大小=%s, 错误=%s",
             self._stream_processed_count,
@@ -133,11 +133,11 @@ class StreamVerifyMixin:
                 try:
                     await asyncio.wait_for(self._stream_event.wait(), timeout=self._stream_timeout_s)
                 except asyncio.TimeoutError:
-                    logger.debug("suppressed exception (core audit)")
+                    audit_suppressed()
                 except asyncio.CancelledError:
                     raise
                 except Exception:  # pragma: no cover - 事件 wait 本身不该抛
-                    logger.debug("suppressed exception (core audit)")
+                    audit_suppressed()
                 # 清 event 后执行一次增量 flush；如果 pending 仍然不够阈值，
                 # flush 内部会按"至少取 1 条 + 已经 >= timeout_s" 的策略决定是否实际验证。
                 self._stream_event.clear()

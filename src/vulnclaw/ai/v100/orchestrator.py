@@ -1306,9 +1306,3 @@ async def run_v100_scan(target: str, session, max_tasks: int = None, initial_qps
     return await system.run()
 
 __all__ = ['V100Orchestrator', 'run_v100_scan']
-1	JWT kid/JWK 注入	engines/auth_engines.py	中	从 2 个 fixture → 6+，覆盖真实 CVE
-2	GraphQL alias 批量攻击	engines/net_engines.py	中	graphql 引擎当前只有 introspection + 基础注入
-3	Prototype Pollution gadget 提示	engines/web_advanced_engines.py	小	加一个 gadget fingerprints 库，现有引擎直接引用
-4	sqli fixture 深度化	tests/fixtures/engines/sqli.yaml	小	从~4 个 case → 12+（WAF 绕过、盲注、堆叠）
-5	xss fixture 深度化	tests/fixtures/engines/xss.yaml	小	补 attribute/JS context/SVG/mutation XSS
-6	ssrf fixture 补盲	tests/fixtures/engines/ssrf.yaml	小	补 gopher/302 跳转/DNS rebind 基础 case
