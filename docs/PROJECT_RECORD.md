@@ -233,6 +233,15 @@ scan.py
 - 命中的真实引擎：`engines/logic_leak_engines_2.py` `JsLibraryCveEngine`（jQuery 区间 `(1,0,0)-(3,5,0)`）与 `BackendComponentFingerprintEngine`（`BACKEND_RULES` 含 Apache 2.4.49/50）。
 - 验证：`test_version_regression_matrix.py` 18 项全绿（A0~D 六组：后端组件易受/修复/边界 + 前端 jQuery 三档 + 安全端点 FP 门禁）；叠加 `test_engines_core.py` 共 44 项全绿无回归（仅 aiohttp 弃用告警）。
 
+### 评审整改波次0：T01/T02/T04/T07（2026-09-15，分支 opt/deepseek-review-v2）
+
+- T01 git 纪律：全部非 thirdparty 变更按主题分 9 个语义化提交（docs/src/tests/scripts/ai/T15 第1批/编排器清理/T15 测试/T06 vulhub_lab/T14 master 修复），提交信息 UTF-8（历史有 GBK 乱码，用临时文件 `-F` 规避，用完即删）；thirdparty 遗留（gitlink 无 submodule 映射 + 数据字典）用户指定单独处理不动。最终非 thirdparty 状态清零。
+- T02 lint 门禁：`pyproject.toml` 新增 `[tool.ruff.lint] select = ["E4","E7","E9","F"]` + tests/scan.py per-file-ignores；存量 957 处 BLE001（盲 except）登记为技术债务（T15 迁移），不在本地全量开启；CI（`.github/workflows/ci.yml`）新增 "New blind-except gate" 步骤——对 PR 变更的 .py 文件 `ruff check --no-config --select BLE001` 强制零新增裸 except，绕开配置白名单。
+- T04 依赖可复现：dev 依赖补版本下限（ruff>=0.16.0 / mypy>=1.10.0 / pre-commit>=3.7.0 / pytest>=8.2.0 / pytest-cov>=5.0.0 / pytest-asyncio>=0.23.0）；lock 文件生成到 `_runtime_cache/requirements-lock.txt`（68 行，运行时产物不入库，遵守不新建仓库文件规则）。
+- T07 引擎能力边界：10 个高危引擎 docstring 追加三段式声明（can_detect / cannot_detect / 前置条件，2026-09-15 评审补录）：SSRFEngine、Log4ShellEngine、FastjsonDeserializationEngine、CMDIEngine、SSTIEngine、IDOREngine、OAuthEngine、WeakCredentialEngine、DeserializationEngine、BusinessLogicEngine。
+- 连带收尾：补提交 T15 审计函数测试（audit_suppressed 落盘/读取 5 用例）、T06 `scripts/vulhub_lab.py`（WSL2+Vulhub 靶场驱动，--check/--list/--up/--down/--endpoints/--status，T08 矩阵用）、T14 master 状态回源 Redis 合并修复（重启后残缺状态不覆写）+ 专项测试 test_sp20_master.py + 主链路冒烟门禁（orchestrator 可导入/无 Markdown 表格残留，补 E2E 门禁不覆盖 orchestrator 的盲区）。
+- 验证：`test_engines_core`+`test_engine_inventory`+`test_core_imports`+`test_sp20_master`+`test_p3_batch2` 193 passed；ruff 配置可解析；git log 9 提交落盘。
+
 ## 5. 评分与技术判断
 
 当前综合评分约 78/100：
