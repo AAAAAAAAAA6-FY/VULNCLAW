@@ -523,3 +523,275 @@ class TestEnvelopeProtocol:
 
     def test_protocol_version_is_declared(self):
         assert PROTOCOL_VERSION == "1.0"
+
+
+# ============================================================
+# T14 分布式压测：内存状态机 Redis（支持真实消费组语义）
+# ============================================================
+class MemRedis:
+    """内存版 Redis：只实现分布式链路用到的命令，但**有真实状态**。
+
+    为什么不用 AsyncMock 桩：T14 要压的是"分发 / ACK / PEL 重投递 / 去重"
+    的**状态机正确性** —— 桩没有状态就压不出来（它只会返回预设值，任何
+    "重复投递/丢任务"的 bug 都会被桩掩盖）。
+
+    覆盖：stream(xadd/xreadgroup/xack/xlen/xpending_range/xrange)、
+    kv(set/setex/get/exists/delete/scan/keys)、hash(hset/hget)、
+    set(sadd/smembers/srem)、llen/close。
+    """
+
+    def __init__(self):
+        self._seq = 0
+        self.kv = {}
+        self.hashes = {}
+        self.sets = {}
+        self.streams = {}   # key -> [(mid, fields)]
+        self.groups = {}    # (stream, group) -> {"last_id": str}
+        self.pel = {}       # (stream, group) -> {mid: consumer}
+        self.xadd_log = []  # 便于断言重投递次数
+        self.deleted = []
+
+    async def ping(self):
+        return True
+
+    async def close(self):
+        return None
+
+    # --- stream ---
+    def _next_id(self):
+        self._seq += 1
+        return f"{self._seq}-0"
+
+    @staticmethod
+    def _gt(a, b):
+        def parse(s):
+            p = str(s).split("-")
+            return (int(p[0]) if p and p[0].isdigit() else 0,
+                    int(p[1]) if len(p) > 1 and p[1].isdigit() else 0)
+        return parse(a) > parse(b)
+
+    async def xgroup_create(self, stream, group, id="0", mkstream=False):
+        self.streams.setdefault(stream, [])
+        self.groups.setdefault((stream, group), {"last_id": id})
+        return True
+
+    async def xadd(self, stream, fields):
+        mid = self._next_id()
+        self.streams.setdefault(stream, []).append((mid, dict(fields)))
+        self.xadd_log.append((stream, mid))
+        return mid
+
+    async def xreadgroup(self, groupname, consumername, streams, count=1, block=None):
+        (stream, start), = list(streams.items())
+        g = self.groups.get((stream, groupname))
+        if g is None:
+            return []
+        out = []
+        for mid, fields in self.streams.get(stream, []):
+            # ">" 语义 = 只看"从未投递过"的消息（即 id > last_id）。
+            # 早期写法 `start == ">" or ...` 条件恒真 → 每次都重发第一条
+            # （T14 压测一跑就抓到：同一条 t00 把 20 个任务全顶掉）。
+            if self._gt(mid, g["last_id"]):
+                out.append((mid, fields))
+                g["last_id"] = mid
+                self.pel.setdefault((stream, groupname), {})[mid] = consumername
+                if len(out) >= int(count or 1):
+                    break
+        return [(stream, out)] if out else []
+
+    async def xack(self, stream, group, *mids):
+        pel = self.pel.get((stream, group), {})
+        n = 0
+        for m in mids:
+            if pel.pop(m, None) is not None:
+                n += 1
+        return n
+
+    async def xlen(self, stream):
+        return len(self.streams.get(stream, []))
+
+    async def xpending_range(self, stream, group, start, end, count, consumer=None):
+        pel = self.pel.get((stream, group), {})
+        rows = [{"message_id": m, "consumer": c}
+                for m, c in pel.items() if consumer is None or c == consumer]
+        return rows[:int(count or 50)]
+
+    async def xrange(self, stream, min=None, max=None):
+        return [(m, f) for m, f in self.streams.get(stream, []) if m == min]
+
+    # --- kv / hash / set ---
+    async def set(self, key, value):
+        self.kv[key] = value
+        return True
+
+    async def setex(self, key, ttl, value):
+        self.kv[key] = value
+        return True
+
+    async def get(self, key):
+        return self.kv.get(key)
+
+    async def delete(self, *keys):
+        n = 0
+        for k in keys:
+            self.deleted.append(k)
+            if self.kv.pop(k, None) is not None:
+                n += 1
+            self.hashes.pop(k, None)
+        return n
+
+    async def exists(self, key):
+        return 1 if key in self.kv else 0
+
+    async def keys(self, pattern):
+        import fnmatch
+        return [k for k in self.kv if fnmatch.fnmatchcase(k, pattern)]
+
+    async def scan(self, cursor=0, match=None, count=100):
+        import fnmatch
+        ks = [k for k in self.kv if fnmatch.fnmatchcase(k, match or "*")]
+        return 0, ks[:int(count or 100)]
+
+    async def hset(self, key, field=None, value=None, mapping=None):
+        h = self.hashes.setdefault(key, {})
+        if mapping:
+            h.update({k: v for k, v in mapping.items()})
+        if field is not None:
+            h[field] = value
+        return 1
+
+    async def hget(self, key, field):
+        return self.hashes.get(key, {}).get(field)
+
+    async def sadd(self, key, *members):
+        s = self.sets.setdefault(key, set())
+        before = len(s)
+        s.update(members)
+        return len(s) - before
+
+    async def smembers(self, key):
+        return set(self.sets.get(key, set()))
+
+    async def srem(self, key, *members):
+        s = self.sets.get(key, set())
+        n = 0
+        for m in members:
+            if m in s:
+                s.discard(m)
+                n += 1
+        return n
+
+    async def llen(self, key):
+        return 0
+
+
+class TestDistributedStressT14:
+    """T14：10 worker 协议级压测 + 故障转移 + 续扫恢复正确性。
+
+    本机无 Redis 服务（6379 CLOSED）→ 用**内存状态机**驱动协议逻辑：
+    压的是"分发 / ACK / PEL 重投递 / 去重 / 重启恢复"的**正确性**；
+    真实网络吞吐需要真 Redis，不在本测范围（报告 note 已注明）。
+    """
+
+    PREFIX = "vulnclaw"
+
+    @staticmethod
+    def _mk_master(fake):
+        m = DistributedMaster(redis_url="redis://mem:6379/0", prefix="vulnclaw")
+        m._redis = fake
+        return m
+
+    @staticmethod
+    def _mk_worker(fake, wid):
+        from vulnclaw.distributed.worker import DistributedWorker
+        w = DistributedWorker(redis_url="redis://mem:6379/0", prefix="vulnclaw")
+        w._redis = fake
+        w._worker_id = wid
+        return w
+
+    def test_10_workers_no_loss_no_duplication(self):
+        """20 任务 × 10 worker：每个任务恰好被处理一次（无丢、无重）。"""
+        async def scenario():
+            fake = MemRedis()
+            master = self._mk_master(fake)
+            for i in range(20):
+                await master.submit_task({"task_id": f"t{i:02d}", "type": "scan"})
+
+            workers = [self._mk_worker(fake, f"w{i}") for i in range(10)]
+            processed = []
+            for _ in range(5):  # 20 任务 / 10 worker 应在 2 轮内取完，留余量
+                for wk in workers:
+                    t = await wk.pull_task(timeout=0)
+                    if not t:
+                        continue
+                    processed.append(t["task_id"])
+                    await fake.xack(f"{self.PREFIX}:tasks", f"{self.PREFIX}:workers",
+                                    wk._current_msg_id)
+
+            assert sorted(processed) == [f"t{i:02d}" for i in range(20)], \
+                f"任务丢失或多余: {processed}"
+            assert len(processed) == len(set(processed)), "同一任务被分发多次"
+
+            # 压测报告（T14 验收物）
+            try:
+                import os as _os
+                _os.makedirs("_runtime_cache", exist_ok=True)
+                with open("_runtime_cache/t14_distributed_stress.json",
+                          "w", encoding="utf-8") as fh:
+                    json.dump({
+                        "kind": "t14_distributed_stress",
+                        "mode": "protocol_level_memredis",
+                        "workers": 10, "tasks": 20,
+                        "processed": len(processed),
+                        "duplicated": len(processed) - len(set(processed)),
+                        "lost": 20 - len(set(processed)),
+                        "note": "本机无 Redis 服务，压的是协议正确性；网络吞吐需真 Redis",
+                    }, fh, ensure_ascii=False, indent=2)
+            except Exception:  # noqa: BLE001 - 报告落盘失败不影响断言结论
+                pass
+        asyncio.run(scenario())
+
+    def test_dead_worker_requeue_is_deduplicated(self):
+        """worker 崩溃（拉到任务但不 ACK）→ 重投递且**只投一次**，新 worker 只取一次。
+
+        这是"断点续扫"的故障侧证明：assigned 记录与消费组 PEL 会同时持有
+        同一任务，若两条路径各自重投递就会重复执行。
+        """
+        async def scenario():
+            fake = MemRedis()
+            master = self._mk_master(fake)
+            await master.submit_task({"task_id": "tX", "type": "scan"})
+
+            dead = self._mk_worker(fake, "w_dead")
+            pulled = await dead.pull_task(timeout=0)
+            assert pulled and pulled["task_id"] == "tX"
+
+            # w_dead 此后不再心跳（模拟崩溃）；assigned 记录与 PEL 都仍在
+            requeued = await master.handle_dead_worker("w_dead")
+            assert requeued == 1, f"重投递次数异常（应为 1，去重后）: {requeued}"
+
+            alive = self._mk_worker(fake, "w_alive")
+            again = await alive.pull_task(timeout=0)
+            assert again and again["task_id"] == "tX", "重投递后应能重新取到"
+            assert await alive.pull_task(timeout=0) is None, "同一任务被重复投递"
+        asyncio.run(scenario())
+
+    def test_resume_after_master_restart(self):
+        """master 重启（进程内 dict 清空）→ 任务状态/结果可从 Redis 读回（续扫恢复）。"""
+        async def scenario():
+            fake = MemRedis()
+            master = self._mk_master(fake)
+            await master.submit_task({"task_id": "tR", "type": "scan"})
+
+            # 重启：新实例、本地 dict 为空，但 Redis 侧状态仍在
+            master2 = self._mk_master(fake)
+            assert master2._task_status == {}, "前置：本地状态确为空"
+
+            await fake.set(f"{self.PREFIX}:result:tR", json.dumps({"ok": True}))
+            res = await master2.get_result("tR", timeout=3)
+            assert res == {"ok": True}, "重启后未能从 Redis 恢复结果（续扫断链）"
+
+            # 已提交任务的状态也能从 Redis 读回（不是只剩结果）
+            st = await master2._load_task_status("tR")
+            assert st and st.get("submitted_at"), "任务元状态未持久化"
+        asyncio.run(scenario())
