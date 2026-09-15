@@ -68,6 +68,136 @@ class TestRepoManager:
 
 
 # ============================================================
+# P0 安全边界契约测试：断言"拒绝/不写出界"，而不是"函数返回了"
+# ============================================================
+import zipfile  # noqa: E402
+
+import pytest  # noqa: E402
+
+
+class TestRepoManagerSecurityBoundaries:
+    """P0-1（归档穿越）/ P0-2（本地目录越界）攻击者输入契约。"""
+
+    def _zip(self, path, members):
+        with zipfile.ZipFile(path, "w") as zf:
+            for name, data in members:
+                zf.writestr(name, data)
+
+    def _run(self, coro):
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    def test_zip_slip_does_not_escape(self, tmp_path):
+        from vulnclaw.code.repo_manager import RepoManager
+        ws = tmp_path / "ws"
+        outside = tmp_path / "pwned.txt"
+        arc = tmp_path / "evil.zip"
+        self._zip(str(arc), [("../pwned.txt", "PWNED"), ("ok.txt", "safe")])
+        self._run(RepoManager(workspace=str(ws)).clone_repo(str(arc)))
+        assert not outside.exists(), "归档路径穿越写出工作区外文件！"
+        assert (ws / "evil" / "ok.txt").read_text(encoding="utf-8") == "safe"
+
+    def test_zip_absolute_and_drive_paths_rejected(self, tmp_path):
+        from vulnclaw.code.repo_manager import RepoManager
+        ws = tmp_path / "ws2"
+        arc = tmp_path / "abs.zip"
+        self._zip(str(arc), [("/abs_pwned.txt", "X"), ("C:/abs_pwned.txt", "Y"),
+                             ("good.txt", "ok")])
+        self._run(RepoManager(workspace=str(ws)).clone_repo(str(arc)))
+        assert (ws / "abs" / "good.txt").exists()
+        assert not (ws / "abs" / "abs_pwned.txt").exists()
+
+    def test_tar_traversal_and_symlink_rejected(self, tmp_path):
+        import io
+        import tarfile
+        from vulnclaw.code.repo_manager import RepoManager
+        ws = tmp_path / "ws3"
+        arc = tmp_path / "evil.tar.gz"
+        with tarfile.open(str(arc), "w:gz") as tf:
+            data = b"PWNED"
+            for name in ("../../tar_pwned.txt", "good.txt"):
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+            link = tarfile.TarInfo("link.txt")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "/etc/passwd"
+            tf.addfile(link)
+        self._run(RepoManager(workspace=str(ws)).clone_repo(str(arc)))
+        assert not (tmp_path / "tar_pwned.txt").exists()
+        assert (ws / "evil" / "good.txt").exists()
+        assert not (ws / "evil" / "link.txt").exists()
+
+    def test_symlink_source_rejected(self, tmp_path):
+        from vulnclaw.code.repo_manager import RepoManager
+        real = tmp_path / "real_repo"
+        real.mkdir()
+        (real / "a.py").write_text("x=1", encoding="utf-8")
+        link = tmp_path / "link_repo"
+        try:
+            os.symlink(str(real), str(link))
+        except (OSError, NotImplementedError):  # pragma: no cover
+            return
+        with pytest.raises(RuntimeError, match="符号链接"):
+            self._run(RepoManager(workspace=str(tmp_path / "ws4")).clone_repo(str(link)))
+
+    def test_local_dir_outside_allowed_roots_refused(self, tmp_path, monkeypatch):
+        from vulnclaw.code.repo_manager import RepoManager
+        from vulnclaw.config.settings import settings as st
+        allowed = tmp_path / "allowed"
+        allowed.mkdir()
+        monkeypatch.setattr(st, "code_audit_allowed_roots", str(allowed))
+        outside = tmp_path / "secret_repo"
+        outside.mkdir()
+        (outside / "s.py").write_text("k=1", encoding="utf-8")
+        with pytest.raises(RuntimeError, match="批准根目录"):
+            self._run(RepoManager(workspace=str(tmp_path / "ws5")).clone_repo(str(outside)))
+
+    def test_local_dir_copies_not_links(self, tmp_path):
+        from vulnclaw.code.repo_manager import RepoManager
+        src = tmp_path / "src_repo"
+        src.mkdir()
+        (src / "m.py").write_text("v=2", encoding="utf-8")
+        dest = self._run(RepoManager(workspace=str(tmp_path / "ws6")).clone_repo(str(src)))
+        assert not os.path.islink(dest), "本地目录不得再使用 symlink"
+        assert (Path(dest) / "m.py").read_text(encoding="utf-8") == "v=2"
+
+
+class TestSandboxEgressGuard:
+    """P0-3：网络命令不得指向内网/本机/云元数据。"""
+
+    @staticmethod
+    def _run(coro):
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    def test_metadata_and_private_blocked(self):
+        from vulnclaw.core import sandbox as sb
+        for target in ("http://169.254.169.254/latest/meta-data/", "http://127.0.0.1:8080/",
+                       "http://10.0.0.5/", "http://192.168.1.1/", "http://[::1]/",
+                       "http://metadata.google.internal/", "http://redis.internal:6379/"):
+            res = self._run(sb.run_sandboxed("curl", [target]))
+            assert res.get("blocked") is True, f"未被拦截: {target}"
+            assert res.get("egress_blocked") is True
+
+    def test_non_network_command_unaffected(self):
+        from vulnclaw.core import sandbox as sb
+        assert sb._egress_guard("echo", ["hello"]) is None
+
+    def test_guard_can_be_disabled(self, monkeypatch):
+        from vulnclaw.config.settings import settings as st
+        monkeypatch.setattr(st, "sandbox_egress_guard", False)
+        from vulnclaw.core import sandbox as sb
+        assert sb._egress_guard("curl", ["http://127.0.0.1/"]) is None
+
+
+# ============================================================
 # SemgrepAdapter 测试
 # ============================================================
 

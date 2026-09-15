@@ -1,0 +1,91 @@
+# G.1/组 D fixture：业务逻辑漏洞（check 型）正反例。
+# 引擎判定：金额/数量/角色/状态/订单/优惠券类参数的关键分支（_check_payment_amount /
+# _check_qty_overflow / _check_param_pollution 等）发现篡改/绕过信号。
+module: vulnclaw.engines.input_engines
+class: BusinessLogicEngine
+engine: business_logic
+
+cases:
+  - id: business_negative_amount
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/order?amount=100
+    param: amount
+    parsed_query: "amount=100"
+    normal_resp: [200, '{"payable":100}', {}]
+    responses:
+      /order:
+        status: 200
+        body: '{"payable":-100,"voucher_applied":true}'
+    evidence_contains: "金额"
+    reproduction: "curl -s 'http://127.0.0.1:8080/order?amount=-100'  # 负金额/篡改使应付金额异常"
+
+  - id: business_price_tamper_qty
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/order?qty=2
+    param: qty
+    parsed_query: "qty=2"
+    normal_resp: [200, '{"total":200}', {}]
+    responses:
+      /order:
+        status: 200
+        body: '{"total":9999999999}'
+    evidence_contains: "数量"
+    reproduction: "curl -s 'http://127.0.0.1:8080/order?qty=2147483647'  # 数量越界使总额异常"
+
+  - id: business_normal_checkout
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/cart?qty=2
+    param: qty
+    parsed_query: "qty=2"
+    normal_resp: [200, '{"total":200}', {}]
+    responses:
+      /cart:
+        status: 200
+        body: '{"total":200}'
+    evidence_contains: ""
+    reproduction: ""
+
+  - id: business_price_bypass_coupon
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/order?discount=10
+    param: discount
+    parsed_query: "discount=10"
+    normal_resp: [200, '{"total":100,"discount":10}', {}]
+    responses:
+      /order:
+        status: 200
+        body: '{"total":0,"discount":90,"coupon_applied":"FREE"}'
+    evidence_contains: "优惠券"
+    reproduction: "curl -s 'http://127.0.0.1:8080/order?discount=FREE'  # 超优惠/0元折扣绕过原价，服务端应用异常折扣"
+
+  - id: business_skip_payment_step
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/checkout?status=pending
+    param: status
+    parsed_query: "status=pending"
+    normal_resp: [200, '{"order_status":"pending"}', {}]
+    responses:
+      /checkout:
+        status: 200
+        body: '{"order_status":"paid","success":true}'
+    evidence_contains: "状态"
+    reproduction: "curl -s 'http://127.0.0.1:8080/checkout?status=paid'  # 状态参数改为已支付，跳过支付步骤直接完成订单"
+
+  - id: business_valid_discount
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/cart?discount=10
+    param: discount
+    parsed_query: "discount=10"
+    normal_resp: [200, '{"total":90,"discount":10,"applied":true}', {}]
+    responses:
+      /cart:
+        status: 200
+        body: '{"total":90,"discount":10,"applied":true}'
+    evidence_contains: ""
+    reproduction: ""

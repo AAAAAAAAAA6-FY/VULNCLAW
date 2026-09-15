@@ -1,0 +1,42 @@
+engine: crlf
+module: vulnclaw.engines.input_engines
+class: CRLFEngine
+name: CRLF 注入（响应特征匹配）
+description: |
+  CRLFEngine.check 对每个优先级参数遍历 payload（%0d%0a 系列），把攻击 URL 发回探测；
+  当响应头或响应体中包含注入特征字符串（X-Test: injected / Set-Cookie: session=evil /
+  HTTP/1.1 200 OK 等）即判定 CRLF 注入（High）或响应拆分（Critical）。
+  _is_crlf_target 快速判断（参数名含 url/redirect 等）兜底恒 True。
+  本 fixture 验证：响应体含注入特征串 → 正例；响应与基线零差异且无任何特征 → 反例（低误报铁律）。
+
+cases:
+  - id: crlf_body_injection_feature
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/page?url=ORIG
+    param: url
+    normal_resp: [200, "<html>normal</html>", {}]
+    responses:
+      "127.0.0.1:8080/page":
+        status: 200
+        headers:
+          Content-Type: "text/html"
+        body: |
+          <html><body>X-Test: injected</body></html>
+    evidence_contains: "X-Test: injected"
+    reproduction: "fixture 复现（离线 mock）：对 ?url= 注入 CRLF 后响应体出现 X-Test: injected → 期望命中「CRLF注入」"
+
+  - id: crlf_clean_no_injection
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/page?url=ORIG
+    param: url
+    normal_resp: [200, "ok", {}]
+    responses:
+      "127.0.0.1:8080/page":
+        status: 200
+        headers:
+          Content-Type: "text/html"
+        body: "ok"
+    evidence_contains: ""
+    reproduction: "fixture 复现（离线 mock）：正常响应无 CRLF 特征且与基线零差异 → 期望无任何 finding"

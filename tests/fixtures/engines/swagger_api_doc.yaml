@@ -1,0 +1,67 @@
+# G.1 fixture：Swagger/OpenAPI 文档暴露（swagger_api_doc）正反例。
+# 引擎逻辑（logic_leak_engines_2.SwaggerApiDocEngine.scan）：
+#   ① JSON_PROBES 命中且响应体以 { 或 [ 开头且匹配 OPENAPI_HINT_RE（"openapi" / "swagger" / "paths" / "info"）
+#   ② 否则退到 HTML_PROBES，匹配 SWAGGER_HTML_RE（swagger-ui / swaggerUIBundle / <title> Swagger）
+module: vulnclaw.engines.logic_leak_engines_2
+class: SwaggerApiDocEngine
+engine: swagger_api_doc
+
+cases:
+  - id: openapi_json_exposed
+    method: scan
+    expect: positive
+    target: http://127.0.0.1:8080
+    responses:
+      /v3/api-docs:
+        status: 200
+        body: '{"openapi":"3.0.1","info":{"title":"Orders API","version":"1.0"},"paths":{"/orders":{"get":{}}}}'
+    evidence_contains: "OpenAPI"
+    reproduction: "fixture 复现（离线 mock）：curl -sS 'http://127.0.0.1:8080/v3/api-docs' → 期望命中「OpenAPI/Swagger 接口文档暴露」"
+
+  - id: swagger_ui_html_exposed
+    method: scan
+    expect: positive
+    target: http://127.0.0.1:8080
+    responses:
+      /swagger-ui.html:
+        status: 200
+        body: "<html><head><title>Swagger UI</title></head><body><div id=swagger-ui></div><script src=swagger-ui-bundle.js></script></body></html>"
+    evidence_contains: "Swagger"
+    reproduction: "fixture 复现（离线 mock）：curl -sS 'http://127.0.0.1:8080/swagger-ui.html' → 期望命中「Swagger UI 文档暴露」"
+
+  # ---------- 反例 ----------
+  - id: all_paths_404
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses: {}
+
+  - id: json_api_without_openapi_hint
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      /v3/api-docs:
+        status: 200
+        body: '{"code":0,"data":{"items":[]},"message":"ok"}'
+      /v2/api-docs:
+        status: 200
+        body: '{"code":0,"data":{"items":[]},"message":"ok"}'
+      /api-docs:
+        status: 200
+        body: '{"code":0,"data":{"items":[]},"message":"ok"}'
+      /openapi.json:
+        status: 404
+        body: 'not found'
+
+  - id: plain_homepage_html
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      /swagger-ui.html:
+        status: 200
+        body: "<html><head><title>Welcome</title></head><body><h1>Hello</h1></body></html>"
+      /docs:
+        status: 200
+        body: "<html><body>documentation index</body></html>"

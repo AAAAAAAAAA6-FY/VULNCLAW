@@ -26,7 +26,7 @@ class _StubFilter:
 class _FakeSelf:
     def __init__(self, brief):
         self._recon_brief = brief
-        self.target = "http://127.0.0.1:1/"
+        self.target = "http://t/"  # 参数池消费按同源过滤：靶场用 http://t/ 对齐条目
         self.task_queue = SmartTaskQueue()
         self.local_filter = _StubFilter()
         self.batch_processor = None
@@ -115,7 +115,10 @@ async def test_mining_task_schedulable_via_queue():
     s, pm = await _run(_brief_with_mining([_item("http://t/x", "hid")]))
     assert len(pm) == 1
     got = None
-    for _ in range(10):
+    # 扫描窗口取队列全长而非固定 10 次：调度队列用堆实现，同优先级任务的弹出顺序
+    # 不保证稳定（新增低优先级兜底任务会重排堆），固定小窗口会让本例随机翻车。
+    # 本例语义只验证"参数补测任务可被调度到"，不验证具体弹出位次。
+    for _ in range(len(s.task_queue._pending_tasks) + 1):
         td = await s.task_queue.get_next()
         if td is None:
             break

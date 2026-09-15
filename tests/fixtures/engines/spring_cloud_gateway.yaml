@@ -1,0 +1,26 @@
+# G.1/组 D fixture：Spring Cloud Gateway 路由端点暴露（scan 型）正反例。
+# 引擎判定：未授权访问 /actuator/gateway/routes 等返回 200 且以 [{ 开头的路由/过滤器 JSON。
+module: vulnclaw.engines.framework_zero_day_engines_2
+class: SpringCloudGatewayEngine
+engine: spring_cloud_gateway
+
+cases:
+  - id: scg_actuator_routes_exposed
+    expect: positive
+    target: http://127.0.0.1:8080/app
+    responses:
+      /actuator/gateway/routes:
+        status: 200
+        body: '[{"route_id":"default","uri":"lb://backend-service","predicates":["Path=/api/**"],"filters":[]}]'
+    evidence_contains: "route_id"
+    reproduction: "curl -s 'http://127.0.0.1:8080/actuator/gateway/routes'  # 未授权读取网关路由/过滤器"
+
+  - id: scg_actuator_denied
+    expect: negative
+    target: http://127.0.0.1:8080/app
+    responses:
+      /actuator/gateway/routes:
+        status: 404
+        body: '{"status":404}'
+    evidence_contains: ""
+    reproduction: ""

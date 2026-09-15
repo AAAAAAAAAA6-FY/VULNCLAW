@@ -86,9 +86,12 @@ def temp_plugin_dir():
     settings.PLUGIN_DIR = tmp_dir
     yield tmp_dir
 
-    # 清理
+    # 清理（best-effort：IDE safe-delete 钩子可能抛 SystemExit，不能让 teardown 致命）
     settings.PLUGIN_DIR = original_plugin_dir
-    shutil.rmtree(tmp_dir, ignore_errors=True)
+    try:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    except (Exception, SystemExit):
+        pass
 
 
 # ============================================================

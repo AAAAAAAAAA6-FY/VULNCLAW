@@ -1,0 +1,34 @@
+# G.1/组 D fixture：竞争条件候选端点（check 型）正反例。
+# 引擎判定：URL 命中竞态相关关键字（order/checkout/claim/withdraw/coupon 等）即报候选端点。
+module: vulnclaw.engines.http_engines
+class: RaceConditionEngine
+engine: race_condition
+
+cases:
+  - id: checkout_candidate
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/api/checkout
+    param: order
+    parsed_query: "order=100"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /api/checkout:
+        status: 200
+        body: '{"ok":true}'
+    evidence_contains: "竞争条件候选端点"
+    reproduction: "并发请求 'http://127.0.0.1:8080/api/checkout'（折扣/库存/余额类端点）检测竞态"
+
+  - id: static_search_page
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/search?q=x
+    param: q
+    parsed_query: "q=x"
+    normal_resp: [200, "results", {}]
+    responses:
+      /search:
+        status: 200
+        body: "results"
+    evidence_contains: ""
+    reproduction: ""

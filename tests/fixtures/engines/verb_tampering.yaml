@@ -1,0 +1,70 @@
+# G.1 fixture：HTTP 方法篡改 / TRACE 跨站追踪（verb_tampering）正反例。
+# 引擎逻辑（logic_leak_engines_2.VerbTamperingEngine.scan）：
+#   仅向 base 发一次 OPTIONS，读 Allow 头；状态码须在 (200,204,405)：
+#     - Allow 含 TRACE            → XST 跨站追踪（Medium）
+#     - 否则 Allow 含 PUT/DELETE  → 方法篡改（Low）
+#   无 Allow 头、或 Allow 不含危险方法 → 不产出 finding。
+#   ⚠️ 该引擎走 async_options：benchmark harness 原先只打桩 async_get/async_post，
+#      会真的发网；本次已补齐 async_put/delete/options/head 的打桩。
+module: vulnclaw.engines.logic_leak_engines_2
+class: VerbTamperingEngine
+engine: verb_tampering
+
+cases:
+  - id: trace_method_enabled
+    method: scan
+    expect: positive
+    target: http://127.0.0.1:8080
+    responses:
+      127.0.0.1:8080:
+        status: 200
+        headers:
+          Allow: "GET, HEAD, POST, TRACE"
+        body: "ok"
+    evidence_contains: "TRACE"
+    reproduction: "fixture 复现（离线 mock）：curl -sSI -X OPTIONS 'http://127.0.0.1:8080/' | grep -i allow → 含 TRACE 即命中「TRACE 开启(XST)」"
+
+  - id: put_delete_allowed
+    method: scan
+    expect: positive
+    target: http://127.0.0.1:8080
+    responses:
+      127.0.0.1:8080:
+        status: 204
+        headers:
+          Allow: "GET, PUT, DELETE"
+        body: ""
+    evidence_contains: "PUT"
+    reproduction: "fixture 复现（离线 mock）：curl -sSI -X OPTIONS 'http://127.0.0.1:8080/' | grep -i allow → 含 PUT/DELETE 即命中「HTTP 方法篡改」"
+
+  # ---------- 反例 ----------
+  - id: no_allow_header
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      127.0.0.1:8080:
+        status: 200
+        body: "<html><body>hello</body></html>"
+
+  - id: safe_allow_list
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      127.0.0.1:8080:
+        status: 200
+        headers:
+          Allow: "GET, HEAD, POST, OPTIONS"
+        body: "ok"
+
+  - id: options_404
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      127.0.0.1:8080:
+        status: 404
+        headers:
+          Allow: "GET, TRACE"
+        body: "not found"

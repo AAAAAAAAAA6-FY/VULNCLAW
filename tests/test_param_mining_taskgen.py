@@ -22,7 +22,7 @@ class _StubFilter:
 class _FakeSelf:
     def __init__(self, brief):
         self._recon_brief = brief
-        self.target = "http://127.0.0.1:1/"
+        self.target = "http://t/"  # 参数池消费按同源过滤：靶场用 http://t/ 对齐条目
         self.task_queue = SmartTaskQueue()
         self.local_filter = _StubFilter()
         self.batch_processor = None
@@ -127,3 +127,16 @@ async def test_crawl_triggers_without_mining():
     s, pm = await _run(brief)
     assert pm == []
     assert len(s.task_queue._pending_tasks) > 0  # 仍有默认参数任务入队
+
+
+@pytest.mark.asyncio
+async def test_cross_origin_pool_item_dropped():
+    """跨靶场隔离：池里非本次目标（异 host / 同 host 异端口）条目一律不发任务。"""
+    brief = _brief_with_mining([
+        {"url": "http://t/ok", "param": "p1"},            # 同源 -> 保留
+        {"url": "http://other/x", "param": "p2"},         # 异 host -> 丢弃
+        {"url": "http://t:99/x", "param": "p3"},          # 同 host 异端口 -> 丢弃
+    ])
+    _, pm = await _run(brief)
+    assert len(pm) == 1
+    assert pm[0].task_data["target"] == "http://t/ok"

@@ -1,0 +1,15 @@
+{
+  "engine": "framework_zero_day_engines._run_oob_scan",
+  "kwargs": {
+    "engine_name": "struts2_ognl",
+    "url": "https://target.example/showcase.action",
+    "param": "x",
+    "parsed_query": "x=1",
+    "payload_templates": [],
+    "type_label": "Struts2 OGNL 执行",
+    "evidence_note": "注入 OGNL 静态方法后未命中 OOB(修复版/参数被过滤)",
+    "recommendation": "升级 Struts2 至官方安全版本(修复 S2-xxx)",
+    "oob_wait": 1
+  },
+  "expected": {"not_none": false}
+}

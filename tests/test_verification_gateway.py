@@ -429,3 +429,85 @@ class TestEvidenceClass:
         f["confidence"] = 90
         assert static_triage(f)["evidence_class"] == "fact"
         assert f["confidence"] == 90
+
+
+# ============================================================
+# G 组: finding 证据五档规范（models.apply_evidence_schema）
+# ============================================================
+class TestEvidenceSchema:
+    """规则命中 / 响应证据 / 验证成功 / 复现成功 / OOB 成功的规范归一。
+
+    这是全部报告格式（HTML / Markdown / SARIF / 网关 SARIF）与统计
+    （benchmark / dataset_metrics）的统一口径——此处语义变更等于全链路口径变更。
+    """
+    from vulnclaw.core.models import apply_evidence_schema as _apply_evidence_schema
+    _schema = staticmethod(_apply_evidence_schema)
+
+    def test_empty_finding_all_false(self):
+        f = self._schema({"type": "x", "url": "http://t"})
+        assert f["rule_hit"] is False
+        assert f["response_evidence"] is False
+        assert f["verified"] is False
+        assert f["reproduced"] is False
+        assert f["oob_success"] is False
+
+    def test_response_evidence_from_raw_text(self):
+        f = self._schema({"type": "sqli", "url": "http://t",
+                          "evidence": "SQL syntax near ' AND"})
+        assert f["response_evidence"] is True
+        # 仅有响应证据文本 ≠ 验证成功（与网关 status_of 语义一致，不虚报落锤）
+        assert f["verified"] is False
+        f2 = self._schema({"type": "x", "url": "u", "response_preview": "uid=0(root)"})
+        assert f2["response_evidence"] is True
+
+    def test_rule_hit_via_local_rule_method(self):
+        f = self._schema({"type": "sqli", "url": "http://t",
+                          "verification_method": "local_rule:sql_error"})
+        assert f["rule_hit"] is True and f["verified"] is True
+
+    def test_reproduced_from_exploit_signals(self):
+        f = self._schema({"type": "rce", "url": "http://t",
+                          "exploited": True, "exploit_evidence": "uid=0(root)"})
+        assert f["reproduced"] is True and f["verified"] is True
+        f2 = self._schema({"type": "xss", "url": "u", "blind_repro": "confirmed"})
+        assert f2["reproduced"] is True and f2["verified"] is True
+        f3 = self._schema({"type": "lfi", "url": "u", "revalidated": True, "evidence": "root:x:0:0"})
+        assert f3["reproduced"] is True
+
+    def test_oob_success_distinct_from_repro(self):
+        f = self._schema({"type": "xxe", "url": "http://t",
+                          "oob_confirmed": True, "evidence": "dnslog 回调"})
+        assert f["oob_success"] is True and f["reproduced"] is True
+        f2 = self._schema({"type": "ssrf", "url": "u",
+                           "oob_evidence": {"channel": "dns", "ts": "2026-01-01T00:00:00"}})
+        assert f2["oob_success"] is True
+        f3 = self._schema({"type": "x", "url": "u",
+                           "verification_method": "oob_callback"})
+        assert f3["oob_success"] is True and f3["verified"] is True
+
+    def test_verdict_drives_verified(self):
+        f = self._schema({"type": "sqli", "url": "http://t", "verdict": "confirm"})
+        assert f["verified"] is True
+        f2 = self._schema({"type": "sqli", "url": "http://t", "ai_verdict": "真实漏洞"})
+        assert f2["verified"] is True
+
+    def test_rule_hit_field_keeps_truthiness(self):
+        # 引擎/网关已有的字符串型 rule_hit 在归一后仍为真（信息不丢、语义不降）
+        f = self._schema({"type": "x", "url": "u", "rule_hit": "sql_error_pattern"})
+        assert bool(f["rule_hit"]) and "sql_error_pattern" in str(f.get("rule_hit", ""))
+
+    def test_gateway_sarif_properties_expose_canonical_fields(self):
+        from vulnclaw.core.verification_gateway import build_verified_sarif, static_triage
+        f = static_triage({"type": "sqli", "url": "http://t/a", "parameter": "id",
+                           "evidence": "HTTP 500 syntax error near mysql", "severity": "high",
+                           "verification_method": "local_rule:sql_error"})
+        f["confidence"] = 90
+        f["status"] = "verified"
+        from vulnclaw.core.models import apply_evidence_schema
+        apply_evidence_schema(f)
+        props = build_verified_sarif([f])["runs"][0]["results"][0]["properties"]
+        assert props["response_evidence"] is True
+        assert props["rule_hit"] is True
+        assert props["verified"] is True
+        # 未触发 OOB / 复现的条目必须显式为 False，勿把 None/缺失渲染成真
+        assert props["reproduced"] is False and props["oob_success"] is False

@@ -1,0 +1,37 @@
+# G.1/组 D fixture：HTTP/2 与 WebSocket（scan 型）正反例（结构性覆盖）。
+# 引擎以目标级握手/端点探测判定：HTTP/2 支持、WebSocket 升级端点、CSWSH/Accept 校验。
+# 需真实 HTTP/2/WS 连接，YAML 仅记录目标级检出语义（supports h2 / ws endpoint 发现）。
+module: vulnclaw.engines.auxiliary_engines
+class: HTTP2WebSocketEngine
+engine: http2_ws
+
+cases:
+  - id: http2_support_detected
+    expect: positive
+    target: https://127.0.0.1:8443/app
+    responses:
+      /ws:
+        status: 101
+        body: ""
+    evidence_contains: "HTTP/2"
+    reproduction: "curl -s --http2 'https://127.0.0.1:8443/app' --write-out '%{http_version}\\n'  # 握手版本为 2"
+
+  - id: ws_endpoint_discovered
+    expect: positive
+    target: https://127.0.0.1:8443
+    responses:
+      /websocket:
+        status: 101
+        body: ""
+    evidence_contains: "WebSocket"
+    reproduction: "curl -s -i 'https://127.0.0.1:8443/websocket' 'Upgrade: websocket' 2>&1 | grep -i 'HTTP/1.1 101'"
+
+  - id: plain_http_page
+    expect: negative
+    target: https://127.0.0.1:8443
+    responses:
+      /:
+        status: 200
+        body: "<html>home</html>"
+    evidence_contains: ""
+    reproduction: ""

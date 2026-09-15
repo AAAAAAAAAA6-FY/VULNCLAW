@@ -1,0 +1,224 @@
+# G.1 fixture：命令注入参数级 check 正反例（组 D 深度补充）。
+# evidence_contains / reproduction 为深度统计口径字段：
+#   evidence_contains = finding.evidence 必含的关键标记；
+#   reproduction = 一行复现说明 / curl 命令（组 E 统计脚本读取，缺失容忍为 0）。
+module: vulnclaw.engines.web_engines
+class: CMDIEngine
+engine: cmdi
+
+cases:
+  - id: id_command_output_reflected
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/exec?cmd=x
+    param: cmd
+    parsed_query: "cmd=x"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /exec:
+        status: 200
+        body: "uid=0(root) gid=0(root) groups=0(root)"
+    evidence_contains: "uid=0(root)"
+    reproduction: "curl --get 'http://127.0.0.1:8080/exec' --data-urlencode 'cmd=;id'"
+
+  - id: benign_command_page
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/exec?cmd=x
+    param: cmd
+    parsed_query: "cmd=x"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /exec:
+        status: 200
+        body: "ok"
+    evidence_contains: ""
+    reproduction: ""
+
+  # ---------- 正例：命令输出指征回显 ----------
+  - id: whoami_reflected
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/exec?cmd=x
+    param: cmd
+    parsed_query: "cmd=x"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /exec:
+        status: 200
+        body: "uid=1000(vulnlab) gid=1000(vulnlab) groups=1000(vulnlab)"
+    evidence_contains: "uid=1000"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/exec' --data-urlencode 'cmd=x' → 期望命中「命令注入-CMD执行(分号注入-id)」"
+
+  - id: linux_dist_reflected
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/exec?cmd=x
+    param: cmd
+    parsed_query: "cmd=x"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /exec:
+        status: 200
+        body: "Linux version 6.1.0-kali (Debian 6.1.0) with GNU/Linux"
+    evidence_contains: "Linux version"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/exec' --data-urlencode 'cmd=x' → 期望命中「命令注入-CMD执行(分号注入-id)」"
+
+  - id: passwd_reflected
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/exec?cmd=x
+    param: cmd
+    parsed_query: "cmd=x"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /exec:
+        status: 200
+        body: "root:x:0:0:root:/root:/bin/bash\nwww-data:x:33:"
+    evidence_contains: "root:x:0:0:"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/exec' --data-urlencode 'cmd=x' → 期望命中「命令注入-CMD执行(分号注入-id)」"
+
+  - id: windows_systeminfo_reflected
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/exec?cmd=x
+    param: cmd
+    parsed_query: "cmd=x"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /exec:
+        status: 200
+        body: "Host Name: PENTEST-WIN-01\nOS Name: Microsoft Windows Server 2022\nOS Version: 10.0.20348"
+    evidence_contains: "Host Name: "
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/exec' --data-urlencode 'cmd=x' → 期望命中「命令注入-CMD执行(分号注入-id)」"
+
+  - id: listening_socket_reflected
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/exec?cmd=x
+    param: cmd
+    parsed_query: "cmd=x"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /exec:
+        status: 200
+        body: "Proto Recv-Q Send-Q Local Address   Foreign Address  State\n tcp 0 0 0.0.0.0:8080 0.0.0.0:* LISTEN"
+    evidence_contains: "tcp 0 0"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/exec' --data-urlencode 'cmd=x' → 期望命中「命令注入-CMD执行(分号注入-id)」"
+
+  - id: memory_info_reflected
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/exec?cmd=x
+    param: cmd
+    parsed_query: "cmd=x"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /exec:
+        status: 200
+        body: "Mem:   2020000k total,  1500000k used\nSwap:        0k total,        0k used"
+    evidence_contains: "Mem:"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/exec' --data-urlencode 'cmd=x' → 期望命中「命令注入-CMD执行(分号注入-id)」"
+
+  - id: command_not_found_reflected
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/exec?cmd=x
+    param: cmd
+    parsed_query: "cmd=x"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /exec:
+        status: 200
+        body: "sh: 1: nonexistent_cmd: command not found"
+    evidence_contains: "command not found"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/exec' --data-urlencode 'cmd=x' → 期望命中「命令注入-CMD执行(分号注入-id)」"
+
+  # ---------- 反例：空 / 5xx / WAF / 重定向 / 非命令参数 ----------
+  - id: empty_response
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/exec?cmd=x
+    param: cmd
+    parsed_query: "cmd=x"
+    # normal_resp 与攻击响应一致：模拟"端点本就返回空"，避免假 diff 触发疑似
+    normal_resp: [200, "", {}]
+    responses:
+      /exec:
+        status: 200
+        body: ""
+
+  - id: server_error_5xx
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/exec?cmd=x
+    param: cmd
+    parsed_query: "cmd=x"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /exec:
+        status: 500
+        body: "500 Internal Server Error"
+
+  - id: waf_block_403
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/exec?cmd=x
+    param: cmd
+    parsed_query: "cmd=x"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /exec:
+        status: 403
+        body: "<html><body>403 Forbidden</body></html>"
+
+  - id: redirect_302
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/exec?cmd=x
+    param: cmd
+    parsed_query: "cmd=x"
+    # normal_resp 与攻击响应一致：端点本就是 302，无 diff 不触发疑似
+    normal_resp: [302, "", {}]
+    responses:
+      /exec:
+        status: 302
+        body: ""
+
+  - id: form_json_field
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/submit
+    param: name
+    parsed_query: "name=alice"
+    normal_resp: [200, '{"ok":true}', {}]
+    responses:
+      /submit:
+        status: 200
+        body: '{"ok":true}'
+
+  - id: static_marketing_page
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/exec?cmd=x
+    param: cmd
+    parsed_query: "cmd=x"
+    # normal_resp 与攻击响应一致：端点本就是静态营销页，无 diff 不触发疑似
+    normal_resp: [200, "<html><body><h1>Fast Internet Speed Test Dashboard</h1></body></html>", {}]
+    responses:
+      /exec:
+        status: 200
+        body: "<html><body><h1>Fast Internet Speed Test Dashboard</h1></body></html>"
+
+  - id: fix_secure_json_api
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/exec?cmd=x
+    param: cmd
+    parsed_query: "cmd=x"
+    # normal_resp 与攻击响应一致：加固后的 JSON API 正常响应，无 diff 不触发疑似
+    normal_resp: [200, '{"success":true,"code":0,"msg":"use allowlist"}', {}]
+    responses:
+      /exec:
+        status: 200
+        body: '{"success":true,"code":0,"msg":"use allowlist"}'

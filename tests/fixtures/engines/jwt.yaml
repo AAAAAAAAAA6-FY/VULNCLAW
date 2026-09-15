@@ -1,0 +1,102 @@
+engine: jwt
+module: vulnclaw.engines.auth_engines
+class: JWTEngine
+name: JWT 攻击检测（alg:none 算法混淆）
+description: |
+  JWTEngine.check 是纯本地分析：从 normal_resp 的 text/headers 用正则提取 JWT，
+  解析 header/payload 检测 alg:none / 弱密钥 / KID 路径注入 / JKU 注入 / 特权 claim 等，
+  完全不发网络请求（HS* 弱密钥分支才发 _jwt_accepted，本 fixture 用 alg:none 规避）。
+  本 fixture 用 method:check + normal_resp 内嵌构造 token 验证：
+  alg:none 的 JWT → 命中「JWT漏洞(Critical)」；正常页面无 token → 不命中（低误报铁律）。
+
+cases:
+  - id: jwt_alg_none
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/api/profile
+    param: token
+    normal_resp: [200, "<html><body>token: eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiYWRtaW4iOnRydWV9.</body></html>", {}]
+    evidence_contains: "alg: none 算法混淆"
+    reproduction: "fixture 复现（离线，纯本地分析）：normal_resp body 内嵌 alg:none 的 JWT → 期望命中「JWT漏洞(Critical)」"
+
+  - id: jwt_no_token
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/app
+    param: token
+    normal_resp: [200, "<html><body>no token here</body></html>", {}]
+    evidence_contains: ""
+    reproduction: "fixture 复现（离线，纯本地分析）：响应体不含 JWT → 期望无任何 finding"
+
+  - id: jwt_jwk_embed
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/api/profile
+    param: token
+    normal_resp: [200, "<html><body>token: eyJhbGciOiJSUzI1NiIsImp3ayI6eyJrdHkiOiJSU0EiLCJuIjoiYWJjIiwiZSI6IkFRQUIifX0.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IngifQ.</body></html>", {}]
+    evidence_contains: "JWK 自包含注入"
+    reproduction: "fixture 复现（离线，纯本地分析）：normal_resp body 内嵌 header.jwk 自包含 RSA 公钥的 JWT → 期望命中「JWK 自包含注入(High)」"
+
+  - id: jwt_kid_selfref
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/api/profile
+    param: token
+    normal_resp: [200, "<html><body>token: eyJhbGciOiJSUzI1NiIsImp3ayI6eyJrdHkiOiJSU0EiLCJuIjoiYWJjIiwiZSI6IkFRQUIiLCJraWQiOiJrMSJ9LCJraWQiOiJrMSJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IngifQ.</body></html>", {}]
+    evidence_contains: "JWK 自包含注入"
+    reproduction: "fixture 复现（离线，纯本地分析）：kid 指向 header.jwk.kid 的 JWT → 期望命中「kid 引用内嵌 JWK」+「JWK 自包含注入」"
+
+  - id: jwt_x5u_external
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/api/profile
+    param: token
+    normal_resp: [200, "<html><body>token: eyJhbGciOiJSUzI1NiIsIng1dSI6Imh0dHA6Ly9ldmlsLmV4YW1wbGUuY29tL2NlcnQucGVtIn0.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IngifQ.</body></html>", {}]
+    evidence_contains: "X5U 外部证书 URL"
+    reproduction: "fixture 复现（离线，纯本地分析）：header.x5u 指向 http://evil 的 JWT → 期望命中「X5U 外部证书 URL(不安全)(High)」"
+
+  # ---------- 真实 CVE 类场景 ----------
+  - id: jwt_alg_confusion_hs256
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/api/profile
+    param: token
+    normal_resp: [200, "<html><body>token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IngifQ.</body></html>", {}]
+    evidence_contains: "算法混淆"
+    reproduction: "CVE-2016-5431 类：算法混淆 RS256→HS256（服务端预期 RS256 却接受 HS256，攻击者可用公钥当 HMAC 密钥伪造）"
+
+  - id: jwt_kid_path_traversal
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/api/profile
+    param: token
+    normal_resp: [200, "<html><body>token: eyJhbGciOiJSUzI1NiIsImtpZCI6Ii4uLy4uLy4uL2V0Yy9wYXNzd2QifQ.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IngifQ.</body></html>", {}]
+    evidence_contains: "KID 路径注入"
+    reproduction: "CVE-2018-0114 类：kid=../../../etc/passwd 路径遍历（服务端用被遍历文件内容当密钥）"
+
+  - id: jwt_kid_cmd_injection
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/api/profile
+    param: token
+    normal_resp: [200, "<html><body>token: eyJhbGciOiJSUzI1NiIsImtpZCI6ImtleTtpZCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IngifQ.</body></html>", {}]
+    evidence_contains: "KID 命令注入"
+    reproduction: "kid 命令注入（kid=key;id → 服务端将 kid 拼接进 shell 命令取密钥）"
+
+  - id: jwt_jku_injection
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/api/profile
+    param: token
+    normal_resp: [200, "<html><body>token: eyJhbGciOiJSUzI1NiIsImprdSI6Imh0dHA6Ly9ldmlsLmV4YW1wbGUuY29tL2p3a3MuanNvbiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IngifQ.</body></html>", {}]
+    evidence_contains: "JKU 注入"
+    reproduction: "CVE-2018-0114 类：JKU 指向攻击者控制的 JWK Set（jku=evil 域名 → 服务端拉取攻击者公钥验签）"
+
+  - id: jwt_x5c_embedded
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/api/profile
+    param: token
+    normal_resp: [200, "<html><body>token: eyJhbGciOiJSUzI1NiIsIng1YyI6WyJNSUlEYXpDQ0FsT2dBd0lCQWdJVUprMXp6WloiXX0.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IngifQ.</body></html>", {}]
+    evidence_contains: "X5C 自包含证书链"
+    reproduction: "x5c 自包含证书链（header 内嵌证书链，弱库直接用其验签 → 攻击者自签即可伪造）"

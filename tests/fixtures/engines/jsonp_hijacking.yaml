@@ -1,0 +1,27 @@
+# G.1/组 D fixture：JSONP 数据劫持（scan 型）正反例。
+# 引擎判定：追加 callback/jsonp 参数后端点以 `callback(` 回显 JSON 且含敏感字段
+# （email/phone/token/password 等）即判敏感数据 JSONP。
+module: vulnclaw.engines.web_advanced_engines
+class: JSONPHijackingEngine
+engine: jsonp_hijacking
+
+cases:
+  - id: jsonp_sensitive_callback
+    expect: positive
+    target: http://127.0.0.1:8080/getuser
+    responses:
+      /getuser:
+        status: 200
+        body: 'vlcjspdeadbeef({"user_id":1,"email":"alice@x.com","phone":"13800000000"})'
+    evidence_contains: "email"
+    reproduction: "curl -s 'http://127.0.0.1:8080/getuser?callback=vlcjspdeadbeef'  # 返回含 email 的反射 JSONP"
+
+  - id: jsonp_no_sensitive
+    expect: negative
+    target: http://127.0.0.1:8080/getinfo
+    responses:
+      /getinfo:
+        status: 200
+        body: '{"status":"ok"}'
+    evidence_contains: ""
+    reproduction: ""

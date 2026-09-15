@@ -1,0 +1,185 @@
+# G.1 fixture：SSTI 模板注入参数级 check 正反例。
+# 正例仅验证"算术表达式被服务端模板引擎求值"（L1），不做 RCE 实锤；
+# 负例为普通渲染响应，注入 payload 不产生计算结果。
+module: vulnclaw.engines.web_engines
+class: SSTIEngine
+engine: ssti
+
+cases:
+  - id: jinja_arithmetic_reflected
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/render
+    param: name
+    parsed_query: "name=demo"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /render:
+        status: 200
+        body: "rendered output: 49"
+    evidence_contains: "SSTI-L1算术检测"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/render' --data-urlencode 'name=demo' → 期望命中「SSTI-L1算术检测(jinja)」"
+
+  - id: ordinary_template_no_injection
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/render
+    param: name
+    parsed_query: "name=demo"
+    normal_resp: [200, "ok", {}]
+    responses: {}
+
+  # ---------- 正例：算术/字符串乘法/L2 配置/L3 RCE 回显 ----------
+  - id: freemarker_arithmetic
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/freemarker
+    param: template
+    parsed_query: "template=demo"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /freemarker:
+        status: 200
+        body: "rendered: 49"
+    evidence_contains: "SSTI-L1算术检测"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/freemarker' --data-urlencode 'template=demo' → 期望命中「SSTI-L1算术检测(freemarker)」"
+
+  - id: mako_string_mult
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/mako
+    param: content
+    parsed_query: "content=demo"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /mako:
+        status: 200
+        body: 'output: "7777777"'
+    evidence_contains: "SSTI-L1算术检测"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/mako' --data-urlencode 'content=demo' → 期望命中「SSTI-L1算术检测(mako)」"
+
+  - id: twig_string_mult
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/twig
+    param: name
+    parsed_query: "name=demo"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /twig:
+        status: 200
+        body: "greeting 7777777"
+    evidence_contains: "SSTI-L1算术检测"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/twig' --data-urlencode 'name=demo' → 期望命中「SSTI-L1算术检测(twig)」"
+
+  - id: config_leak_flask
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/config
+    param: page
+    parsed_query: "page=demo"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /config:
+        status: 200
+        body: "SECRET_KEY = 'flask-unsafe-secret'"
+    evidence_contains: "SSTI-L2配置泄露"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/config' --data-urlencode 'page=demo' → 期望命中「SSTI-L2配置泄露(flask)」"
+
+  - id: rce_uid_reflected
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/rce
+    param: name
+    parsed_query: "name=demo"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /rce:
+        status: 200
+        body: "uid=0(root) gid=0(root) groups=0(root)"
+    evidence_contains: "SSTI-L3 RCE验证"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/rce' --data-urlencode 'name=demo' → 期望命中「SSTI-L3 RCE验证」"
+
+  - id: django_settings_leak
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/django
+    param: content
+    parsed_query: "content=demo"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /django:
+        status: 200
+        body: "SECRET_KEY = 'django-insecure-abc'"
+    evidence_contains: "SSTI-L2配置泄露"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/django' --data-urlencode 'content=demo' → 期望命中「SSTI-L2配置泄露(django)」"
+
+  # ---------- 反例：空 / 5xx / WAF / 重定向 / 转义修复 ----------
+  - id: empty_response
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/render
+    param: name
+    parsed_query: "name=demo"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /render:
+        status: 200
+        body: ""
+
+  - id: server_error_5xx
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/render
+    param: name
+    parsed_query: "name=demo"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /render:
+        status: 500
+        body: "500 Internal Server Error"
+
+  - id: waf_block_403
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/render
+    param: name
+    parsed_query: "name=demo"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /render:
+        status: 403
+        body: "<html><body>403 Forbidden</body></html>"
+
+  - id: redirect_302
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/render
+    param: name
+    parsed_query: "name=demo"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /render:
+        status: 302
+        body: ""
+
+  - id: sanitized_escaped_rendering
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/render
+    param: name
+    parsed_query: "name=demo"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /render:
+        status: 200
+        body: "rendered output: {{7*7}}"
+
+  - id: non_template_param
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/render?age=30
+    param: age
+    parsed_query: "age=30"
+    normal_resp: [200, "ok", {}]
+    responses: {}

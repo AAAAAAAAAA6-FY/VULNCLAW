@@ -1,0 +1,26 @@
+# G.1/组 D fixture：容器平台未授权暴露（scan 型）正反例。
+# 引擎判定：Kubernetes API Server /version 返回带 gitVersion/major/minor 的版本 JSON。
+module: vulnclaw.engines.framework_zero_day_engines_2
+class: ContainerPlatformExposureEngine
+engine: container_platform_exposure
+
+cases:
+  - id: k8s_api_version_exposed
+    expect: positive
+    target: http://192.168.10.10:6443
+    responses:
+      /version:
+        status: 200
+        body: '{"major":"1","minor":"26","gitVersion":"v1.26.4","platform":"linux/amd64"}'
+    evidence_contains: "gitVersion"
+    reproduction: "curl -s 'http://192.168.10.10:6443/version'"
+
+  - id: k8s_version_denied
+    expect: negative
+    target: http://192.168.10.10:6443
+    responses:
+      /version:
+        status: 403
+        body: '{"kind":"Status","reason":"Forbidden"}'
+    evidence_contains: ""
+    reproduction: ""

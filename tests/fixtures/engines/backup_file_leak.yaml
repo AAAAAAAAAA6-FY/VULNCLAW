@@ -1,0 +1,70 @@
+# G.1 fixture：备份/源码/环境变量泄露（backup_file_leak）正反例。
+# 引擎逻辑（logic_leak_engines_2.BackupFileLeakEngine.scan）：
+#   对 PROBES 里的 path 逐个请求 base+/<path>，命中"响应体指纹"才产出 finding。
+#   正例用真实指纹驱动（.env 的 KEY=VALUE / SQL 转储的 create table / PHP 备份的 <?php）；
+#   反例覆盖全 404、以及 200 但内容不匹配（低误报铁律）。
+module: vulnclaw.engines.logic_leak_engines_2
+class: BackupFileLeakEngine
+engine: backup_file_leak
+
+cases:
+  - id: env_file_exposed
+    method: scan
+    expect: positive
+    target: http://127.0.0.1:8080
+    responses:
+      /.env:
+        status: 200
+        body: "APP_ENV=production\nDB_HOST=127.0.0.1\nDB_PASSWORD=s3cr3t\nREDIS_URL=redis://cache:6379/0\n"
+    evidence_contains: ".env"
+    reproduction: "fixture 复现（离线 mock）：curl -sS 'http://127.0.0.1:8080/.env' → 期望命中「.env 环境变量泄露」"
+
+  - id: sql_dump_exposed
+    method: scan
+    expect: positive
+    target: http://127.0.0.1:8080
+    responses:
+      /database.sql:
+        status: 200
+        body: "CREATE TABLE users (id int, name varchar(32));\nINSERT INTO users VALUES (1,'admin');\n"
+    evidence_contains: "SQL"
+    reproduction: "fixture 复现（离线 mock）：curl -sS 'http://127.0.0.1:8080/database.sql' → 期望命中「SQL 转储泄露」"
+
+  - id: php_backup_exposed
+    method: scan
+    expect: positive
+    target: http://127.0.0.1:8080
+    responses:
+      /config.php.bak:
+        status: 200
+        body: "<?php\ndefine('DB_HOST', 'localhost');\n$db_user = 'root';\n"
+    evidence_contains: "PHP"
+    reproduction: "fixture 复现（离线 mock）：curl -sS 'http://127.0.0.1:8080/config.php.bak' → 期望命中「PHP 源码备份泄露」"
+
+  # ---------- 反例 ----------
+  - id: all_paths_404
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses: {}
+
+  - id: env_path_200_but_plain_asset
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      /.env:
+        status: 200
+        body: "<html><body><h1>Not a config file</h1><p>This is a static placeholder.</p></body></html>"
+      /.env.production:
+        status: 200
+        body: "<html><body><h1>Not a config file</h1></body></html>"
+
+  - id: html_error_page_not_backup
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      /.env:
+        status: 200
+        body: "<!DOCTYPE html><html><head><title>404 Not Found</title></head><body>nginx</body></html>"

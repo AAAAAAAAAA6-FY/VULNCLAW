@@ -22,6 +22,27 @@ from vulnclaw.core import impersonate as imp_mod
 from vulnclaw.core.settings import settings
 
 
+@pytest.fixture(autouse=True)
+def _restore_impersonate_module_state():
+    """本文件多处**直接给模块全局赋值**（CURL_CFFI_AVAILABLE / AsyncSession），
+    这些赋值不会像 monkeypatch 那样自动回滚 → 污染同 worker 的后续用例
+    （实测：把 `test_unavailable_module_returns_none` 从"跳过/返回 None"变成
+    "伪装通道可用 → 返回真响应"，全量跑红、单独跑绿）。这里统一快照+还原。
+    """
+    saved = (
+        imp_mod.CURL_CFFI_AVAILABLE,
+        getattr(imp_mod, "AsyncSession", None),
+        getattr(imp_mod, "_impersonate_session", None),
+    )
+    try:
+        yield
+    finally:
+        imp_mod.CURL_CFFI_AVAILABLE = saved[0]
+        imp_mod.AsyncSession = saved[1]
+        if hasattr(imp_mod, "_impersonate_session"):
+            imp_mod._impersonate_session = saved[2]
+
+
 def _on(browser: str = "chrome") -> None:
     settings.http_impersonate = True
     settings.http_impersonate_browser = browser

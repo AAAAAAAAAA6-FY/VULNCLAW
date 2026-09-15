@@ -1,6 +1,33 @@
 {
   "summary": [
     {
+      "engine": "api_security",
+      "TP": 1,
+      "FN": 0,
+      "FP": 0,
+      "TN": 1,
+      "detect_rate": 100.0,
+      "false_rate": 0.0
+    },
+    {
+      "engine": "jwt",
+      "TP": 1,
+      "FN": 0,
+      "FP": 0,
+      "TN": 1,
+      "detect_rate": 100.0,
+      "false_rate": 0.0
+    },
+    {
+      "engine": "deserialization",
+      "TP": 1,
+      "FN": 0,
+      "FP": 0,
+      "TN": 1,
+      "detect_rate": 100.0,
+      "false_rate": 0.0
+    },
+    {
       "engine": "exposure_fingerprint",
       "TP": 4,
       "FN": 0,
@@ -8,15 +35,180 @@
       "TN": 2,
       "detect_rate": 100.0,
       "false_rate": 0.0
+    },
+    {
+      "engine": "file_upload",
+      "TP": 1,
+      "FN": 0,
+      "FP": 0,
+      "TN": 1,
+      "detect_rate": 100.0,
+      "false_rate": 0.0
+    },
+    {
+      "engine": "idor",
+      "TP": 1,
+      "FN": 0,
+      "FP": 0,
+      "TN": 1,
+      "detect_rate": 100.0,
+      "false_rate": 0.0
+    },
+    {
+      "engine": "lfi",
+      "TP": 1,
+      "FN": 0,
+      "FP": 0,
+      "TN": 1,
+      "detect_rate": 100.0,
+      "false_rate": 0.0
+    },
+    {
+      "engine": "nosql",
+      "TP": 1,
+      "FN": 0,
+      "FP": 0,
+      "TN": 1,
+      "detect_rate": 100.0,
+      "false_rate": 0.0
+    },
+    {
+      "engine": "ssrf",
+      "TP": 1,
+      "FN": 0,
+      "FP": 0,
+      "TN": 1,
+      "detect_rate": 100.0,
+      "false_rate": 0.0
+    },
+    {
+      "engine": "ssti",
+      "TP": 1,
+      "FN": 0,
+      "FP": 0,
+      "TN": 1,
+      "detect_rate": 100.0,
+      "false_rate": 0.0
+    },
+    {
+      "engine": "xss",
+      "TP": 1,
+      "FN": 0,
+      "FP": 0,
+      "TN": 1,
+      "detect_rate": 100.0,
+      "false_rate": 0.0
+    },
+    {
+      "engine": "xxe",
+      "TP": 1,
+      "FN": 0,
+      "FP": 0,
+      "TN": 1,
+      "detect_rate": 100.0,
+      "false_rate": 0.0
     }
   ],
   "total": {
-    "TP": 4,
+    "TP": 15,
     "FN": 0,
     "FP": 0,
-    "TN": 2
+    "TN": 13
+  },
+  "quality": {
+    "case_count": 28,
+    "evidence_count": 15,
+    "evidence_rate": 0.5357142857142857,
+    "reproduced_count": 0,
+    "reproduction_rate": 0.0,
+    "request_count": 192,
+    "elapsed_seconds": 12.337577
   },
   "cases": [
+    {
+      "file": "api_security.yaml",
+      "engine": "api_security",
+      "case": "graphql_endpoint_discovered",
+      "expect": "positive",
+      "found": true,
+      "verdict": "TP",
+      "severity": "Info",
+      "top": "GraphQL 端点发现",
+      "evidence": true,
+      "reproduced": false,
+      "request_count": 1,
+      "elapsed_seconds": 0.000546
+    },
+    {
+      "file": "api_security.yaml",
+      "engine": "api_security",
+      "case": "ordinary_endpoint_not_graphql",
+      "expect": "negative",
+      "found": false,
+      "verdict": "TN",
+      "severity": "",
+      "top": "",
+      "evidence": false,
+      "reproduced": false,
+      "request_count": 2,
+      "elapsed_seconds": 0.001084
+    },
+    {
+      "file": "auth.yaml",
+      "engine": "jwt",
+      "case": "jwt_alg_none",
+      "expect": "positive",
+      "found": true,
+      "verdict": "TP",
+      "severity": "Critical",
+      "top": "JWT漏洞",
+      "evidence": true,
+      "reproduced": false,
+      "request_count": 0,
+      "elapsed_seconds": 0.053107
+    },
+    {
+      "file": "auth.yaml",
+      "engine": "jwt",
+      "case": "no_jwt_token",
+      "expect": "negative",
+      "found": false,
+      "verdict": "TN",
+      "severity": "",
+      "top": "",
+      "evidence": false,
+      "reproduced": false,
+      "request_count": 0,
+      "elapsed_seconds": 0.00093
+    },
+    {
+      "file": "deserialization.yaml",
+      "engine": "deserialization",
+      "case": "java_runtime_serialization_marker",
+      "expect": "positive",
+      "found": true,
+      "verdict": "TP",
+      "severity": "Medium",
+      "top": "反序列化特征-java.lang.Runtime 调用链",
+      "evidence": true,
+      "reproduced": false,
+      "request_count": 1,
+      "elapsed_seconds": 0.019869
+    },
+    {
+      "file": "deserialization.yaml",
+      "engine": "deserialization",
+      "case": "ordinary_application_response",
+      "expect": "negative",
+      "found": false,
+      "verdict": "TN",
+      "severity": "",
+      "top": "",
+      "evidence": false,
+      "reproduced": false,
+      "request_count": 1,
+      "elapsed_seconds": 0.008088
+    },
     {
       "file": "exposure.yaml",
       "engine": "exposure_fingerprint",
@@ -25,7 +217,11 @@
       "found": true,
       "verdict": "TP",
       "severity": "Critical",
-      "top": "Nacos 未授权访问-用户列表泄露"
+      "top": "Nacos 未授权访问-用户列表泄露",
+      "evidence": true,
+      "reproduced": false,
+      "request_count": 5,
+      "elapsed_seconds": 0.033032
     },
     {
       "file": "exposure.yaml",
@@ -35,7 +231,11 @@
       "found": true,
       "verdict": "TP",
       "severity": "High",
-      "top": "Nacos 未授权访问-配置中心泄露"
+      "top": "Nacos 未授权访问-配置中心泄露",
+      "evidence": true,
+      "reproduced": false,
+      "request_count": 6,
+      "elapsed_seconds": 0.00073
     },
     {
       "file": "exposure.yaml",
@@ -45,7 +245,11 @@
       "found": true,
       "verdict": "TP",
       "severity": "High",
-      "top": "Apache Solr Admin 未授权访问"
+      "top": "Apache Solr Admin 未授权访问",
+      "evidence": true,
+      "reproduced": false,
+      "request_count": 5,
+      "elapsed_seconds": 0.000556
     },
     {
       "file": "exposure.yaml",
@@ -55,7 +259,11 @@
       "found": true,
       "verdict": "TP",
       "severity": "High",
-      "top": "Confluence 未授权访问-内容读取"
+      "top": "Confluence 未授权访问-内容读取",
+      "evidence": true,
+      "reproduced": false,
+      "request_count": 5,
+      "elapsed_seconds": 0.000441
     },
     {
       "file": "exposure.yaml",
@@ -65,7 +273,11 @@
       "found": false,
       "verdict": "TN",
       "severity": "",
-      "top": ""
+      "top": "",
+      "evidence": false,
+      "reproduced": false,
+      "request_count": 4,
+      "elapsed_seconds": 0.001182
     },
     {
       "file": "exposure.yaml",
@@ -75,7 +287,235 @@
       "found": false,
       "verdict": "TN",
       "severity": "",
-      "top": ""
+      "top": "",
+      "evidence": false,
+      "reproduced": false,
+      "request_count": 6,
+      "elapsed_seconds": 0.000907
+    },
+    {
+      "file": "file_upload.yaml",
+      "engine": "file_upload",
+      "case": "upload_endpoint_candidate",
+      "expect": "positive",
+      "found": true,
+      "verdict": "TP",
+      "severity": null,
+      "top": "文件上传端点发现",
+      "evidence": true,
+      "reproduced": false,
+      "request_count": 0,
+      "elapsed_seconds": 0.000333
+    },
+    {
+      "file": "file_upload.yaml",
+      "engine": "file_upload",
+      "case": "ordinary_endpoint_not_upload",
+      "expect": "negative",
+      "found": false,
+      "verdict": "TN",
+      "severity": "",
+      "top": "",
+      "evidence": false,
+      "reproduced": false,
+      "request_count": 0,
+      "elapsed_seconds": 0.000162
+    },
+    {
+      "file": "idor.yaml",
+      "engine": "idor",
+      "case": "numeric_object_identifier",
+      "expect": "positive",
+      "found": true,
+      "verdict": "TP",
+      "severity": "Info",
+      "top": "IDOR候选参数",
+      "evidence": true,
+      "reproduced": false,
+      "request_count": 0,
+      "elapsed_seconds": 0.001184
+    },
+    {
+      "file": "idor.yaml",
+      "engine": "idor",
+      "case": "non_identifier_parameter",
+      "expect": "negative",
+      "found": false,
+      "verdict": "TN",
+      "severity": "",
+      "top": "",
+      "evidence": false,
+      "reproduced": false,
+      "request_count": 0,
+      "elapsed_seconds": 0.001114
+    },
+    {
+      "file": "lfi.yaml",
+      "engine": "lfi",
+      "case": "passwd_file_disclosure",
+      "expect": "positive",
+      "found": true,
+      "verdict": "TP",
+      "severity": "Critical",
+      "top": "文件包含-LFI(Windows win.ini)",
+      "evidence": true,
+      "reproduced": false,
+      "request_count": 1,
+      "elapsed_seconds": 0.000882
+    },
+    {
+      "file": "lfi.yaml",
+      "engine": "lfi",
+      "case": "safe_download_response",
+      "expect": "negative",
+      "found": false,
+      "verdict": "TN",
+      "severity": "",
+      "top": "",
+      "evidence": false,
+      "reproduced": false,
+      "request_count": 20,
+      "elapsed_seconds": 0.025453
+    },
+    {
+      "file": "nosql.yaml",
+      "engine": "nosql",
+      "case": "mongodb_ne_error_reflected",
+      "expect": "positive",
+      "found": true,
+      "verdict": "TP",
+      "severity": null,
+      "top": "NoSQL注入(MongoDB $ne(不等于))",
+      "evidence": true,
+      "reproduced": false,
+      "request_count": 2,
+      "elapsed_seconds": 0.000804
+    },
+    {
+      "file": "nosql.yaml",
+      "engine": "nosql",
+      "case": "safe_login_no_injection",
+      "expect": "negative",
+      "found": false,
+      "verdict": "TN",
+      "severity": "",
+      "top": "",
+      "evidence": false,
+      "reproduced": false,
+      "request_count": 21,
+      "elapsed_seconds": 0.016241
+    },
+    {
+      "file": "ssrf.yaml",
+      "engine": "ssrf",
+      "case": "internal_secret_reflected",
+      "expect": "positive",
+      "found": true,
+      "verdict": "TP",
+      "severity": "High",
+      "top": "SSRF(localhost)",
+      "evidence": true,
+      "reproduced": false,
+      "request_count": 1,
+      "elapsed_seconds": 0.002222
+    },
+    {
+      "file": "ssrf.yaml",
+      "engine": "ssrf",
+      "case": "ordinary_fetch_response",
+      "expect": "negative",
+      "found": false,
+      "verdict": "TN",
+      "severity": "",
+      "top": "",
+      "evidence": false,
+      "reproduced": false,
+      "request_count": 20,
+      "elapsed_seconds": 0.007102
+    },
+    {
+      "file": "ssti.yaml",
+      "engine": "ssti",
+      "case": "jinja_arithmetic_reflected",
+      "expect": "positive",
+      "found": true,
+      "verdict": "TP",
+      "severity": null,
+      "top": "SSTI-L1算术检测(Jinja2/Twig/Nunjucks)",
+      "evidence": true,
+      "reproduced": false,
+      "request_count": 26,
+      "elapsed_seconds": 0.006165
+    },
+    {
+      "file": "ssti.yaml",
+      "engine": "ssti",
+      "case": "ordinary_template_no_injection",
+      "expect": "negative",
+      "found": false,
+      "verdict": "TN",
+      "severity": "",
+      "top": "",
+      "evidence": false,
+      "reproduced": false,
+      "request_count": 21,
+      "elapsed_seconds": 0.002954
+    },
+    {
+      "file": "xss.yaml",
+      "engine": "xss",
+      "case": "reflected_script_payload",
+      "expect": "positive",
+      "found": true,
+      "verdict": "TP",
+      "severity": "High",
+      "top": "XSS-反射型(基础script标签(混淆))",
+      "evidence": true,
+      "reproduced": false,
+      "request_count": 2,
+      "elapsed_seconds": 12.122503
+    },
+    {
+      "file": "xss.yaml",
+      "engine": "xss",
+      "case": "encoded_or_sanitized_response",
+      "expect": "negative",
+      "found": false,
+      "verdict": "TN",
+      "severity": "",
+      "top": "",
+      "evidence": false,
+      "reproduced": false,
+      "request_count": 1,
+      "elapsed_seconds": 0.000591
+    },
+    {
+      "file": "xxe.yaml",
+      "engine": "xxe",
+      "case": "xxe_passwd_disclosure",
+      "expect": "positive",
+      "found": true,
+      "verdict": "TP",
+      "severity": null,
+      "top": "XXE(Linux passwd)",
+      "evidence": true,
+      "reproduced": false,
+      "request_count": 1,
+      "elapsed_seconds": 0.00065
+    },
+    {
+      "file": "xxe.yaml",
+      "engine": "xxe",
+      "case": "ordinary_xml_response",
+      "expect": "negative",
+      "found": false,
+      "verdict": "TN",
+      "severity": "",
+      "top": "",
+      "evidence": false,
+      "reproduced": false,
+      "request_count": 40,
+      "elapsed_seconds": 0.028745
     }
   ]
 }

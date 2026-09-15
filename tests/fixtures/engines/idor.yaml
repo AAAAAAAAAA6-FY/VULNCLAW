@@ -1,0 +1,130 @@
+module: vulnclaw.engines.auth_engines
+class: IDOREngine
+engine: idor
+
+target: http://127.0.0.1:8080/orders?id=1001
+
+cases:
+  - id: numeric_object_identifier
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/orders?id=1001
+    param: id
+    parsed_query: "id=1001"
+    normal_resp: [200, '{"order_id":1001}', {}]
+    responses: {}
+    evidence_contains: "发现 ID 参数 id=1001，建议进行越权测试"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/orders' --data-urlencode 'id=1001' → 期望命中「IDOR候选参数」"
+
+  - id: non_identifier_parameter
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/search?q=shoes
+    param: q
+    parsed_query: "q=shoes"
+    normal_resp: [200, '{"results":[]}', {}]
+    responses: {}
+
+  # ---------- 正例：各类 ID 参数（BOLA 面） ----------
+  - id: user_id_param
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/profile?user_id=42
+    param: user_id
+    parsed_query: "user_id=42"
+    normal_resp: [200, '{"user":1}', {}]
+    responses: {}
+    evidence_contains: "发现 ID 参数 user_id=42，建议进行越权测试"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/profile' --data-urlencode 'user_id=42' → 期望命中「IDOR候选参数」"
+
+  - id: account_id_param
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/account?account_id=100
+    param: account_id
+    parsed_query: "account_id=100"
+    normal_resp: [200, '{"acct":1}', {}]
+    responses: {}
+    evidence_contains: "发现 ID 参数 account_id=100，建议进行越权测试"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/account' --data-urlencode 'account_id=100' → 期望命中「IDOR候选参数」"
+
+  - id: order_id_param
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/orders/invoice
+    param: order_id
+    parsed_query: "order_id=9001"
+    normal_resp: [200, '{"order_id":9001}', {}]
+    responses: {}
+    evidence_contains: "发现 ID 参数 order_id=9001，建议进行越权测试"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/orders/invoice' --data-urlencode 'order_id=9001' → 期望命中「IDOR候选参数」"
+
+  - id: uuid_object_value
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/documents
+    param: doc
+    parsed_query: "doc=9f8c0a12-1a2b-3c4d-5e6f-7a8b9c0d1e2f"
+    normal_resp: [200, '{"doc":1}', {}]
+    responses: {}
+    evidence_contains: "发现 ID 参数 doc=9f8c0a12-1a2b-3c4d-5e6f-7a8b9c0d1e2f，建议进行越权测试"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/documents' --data-urlencode 'doc=9f8c0a12-1a2b-3c4d-5e6f-7a8b9c0d1e2f' → 期望命中「IDOR候选参数」"
+
+  - id: invoice_id_param
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/billing
+    param: invoice_id
+    parsed_query: "invoice_id=7"
+    normal_resp: [200, '{"invoice":1}', {}]
+    responses: {}
+    evidence_contains: "发现 ID 参数 invoice_id=7，建议进行越权测试"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/billing' --data-urlencode 'invoice_id=7' → 期望命中「IDOR候选参数」"
+
+  - id: customer_id_param
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/crm
+    param: customer_id
+    parsed_query: "customer_id=55"
+    normal_resp: [200, '{"customer":1}', {}]
+    responses: {}
+
+  # ---------- 反例：非 ID 参数 / 非 ID 值 ----------
+    evidence_contains: "发现 ID 参数 customer_id=55，建议进行越权测试"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/crm' --data-urlencode 'customer_id=55' → 期望命中「IDOR候选参数」"
+  - id: sort_parameter
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/list?sort=price
+    param: sort
+    parsed_query: "sort=price"
+    normal_resp: [200, '{"rows":[]}', {}]
+    responses: {}
+
+  - id: query_text_parameter
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/search?q=shoes
+    param: q
+    parsed_query: "q=shoes"
+    normal_resp: [200, '{"results":[]}', {}]
+    responses: {}
+
+  - id: status_parameter
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/orders?status=active
+    param: status
+    parsed_query: "status=active"
+    normal_resp: [200, '{"orders":[]}', {}]
+    responses: {}
+
+  - id: search_text_value
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/products
+    param: name
+    parsed_query: "name=t-shirt"
+    normal_resp: [200, '{"items":[]}', {}]
+    responses: {}

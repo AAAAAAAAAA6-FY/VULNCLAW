@@ -1,0 +1,60 @@
+# G.1 fixture：GraphQL introspection 开启（graphql_introspection）正反例。
+# 引擎逻辑（logic_leak_engines_2.GraphQLIntrospectionEngine.scan）：
+#   对 ENDPOINTS 逐个 POST {"query": "{__schema{queryType{name}types{name}}}"}，
+#   响应同时含 "data" 与 "__schema" 即判定 introspection 可用。
+#   ⚠️ 本引擎走 async_post（benchmark 的 fake 同时打 async_get/async_post）。
+module: vulnclaw.engines.logic_leak_engines_2
+class: GraphQLIntrospectionEngine
+engine: graphql_introspection
+
+cases:
+  - id: introspection_enabled
+    method: scan
+    expect: positive
+    target: http://127.0.0.1:8080
+    responses:
+      /graphql:
+        status: 200
+        body: '{"data":{"__schema":{"queryType":{"name":"Query"},"types":[{"name":"User"},{"name":"Order"}]}}}'
+    evidence_contains: "__schema"
+    reproduction: "fixture 复现（离线 mock）：curl -sS 'http://127.0.0.1:8080/graphql' -H 'content-type: application/json' -d '{\"query\":\"{__schema{queryType{name}types{name}}}\"}' → 期望命中「GraphQL introspection 开启」"
+
+  # ---------- 反例 ----------
+  - id: all_endpoints_404
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses: {}
+
+  - id: introspection_disabled_by_config
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      /graphql:
+        status: 200
+        body: '{"errors":[{"message":"GraphQL introspection is not allowed, but the query contained __schema or __type"}]}'
+      /gql:
+        status: 200
+        body: '{"errors":[{"message":"introspection disabled"}]}'
+      /api/graphql:
+        status: 200
+        body: '{"errors":[{"message":"introspection disabled"}]}'
+      /v1/graphql:
+        status: 200
+        body: '{"errors":[{"message":"introspection disabled"}]}'
+      /graphiql:
+        status: 200
+        body: '{"errors":[{"message":"introspection disabled"}]}'
+
+  - id: ordinary_json_api
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      /graphql:
+        status: 200
+        body: '{"code":0,"data":{"schema_version":"1.0"},"message":"ok"}'
+      /gql:
+        status: 200
+        body: '{"code":0,"message":"ok"}'

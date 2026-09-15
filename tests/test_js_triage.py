@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """K.2 AB 分诊测试：纯函数(A)→沙箱执行(B)→降级(C) 三路 + LLM 失败不报错。
 

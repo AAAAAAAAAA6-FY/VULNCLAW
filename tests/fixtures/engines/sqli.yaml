@@ -1,0 +1,286 @@
+# G.1 fixture：SQL 注入参数级 check 正反例（P0 补齐，后端离线 mock）。
+# 正例统一采用引擎 SQL_ERROR_PHRASES 唯一指纹（报错注入回显）驱动检出；
+# 反例覆盖安全页面/WAF 拦截/5xx 服务器错误/重定向等维度，杜绝误报。
+module: vulnclaw.engines.web_engines
+class: SQLiEngine
+engine: sqli
+
+cases:
+  # ---------- 正例：主流 DB 报错指纹 ----------
+  - id: mysql_error_syntax
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/sqlinject?id=1
+    param: id
+    parsed_query: "id=1"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /sqlinject:
+        status: 500
+        body: "You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version near '1'' at line 1"
+    evidence_contains: "check the manual that corresponds to your MySQL server vers"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/sqlinject' --data-urlencode 'id=1' → 期望命中「SQL注入-报错注入(数字自逆布尔)」"
+
+  - id: mssql_unclosed_quote
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/sqlinject?id=1
+    param: id
+    parsed_query: "id=1"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /sqlinject:
+        status: 500
+        body: "Unclosed quotation mark after the character string ''1'''"
+    evidence_contains: "SQL错误特征(新出现): 检测到 SQL 错误特征"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/sqlinject' --data-urlencode 'id=1' → 期望命中「SQL注入-报错注入(数字自逆布尔)」"
+
+  - id: oracle_ora_error
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/sqlinject?id=1
+    param: id
+    parsed_query: "id=1"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /sqlinject:
+        status: 500
+        body: "ORA-00933: SQL command not properly ended"
+    evidence_contains: "SQL错误特征(新出现): : SQL command not properly ended"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/sqlinject' --data-urlencode 'id=1' → 期望命中「SQL注入-报错注入(数字自逆布尔)」"
+
+  - id: postgres_psql_error
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/sqlinject?id=1
+    param: id
+    parsed_query: "id=1"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /sqlinject:
+        status: 400
+        body: "psql: error: syntax error at or near \"1'\""
+    evidence_contains: "SQL错误特征(新出现): : syntax error at or near"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/sqlinject' --data-urlencode 'id=1' → 期望命中「SQL注入-报错注入(数字自逆布尔)」"
+
+  - id: sqlite_operational_error
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/sqlinject?id=1
+    param: id
+    parsed_query: "id=1"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /sqlinject:
+        status: 400
+        body: "sqlite3.OperationalError: near \"1'\": syntax error"
+    evidence_contains: ": sqlite3.OperationalError: near \"1'\": syntax error"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/sqlinject' --data-urlencode 'id=1' → 期望命中「SQL注入-报错注入(数字自逆布尔)」"
+
+  - id: generic_native_error
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/sqlinject?id=1
+    param: id
+    parsed_query: "id=1"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /sqlinject:
+        status: 500
+        body: "SQLSTATE[42000]: Syntax error: you have an error in your SQL syntax"
+    evidence_contains: "SQL错误特征(新出现): : you have an error in your SQL syntax"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/sqlinject' --data-urlencode 'id=1' → 期望命中「SQL注入-报错注入(数字自逆布尔)」"
+
+  - id: mysql_fetch_warning
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/sqlinject?id=1
+    param: id
+    parsed_query: "id=1"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /sqlinject:
+        status: 500
+        body: "Warning: mysqli_fetch_array() expects parameter 1 to be mysqli_result, boolean given in query.php on line 20"
+    evidence_contains: ": : mysqli_fetch_array"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/sqlinject' --data-urlencode 'id=1' → 期望命中「SQL注入-报错注入(数字自逆布尔)」"
+
+  - id: case_insensitive_marker
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/sqlinject?id=1
+    param: id
+    parsed_query: "id=1"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /sqlinject:
+        status: 500
+        body: "AMBIGUOUS COLUMN NAME 'ID' in statement (near \"1'\")"
+    evidence_contains: "SQL错误特征(新出现): 检测到 SQL 错误特征"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/sqlinject' --data-urlencode 'id=1' → 期望命中「SQL注入-报错注入(数字自逆布尔)」"
+
+  - id: union_error_reflected
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/sqlinject?id=1
+    param: id
+    parsed_query: "id=1"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /sqlinject:
+        status: 500
+        body: "Invalid query: union select 1,2,3 -- syntax error in SQL near \"union\""
+    evidence_contains: ": Invalid query: union select 1"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/sqlinject' --data-urlencode 'id=1' → 期望命中「SQL注入-报错注入(数字自逆布尔)」"
+
+  - id: non_sql_parameter_no_hit
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/search?q=tools
+    param: q
+    parsed_query: "q=tools"
+    normal_resp: [200, '{"results":[]}', {}]
+    responses: {}
+
+  - id: generic_json_api_no_hit
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/api/items?id=1
+    param: id
+    parsed_query: "id=1"
+    normal_resp: [200, '{"id":1,"name":"item"}', {}]
+    responses:
+      /api/items:
+        status: 200
+        body: '{"id":1,"name":"item","price":10}'
+
+  - id: server_error_generic_5xx
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/sqlinject?id=1
+    param: id
+    parsed_query: "id=1"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /sqlinject:
+        status: 500
+        body: "Internal Server Error - the application crashed"
+
+  - id: waf_block_page
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/sqlinject?id=1
+    param: id
+    parsed_query: "id=1"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /sqlinject:
+        status: 403
+        body: "<html><body><h1>403 Forbidden</h1><p>Only God can judge me. - WAF</p></body></html>"
+
+  - id: redirect_302_no_follow
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/sqlinject?id=1
+    param: id
+    parsed_query: "id=1"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /sqlinject:
+        status: 302
+        body: ""
+
+  - id: empty_response_200
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/sqlinject?id=1
+    param: id
+    parsed_query: "id=1"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /sqlinject:
+        status: 200
+        body: ""
+
+  # ---------- 深度化：堆叠查询 / 更多 DB 报错面 / WAF 绕过后的报错 ----------
+  - id: stacked_query_error
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/sqlinject?id=1
+    param: id
+    parsed_query: "id=1"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /sqlinject:
+        status: 500
+        body: "You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version near '; DROP TABLE users' at line 2"
+    evidence_contains: "check the manual that corresponds to your MySQL server vers"
+    reproduction: "堆叠查询（id=1'; DROP TABLE users）触发 MySQL 语法报错回显 → 期望命中报错注入"
+
+  - id: mssql_ole_db_provider_error
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/sqlinject?id=1
+    param: id
+    parsed_query: "id=1"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /sqlinject:
+        status: 500
+        body: "Microsoft OLE DB Provider for SQL Server error '80040e14' : Unclosed quotation mark after the character string"
+    evidence_contains: "Unclosed quotation mark"
+    reproduction: "MSSQL OLE DB 驱动报错回显（OLE DB Provider for SQL Server + Unclosed quotation mark）→ 期望命中报错注入"
+
+  - id: db2_sql_error_disclosure
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/sqlinject?id=1
+    param: id
+    parsed_query: "id=1"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /sqlinject:
+        status: 500
+        body: "DB2 SQL Error: SQLCODE=-104, SQLSTATE=42601, SQLERRMC=FROM;1'"
+    evidence_contains: "SQLSTATE"
+    reproduction: "DB2 报错回显（DB2 SQL Error / SQLCODE）→ 期望命中报错注入"
+
+  - id: sqlite_unterminated_string
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/sqlinject?id=1
+    param: id
+    parsed_query: "id=1"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /sqlinject:
+        status: 400
+        body: "sqlite3.OperationalError: unterminated string literal: near \"1'\""
+    evidence_contains: "unterminated string literal"
+    reproduction: "SQLite 报错回显（unterminated string literal）→ 期望命中报错注入"
+
+  - id: waf_bypass_comment_obfuscated_error
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/sqlinject?id=1
+    param: id
+    parsed_query: "id=1"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /sqlinject:
+        status: 500
+        body: "SQLSTATE[42000]: Syntax error: you have an error in your SQL syntax near '/*!50000union*/'"
+    evidence_contains: "/*!50000union*/"
+    reproduction: "WAF 绕过（注释混淆 /*!50000union*/）后服务端仍抛 SQL 语法错误 → 期望命中报错注入"
+
+  - id: waf_block_sql_injection_word
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/sqlinject?id=1
+    param: id
+    parsed_query: "id=1"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /sqlinject:
+        status: 403
+        body: "<html><body><h1>Access Denied</h1><p>SQL Injection attempt detected and blocked.</p></body></html>"

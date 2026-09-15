@@ -1,0 +1,55 @@
+# G.1 fixture：Prometheus 指标端点未授权暴露（prometheus_metrics）正反例。
+# 引擎逻辑（logic_leak_engines_2.PrometheusMetricsExposureEngine.scan）：
+#   状态码 200 且正文 >= 200 字符，且 METRIC_LINE_RE 命中 >= 5 次才产出 finding。
+#   正则：^\s*(?:#\s*HELP|#\s*TYPE|[a-zA-Z_:][a-zA-Z0-9_:]*\s+\d)
+module: vulnclaw.engines.logic_leak_engines_2
+class: PrometheusMetricsExposureEngine
+engine: prometheus_metrics
+
+cases:
+  - id: metrics_endpoint_exposed
+    method: scan
+    expect: positive
+    target: http://127.0.0.1:8080
+    responses:
+      /metrics:
+        status: 200
+        body: |
+          # HELP http_requests_total Total number of HTTP requests
+          # TYPE http_requests_total counter
+          http_requests_total{method="get",code="200"} 1027
+          http_requests_total{method="post",code="500"} 3
+          process_cpu_seconds_total 12.34
+          process_resident_memory_bytes 8.3e+07
+          node_build_info{version="1.7.0"} 1
+          go_goroutines 42
+    evidence_contains: "Prometheus"
+    reproduction: "fixture 复现（离线 mock）：curl -sS 'http://127.0.0.1:8080/metrics' → 期望命中「Prometheus 指标暴露」"
+
+  # ---------- 反例 ----------
+  - id: all_paths_404
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses: {}
+
+  - id: metrics_200_but_plain_html
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      /metrics:
+        status: 200
+        body: "<html><body><h1>Metrics dashboard</h1><p>Please login to view metrics.</p><p>This page has no machine readable metric series at all, it is only a marketing landing page rendered for humans and contains no exposition format lines.</p></body></html>"
+      /prometheus:
+        status: 200
+        body: "<html><body><h1>Prometheus</h1><p>login required</p></body></html>"
+
+  - id: short_body_below_length_gate
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      /metrics:
+        status: 200
+        body: "http_requests_total 1\n"

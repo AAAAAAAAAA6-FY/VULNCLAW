@@ -18,6 +18,31 @@ import pytest
 from vulnclaw.core import impersonate as imp_mod
 from vulnclaw.core.settings import settings
 
+
+@pytest.fixture(autouse=True)
+def _restore_impersonate_pool_singleton():
+    """`get_impersonate_pool()` 是**模块级单例**，池里持有会话引用。
+
+    本文件用假会话 `force_new=True` 重建池后，池会一直留在 `imp_mod._pool` 里
+    （monkeypatch 只回滚 `CURL_CFFI_AVAILABLE`/`AsyncSession`，回滚不了单例内容）→
+    污染同 worker 的后续用例：实测 `test_sp16_impersonate.py::
+    test_unavailable_module_returns_none` 会从"降级返回 None"变成"走池里的假会话
+    拿到 (200,'ok-body')"，全量跑红、单独跑绿。这里快照+还原单例。
+    """
+    saved = (
+        getattr(imp_mod, "_pool", None),
+        getattr(imp_mod, "_impersonate_session", None),
+        imp_mod.CURL_CFFI_AVAILABLE,
+        getattr(imp_mod, "AsyncSession", None),
+    )
+    try:
+        yield
+    finally:
+        imp_mod._pool = saved[0]
+        imp_mod._impersonate_session = saved[1]
+        imp_mod.CURL_CFFI_AVAILABLE = saved[2]
+        imp_mod.AsyncSession = saved[3]
+
 # ---------- a) settings 默认值 ----------
 
 def test_settings_defaults_zero_regression():

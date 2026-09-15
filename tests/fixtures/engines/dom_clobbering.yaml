@@ -1,0 +1,50 @@
+engine: dom_clobbering
+module: vulnclaw.engines.dom_clobbering
+class: DOMClobberingEngine
+name: DOM Clobbering 攻击面检测（HTML 属性覆盖 + JS URL 注入）
+description: |
+  DOMClobberingEngine.scan：fetch target → 正则分析 HTML →
+    A) 元素 id/name 命中 DANGEROUS_NAMES（top/self/parent/location/document 等）
+       → 覆盖 window.X/document.X → Medium finding
+    B) href/action/formaction/data/src/xlink:href 含 javascript: URL
+       → 可结合 clobbering 绕过 CSP 触发 XSS → High finding
+
+cases:
+  - id: dom_clobbering_dangerous_name
+    expect: positive
+    target: http://127.0.0.1:8080
+    responses:
+      "/":
+        status: 200
+        body: |
+          <html><body>
+          <form id="top" action="/api"><input name="x"></form>
+          <img name="self" src="/x.gif">
+          <a id="location" href="/foo">link</a>
+          </body></html>
+    evidence_contains: "DOM Clobbering"
+    reproduction: "fixture 复现（离线 mock）：页面含 form id=top / img name=self / a id=location → 期望命中「DOM Clobbering(危险名覆盖)」"
+
+  - id: dom_clobbering_js_url
+    expect: positive
+    target: http://127.0.0.1:8080
+    responses:
+      "/":
+        status: 200
+        body: |
+          <html><body>
+          <a href="javascript:alert(1)">click</a>
+          <form action="javascript:void(0)"><input name="x"></form>
+          </body></html>
+    evidence_contains: "javascript:"
+    reproduction: "fixture 复现（离线 mock）：页面含 <a href=javascript:...> 与 <form action=javascript:...> → 期望命中「DOM Clobbering(javascript: URL 注入)」"
+
+  - id: dom_clobbering_clean
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      "/":
+        status: 200
+        body: "<html><body><a href='/about'>about</a><img src='/x.gif'></body></html>"
+    evidence_contains: ""
+    reproduction: "fixture 复现（离线 mock）：普通页面无危险名/JS URL → 期望无 finding"

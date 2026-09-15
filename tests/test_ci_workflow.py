@@ -14,10 +14,9 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_DIR = PROJECT_ROOT / ".github" / "workflows"
 CLI_PATH = PROJECT_ROOT / "src" / "vulnclaw" / "cli.py"
-WORKFLOW_FILES = [
-    WORKFLOW_DIR / "scan.yml",
-    WORKFLOW_DIR / "regression.yml",
-]
+# 校验全部 workflow（glob 自动纳入新增门禁文件：version-regression / mutation_fuzz /
+# fastjson_log4shell / egress_ssrf_guard 等，避免新文件绕过 YAML/凭据/子命令校验）。
+WORKFLOW_FILES = sorted(WORKFLOW_DIR.glob("*.yml"))
 
 # 凭据键名（大小写不敏感）。前置 (?<![A-Za-z0-9_]) 防止误命中
 # SCAN_API_KEY / SECRET_TARGET 这类环境变量名（它们前一个字符是下划线/字母）。

@@ -60,6 +60,19 @@ def test_engine_target_allowed_no_host_passes():
     assert pe._engine_task_target_allowed(s, {"target": "/static/app.js"})[0]
 
 
+def test_engine_target_port_isolation(monkeypatch):
+    """同主机多靶场：主目标显式端口时，异端口任务拒绝（防跨靶场串扫）。"""
+    monkeypatch.setattr(settings, "allowed_scope", "")
+    s = _FakeSelf("http://127.0.0.1:8791/")
+    assert pe._engine_task_target_allowed(s, {"target": "http://127.0.0.1:8791/x"})[0]
+    ok, reason = pe._engine_task_target_allowed(s, {"target": "http://127.0.0.1:8090/xss"})
+    assert not ok
+    assert "端口" in reason
+    # 主目标无显式端口（默认 80/443）时不启用端口隔离（兼容普通域名扫描）
+    s2 = _FakeSelf("https://example.com/")
+    assert pe._engine_task_target_allowed(s2, {"target": "https://example.com:8443/x"})[0]
+
+
 # ---------------- D1: 粘滞剔除 ----------------
 def test_sticky_blacklist_after_two_failures():
     """同键任务累计 2 次失败 → 入墓碑黑名单。"""

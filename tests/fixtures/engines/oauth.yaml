@@ -1,0 +1,66 @@
+# G.1/组 D fixture：OAuth 端点发现（check 型）正反例。
+# 引擎判定：URL 命中 OAuth 授权/令牌端点路径（/oauth/authorize、/token 等）即报端点发现。
+module: vulnclaw.engines.auth_engines
+class: OAuthEngine
+engine: oauth
+
+cases:
+  - id: oauth_authorize_endpoint
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/oauth/authorize?client_id=demo&response_type=code
+    param: client_id
+    parsed_query: "client_id=demo"
+    normal_resp: [200, "authorize page", {}]
+    responses:
+      /oauth/authorize:
+        status: 200
+        body: "<html>Authorization page</html>"
+    evidence_contains: "OAuth 端点发现"
+    reproduction: "curl -s 'http://127.0.0.1:8080/oauth/authorize?client_id=demo&response_type=code'"
+
+  - id: non_oauth_page
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/account/profile
+    param: id
+    parsed_query: "id=1"
+    normal_resp: [200, "profile", {}]
+    responses:
+      /account/profile:
+        status: 200
+        body: "profile"
+    evidence_contains: ""
+    reproduction: ""
+
+  # P2：redirect_uri 绕过正例——@ 混淆变体，buggy server 把授权码下发至攻击者域
+  - id: oauth_redirect_uri_at_obfuscation
+    method: test_redirect_uri_hijack
+    expect: positive
+    url: http://127.0.0.1:8080/oauth/authorize?client_id=demo&redirect_uri=https://trusted.com&response_type=code
+    param: redirect_uri
+    parsed_query: "redirect_uri=https://trusted.com"
+    normal_resp: [200, "authorize page", {}]
+    responses:
+      /oauth/authorize:
+        status: 302
+        body: ""
+        headers:
+          Location: "https://evil.com/callback?code=abc123"
+    evidence_contains: "redirect_uri"
+    reproduction: "curl -s -D- 'http://127.0.0.1:8080/oauth/authorize?redirect_uri=https://trusted.com@evil.com/callback' | grep -i location"
+
+  # P2：redirect_uri 反例——服务器拒绝恶意 redirect_uri 返回 400 无授权码，不产 finding
+  - id: oauth_redirect_uri_safe_deny
+    method: test_redirect_uri_hijack
+    expect: negative
+    url: http://127.0.0.1:8080/oauth/authorize?client_id=demo&redirect_uri=http://localhost:8080/callback&response_type=code
+    param: redirect_uri
+    parsed_query: "redirect_uri=http://localhost:8080/callback"
+    normal_resp: [400, "denied", {}]
+    responses:
+      /oauth/authorize:
+        status: 400
+        body: "denied"
+    evidence_contains: ""
+    reproduction: ""

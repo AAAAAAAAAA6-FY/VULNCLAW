@@ -1,0 +1,50 @@
+# G.1/组 D fixture：多步序列/并发竞态引擎（SequenceChain，端点级）正反例。
+# 引擎判定：按序请求业务链末步由业务 oracle 裁决（2xx 且含成功信号、无失败信号）
+# → 报「多步序列业务链可达（Sequence Chain）」，说明缺跨步骤状态/令牌校验；
+# 服务端正确校验步骤顺序（乱序被拒 / oracle 失败）→ 不报。
+module: vulnclaw.engines.sequence_engines
+class: SequenceChainEngine
+engine: sequence_chain
+
+cases:
+  - id: sequence_chain_skip_guard_bypass
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/payflow/complete?step=pay
+    param: step
+    parsed_query: "step=pay"
+    normal_resp: [200, "step=pay accepted", {}]
+    responses:
+      /payflow/complete:
+        status: 200
+        body: '{"ok":true,"order_id":"ORD20260915001"}'
+    evidence_contains: "业务成功信号"
+    reproduction: "curl -sS 'http://127.0.0.1:8080/payflow/complete?step=pay'  # 跳过敏捷步骤直接访问末步被业务接受"
+
+  - id: sequence_chain_order_enforced
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/payflow/complete?step=pay
+    param: step
+    parsed_query: "step=pay"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /payflow/complete:
+        status: 403
+        body: '{"error":"invalid sequence order"}'
+    evidence_contains: ""
+    reproduction: ""
+
+  - id: sequence_chain_locked_no_success
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/payflow/complete?step=pay
+    param: step
+    parsed_query: "step=pay"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /payflow/complete:
+        status: 200
+        body: "重复提交，流程已锁定"
+    evidence_contains: ""
+    reproduction: ""

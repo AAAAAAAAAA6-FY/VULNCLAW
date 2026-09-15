@@ -1,0 +1,116 @@
+# G.1 fixture：GraphQL 端点发现 + 内省扫描（scan 入口）正反例（组 D 深度补充）。
+# 正例 schema 仅含良构字段（status），别名碰撞/递归/批量提取均不命中，
+# 保证唯一 finding = 内省开启；负例为无 GraphQL 端点的普通页面。
+# evidence_contains / reproduction 为深度统计口径字段（组 E 统计脚本读取）。
+module: vulnclaw.engines.net_engines
+class: GraphQLEngine
+engine: graphql
+
+cases:
+  - id: graphql_introspection_enabled
+    expect: positive
+    target: http://127.0.0.1:8080/graphql
+    responses:
+      /graphql:
+        status: 200
+        body: '{"data":{"__schema":{"queryType":{"name":"Query"},"types":[{"name":"Query","kind":"OBJECT","fields":[{"name":"status","type":{"name":"String","kind":"SCALAR"}}]},{"name":"String","kind":"SCALAR"}]}}}'
+    evidence_contains: "内省查询返回"
+    reproduction: "curl -X POST 'http://127.0.0.1:8080/graphql' -H 'Content-Type: application/json' --data '{\"query\":\"query { __schema { types { name } } }\"}'"
+
+  - id: no_graphql_endpoint
+    expect: negative
+    target: http://127.0.0.1:8080/app
+    responses:
+      /app:
+        status: 200
+        body: "<html><body>plain page</body></html>"
+    evidence_contains: ""
+    reproduction: ""
+
+  - id: graphql_http_batch_supported
+    expect: positive
+    target: http://127.0.0.1:8080
+    responses:
+      /graphql:
+        status: 200
+        body: '[{"data":{"__typename":"Query"}},{"data":{"__typename":"Query"}}]'
+      /graphiql:
+        status: 200
+        body: '[{"data":{"__typename":"Query"}},{"data":{"__typename":"Query"}}]'
+      /playground:
+        status: 200
+        body: '[{"data":{"__typename":"Query"}},{"data":{"__typename":"Query"}}]'
+      /gql:
+        status: 200
+        body: '[{"data":{"__typename":"Query"}},{"data":{"__typename":"Query"}}]'
+      /api/graphql:
+        status: 200
+        body: '[{"data":{"__typename":"Query"}},{"data":{"__typename":"Query"}}]'
+    evidence_contains: "GraphQL 请求级批量"
+    reproduction: "fixture 复现（离线 mock）：POST http://127.0.0.1:8080/graphql 传 JSON 数组 [{q},{q}] → 服务端接受并返回多元素 data → 期望命中「GraphQL 请求级批量(限流绕过面)」"
+
+  - id: graphql_no_http_batch
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      /graphql:
+        status: 200
+        body: '{"data":{"__typename":"Query"}}'
+      /graphiql:
+        status: 200
+        body: '{"data":{"__typename":"Query"}}'
+      /playground:
+        status: 200
+        body: '{"data":{"__typename":"Query"}}'
+      /gql:
+        status: 200
+        body: '{"data":{"__typename":"Query"}}'
+      /api/graphql:
+        status: 200
+        body: '{"data":{"__typename":"Query"}}'
+    evidence_contains: ""
+    reproduction: "fixture 复现（离线 mock）：GraphQL 端点仅接受单对象查询（POST 数组被拒或返单对象）→ 期望无 finding"
+
+  - id: graphql_alias_batching
+    expect: positive
+    target: http://127.0.0.1:8080
+    responses:
+      /graphql:
+        status: 200
+        body: '{"data":{"a0":{"__typename":"Query"},"a1":{"__typename":"Query"},"a2":{"__typename":"Query"},"a3":{"__typename":"Query"},"a4":{"__typename":"Query"},"a5":{"__typename":"Query"},"a6":{"__typename":"Query"},"a7":{"__typename":"Query"},"a8":{"__typename":"Query"},"a9":{"__typename":"Query"}}}'
+      /graphiql:
+        status: 200
+        body: '{"data":{"a0":{"__typename":"Query"},"a1":{"__typename":"Query"},"a2":{"__typename":"Query"},"a3":{"__typename":"Query"},"a4":{"__typename":"Query"},"a5":{"__typename":"Query"},"a6":{"__typename":"Query"},"a7":{"__typename":"Query"},"a8":{"__typename":"Query"},"a9":{"__typename":"Query"}}}'
+      /playground:
+        status: 200
+        body: '{"data":{"a0":{"__typename":"Query"},"a1":{"__typename":"Query"},"a2":{"__typename":"Query"},"a3":{"__typename":"Query"},"a4":{"__typename":"Query"},"a5":{"__typename":"Query"},"a6":{"__typename":"Query"},"a7":{"__typename":"Query"},"a8":{"__typename":"Query"},"a9":{"__typename":"Query"}}}'
+      /gql:
+        status: 200
+        body: '{"data":{"a0":{"__typename":"Query"},"a1":{"__typename":"Query"},"a2":{"__typename":"Query"},"a3":{"__typename":"Query"},"a4":{"__typename":"Query"},"a5":{"__typename":"Query"},"a6":{"__typename":"Query"},"a7":{"__typename":"Query"},"a8":{"__typename":"Query"},"a9":{"__typename":"Query"}}}'
+      /api/graphql:
+        status: 200
+        body: '{"data":{"a0":{"__typename":"Query"},"a1":{"__typename":"Query"},"a2":{"__typename":"Query"},"a3":{"__typename":"Query"},"a4":{"__typename":"Query"},"a5":{"__typename":"Query"},"a6":{"__typename":"Query"},"a7":{"__typename":"Query"},"a8":{"__typename":"Query"},"a9":{"__typename":"Query"}}}'
+    evidence_contains: "GraphQL alias 批量"
+    reproduction: "fixture 复现（离线 mock）：单请求 query 内 10 个别名（a0..a9）均被执行并返回 → 期望命中「GraphQL alias 批量(限流绕过面)」"
+
+  - id: graphql_no_alias_batching
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      /graphql:
+        status: 200
+        body: '{"data":{"__typename":"Query"}}'
+      /graphiql:
+        status: 200
+        body: '{"data":{"__typename":"Query"}}'
+      /playground:
+        status: 200
+        body: '{"data":{"__typename":"Query"}}'
+      /gql:
+        status: 200
+        body: '{"data":{"__typename":"Query"}}'
+      /api/graphql:
+        status: 200
+        body: '{"data":{"__typename":"Query"}}'
+    evidence_contains: ""
+    reproduction: "fixture 复现（离线 mock）：单请求未返回多 alias 结果 → 期望无 alias 批量 finding"

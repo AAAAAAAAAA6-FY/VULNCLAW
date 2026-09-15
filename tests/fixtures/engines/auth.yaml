@@ -1,0 +1,110 @@
+module: vulnclaw.engines.auth_engines
+class: JWTEngine
+engine: jwt
+
+target: http://127.0.0.1:8080/api
+
+cases:
+  - id: jwt_alg_none
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/api
+    param: Authorization
+    parsed_query: ""
+    normal_resp:
+      - 200
+      - ""
+      - Authorization: "Bearer eyJhbGciOiJub25lIn0.eyJzdWIiOiIxMjMifQ."
+    responses: {}
+    evidence_contains: "发现 2 个问题: alg: none 算法混淆, 缺少过期时间"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/api' --data-urlencode 'Authorization=x' → 期望命中「JWT漏洞」"
+
+  - id: no_jwt_token
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/api
+    param: Authorization
+    parsed_query: ""
+    normal_resp:
+      - 200
+      - '{"message":"ok"}'
+      - {}
+    responses: {}
+
+  # ---------- 正例：弱密钥 / admin 弱密钥 / 算法混淆 ----------
+  - id: jwt_weak_secret_hmac
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/api
+    param: Authorization
+    parsed_query: ""
+    normal_resp:
+      - 200
+      - ""
+      - Authorization: "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjMiLCJyb2xlIjoiYWRtaW4ifQ.vzS3XcnBO4kOXzE2G-dmmxFIQim_VhbfnrDvY1IW0fU"
+    evidence_contains: "发现 3 个问题: 算法混淆候选(RS256→HS256), Claim 注入（特权提升）, 缺少过期时间"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/api' --data-urlencode 'Authorization=x' → 期望命中「JWT漏洞」"
+
+  - id: jwt_weak_secret_admin
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/api
+    param: Authorization
+    parsed_query: ""
+    normal_resp:
+      - 200
+      - ""
+      - Authorization: "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiJ9.52IpMc-ENmbxh3jlkHL-nMVMRVn39lktjL1Azj0Ce5M"
+    evidence_contains: "发现 2 个问题: 算法混淆候选(RS256→HS256), 缺少过期时间"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/api' --data-urlencode 'Authorization=x' → 期望命中「JWT漏洞」"
+
+  - id: jwt_weak_secret_123
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/api
+    param: Authorization
+    parsed_query: ""
+    normal_resp:
+      - 200
+      - ""
+      - Authorization: "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI3In0.ULdBsElNJW1WUJc2mzNfY3rjkoTSjOw46W3NC4tK_7Y"
+    evidence_contains: "发现 2 个问题: 算法混淆候选(RS256→HS256), 缺少过期时间"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/api' --data-urlencode 'Authorization=x' → 期望命中「JWT漏洞」"
+
+  - id: jwt_alg_none_in_body
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/api
+    param: Authorization
+    parsed_query: ""
+    normal_resp:
+      - 200
+      - '<html>token: eyJhbGciOiJub25lIn0.eyJzdWIiOiIxIiwiYWRtaW4iOnRydWV9.</html>'
+      - {}
+    responses: {}
+
+  # ---------- 反例：强密钥 / 无令牌 / 非 JWT ----------
+    evidence_contains: "发现 3 个问题: alg: none 算法混淆, Claim 注入（特权提升）, 缺少过期时间"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/api' --data-urlencode 'Authorization=x' → 期望命中「JWT漏洞」"
+  - id: jwt_strong_secret
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/api
+    param: Authorization
+    parsed_query: ""
+    normal_resp:
+      - 200
+      - ""
+      - Authorization: "Bearer 7cc3f8e8e914b6d5d6f92c9d3f010c9d7d1f2d4b0f4c9e2a1d4b7e8c6a4b2c0.eyJzdWIiOiI0IiwiYmxvY2tzIjoiZm9ybWF0dGVkIiwibmFtZSI6IkEmQlpaIn0.sC-Hc7rzE2AH2B0l5tHJVMBvQH93vFSF9ov8tPHxc5U"
+
+  - id: generic_session_cookie
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/api
+    param: Authorization
+    parsed_query: ""
+    normal_resp:
+      - 200
+      - '{"user":"anon"}'
+      - {}
+    responses: {}

@@ -1,0 +1,49 @@
+# G.1 fixture：登录接口缺少限流/锁定（rate_limit）正反例。
+# 引擎逻辑（logic_leak_engines_2.RateLimitEngine.scan）：
+#   先 GET base 与 LOGIN_PATHS 找登录页（正文含 password 或状态码 200/405），
+#   再对该 URL POST MAX_ATTEMPTS(5) 次错误口令；只要**没有**出现 429 或
+#   LOCKOUT_HINTS（rate limit / too many attempts / account locked / captcha / 验证码…）
+#   就判定"限流缺失"。
+module: vulnclaw.engines.logic_leak_engines_2
+class: RateLimitEngine
+engine: rate_limit
+
+cases:
+  - id: login_without_rate_limit
+    method: scan
+    expect: positive
+    target: http://127.0.0.1:8080
+    responses:
+      /login:
+        status: 200
+        body: "<html><body><form method=post action=/login><input name=username><input type=password name=password><button>Sign in</button></form></body></html>"
+    evidence_contains: "限流"
+    reproduction: "fixture 复现（离线 mock）：对 'http://127.0.0.1:8080/login' 连续 5 次错误口令 POST，观察是否出现 429/锁定提示 → 期望命中「登录接口缺少限流」"
+
+  # ---------- 反例 ----------
+  - id: no_login_endpoint
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      /login:
+        status: 404
+        body: "<html><body>404 Not Found</body></html>"
+
+  - id: lockout_enforced
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      /login:
+        status: 200
+        body: "<html><body>Too many attempts. Your account is temporarily locked. Please try again later.</body></html>"
+
+  - id: rate_limited_429_style_body
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      /login:
+        status: 200
+        body: "<html><body>Rate limit exceeded, please complete the captcha to continue.</body></html>"

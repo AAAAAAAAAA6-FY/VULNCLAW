@@ -26,6 +26,8 @@ cases:
         body: '{"username":"nacos","password":"$2a$10$xxx"}'
 
   # ---------- 正例：Nacos 配置中心泄露（用户接口未开放，走第二条 probe）----------
+    evidence_contains: "http://127.0.0.1:8080/nacos/v1/auth/users"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get '' --data-urlencode '=x' → 期望命中「Nacos 未授权访问-用户列表泄露」"
   - id: nacos_configs_leak
     expect: positive
     responses:
@@ -37,6 +39,8 @@ cases:
         body: '{"totalCount":3,"pageItems":[{"dataId":"db.properties"}]}'
 
   # ---------- 正例：Solr Admin 未授权（指纹本身即漏洞面）----------
+    evidence_contains: "http://127.0.0.1:8080/nacos/v1/cs/configs"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get '' --data-urlencode '=x' → 期望命中「Nacos 未授权访问-配置中心泄露」"
   - id: solr_admin_open
     expect: positive
     responses:
@@ -48,6 +52,8 @@ cases:
         body: '{"lucene":{"solr-spec-version":"8.11.1"},"jvm":{"name":"OpenJDK"}}'
 
   # ---------- 正例：Confluence 未授权内容读取 ----------
+    evidence_contains: "http://127.0.0.1:8080/solr/admin/cores"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get '' --data-urlencode '=x' → 期望命中「Apache Solr Admin 未授权访问」"
   - id: confluence_content_read
     expect: positive
     responses:
@@ -59,6 +65,8 @@ cases:
         body: '{"results":[],"type":"page"}'
 
   # ---------- 反例：普通站点（指纹不命中，绝不能报）----------
+    evidence_contains: "http://127.0.0.1:8080/rest/api/content"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get '' --data-urlencode '=x' → 期望命中「Confluence 未授权访问-内容读取」"
   - id: generic_site_negative
     expect: negative
     responses:

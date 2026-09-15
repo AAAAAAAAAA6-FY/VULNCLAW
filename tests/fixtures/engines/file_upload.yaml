@@ -1,0 +1,119 @@
+module: vulnclaw.engines.input_engines
+class: FileUploadEngine
+engine: file_upload
+
+target: http://127.0.0.1:8080/upload
+
+cases:
+  - id: upload_endpoint_candidate
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/upload
+    param: file
+    parsed_query: ""
+    normal_resp: [200, "upload form", {}]
+    responses: {}
+    evidence_contains: "发现文件上传端点: http://127.0.0.1:8080/upload"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/upload' --data-urlencode 'file=x' → 期望命中「文件上传端点发现」"
+
+  - id: ordinary_endpoint_not_upload
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/health
+    param: name
+    parsed_query: ""
+    normal_resp: [200, "profile", {}]
+    responses: {}
+
+  # ---------- 正例：不同上传端点面（URL 关键词驱动发现） ----------
+  - id: avatar_upload_endpoint
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/api/avatars
+    param: picture
+    parsed_query: ""
+    normal_resp: [200, "upload form", {}]
+    responses: {}
+    evidence_contains: "发现文件上传端点: http://127.0.0.1:8080/api/avatars"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/api/avatars' --data-urlencode 'picture=x' → 期望命中「文件上传端点发现」"
+
+  - id: import_endpoint
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/import
+    param: file
+    parsed_query: ""
+    normal_resp: [200, "import wizard", {}]
+    responses: {}
+    evidence_contains: "发现文件上传端点: http://127.0.0.1:8080/import"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/import' --data-urlencode 'file=x' → 期望命中「文件上传端点发现」"
+
+  - id: media_gallery_endpoint
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/gallery/media
+    param: media
+    parsed_query: ""
+    normal_resp: [200, "gallery", {}]
+    responses: {}
+    evidence_contains: "发现文件上传端点: http://127.0.0.1:8080/gallery/media"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/gallery/media' --data-urlencode 'media=x' → 期望命中「文件上传端点发现」"
+
+  - id: attachment_endpoint
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/attachments/upload
+    param: attachment
+    parsed_query: ""
+    normal_resp: [200, "upload area", {}]
+    responses: {}
+    evidence_contains: "发现文件上传端点: http://127.0.0.1:8080/attachments/upload"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/attachments/upload' --data-urlencode 'attachment=x' → 期望命中「文件上传端点发现」"
+
+  - id: upload_endpoint_redirect_state
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/upload
+    param: file
+    parsed_query: ""
+    normal_resp: [200, "upload form", {}]
+    responses: {}
+
+  # ---------- 反例：非上传端点（各响应状态） ----------
+    evidence_contains: "发现文件上传端点: http://127.0.0.1:8080/upload"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/upload' --data-urlencode 'file=x' → 期望命中「文件上传端点发现」"
+  - id: orders_api_no_upload
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/api/orders/1234
+    param: id
+    parsed_query: "id=1234"
+    normal_resp: [200, '{"order":1}', {}]
+    responses: {}
+
+  - id: login_page_no_upload
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/login
+    param: password
+    parsed_query: ""
+    normal_resp: [200, "login", {}]
+    responses: {}
+
+  - id: search_page_no_upload
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/search
+    param: q
+    parsed_query: "q=tools"
+    normal_resp: [200, "results", {}]
+    responses: {}
+
+  - id: status_redirect_no_upload
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/account/settings
+    param: role
+    parsed_query: ""
+    normal_resp: [200, "settings", {}]
+    responses: {}

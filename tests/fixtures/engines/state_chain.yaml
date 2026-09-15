@@ -1,0 +1,38 @@
+# G.1/组 D fixture：状态链/多步漏洞（check 型）正反例。
+# 引擎判定：越序直达——阶段端点(/checkout|/admin|/pay|/complete)无前置状态可 2xx 直接访问，
+# 而正常流程首步 /login 返回登录页，业务页与登录页差异显著。
+module: vulnclaw.engines.state_chain
+class: StateChainEngine
+engine: state_chain
+
+cases:
+  - id: state_order_bypass_checkout
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/checkout/confirm
+    param: order
+    parsed_query: "order=100"
+    normal_resp: [200, "<html><body><h1>Confirm your order</h1><p>Please review the following items and confirm payment to complete the purchase.</p><table>...</table></body></html>", {}]
+    responses:
+      /checkout/confirm:
+        status: 200
+        body: "<html><body><h1>Confirm your order</h1><p>Please review the following items and confirm payment to complete the purchase.</p><table>...</table></body></html>"
+      /login:
+        status: 200
+        body: "<html><body><h1>Sign in</h1><label>请登录后继续</label></body></html>"
+    evidence_contains: "越序直达"
+    reproduction: "curl -s 'http://127.0.0.1:8080/checkout/confirm'  # 无前置状态直达关键阶段页（对照 /login 差异显著）"
+
+  - id: state_protected_flow
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/checkout/confirm
+    param: order
+    parsed_query: "order=100"
+    normal_resp: [200, "<html><body>请登录</body></html>", {}]
+    responses:
+      /checkout/confirm:
+        status: 302
+        body: ""
+    evidence_contains: ""
+    reproduction: ""

@@ -1,0 +1,178 @@
+module: vulnclaw.engines.net_engines
+class: XXEEngine
+engine: xxe
+
+target: http://127.0.0.1:8080/xxe
+
+cases:
+  - id: xxe_passwd_disclosure
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/xxe
+    param: xml
+    parsed_query: ""
+    normal_resp: [200, "<?xml version=\"1.0\"?><root/>", {}]
+    responses:
+      /xxe:
+        status: 200
+        body: "root:x:0:0:root:/root:/bin/bash"
+    evidence_contains: "root:x:0:0:root:/root:/bin/bash"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/xxe' --data-urlencode 'xml=x' → 期望命中「XXE(Linux passwd)」"
+
+  - id: ordinary_xml_response
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/xxe
+    param: xml
+    parsed_query: ""
+    normal_resp: [200, "<?xml version=\"1.0\"?><root/>", {}]
+    responses:
+      /xxe:
+        status: 200
+        body: "request accepted"
+
+  # ---------- 正例：实体回显特征 ----------
+  - id: xxe_winini_registry
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/xxe
+    param: xml
+    parsed_query: ""
+    normal_resp: [200, "<?xml version=\"1.0\"?><root/>", {}]
+    responses:
+      /xxe:
+        status: 200
+        body: "[fonts]\r\n[extensions]\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft"
+    evidence_contains: "HKEY_LOCAL_MACHINE"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/xxe' --data-urlencode 'xml=x' → 期望命中「XXE(Linux passwd)」"
+
+  - id: xxe_file_not_found_error
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/xxe
+    param: xml
+    parsed_query: ""
+    normal_resp: [200, "<?xml version=\"1.0\"?><root/>", {}]
+    responses:
+      /xxe:
+        status: 500
+        body: "java.io.FileNotFoundException: /nonexistent (No such file or directory)"
+    evidence_contains: "java.io.FileNotFoundException: /nonexistent"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/xxe' --data-urlencode 'xml=x' → 期望命中「XXE(Linux passwd)」"
+
+  - id: xxe_parse_error_echo
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/xxe
+    param: xml
+    parsed_query: ""
+    normal_resp: [200, "<?xml version=\"1.0\"?><root/>", {}]
+    responses:
+      /xxe:
+        status: 400
+        body: "XML parsing error: Entity not found, line 3, column 10"
+    evidence_contains: "XML parsing error: Entity not found, line 3, column 10"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/xxe' --data-urlencode 'xml=x' → 期望命中「XXE(Linux passwd)」"
+
+  - id: xxe_php_filter_rce
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/xxe
+    param: xml
+    parsed_query: ""
+    normal_resp: [200, "<?xml version=\"1.0\"?><root/>", {}]
+    responses:
+      /xxe:
+        status: 200
+        body: "<?php echo 'PD9waHAgc3lzdGVtKCdpZCcpOw=='; ?>"
+    evidence_contains: "<?php echo 'PD9waHAgc3lzdGVtKCdpZCcpOw=='; ?>"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/xxe' --data-urlencode 'xml=x' → 期望命中「XXE(Linux passwd)」"
+
+  - id: xxe_env_secret_leak
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/xxe
+    param: xml
+    parsed_query: ""
+    normal_resp: [200, "<?xml version=\"1.0\"?><root/>", {}]
+    responses:
+      /xxe:
+        status: 200
+        body: "DB_PASSWORD=sup3rsecret&SECRET_KEY=prod"
+    evidence_contains: "DB_PASSWORD=sup3rsecret&SECRET_KEY=prod"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/xxe' --data-urlencode 'xml=x' → 期望命中「XXE(Linux passwd)」"
+
+  - id: xxe_db_stack_error
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/xxe
+    param: xml
+    parsed_query: ""
+    normal_resp: [200, "<?xml version=\"1.0\"?><root/>", {}]
+    responses:
+      /xxe:
+        status: 500
+        body: "Redis: connection refused while resolving 127.0.0.1:6379"
+
+  # ---------- 反例：空 / 5xx / WAF / 重定向 / 安全解析 ----------
+    evidence_contains: "Redis: connection refused while resolving 127.0.0.1:6379"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/xxe' --data-urlencode 'xml=x' → 期望命中「XXE(Linux passwd)」"
+  - id: empty_response
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/xxe
+    param: xml
+    parsed_query: ""
+    normal_resp: [200, "<?xml version=\"1.0\"?><root/>", {}]
+    responses:
+      /xxe:
+        status: 200
+        body: ""
+
+  - id: server_error_5xx
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/xxe
+    param: xml
+    parsed_query: ""
+    normal_resp: [200, "<?xml version=\"1.0\"?><root/>", {}]
+    responses:
+      /xxe:
+        status: 500
+        body: "500 Internal Server Error"
+
+  - id: waf_block_403
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/xxe
+    param: xml
+    parsed_query: ""
+    normal_resp: [200, "<?xml version=\"1.0\"?><root/>", {}]
+    responses:
+      /xxe:
+        status: 403
+        body: "<html><body>403 Forbidden</body></html>"
+
+  - id: redirect_302
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/xxe
+    param: xml
+    parsed_query: ""
+    normal_resp: [200, "<?xml version=\"1.0\"?><root/>", {}]
+    responses:
+      /xxe:
+        status: 302
+        body: ""
+
+  - id: secure_disallow_doctype
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/xxe
+    param: xml
+    parsed_query: ""
+    normal_resp: [200, "<?xml version=\"1.0\"?><root/>", {}]
+    responses:
+      /xxe:
+        status: 400
+        body: "DOCTYPE is disallowed when the feature \"http://apache.org/xml/features/disallow-doctype-decl\" set to true"

@@ -1,0 +1,27 @@
+# G.1/组 D fixture：用户枚举（登录响应差异，scan 型）正反例。
+# 引擎判定：对登录端点比较存在用户(admin)与随机用户：随机用户出现"未找到"提示
+# 而 admin 没有 / admin 出现"密码错误"而随机用户没有 / 两者状态码不同。
+module: vulnclaw.engines.leak_logic_engines
+class: AuthEnumerationEngine
+engine: auth_enumeration
+
+cases:
+  - id: login_user_enum_diff
+    expect: positive
+    target: http://127.0.0.1:8080
+    responses:
+      /login:
+        status: 200
+        body: '<form action="/login" method="POST"><input name="username"><input name="password">invalid password</form>'
+    evidence_contains: "用户枚举"
+    reproduction: "curl -s -X POST 'http://127.0.0.1:8080/login' --data 'username=admin&password=wrong'  # admin 报'密码错误'，随机用户报'不存在'"
+
+  - id: logout_only_page
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      /login:
+        status: 200
+        body: "<html><body>Site under maintenance</body></html>"
+    evidence_contains: ""
+    reproduction: ""

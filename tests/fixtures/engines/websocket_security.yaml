@@ -1,0 +1,28 @@
+# WebSocket 安全 fixture（正反例）。
+# 说明：mock 已支持 ws_accept（按请求 Sec-WebSocket-Key 动态计算 RFC6455
+# Accept 头），可真实模拟"服务端正确握手且接受任意 Origin"的 CSWSH 场景。
+module: vulnclaw.engines.websocket_security
+class: WebSocketSecurityEngine
+engine: websocket_security
+
+cases:
+  - id: websocket_positive_cswsh
+    method: scan
+    expect: positive
+    target: http://127.0.0.1:8080/app
+    responses:
+      /app:
+        status: 101
+        body: ""
+        ws_accept: true
+    evidence_contains: "HTTP 101 (101 Switching Protocols)，恶意 Origin 握手成功"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/app' --data-urlencode '=x' → 期望命中「WebSocket CSWSH（跨站 WebSocket 劫持）」"
+
+  - id: websocket_negative
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080/app-safe
+    responses:
+      /app-safe:
+        status: 200
+        body: "<html><body>ok</body></html>"

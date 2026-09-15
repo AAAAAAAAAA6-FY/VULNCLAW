@@ -1,0 +1,37 @@
+# G.1/组 D fixture：管理控制台暴露（scan 型）正反例。
+# 引擎判定：探测 /manager/html、/console、/jmx-console 等路径，命中中间件指纹
+# （tomcat/manager/weblogic/jenkins 等）且状态 200/401/403。
+module: vulnclaw.engines.framework_zero_day_engines_2
+class: AdminConsoleExposureEngine
+engine: admin_console_exposure
+
+cases:
+  - id: tomcat_manager_exposed
+    expect: positive
+    target: http://127.0.0.1:8080
+    responses:
+      /manager/html:
+        status: 200
+        body: "Apache Tomcat/9.0 Manager - Please enter your credentials"
+    evidence_contains: "tomcat"
+    reproduction: "curl -s 'http://127.0.0.1:8080/manager/html'"
+
+  - id: weblogic_console_exposed
+    expect: positive
+    target: http://127.0.0.1:7001
+    responses:
+      /console:
+        status: 200
+        body: "Oracle WebLogic Server Administration Console / console.portal"
+    evidence_contains: "WebLogic"
+    reproduction: "curl -s 'http://127.0.0.1:7001/console'"
+
+  - id: no_admin_console
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      /manager/html:
+        status: 404
+        body: "<html><body>404 Not Found</body></html>"
+    evidence_contains: ""
+    reproduction: ""

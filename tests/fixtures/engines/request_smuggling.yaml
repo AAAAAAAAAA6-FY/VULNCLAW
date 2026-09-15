@@ -1,0 +1,27 @@
+# G.1/组 D fixture：HTTP 请求走私（scan 型）正反例。
+# 引擎判定：CL.TE/CL 走私前缀(GET /smuggled-xxx)被后端处理并回显，或后续请求
+# 超时/连接被污染。
+module: vulnclaw.engines.auxiliary_engines
+class: RequestSmugglingEngine
+engine: request_smuggling
+
+cases:
+  - id: clte_smuggling_marker_echo
+    expect: positive
+    target: http://127.0.0.1:8080/api/search
+    responses:
+      /api/search:
+        status: 200
+        body: "smuggled-aff32cd1f2 Reflect: GET /smuggled-aff32cd1f2"
+    evidence_contains: "smuggled-"
+    reproduction: "curl -s -X POST 'http://127.0.0.1:8080/api/search' -H 'Content-Length: 42' -H 'Transfer-Encoding: chunked' --data-binary $'0\\r\\n\\r\\nGET /smuggled-aff32cd1f2 HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\n\\r\\n'"
+
+  - id: normal_smuggling_response
+    expect: negative
+    target: http://127.0.0.1:8080/api/search
+    responses:
+      /api/search:
+        status: 200
+        body: '{"results":[]}'
+    evidence_contains: ""
+    reproduction: ""

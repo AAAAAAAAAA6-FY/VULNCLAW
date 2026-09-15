@@ -1,0 +1,15 @@
+{
+  "engine": "framework_zero_day_engines._run_oob_scan",
+  "kwargs": {
+    "engine_name": "fastjson_deserialization",
+    "url": "https://target.example/json",
+    "param": "data",
+    "parsed_query": "data=x",
+    "payload_templates": [],
+    "type_label": "Fastjson JNDI 注入",
+    "evidence_note": "注入 autoType 外带载荷后未命中 OOB(修复版/autoType 关闭)",
+    "recommendation": "升级 Fastjson 至 1.2.83+ 或 2.x，或改用 Jackson 并配置安全后备",
+    "oob_wait": 1
+  },
+  "expected": {"not_none": false}
+}

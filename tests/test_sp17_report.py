@@ -9,6 +9,7 @@ import pytest
 
 from vulnclaw.core.report_generator import (
     build_distribution,
+    compact_report,
     enrich_report,
     generate_sarif,
     suggest_remediation,
@@ -141,3 +142,27 @@ class TestEnrichReport:
         generate_sarif(report)
         assert "distribution" in report
         assert report["vulnerabilities"][0]["remediation_tier"].startswith("立即修复")
+
+def test_compact_report_summary_mode_limits_findings_and_evidence():
+    findings = [
+        _finding("http://h.example.com/a", "SQL??", "Critical", remediation="??????"),
+        _finding("http://h.example.com/b", "XSS", "High"),
+        _finding("http://h.example.com/c", "Cmd", "Medium"),
+    ]
+    report = _report(findings)
+    report["vulnerabilities"][0]["evidence"] = "A" * 200
+    compact = compact_report(report, detail="summary", max_findings=2, max_evidence=32)
+
+    assert compact["summary"]["total_vulnerabilities"] == 3
+    assert compact["summary"]["displayed_vulnerabilities"] == 2
+    assert compact["reporting"]["truncated"] is True
+    assert compact["reporting"]["hidden_count"] == 1
+    assert "..." in compact["vulnerabilities"][0]["evidence"]
+    assert compact["vulnerabilities"][0]["severity"] == "Critical"
+
+
+def test_compact_report_full_mode_preserves_original_payloads():
+    report = _report([_finding("http://h.example.com/a", "SQL??", "Critical")])
+    compact = compact_report(report, detail="full", max_findings=1, max_evidence=8)
+    assert compact["vulnerabilities"][0]["evidence"] == "proof"
+    assert compact["reporting"]["detail"] == "full"

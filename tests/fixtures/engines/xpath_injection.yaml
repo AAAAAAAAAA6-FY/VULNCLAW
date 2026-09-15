@@ -1,0 +1,49 @@
+# G.1/组 D fixture：XPath 注入（check 型）正反例。
+# 引擎判定：攻击响应出现 XPath 引擎错误签名（System.Xml.XPath / XPathException / javax.xml.xpath）
+# 或布尔盲注恒真回显。
+module: vulnclaw.engines.web_advanced_engines
+class: XPathInjectionEngine
+engine: xpath_injection
+
+cases:
+  - id: xpath_exception_echo
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/find?q=x
+    param: q
+    parsed_query: "q=x"
+    normal_resp: [200, '{"users":[]}', {}]
+    responses:
+      /find:
+        status: 500
+        body: "System.Xml.XPath.XPathException: Expression must evaluate to a node-set"
+    evidence_contains: "System.Xml.XPath"
+    reproduction: "curl --get 'http://127.0.0.1:8080/find' --data-urlencode \"q=' or '1'='1\""
+
+  - id: xpath_benign_json
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/find?q=x
+    param: q
+    parsed_query: "q=x"
+    normal_resp: [200, '{"users":[]}', {}]
+    responses:
+      /find:
+        status: 200
+        body: '{"users":[]}'
+    evidence_contains: ""
+    reproduction: ""
+
+  - id: xpath_or_true_derived
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/find?q=x
+    param: q
+    parsed_query: "q=x"
+    normal_resp: [200, '{"count":0}', {}]
+    responses:
+      /find:
+        status: 200
+        body: '{"count":null,"users":[{"name":"alice"}]}'
+    evidence_contains: "count"
+    reproduction: "fixture 离线复现：双引号恒真 ' or '1'='1 改变节点集数量，响应结构显著变化"

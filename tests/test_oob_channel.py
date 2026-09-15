@@ -426,6 +426,7 @@ class TestSelfCheck:
         ch2._domain, ch2._resolved_provider = "x.oast.pro", "interactsh"
 
         async def boom(timeout):
+            import asyncio
             raise asyncio.TimeoutError("poll timeout")
         monkeypatch.setattr(ch2, "_poll_interactsh", boom)
         assert asyncio_run(ch2.poll(timeout=1)) == []
@@ -507,3 +508,31 @@ class TestOOBBreaker:
         assert snap["miss_threshold"] == oob_mod._OOB_MISS_THRESHOLD
         oob_mod.reset_oob_breaker()
         assert oob_mod.oob_state_snapshot()["miss_streak"] == {}
+
+
+class TestInteractshConfiguration:
+    """Configuration diagnostics are offline and must not imply a callback."""
+
+    def test_server_validation_accepts_origin_only(self):
+        result = oob_mod.validate_interactsh_server("https://oob.example.test")
+        assert result["configured"] is True
+        assert result["valid"] is True
+
+    @pytest.mark.parametrize("value", [
+        "oob.example.test",
+        "ftp://oob.example.test",
+        "https://user:pass@oob.example.test",
+        "https://oob.example.test/api",
+        "https://oob.example.test/?x=1",
+    ])
+    def test_server_validation_rejects_unsafe_or_ambiguous_values(self, value):
+        result = oob_mod.validate_interactsh_server(value)
+        assert result["valid"] is False
+        assert result["error"]
+
+    def test_diagnostics_do_not_claim_network_success(self, monkeypatch):
+        monkeypatch.delenv("OOB_INTERACTSH_SERVER", raising=False)
+        result = oob_mod.get_oob_diagnostics()
+        assert result["configured"] is False
+        assert result["network_checked"] is False
+        assert result["callback_verified"] is False

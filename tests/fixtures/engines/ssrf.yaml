@@ -1,0 +1,272 @@
+# G.1 fixture：SSRF 参数级 check 正反例。
+module: vulnclaw.engines.net_engines
+class: SSRFEngine
+engine: ssrf
+
+cases:
+  - id: internal_secret_reflected
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/fetch
+    param: url
+    parsed_query: url=https%3A%2F%2Fexample.com
+    normal_resp: [200, "ok", {}]
+    responses:
+      127.0.0.1:
+        status: 200
+        body: "internal_secret=lab-only"
+    evidence_contains: "internal_secret=lab-only"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/fetch' --data-urlencode 'url=https%3A%2F%2Fexample.com' → 期望命中「SSRF(localhost)」"
+
+  - id: ordinary_fetch_response
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/fetch
+    param: url
+    parsed_query: url=https%3A%2F%2Fexample.com
+    normal_resp: [200, "ok", {}]
+    responses: {}
+
+  # ---------- 正例：不同参数面/不同内网服务响应特征回显 ----------
+  - id: internal_secret_import_param
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/import
+    param: source
+    parsed_query: source=https%3A%2F%2Fcdn.example
+    normal_resp: [200, "ok", {}]
+    responses:
+      127.0.0.1:
+        status: 200
+        body: "internal_secret=lab-only"
+    evidence_contains: "internal_secret=lab-only"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/import' --data-urlencode 'source=https%3A%2F%2Fcdn.example' → 期望命中「SSRF(localhost)」"
+
+  - id: cloud_metadata_ami_reflected
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/fetch
+    param: url
+    parsed_query: url=https%3A%2F%2Fexample.com
+    normal_resp: [200, "ok", {}]
+    responses:
+      127.0.0.1:
+        status: 200
+        body: "ami-id: ami-0abcdef1234567890&security-credentials"
+    evidence_contains: "ami-id: ami-0abcdef1234567890&security-credentials"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/fetch' --data-urlencode 'url=https%3A%2F%2Fexample.com' → 期望命中「SSRF(localhost)」"
+
+  - id: file_protocol_passwd
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/read
+    param: file
+    parsed_query: file=readme.txt
+    normal_resp: [200, "ok", {}]
+    responses:
+      passwd:
+        status: 200
+        body: "root:x:0:0:root:/root:/bin/bash"
+    evidence_contains: "root:x:0:0:root:/root:/bin/bash"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/read' --data-urlencode 'file=readme.txt' → 期望命中「SSRF(file协议-passwd)」"
+
+  - id: file_protocol_winini_registry
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/read
+    param: file
+    parsed_query: file=readme.txt
+    normal_resp: [200, "ok", {}]
+    responses:
+      win.ini:
+        status: 200
+        body: "[fonts] HKEY_LOCAL_MACHINE\\SOFTWARE\\Windows"
+    evidence_contains: "[fonts] HKEY_LOCAL_MACHINE\\SOFTWARE\\Windows"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/read' --data-urlencode 'file=readme.txt' → 期望命中「SSRF(file协议-win.ini)」"
+
+  - id: redis_banner_reflected
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/proxy
+    param: url
+    parsed_query: url=https%3A%2F%2Fexample.com
+    normal_resp: [200, "ok", {}]
+    responses:
+      3306:
+        status: 200
+        body: "MySQL 5.7.35 - debug build"
+      6379:
+        status: 200
+        body: "redis_version:6.2.6"
+    evidence_contains: "redis_version:6.2.6"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/proxy' --data-urlencode 'url=https%3A%2F%2Fexample.com' → 期望命中「SSRF(dict协议-Redis)」"
+
+  - id: dict_protocol_redis
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/proxy
+    param: url
+    parsed_query: url=x
+    normal_resp: [200, "ok", {}]
+    responses:
+      info:
+        status: 200
+        body: "$1\r\nredis_version\r\n"
+    evidence_contains: "redis_version"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/proxy' --data-urlencode 'url=x' → 期望命中「SSRF(dict协议-Redis)」"
+
+  - id: gopher_protocol_redis
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/proxy
+    param: url
+    parsed_query: url=x
+    normal_resp: [200, "ok", {}]
+    responses:
+      gopher:
+        status: 200
+        body: "+OK\r\nredis_version:7.0.0"
+    evidence_contains: "redis_version:7.0.0"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/proxy' --data-urlencode 'url=x' → 期望命中「SSRF(gopher协议-Redis)」"
+
+  - id: integer_ip_bypass_reflected
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/fetch
+    param: url
+    parsed_query: url=https%3A%2F%2Fexample.com
+    normal_resp: [200, "ok", {}]
+    responses:
+      2130706433:
+        status: 200
+        body: "internal_secret=lab-only"
+    evidence_contains: "internal_secret=lab-only"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/fetch' --data-urlencode 'url=https%3A%2F%2Fexample.com' → 期望命中「SSRF(整数IP-127.0.0.1)」"
+
+  - id: ssh_banner_reflected
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/fetch
+    param: url
+    parsed_query: url=https%3A%2F%2Fexample.com
+    normal_resp: [200, "ok", {}]
+    responses:
+      '%3A22':
+        status: 200
+        body: "SSH-2.0-OpenSSH_7.4"
+
+  # ---------- 反例：空响应 / 5xx / WAF / 重定向 / 非 SSRF 参数 ----------
+    evidence_contains: "SSH-2.0-OpenSSH_7.4"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/fetch' --data-urlencode 'url=https%3A%2F%2Fexample.com' → 期望命中「SSRF(SSH端口)」"
+  - id: empty_response_200_fetch
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/fetch
+    param: url
+    parsed_query: url=https%3A%2F%2Fexample.com
+    normal_resp: [200, "ok", {}]
+    responses:
+      127.0.0.1:
+        status: 200
+        body: ""
+
+  - id: server_error_5xx_fetch
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/fetch
+    param: url
+    parsed_query: url=https%3A%2F%2Fexample.com
+    normal_resp: [200, "ok", {}]
+    responses:
+      127.0.0.1:
+        status: 503
+        body: "service unavailable"
+
+  - id: waf_block_403_fetch
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/fetch
+    param: url
+    parsed_query: url=https%3A%2F%2Fexample.com
+    normal_resp: [200, "ok", {}]
+    responses:
+      127.0.0.1:
+        status: 403
+        body: "<html><body>403 Forbidden by WAF</body></html>"
+
+  - id: redirect_302_fetch
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/fetch
+    param: url
+    parsed_query: url=https%3A%2F%2Fexample.com
+    normal_resp: [200, "ok", {}]
+    responses:
+      127.0.0.1:
+        status: 302
+        body: ""
+
+  - id: benign_html_site_fetch
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/fetch
+    param: url
+    parsed_query: url=https%3A%2F%2Fexample.com
+    normal_resp: [200, "ok", {}]
+    responses:
+      example.com:
+        status: 200
+        body: "<html><body><h1>Welcome to Example Corp</h1></body></html>"
+
+  - id: non_ssrf_param_name
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/fetch?name=alice
+    param: name
+    parsed_query: "name=alice"
+    normal_resp: [200, "ok", {}]
+    responses: {}
+
+  # ---------- 深度化：302 跳转 / DNS rebind（解析到内网）----------
+  # SSRF 判定不看 status：302 携带内网内容同样命中（引擎剥离 payload 反射后匹配 indicator）。
+  - id: redirect_302_to_internal_content
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/fetch
+    param: url
+    parsed_query: url=https%3A%2F%2Fexample.com
+    normal_resp: [200, "ok", {}]
+    responses:
+      127.0.0.1:
+        status: 302
+        body: "internal_secret=lab-only"
+    evidence_contains: "internal_secret=lab-only"
+    reproduction: "SSRF 经 302 跳转后返回内网内容（响应含 internal_secret）→ 期望命中「SSRF(localhost)」"
+
+  - id: dns_rebind_nip_io
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/fetch
+    param: url
+    parsed_query: url=https%3A%2F%2Fexample.com
+    normal_resp: [200, "ok", {}]
+    responses:
+      nip.io:
+        status: 200
+        body: "internal_secret=lab-only"
+    evidence_contains: "internal_secret=lab-only"
+    reproduction: "DNS rebind（127.0.0.1.nip.io 通配解析到内网）→ 期望命中「SSRF(localhost)」"
+
+  - id: dns_rebind_localtest_me
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/fetch
+    param: url
+    parsed_query: url=https%3A%2F%2Fexample.com
+    normal_resp: [200, "ok", {}]
+    responses:
+      localtest.me:
+        status: 200
+        body: "redis_version:6.2.6"
+    evidence_contains: "redis_version:6.2.6"
+    reproduction: "DNS rebind（localtest.me 解析到 127.0.0.1）→ 期望命中「SSRF(内网端口)」"

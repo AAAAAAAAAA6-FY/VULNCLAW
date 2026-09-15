@@ -1,0 +1,73 @@
+# G.1 fixture：源码/版本库元数据泄露（source_code_leak）正反例。
+# 引擎逻辑（leak_logic_engines.SourceCodeLeakEngine.scan）：
+#   PROBE_PATHS = .git/config | .git/HEAD | .gitignore | .svn/entries | .svn/wc.db | .DS_Store | .idea/workspace.xml
+#   命中判据：GIT_CONFIG_RE([core]/[remote]/[branch]/repositoryformatversion)、
+#             GIT_HEAD_RE(ref: refs/heads/)、SVN_ENTRIES_RE、DS_STORE_MAGIC
+module: vulnclaw.engines.leak_logic_engines
+class: SourceCodeLeakEngine
+engine: source_code_leak
+
+cases:
+  - id: git_config_exposed
+    method: scan
+    expect: positive
+    target: http://127.0.0.1:8080
+    responses:
+      /.git/config:
+        status: 200
+        body: "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n[remote \"origin\"]\n\turl = git@github.com:acme/shop.git\n"
+    evidence_contains: "git"
+    reproduction: "fixture 复现（离线 mock）：curl -sS 'http://127.0.0.1:8080/.git/config' → 期望命中「Git 元数据泄露」"
+
+  - id: git_head_exposed
+    method: scan
+    expect: positive
+    target: http://127.0.0.1:8080
+    responses:
+      /.git/HEAD:
+        status: 200
+        body: "ref: refs/heads/main\n"
+    evidence_contains: "git"
+    reproduction: "fixture 复现（离线 mock）：curl -sS 'http://127.0.0.1:8080/.git/HEAD' → 期望命中「Git 元数据泄露」"
+
+  - id: gitignore_exposed
+    method: scan
+    expect: positive
+    target: http://127.0.0.1:8080
+    responses:
+      /.gitignore:
+        status: 200
+        body: "# deps\nnode_modules/\n*.log\n.env.local\ndist/\n"
+    evidence_contains: "gitignore"
+    reproduction: "fixture 复现（离线 mock）：curl -sS 'http://127.0.0.1:8080/.gitignore' → 期望命中「源码/版本库元数据泄露(.gitignore)」"
+
+  # ---------- 反例 ----------
+  - id: all_paths_404
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses: {}
+
+  - id: git_path_200_but_html
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      /.git/config:
+        status: 200
+        body: "<html><body><h1>404</h1><p>Not found</p></body></html>"
+      /.git/HEAD:
+        status: 200
+        body: "<html><body><h1>404</h1></body></html>"
+      /.gitignore:
+        status: 200
+        body: "<html><body>placeholder</body></html>"
+
+  - id: svn_entries_generic_xml
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      /.svn/entries:
+        status: 200
+        body: "<?xml version=\"1.0\"?><root><note>not a svn entries file</note></root>"

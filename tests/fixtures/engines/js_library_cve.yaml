@@ -1,0 +1,42 @@
+engine: js_library_cve
+module: vulnclaw.engines.logic_leak_engines_2
+class: JsLibraryCveEngine
+name: 前端 JS 库版本已知漏洞匹配
+description: |
+  JsLibraryCve 引擎（scan 型）抓取首页 HTML，用正则识别引用的前端库与版本号，
+  命中内置「已知漏洞版本区间」即报组件漏洞（CWE-1104）。受 settings.component_cve_check 控制（默认开）。
+  本 fixture 验证：jQuery 1.11.3（落在 CVE-2020-11022/11023 受影响区间）报正例；
+  jQuery 3.6.0（已超出受影响区间）不报反例。
+
+cases:
+  - id: jquery_1_11_3_vulnerable
+    method: scan
+    expect: positive
+    target: http://127.0.0.1:8080
+    responses:
+      "/":
+        status: 200
+        headers:
+          Content-Type: "text/html; charset=utf-8"
+        body: |
+          <html><head>
+          <script src="/static/jquery-1.11.3.min.js"></script>
+          </head><body><h1>welcome</h1></body></html>
+    evidence_contains: "jQuery 1.11.3"
+    reproduction: "fixture 复现（离线 mock）：首页引用 jquery-1.11.3 → 期望命中「前端组件漏洞：jQuery 1.11.3」"
+
+  - id: jquery_3_6_0_safe
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      "/":
+        status: 200
+        headers:
+          Content-Type: "text/html; charset=utf-8"
+        body: |
+          <html><head>
+          <script src="/static/jquery-3.6.0.min.js"></script>
+          </head><body><h1>welcome</h1></body></html>
+    evidence_contains: ""
+    reproduction: "fixture 复现（离线 mock）：首页引用 jquery-3.6.0（超出受影响区间）→ 期望无任何 finding"

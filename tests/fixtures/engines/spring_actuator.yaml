@@ -1,0 +1,55 @@
+# G.1 fixture：Spring Boot Actuator 未授权端点暴露（spring_actuator）正反例。
+# 引擎逻辑（leak_logic_engines.SpringActuatorEngine）：
+#   _probe() 按 PROBE_PATHS 取**首个 200**；随后按 path 分派判定：
+#     - actuator/heapdump|heapdump：二进制魔数 或 content-type=octet-stream 且体长 > 1000
+#     - actuator|actuator/env|env：ENV_HINT_RE（"propertySources" / "java.version" / "server.port" / "spring."）
+module: vulnclaw.engines.leak_logic_engines
+class: SpringActuatorEngine
+engine: spring_actuator
+
+cases:
+  - id: actuator_env_exposed
+    method: scan
+    expect: positive
+    target: http://127.0.0.1:8080
+    responses:
+      /actuator/env:
+        status: 200
+        body: '{"activeProfiles":["prod"],"propertySources":[{"name":"systemProperties","properties":{"java.version":{"value":"17.0.9"},"server.port":{"value":"8080"}}}]}'
+    evidence_contains: "actuator/env"
+    reproduction: "fixture 复现（离线 mock）：curl -sS 'http://127.0.0.1:8080/actuator/env' → 期望命中「Spring Actuator 环境变量泄露」"
+
+  - id: actuator_heapdump_exposed
+    method: scan
+    expect: positive
+    target: http://127.0.0.1:8080
+    responses:
+      /actuator/heapdump:
+        status: 200
+        headers:
+          content-type: application/octet-stream
+        body: "JAVA PROFILE 1.0.2 heap dump payload placeholder .................... 0000000000000000000000000000000000000000000000000000000000000000 0000000000000000000000000000000000000000000000000000000000000000 0000000000000000000000000000000000000000000000000000000000000000 0000000000000000000000000000000000000000000000000000000000000000 0000000000000000000000000000000000000000000000000000000000000000 0000000000000000000000000000000000000000000000000000000000000000 0000000000000000000000000000000000000000000000000000000000000000 0000000000000000000000000000000000000000000000000000000000000000 0000000000000000000000000000000000000000000000000000000000000000 0000000000000000000000000000000000000000000000000000000000000000 0000000000000000000000000000000000000000000000000000000000000000 0000000000000000000000000000000000000000000000000000000000000000 0000000000000000000000000000000000000000000000000000000000000000 0000000000000000000000000000000000000000000000000000000000000000 0000000000000000000000000000000000000000000000000000000000000000 0000000000000000000000000000000000000000000000000000000000000000"
+    evidence_contains: "heapdump"
+    reproduction: "fixture 复现（离线 mock）：curl -sSI 'http://127.0.0.1:8080/actuator/heapdump' → 期望命中「Spring Actuator heapdump 泄露」"
+
+  # ---------- 反例 ----------
+  - id: all_paths_404
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses: {}
+
+  - id: actuator_200_but_plain_page
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      /actuator:
+        status: 200
+        body: "<html><body><h1>Spring Boot</h1><p>Welcome to our application.</p></body></html>"
+      /actuator/env:
+        status: 404
+        body: '{"timestamp":"2026-09-16","status":404,"error":"Not Found","path":"/actuator/env"}'
+      /env:
+        status: 404
+        body: '{"status":404}'

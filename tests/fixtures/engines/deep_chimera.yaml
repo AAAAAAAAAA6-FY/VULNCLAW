@@ -1,0 +1,35 @@
+# G.1/组 D fixture：深藏复合漏洞（check 型）正反例。
+# 引擎判定：8 个载荷族注入"多层编码变体"后，强语义回显(marker)或剥壳后 A/B diff 弱信号
+# 聚合达阈值即命中（需 ≥1 强家庭或 ≥2 聚合弱家庭）。
+module: vulnclaw.engines.deep_chimera
+class: DeepChimeraEngine
+engine: deep_chimera
+
+cases:
+  - id: deep_chimera_semantic_echo
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/echo?q=x
+    param: q
+    parsed_query: "q=x"
+    normal_resp: [200, "plain echo", {}]
+    responses:
+      /echo:
+        status: 200
+        body: "reflected=JL22%3AXXX[marker]computed" 
+    evidence_contains: "marker"
+    reproduction: "fixture 离线复现：注入多层编码变体后响应出现强语义回显重构标记(marker)"
+
+  - id: deep_chimera_no_signal
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/echo?q=x
+    param: q
+    parsed_query: "q=x"
+    normal_resp: [200, "plain echo", {}]
+    responses:
+      /echo:
+        status: 200
+        body: "plain echo"
+    evidence_contains: ""
+    reproduction: ""

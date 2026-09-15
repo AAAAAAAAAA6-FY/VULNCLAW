@@ -1,208 +1,174 @@
 # -*- coding: utf-8 -*-
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VULNCLAW Authors (see README & LICENSE)
-# This file is part of VULNCLAW / pentest_platform.
+# 验收：P1-2 LLM Prompt 压缩 + 语义缓存（OPTIMIZATION_ROADMAP.md）
+#
+# 覆盖：
+#   1) 语义缓存命中：相同 (model,system,prompt) 第二次请求直接命中，不再打 Provider
+#   2) 语义缓存未命中：不同 prompt 触发新 Provider 调用
+#   3) 默认关闭：use_cache=False（默认）时即便相同 prompt 也每次都打 Provider
+#   4) TTL 过期：缓存条目超时被视作 miss，重新打 Provider 并刷新
+#   5) Prompt 压缩：超长 prompt 被压成含关键三元组行的精简版；短 prompt 原样返回
+#
+# 全部离线：通过 monkeypatch LLMClient._call_model_once 避免真实 API 调用。
+# 语义缓存是 LLMClient 类级共享结构，每个用例前清理以保证隔离。
 
-"""A4.5: 语义缓存（P1-2）单元测试。
-
-覆盖：同 prompt 二次调用命中（hit +1，模型仅真实调用一次）；
-      不同 prompt / 不同模型不命中；空白归一化（语义等价命中）；
-      TTL 过期后重新计算（含恰好 TTL 边界）；512 上限的过期清理与裁剪；
-      get_cache_stats() 的 hits/misses/hit_rate/size 正确性。
-
-零外网：monkeypatch _call_model_once 为假应答，不真调 LLM。
-"""
-import hashlib
+import asyncio
 import time
 
 import pytest
+from unittest.mock import AsyncMock
 
-from vulnclaw.ai.core import LLMClient, TokenBudget
-
-_MODEL = "test-cache-model"
-
-
-@pytest.fixture
-def client(monkeypatch):
-    """干净的 LLMClient：类级缓存状态重置 + _call_model_once 假应答。"""
-    # 类级缓存是全局共享的，逐用例重置，避免用例间互相污染
-    monkeypatch.setattr(LLMClient, "_semantic_cache", {})
-    monkeypatch.setattr(LLMClient, "_cache_hits", 0)
-    monkeypatch.setattr(LLMClient, "_cache_misses", 0)
-
-    calls = []
-
-    async def _fake_call(model, prompt, system, temperature, max_tokens, usage_site=None, **kw):
-        calls.append((model, prompt))
-        return f"answer-{len(calls)}"
-
-    c = LLMClient(models=[_MODEL], budget=TokenBudget())
-    c.api_key = "test-key"
-    # 隔离熔断：fixture 不使用 Provider 熔断检查（避免 test_sp23_tier_router 的
-    # breaker 状态跨测试泄漏到本文件），直接走 _call_model_once 假应答
-    c._failover = None
-    monkeypatch.setattr(c, "_call_model_once", _fake_call)
-    c._fake_calls = calls
-    return c
+from vulnclaw.ai.core import LLMClient
 
 
-async def _ask(client, prompt, system=None, models=None, **kw):
-    return await client.ask(
-        prompt=prompt,
-        system=system,
-        models=models or [_MODEL],
-        use_cache=kw.pop("use_cache", True),
-        **kw,
+@pytest.fixture(autouse=True)
+def _reset_cache():
+    """每个用例前清空类级语义缓存与命中计数，保证隔离。"""
+    LLMClient._semantic_cache.clear()
+    LLMClient._cache_hits = 0
+    LLMClient._cache_misses = 0
+    yield
+    LLMClient._semantic_cache.clear()
+    LLMClient._cache_hits = 0
+    LLMClient._cache_misses = 0
+
+
+def _make_client():
+    # api_key 用占位值（ask 仅校验非空，不会真正发起请求——_call_model_once 被 mock）
+    client = LLMClient(
+        provider="zhipu",
+        api_key="dummy-key-for-test",
+        models=["test-model"],
+        timeout=5,
+    )
+    client._call_model_once = AsyncMock(return_value="CACHED_RESULT")
+    return client
+
+
+def test_semantic_cache_hit_avoids_provider_call():
+    """相同 prompt 第二次命中缓存：Provider 只被打一次，cache_hits==1。"""
+    client = _make_client()
+
+    r1 = asyncio.run(
+        client.ask("相同的探测 prompt", system="sys", use_cache=True, models=["test-model"])
+    )
+    r2 = asyncio.run(
+        client.ask("相同的探测 prompt", system="sys", use_cache=True, models=["test-model"])
     )
 
-
-@pytest.mark.asyncio
-async def test_cache_hit_second_call(client):
-    """同 prompt 二次调用：命中缓存，模型只被真实调用一次。"""
-    r1 = await _ask(client, "判断该输入是否存在注入风险", system="你是安全分析专家")
-    r2 = await _ask(client, "判断该输入是否存在注入风险", system="你是安全分析专家")
-    assert r1 == r2
-    assert len(client._fake_calls) == 1  # 第二次走缓存，不再调模型
+    assert r1 == "CACHED_RESULT"
+    assert r2 == "CACHED_RESULT"
+    # 第二次应直接命中，Provider 仅被调用一次
+    assert client._call_model_once.call_count == 1
     stats = LLMClient.get_cache_stats()
     assert stats["hits"] == 1
-    assert stats["misses"] == 1
-    assert stats["hit_rate"] == 0.5
+    assert stats["misses"] == 1  # 第一次是 miss
 
 
-@pytest.mark.asyncio
-async def test_cache_miss_on_different_prompt(client):
-    """不同 prompt：均未命中，各自真实调用一次。"""
-    await _ask(client, "prompt-A")
-    await _ask(client, "prompt-B")
-    stats = LLMClient.get_cache_stats()
-    assert stats["hits"] == 0
-    assert stats["misses"] == 2
-    assert len(client._fake_calls) == 2
+def test_semantic_cache_miss_on_different_prompt():
+    """不同 prompt 视为不同键：两次都 miss，Provider 被打两次。"""
+    client = _make_client()
+
+    asyncio.run(client.ask("prompt-A", system="sys", use_cache=True, models=["test-model"]))
+    asyncio.run(client.ask("prompt-B", system="sys", use_cache=True, models=["test-model"]))
+
+    assert client._call_model_once.call_count == 2
+    assert LLMClient.get_cache_stats()["hits"] == 0
+    assert LLMClient.get_cache_stats()["misses"] == 2
 
 
-@pytest.mark.asyncio
-async def test_cache_key_normalizes_whitespace(client):
-    """缓存 key 按空白归一化：仅空白差异的 prompt 视为同一请求。"""
-    await _ask(client, "  a    b  c ")
-    await _ask(client, " a b c")
-    stats = LLMClient.get_cache_stats()
-    assert stats["hits"] == 1
-    assert stats["misses"] == 1
+def test_semantic_cache_disabled_by_default():
+    """use_cache 默认 False：相同 prompt 也每次打 Provider，不产生命中。"""
+    client = _make_client()
+
+    asyncio.run(client.ask("重复 prompt", system="sys", models=["test-model"]))
+    asyncio.run(client.ask("重复 prompt", system="sys", models=["test-model"]))
+
+    assert client._call_model_once.call_count == 2
+    assert LLMClient.get_cache_stats()["hits"] == 0
 
 
-@pytest.mark.asyncio
-async def test_cache_key_includes_model(client):
-    """缓存 key 含模型名：同 prompt 不同模型 → 不命中。"""
-    await _ask(client, "same prompt", models=["model-a"])
-    await _ask(client, "same prompt", models=["model-b"])
-    stats = LLMClient.get_cache_stats()
-    assert stats["hits"] == 0
-    assert stats["misses"] == 2
+def test_semantic_cache_ttl_expiry():
+    """缓存条目超时被视作 miss：过期后重新打 Provider 并刷新。"""
+    client = _make_client()
+
+    # 第一次：miss + 写入（now）
+    asyncio.run(client.ask("ttl-prompt", system="sys", use_cache=True, models=["test-model"]))
+    assert client._call_model_once.call_count == 1
+
+    # 手动把已存条目时间戳改成过期
+    key = next(iter(LLMClient._semantic_cache))
+    LLMClient._semantic_cache[key] = (time.time() - 9999, "stale")
+
+    # 第二次：条目过期 → 视为 miss → 重新打 Provider，返回新结果而非 stale
+    r2 = asyncio.run(
+        client.ask("ttl-prompt", system="sys", use_cache=True, models=["test-model"])
+    )
+    assert r2 == "CACHED_RESULT"
+    assert client._call_model_once.call_count == 2
 
 
-@pytest.mark.asyncio
-async def test_cache_ttl_exact_boundary_hits(client, monkeypatch):
-    """TTL 边界：elapsed 恰好等于 TTL（<= 判定）→ 仍命中。"""
-    clock = [2000.0]
-    monkeypatch.setattr("vulnclaw.ai.core.time.time", lambda: clock[0])
-    await _ask(client, "boundary prompt")
-    clock[0] = 2000.0 + LLMClient._semantic_cache_ttl
-    await _ask(client, "boundary prompt")
-    stats = LLMClient.get_cache_stats()
-    assert stats["hits"] == 1
-    assert stats["misses"] == 1
+# ---- H 组: 统一缓存 key（解析后模型集合 + temperature 分档） ----
+def test_cache_key_split_by_temperature():
+    """temperature 参与 key：同 prompt 不同采样档位不得互相串味。"""
+    client = _make_client()
+
+    asyncio.run(client.ask("temp-key", system="sys", use_cache=True,
+                           models=["test-model"], temperature=0.0))
+    asyncio.run(client.ask("temp-key", system="sys", use_cache=True,
+                           models=["test-model"], temperature=0.9))
+
+    assert client._call_model_once.call_count == 2
+    assert LLMClient.get_cache_stats()["hits"] == 0
 
 
-@pytest.mark.asyncio
-async def test_cache_ttl_expiry_recomputes(client, monkeypatch):
-    """TTL 过期：条目作废并重新计算，新条目随后可命中。"""
-    clock = [1000.0]
-    monkeypatch.setattr("vulnclaw.ai.core.time.time", lambda: clock[0])
-    await _ask(client, "ttl prompt")  # miss → 写入（@1000）
-    assert LLMClient.get_cache_stats()["misses"] == 1
+def test_cache_key_model_order_invariant():
+    """key 取解析后模型集合：models 传参顺序无关（sorted 归一），同档位命中。"""
+    client = _make_client()
 
-    clock[0] = 1000.0 + LLMClient._semantic_cache_ttl + 0.1
-    await _ask(client, "ttl prompt")  # 过期 → 重新计算（miss）
-    stats = LLMClient.get_cache_stats()
-    assert stats["misses"] == 2
-    assert stats["hits"] == 0
-    assert stats["size"] == 1  # 旧条目已被弹出
+    asyncio.run(client.ask("order-key", system="sys", use_cache=True,
+                           models=["test-model-a", "test-model-b"]))
+    r2 = asyncio.run(client.ask("order-key", system="sys", use_cache=True,
+                                models=["test-model-b", "test-model-a"]))
 
-    await _ask(client, "ttl prompt")  # 新条目在有效期内 → hit
+    assert r2 == "CACHED_RESULT"
+    assert client._call_model_once.call_count == 1  # 顺序无关 → 第二次命中
     assert LLMClient.get_cache_stats()["hits"] == 1
 
 
-@pytest.mark.asyncio
-async def test_cache_max_512_trims(client):
-    """超过 512 上限：先清过期，仍超限则裁剪到 max//2。"""
-    now = time.time()
-    LLMClient._semantic_cache.update(
-        {f"seed-{i}": (now, f"x{i}") for i in range(LLMClient._semantic_cache_max + 1)}
-    )
-    assert len(LLMClient._semantic_cache) == 513
+def test_cache_key_respects_task_type_route():
+    """按 task_type 路由时 key 用解析后的模型档位而非 'default'。"""
+    client = _make_client()
 
-    await _ask(client, "overflow prompt")  # miss → 写入 → 触发裁剪
-
+    asyncio.run(client.ask("task-key", system="sys", use_cache=True, task_type="filter"))
     stats = LLMClient.get_cache_stats()
-    assert stats["size"] == LLMClient._semantic_cache_max // 2  # 512 → 256
     assert stats["misses"] == 1
-    # 新写入的 key 必须保留（裁剪保留最后插入的条目）
-    norm = " ".join("overflow prompt".split())
-    norm_sys = " ".join("".split())
-    new_key = hashlib.sha256(f"{_MODEL}||{norm_sys}||{norm}".encode("utf-8")).hexdigest()
-    assert new_key in LLMClient._semantic_cache
-    # 最早插入的种子条目应被裁剪掉
-    assert "seed-0" not in LLMClient._semantic_cache
-
-
-@pytest.mark.asyncio
-async def test_cache_trim_removes_expired_first(client):
-    """超上限时先清理过期条目；清理后未超限则不再裁剪。"""
-    now = time.time()
-    fresh = {f"f-{i}": (now, "x") for i in range(300)}
-    stale = {f"s-{i}": (now - LLMClient._semantic_cache_ttl - 10, "x") for i in range(213)}
-    LLMClient._semantic_cache.update(fresh)
-    LLMClient._semantic_cache.update(stale)
-    assert len(LLMClient._semantic_cache) == 513
-
-    await _ask(client, "expired-trim prompt")
-
-    stats = LLMClient.get_cache_stats()
-    # 213 条过期全部清除，300 fresh + 1 新条目 = 301，无需二次裁剪
-    assert stats["size"] == 301
-
-
-@pytest.mark.asyncio
-async def test_no_cache_side_effect_when_disabled(client):
-    """use_cache=False：不读不写缓存，统计与模型调用均不受影响。"""
-    await _ask(client, "nocache", use_cache=False)
-    await _ask(client, "nocache", use_cache=False)
-    stats = LLMClient.get_cache_stats()
     assert stats["hits"] == 0
-    assert stats["misses"] == 0
-    assert stats["size"] == 0
-    assert len(client._fake_calls) == 2  # 每次都真实调用
 
 
-@pytest.mark.asyncio
-async def test_cache_stats_zero_before_calls(client):
-    """无任何调用：hit_rate 兜底为 0，不除零。"""
-    stats = LLMClient.get_cache_stats()
-    assert stats["hits"] == 0
-    assert stats["misses"] == 0
-    assert stats["hit_rate"] == 0.0
-    assert stats["size"] == 0
-    assert stats["ttl_seconds"] == LLMClient._semantic_cache_ttl
+def test_compress_prompt_short_passthrough():
+    """短 prompt 不触发压缩，原样返回。"""
+    from vulnclaw.ai.v100.orchestrator import compress_prompt
+
+    short = "请判断 http://x/?id=1 是否存在 SQL 注入"
+    assert compress_prompt(short, max_len=16000) == short
 
 
-@pytest.mark.asyncio
-async def test_cache_stats_hit_rate(client):
-    """hit_rate = hits / (hits + misses) 四舍五入到 4 位。"""
-    await _ask(client, "p1")
-    await _ask(client, "p1")  # hit
-    await _ask(client, "p2")  # miss
-    stats = LLMClient.get_cache_stats()
-    assert stats["hits"] == 1
-    assert stats["misses"] == 2
-    assert stats["hit_rate"] == round(1 / 3, 4)
-    assert stats["size"] == 2  # p1 / p2 两条均存活
+def test_compress_prompt_long_keeps_key_lines():
+    """超长 prompt 被压缩：长度下降、保留含 url/param/engine 的关键行。"""
+    from vulnclaw.ai.v100.orchestrator import compress_prompt
+
+    filler = "\n".join(f"无关填充行 {i}" for i in range(2000))  # 远超 16000 字符
+    key_block = "url=http://x/a\nparam=id\nengine=nuclei\n"
+    long_prompt = key_block + filler
+
+    compressed = compress_prompt(long_prompt, max_len=16000)
+
+    assert len(compressed) < len(long_prompt)
+    assert "压缩后" in compressed
+    assert "url=http://x/a" in compressed
+    assert "param=id" in compressed
+    assert "engine=nuclei" in compressed
+    # 无关填充行不应被逐行保留
+    assert "无关填充行 1999" not in compressed

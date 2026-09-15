@@ -1,0 +1,60 @@
+# G.1 fixture：HTTP 安全响应头缺失（security_headers）正反例。
+# 引擎逻辑（http_engines.SecurityHeadersEngine.scan）：
+#   GET 目标，对 SECURITY_HEADERS 逐一检查；required=True 的项缺失即产 finding
+#   （HSTS/Content-Security-Policy=High，X-Frame-Options/X-Content-Type-Options/
+#   Referrer-Policy=Medium）。无 Set-Cookie 时不做 Cookie 标记检查。
+module: vulnclaw.engines.http_engines
+class: SecurityHeadersEngine
+engine: security_headers
+
+cases:
+  - id: missing_all_required_headers
+    method: scan
+    expect: positive
+    target: http://127.0.0.1:8080
+    responses:
+      127.0.0.1:8080:
+        status: 200
+        headers:
+          Content-Type: text/html
+        body: "<html><body>hello</body></html>"
+    evidence_contains: "Strict-Transport-Security"
+    reproduction: "fixture 复现（离线 mock）：对目标 GET，观察是否缺失 HSTS/CSP/X-Frame-Options 等 → 期望命中「安全头缺失」"
+
+  - id: all_required_headers_present
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      127.0.0.1:8080:
+        status: 200
+        headers:
+          Content-Type: text/html
+          Strict-Transport-Security: "max-age=31536000; includeSubDomains; preload"
+          Content-Security-Policy: "default-src 'self'"
+          X-Frame-Options: "DENY"
+          X-Content-Type-Options: "nosniff"
+          Referrer-Policy: "no-referrer"
+          Permissions-Policy: "geolocation=(), microphone=(), camera=()"
+          X-XSS-Protection: "1; mode=block"
+          Cache-Control: "no-cache, no-store, must-revalidate"
+          Pragma: "no-cache"
+        body: "<html><body>hello</body></html>"
+    evidence_contains: ""
+    reproduction: "fixture 复现（离线 mock）：目标已具备全部 required 安全头 → 期望无任何 finding"
+
+  - id: missing_hsts_and_csp
+    method: scan
+    expect: positive
+    target: http://127.0.0.1:8080
+    responses:
+      127.0.0.1:8080:
+        status: 200
+        headers:
+          Content-Type: text/html
+          X-Frame-Options: "SAMEORIGIN"
+          X-Content-Type-Options: "nosniff"
+          Referrer-Policy: "same-origin"
+        body: "<html><body>hello</body></html>"
+    evidence_contains: "Strict-Transport-Security"
+    reproduction: "fixture 复现（离线 mock）：缺失 HSTS 与 CSP → 期望命中两个 High 级安全头缺失"

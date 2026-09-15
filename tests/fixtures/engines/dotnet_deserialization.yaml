@@ -1,0 +1,37 @@
+# G.1/组 D fixture：.NET 反序列化（scan 型）正反例。
+# 引擎判定：被动——目标响应体/头出现反序列化特征（__VIEWSTATE / __EVENTVALIDATION /
+# TypeNameHandling.Auto / ObjectDataProvider 等）；主动——注入 payload 后回显 .NET 错误签名。
+module: vulnclaw.engines.dotnet_deserialization
+class: DotNetDeserializationEngine
+engine: dotnet_deserialization
+
+cases:
+  - id: dotnet_viewstate_passive
+    expect: positive
+    target: http://127.0.0.1:8080/account.aspx
+    responses:
+      /account.aspx:
+        status: 200
+        body: '<input type="hidden" name="__VIEWSTATE" id="__VIEWSTATE" value="/wEPDwUK...">'
+    evidence_contains: "__VIEWSTATE"
+    reproduction: "curl -s 'http://127.0.0.1:8080/account.aspx'  # 被动响应含 ASP.NET ViewState"
+
+  - id: dotnet_error_echo
+    expect: positive
+    target: http://127.0.0.1:8080/api/import?data=x
+    responses:
+      /api/import:
+        status: 500
+        body: "JsonSerializationException: Type 'System.Windows.Data.ObjectDataProvider' cannot be resolved from assembly"
+    evidence_contains: "JsonSerializationException"
+    reproduction: "curl --get 'http://127.0.0.1:8080/api/import' --data-urlencode 'data={\"$type\":\"System.Windows.Data.ObjectDataProvider, PresentationFramework\"}'"
+
+  - id: plain_mvc_page
+    expect: negative
+    target: http://127.0.0.1:8080/home
+    responses:
+      /home:
+        status: 200
+        body: "<html><body>welcome</body></html>"
+    evidence_contains: ""
+    reproduction: ""

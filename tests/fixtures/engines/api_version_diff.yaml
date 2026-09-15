@@ -1,0 +1,26 @@
+# G.1/组 D fixture：API 版本差异（auxiliary，scan 型）正反例。
+# 引擎判定：从 target 正则提取版本号，替换探测邻接版本；久版本端点 200 且体长>50 即报。
+module: vulnclaw.engines.auxiliary_engines
+class: APIVersionDiffEngine
+engine: api_version_diff
+
+cases:
+  - id: old_api_version_alive
+    expect: positive
+    target: http://127.0.0.1:8080/api/v2/users
+    responses:
+      /api/v2/users:
+        status: 200
+        body: '[{"id":1,"name":"alice"},{"id":2,"name":"bob"},{"id":3,"name":"carol"}]'
+    evidence_contains: "可访问"
+    reproduction: "curl -s 'http://127.0.0.1:8080/api/v2/users'  # 旧版本 API 仍可访问且返回数据"
+
+  - id: version_probe_404
+    expect: negative
+    target: http://127.0.0.1:8080/api/v2/users
+    responses:
+      /api/v2/users:
+        status: 404
+        body: '<html>not found</html>'
+    evidence_contains: ""
+    reproduction: ""

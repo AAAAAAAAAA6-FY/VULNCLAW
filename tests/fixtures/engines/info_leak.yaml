@@ -1,0 +1,68 @@
+# G.1 fixture：敏感路径/信息泄露（info_leak）正反例。
+# 引擎逻辑（input_engines.InfoLeakEngine.scan）：
+#   按 SENSITIVE_PATHS 依次 GET（默认前 50 个），跳过 404；命中其一即：
+#     - 响应含目录列表特征(DIRECTORY_LISTING_INDICATORS) → 目录遍历泄露；
+#     - 否则 _extract_sensitive_data 命中密钥/凭据正则 → 信息泄露。
+module: vulnclaw.engines.input_engines
+class: InfoLeakEngine
+engine: info_leak
+
+cases:
+  - id: env_file_with_aws_key
+    method: scan
+    expect: positive
+    target: http://127.0.0.1:8080
+    responses:
+      /.env:
+        status: 200
+        body: |
+          APP_NAME=myapp
+          APP_ENV=production
+          DB_PASSWORD=supersecret123
+          AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
+          AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+    evidence_contains: "aws_key"
+    reproduction: "fixture 复现（离线 mock）：curl -sS 'http://127.0.0.1:8080/.env' → 期望命中「敏感信息泄露 /.env / AWS key」"
+
+  - id: git_config_exposed
+    method: scan
+    expect: positive
+    target: http://127.0.0.1:8080
+    responses:
+      /.git/config:
+        status: 200
+        body: |
+          [core]
+              repositoryformatversion = 0
+              filemode = true
+              bare = false
+          [credential "helper"]
+              aws_access_key_id = AKIAIOSFODNN7EXAMPLE
+          [remote "origin"]
+              url = https://github.com/victim/private-repo.git
+              fetch = +refs/heads/*:refs/remotes/origin/*
+    evidence_contains: "aws_key"
+    reproduction: "fixture 复现（离线 mock）：curl -sS 'http://127.0.0.1:8080/.git/config' → 期望命中「敏感信息泄露 /.git/config」"
+
+  # ---------- 反例 ----------
+  - id: all_sensitive_paths_404
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses: {}
+
+  - id: env_file_benign
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      /.env:
+        status: 200
+        body: |
+          APP_NAME=MyApp
+          APP_ENV=local
+          LOG_LEVEL=info
+          APP_DEBUG=false
+      /.git/config:
+        status: 404
+        body: '{"status":404}'

@@ -1,0 +1,28 @@
+# G.1/组 D fixture：Shiro rememberMe 指纹（scan 型）正反例。
+# 引擎判定：正常响应 Set-Cookie 含 rememberMe；或注入无效 rememberMe Cookie 后
+# 服务端回 rememberMe=deleteMe —— 证明 Apache Shiro 框架暴露（CVE-2016-4437 前奏）。
+# （YAML 无法承载响应头，均以删除线标注复现。）
+module: vulnclaw.engines.framework_zero_day_engines_2
+class: ShiroRememberMeEngine
+engine: shiro_rememberme
+
+cases:
+  - id: shiro_rememberme_deleteme
+    expect: positive
+    target: http://127.0.0.1:8080/app
+    responses:
+      /app:
+        status: 200
+        body: "logged in as alice"
+    evidence_contains: "rememberMe"
+    reproduction: "curl -s -i 'http://127.0.0.1:8080/app' -H 'Cookie: rememberMe=deadbeef' | grep -i 'Set-Cookie'  # 响应 Set-Cookie 回 rememberMe=deleteMe"
+
+  - id: shiro_plain_app
+    expect: negative
+    target: http://127.0.0.1:8080/app
+    responses:
+      /app:
+        status: 200
+        body: "logged in as alice"
+    evidence_contains: ""
+    reproduction: ""

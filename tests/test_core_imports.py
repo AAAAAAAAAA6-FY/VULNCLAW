@@ -60,6 +60,28 @@ def test_exception_hierarchy():
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolate_llm_shared_state():
+    """LLM 语义缓存 / Provider 熔断是**进程级共享状态**，会制造"顺序依赖"假失败。
+
+    实测：同 worker 内其它用例把 zhipu provider 打成 OPEN 后，本模块的缓存用例
+    会在 `ask()` 里被熔断直接跳过 → `RuntimeError: 所有模型均被熔断跳过`，
+    表现为"单独跑绿、全量跑红"。跑前统一复位，保证用例自洽（不依赖执行顺序）。
+    """
+    try:
+        from vulnclaw.ai.core import LLMClient
+        LLMClient._semantic_cache.clear()
+        LLMClient._blocked_models = set()
+        from vulnclaw.ai.provider_failover import get_provider_failover
+        for cb in get_provider_failover()._breakers.values():
+            cb._state = "CLOSED"
+            cb._failures = 0
+            cb._last_fail_time = None
+    except Exception:  # noqa: BLE001 - 隔离失败不阻断用例本身
+        pass
+    yield
+
+
 @pytest.mark.asyncio
 async def test_llm_semantic_cache_hit():
     """同 prompt + use_cache=True：第二次命中缓存，网络层只调 1 次。"""

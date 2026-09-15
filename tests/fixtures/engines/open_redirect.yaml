@@ -1,0 +1,39 @@
+engine: open_redirect
+module: vulnclaw.engines.http_engines
+class: OpenRedirectEngine
+name: 开放重定向（Location 指向外部）
+description: |
+  OpenRedirectEngine.check 对每个重定向参数（redirect/next/url/to…）遍历 payload
+  （//evil.com、http://evil.com…），发送 allow_redirects=False 的请求；当 Location/Meta/JS
+  重定向指向恶意域名（_is_malicious_redirect）即报 Medium「开放重定向」；仅 3xx 但 Location 为空则报 Low「疑似」。
+  本 fixture 验证：Location: http://evil.com → 正例；始终 200 无 Location → 反例（低误报铁律）。
+
+cases:
+  - id: open_redirect_location_evil
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/redirect?redirect=ORIG
+    param: redirect
+    normal_resp: [200, "<html>ok</html>", {}]
+    responses:
+      "127.0.0.1:8080/redirect":
+        status: 302
+        headers:
+          Location: "http://evil.com"
+        body: ""
+    evidence_contains: "evil.com"
+    reproduction: "fixture 复现（离线 mock）：?redirect=//evil.com → 响应 302 Location: http://evil.com → 期望命中「开放重定向」"
+
+  - id: open_redirect_clean_no_redirect
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/redirect?redirect=ORIG
+    param: redirect
+    normal_resp: [200, "<html>ok</html>", {}]
+    responses:
+      "127.0.0.1:8080/redirect":
+        status: 200
+        headers: {}
+        body: "ok"
+    evidence_contains: ""
+    reproduction: "fixture 复现（离线 mock）：始终返回 200 无 Location → 期望无任何 finding"

@@ -1,0 +1,27 @@
+# G.1/组 D fixture：解析差异/语义分歧（scan 型）正反例。
+# 引擎判定：路径解析分歧——基线 403/404，路径变体(尾斜杠/重复斜杠/;shadow=%00/大小写)
+# 返回 200 业务页(>150B 且非错误页)即防护绕过。
+module: vulnclaw.engines.parsing_shadow
+class: ParsingShadowEngine
+engine: parsing_shadow
+
+cases:
+  - id: parsing_shadow_path_bypass
+    expect: positive
+    target: http://127.0.0.1:8080/admin/panel
+    responses:
+      /admin/panel:
+        status: 200
+        body: "<html><body><h1>Server Configuration Panel</h1><p>access your sensitive server configuration settings and user management functions here</p><table>...</table></body></html>"
+    evidence_contains: "路径归一化"
+    reproduction: "fixture 离线复现：基线 /admin/panel 403，变体 /admin/panel/ 或 /admin/panel;shadow=1 返回 200 业务页"
+
+  - id: parsing_shadow_no_bypass
+    expect: negative
+    target: http://127.0.0.1:8080/admin/panel
+    responses:
+      /admin/panel:
+        status: 403
+        body: "<html>Forbidden</html>"
+    evidence_contains: ""
+    reproduction: ""

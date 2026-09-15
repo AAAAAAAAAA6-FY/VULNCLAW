@@ -1,0 +1,40 @@
+# G.1 fixture：符号执行逻辑洞引擎（IR 驱动，dry-run 零网络）正反例。
+# scan() 以 recon_brief.business_ir（IR 业务模型）为输入，无 IR / 无带值域参数时 fail-closed。
+# 正例：转账端点 quantity 值域 [0,9] + 不变量 (余额 >= 0)：约束求解证明"金额篡改/数量越界"目标可满足。
+# 反例：无 IR 或 IR 无带值域参数 -> fail-closed 不产出（杜绝默认"无界即可满足"）。
+# evidence_contains / reproduction 为深度统计口径字段（组 E 统计脚本读取）。
+module: vulnclaw.engines.symbolic_engine
+class: SymbolicLogicEngine
+engine: symbolic_logic
+
+cases:
+  - id: quantity_overflow_solvable
+    expect: positive
+    # scan 入口：IR 携带 amount 参数（值域 0..9）与余额不变量，约束求解产出候选
+    target: http://127.0.0.1:8080/order
+    responses:
+      /order:
+        status: 200
+        body: "ok"
+    evidence_contains: "约束求解证明目标可满足"
+    reproduction: "fixture 复现（离线 mock）：喂入 recon_brief.business_ir（quantity 值域[0,9] + 余额不变量）→ 约束求解证明数量越界目标可满足，产出 needs_verification 候选"
+
+  - id: no_ir_fail_closed
+    expect: negative
+    target: http://127.0.0.1:8080/order
+    responses:
+      /order:
+        status: 200
+        body: "ok"
+    evidence_contains: ""
+    reproduction: ""
+
+  - id: no_ir_params_fail_closed
+    expect: negative
+    target: http://127.0.0.1:8080/order
+    responses:
+      /order:
+        status: 200
+        body: "ok"
+    evidence_contains: ""
+    reproduction: ""

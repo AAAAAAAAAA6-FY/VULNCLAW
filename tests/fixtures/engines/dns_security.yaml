@@ -1,0 +1,46 @@
+# G.3 fixture：DNS/邮件安全检测引擎（SPF/DMARC/DKIM、AXFR、DNSSEC）正反例。
+# scan() 目标级：对域名资产做真实 DNS 查询（TXT/NS/DS/CNAME）。参数级 check() 恒返回 None。
+# 正例：无 SPF（email_spf_missing）+ DMARC 策略 p=none（email_dmarc_none）+ 未启用 DNSSEC（dns_dnssec_missing）。
+# 反例：SPF -all + DMARC p=quarantine + 已发布 DKIM/DS 记录 -> 无 finding。
+# evidence_contains / reproduction 为深度统计口径字段（组 E 统计脚本读取）。
+module: vulnclaw.engines.net_engines
+class: DnsSecurityEngine
+engine: dns_security
+
+cases:
+  - id: missing_spf_and_dmarc_none
+    expect: positive
+    target: https://mail.example.com/
+    responses:
+      example.com TXT:
+        status: 200
+        body: "no v=spf1 record"
+    evidence_contains: "的 TXT 记录中未找到 v=spf1 记录"
+    reproduction: "fixture 复现（离线 mock）：域名 TXT 无 SPF + _dmarc 为 p=none → 引擎产出 email_spf_missing/email_dmarc_none 候选"
+
+  - id: dnssec_disabled
+    expect: positive
+    target: https://www.example.com/
+    responses:
+      example.com DS:
+        status: 200
+        body: "no DS record"
+    evidence_contains: "无 DS 记录（DNSSEC 未启用）"
+    reproduction: "fixture 复现（离线 mock）：域名 DS 查询 NoAnswer → 引擎产出 dns_dnssec_missing 候选"
+
+  - id: fully_hardened_email_security
+    expect: negative
+    # 合法 SPF -all + DMARC p=quarantine + DKIM 已发布 -> 引擎不产邮件安全 finding
+    target: https://mail.example.com/
+    responses:
+      example.com TXT:
+        status: 200
+        body: "v=spf1 include:_spf.example.com -all"
+      _dmarc.example.com TXT:
+        status: 200
+        body: "v=DMARC1; p=quarantine; rua=mailto:dmarc@example.com"
+      default._domainkey.example.com TXT:
+        status: 200
+        body: "v=DKIM1; k=rsa; p=MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQ..."
+    evidence_contains: ""
+    reproduction: ""

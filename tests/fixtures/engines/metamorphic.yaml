@@ -1,0 +1,49 @@
+# G.1/组 D fixture：元orphic 不变量探针 v1.0（Metamorphic，端点级）正反例。
+# 引擎判定：篡改可控参数后响应与基线产生显著差分（金额回显 / 响应差异率 / 状态差异）
+# → 报逻辑漏洞（金额篡改/重放不幂等/ID 越权候选）；响应与基线一致（无差分）→ 不报。
+module: vulnclaw.engines.metamorphic_engines
+class: MetamorphicEngine
+engine: metamorphic
+
+cases:
+  - id: metamorphic_amount_echo_reaccepted
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/order?amount=100
+    param: amount
+    parsed_query: "amount=100"
+    normal_resp: [200, "amount: 100 complete", {}]
+    responses:
+      /order:
+        status: 200
+        body: "amount: 0.01 complete"
+    evidence_contains: "响应 HTTP "
+    reproduction: "curl -sS -X POST 'http://127.0.0.1:8080/order' -d 'amount=0.01'  # 篡改金额 0.01 被服务端采信并回显"
+
+  - id: metamorphic_no_diff_no_issue
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/order?amount=100
+    param: amount
+    parsed_query: "amount=100"
+    normal_resp: [200, '{"ok":true,"amount":100}', {}]
+    responses:
+      /order:
+        status: 200
+        body: '{"ok":true,"amount":100}'
+    evidence_contains: ""
+    reproduction: ""
+
+  - id: metamorphic_baseline_fails
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/order?amount=100
+    param: amount
+    parsed_query: "amount=100"
+    normal_resp: [403, "forbidden", {}]
+    responses:
+      /order:
+        status: 403
+        body: "forbidden"
+    evidence_contains: ""
+    reproduction: ""

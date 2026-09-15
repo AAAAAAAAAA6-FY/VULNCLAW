@@ -1,0 +1,155 @@
+# G.1 fixture：反序列化被动检测正反例。
+module: vulnclaw.engines.deserialization
+class: DeserializationEngine
+engine: deserialization
+
+cases:
+  - id: java_runtime_serialization_marker
+    expect: positive
+    target: http://127.0.0.1:8080/deser
+    responses:
+      /deser:
+        status: 500
+        body: "java.lang.Runtime serialization handler"
+    evidence_contains: "在响应/头中发现反序列化特征: java.lang.Runtime 调用链"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/deser' --data-urlencode '=x' → 期望命中「反序列化特征-java.lang.Runtime 调用链」"
+
+  - id: ordinary_application_response
+    expect: negative
+    target: http://127.0.0.1:8080/deser
+    responses:
+      /deser:
+        status: 200
+        body: '{"status":"ok","message":"welcome"}'
+
+  # ---------- 正例：多语言栈反序列化指纹 ----------
+  - id: jackson_attype_marker
+    expect: positive
+    target: http://127.0.0.1:8080/deser
+    responses:
+      /deser:
+        status: 500
+        body: '{"@type":"com.sun.rowset.JdbcRowSetImpl","dataSourceName":"ldap://127.0.0.1:1389/x"}'
+    evidence_contains: "在响应/头中发现反序列化特征: Java 序列化框架组件"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/deser' --data-urlencode '=x' → 期望命中「反序列化特征-Java 序列化框架组件」"
+
+  - id: read_object_marker
+    expect: positive
+    target: http://127.0.0.1:8080/deser
+    responses:
+      /deser:
+        status: 200
+        body: "java.io.ObjectInputStream.readObject(ObjectInputStream.java:365)"
+    evidence_contains: "在响应/头中发现反序列化特征: readObject() 反序列化入口"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/deser' --data-urlencode '=x' → 期望命中「反序列化特征-readObject() 反序列化入口」"
+
+  - id: php_serialized_object
+    expect: positive
+    target: http://127.0.0.1:8080/deser
+    responses:
+      /deser:
+        status: 200
+        body: 'O:8:"VulnClawOBJ":1:{s:4:"evil";s:4:"test";}'
+    evidence_contains: "在响应/头中发现反序列化特征: PHP 序列化对象（O:长度:\"类名\"）"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/deser' --data-urlencode '=x' → 期望命中「反序列化特征-PHP 序列化对象（O:长度:\"类名\"）」"
+
+  - id: php_wakeup_marker
+    expect: positive
+    target: http://127.0.0.1:8080/deser
+    responses:
+      /deser:
+        status: 200
+        body: "Warning: unserialize(): __wakeup() must not access restricted property"
+    evidence_contains: "在响应/头中发现反序列化特征: PHP __wakeup() 魔术方法"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/deser' --data-urlencode '=x' → 期望命中「反序列化特征-PHP __wakeup() 魔术方法」"
+
+  - id: python_pickle_loads
+    expect: positive
+    target: http://127.0.0.1:8080/deser
+    responses:
+      /deser:
+        status: 200
+        body: "Traceback: _pickle.UnpicklingError: pickle.loads() failed on object"
+    evidence_contains: "在响应/头中发现反序列化特征: Python pickle.loads() 反序列化"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/deser' --data-urlencode '=x' → 期望命中「反序列化特征-Python pickle.loads() 反序列化」"
+
+  - id: python_reduce_marker
+    expect: positive
+    target: http://127.0.0.1:8080/deser
+    responses:
+      /deser:
+        status: 200
+        body: "os.__reduce__() returned a non-string second argument"
+    evidence_contains: "在响应/头中发现反序列化特征: Python __reduce__()（pickle 协议）"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/deser' --data-urlencode '=x' → 期望命中「反序列化特征-Python __reduce__()（pickle 协议）」"
+
+  - id: ruby_marshal_marker
+    expect: positive
+    target: http://127.0.0.1:8080/deser
+    responses:
+      /deser:
+        status: 200
+        body: "Marshal.load undefined class/module VulnClawProbe (ArgumentError)"
+    evidence_contains: "在响应/头中发现反序列化特征: Ruby Marshal.load 反序列化"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/deser' --data-urlencode '=x' → 期望命中「反序列化特征-Ruby Marshal.load 反序列化」"
+
+  - id: node_serialize_marker
+    expect: positive
+    target: http://127.0.0.1:8080/deser
+    responses:
+      /deser:
+        status: 200
+        body: "{\"rce\":\"_$$ND_FUNC$$_function(){require('child_process').exec('id')}()\"}"
+    evidence_contains: "在响应/头中发现反序列化特征: Node.js _$$ND_FUNC$$_ 函数注入"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/deser' --data-urlencode '=x' → 期望命中「反序列化特征-Node.js _$$ND_FUNC$$_ 函数注入」"
+
+  - id: java_json_error_sig
+    expect: positive
+    target: http://127.0.0.1:8080/deser
+    responses:
+      /deser:
+        status: 500
+        body: "com.fasterxml.jackson.databind.exc.UnrecognizedPropertyException: token would be overwritten"
+
+  # ---------- 反例：5xx / WAF / 重定向 / 修复版本 ----------
+    evidence_contains: "在响应/头中发现反序列化特征: Java 序列化框架组件"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/deser' --data-urlencode '=x' → 期望命中「反序列化特征-Java 序列化框架组件」"
+  - id: server_error_generic_5xx
+    expect: negative
+    target: http://127.0.0.1:8080/deser
+    responses:
+      /deser:
+        status: 502
+        body: "502 Bad Gateway"
+
+  - id: waf_block_403
+    expect: negative
+    target: http://127.0.0.1:8080/deser
+    responses:
+      /deser:
+        status: 403
+        body: "<html><body>403 Forbidden</body></html>"
+
+  - id: redirect_302
+    expect: negative
+    target: http://127.0.0.1:8080/deser
+    responses:
+      /deser:
+        status: 302
+        body: ""
+
+  - id: fix_secure_headers_response
+    expect: negative
+    target: http://127.0.0.1:8080/deser
+    responses:
+      /deser:
+        status: 200
+        body: "{\"frame\":\"deny\",\"csp\":\"default-src 'self'\",\"nosniff\":\"on\"}"
+
+  - id: static_site_no_deser
+    expect: negative
+    target: http://127.0.0.1:8080/deser
+    responses:
+      /deser:
+        status: 200
+        body: "<html><body><h1>Index of /</h1><p>Welcome</p></body></html>"

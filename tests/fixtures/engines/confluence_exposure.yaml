@@ -1,0 +1,53 @@
+# G.1/组 D fixture：Confluence 未授权访问检测（scan 型）正反例。
+# 引擎判定：先指纹 /rest/applinks/1.0/manifest 命中（JSON 含 applicationLinks/confluence），
+# 再探测 /rest/api/content?limit=1 未授权内容读（results/type:page 特征）→ 报 High
+# 「Confluence 未授权访问-内容读取」；仅指纹命中的暴露报 Medium「应用链接信息暴露」。
+module: vulnclaw.engines.middleware_exposure_engines
+class: ConfluenceExposureEngine
+engine: confluence_exposure
+
+cases:
+  - id: confluence_unauth_content_read
+    method: scan
+    expect: positive
+    target: http://127.0.0.1:8080
+    responses:
+      /rest/applinks/1.0/manifest:
+        status: 200
+        headers:
+          Content-Type: "application/json"
+        body: '{"applicationLinks":[{"typeId":"confluence"}]}'
+      /rest/api/content?limit=1:
+        status: 200
+        headers:
+          Content-Type: "application/json"
+        body: '{"results":[{"id":"534124","type":"page","title":"Internal-Q3-Plan"}]}'
+    evidence_contains: "产品 JSON 特征命中"
+    reproduction: "curl -s 'http://127.0.0.1:8080/rest/api/content?limit=1'  # 未授权读取页面列表结果 JSON"
+
+  - id: confluence_fingerprint_only_exposure
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      /rest/applinks/1.0/manifest:
+        status: 200
+        headers:
+          Content-Type: "text/html"
+        body: "<html><body>generic app static page</body></html>"
+    evidence_contains: ""
+    reproduction: ""
+
+  - id: confluence_not_product
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      /rest/applinks/1.0/manifest:
+        status: 404
+        body: "Not Found"
+      /rest/api/content?limit=1:
+        status: 404
+        body: "Not Found"
+    evidence_contains: ""
+    reproduction: ""

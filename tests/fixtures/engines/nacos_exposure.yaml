@@ -1,0 +1,50 @@
+# G.1/组 D fixture：Nacos 未授权访问检测（scan 型）正反例。
+# 引擎判定：先指纹 /nacos/v1/console/health/readiness 命中（JSON 含 UP/nacos 语义），
+# 再探测 /nacos/v1/auth/users 未授权用户列表（username 特征）→ 报 Critical
+# 「Nacos 未授权访问-用户列表泄露」（CVE-2021-29441 风险面）。
+module: vulnclaw.engines.middleware_exposure_engines
+class: NacosExposureEngine
+engine: nacos_exposure
+
+cases:
+  - id: nacos_unauth_users_list
+    method: scan
+    expect: positive
+    target: http://127.0.0.1:8080
+    responses:
+      /nacos/v1/console/health/readiness:
+        status: 200
+        headers:
+          Content-Type: "application/json"
+        body: '{"status":"UP","nacos":true}'
+      /nacos/v1/auth/users:
+        status: 200
+        headers:
+          Content-Type: "application/json"
+        body: '{"username":"nacos","password":"nacos"}'
+    evidence_contains: "产品 JSON 特征命中"
+    reproduction: "curl -s 'http://127.0.0.1:8080/nacos/v1/auth/users'  # 未鉴权枚举用户列表"
+
+  - id: nacos_health_no_fingerprint
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      /nacos/v1/console/health/readiness:
+        status: 200
+        headers:
+          Content-Type: "application/json"
+        body: '{"status":"OK"}'
+    evidence_contains: ""
+    reproduction: ""
+
+  - id: nacos_readiness_not_found
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      /nacos/v1/console/health/readiness:
+        status: 404
+        body: "Not Found"
+    evidence_contains: ""
+    reproduction: ""

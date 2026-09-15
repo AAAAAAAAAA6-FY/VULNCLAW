@@ -1,0 +1,41 @@
+engine: backend_component_cve
+module: vulnclaw.engines.logic_leak_engines_2
+class: BackendComponentFingerprintEngine
+name: 后端组件版本指纹已知 CVE 匹配
+description: |
+  BackendComponentFingerprintEngine（scan 型）从响应头(Server/X-Powered-By)与 HTML 框架特征识别
+  后端组件版本号，命中内置「过时/高危版本区间」表即报组件漏洞（CWE-1104），受
+  settings.component_cve_check 控制（默认开）。本 fixture 验证：
+  Server: Apache/2.4.49（命中 CVE-2021-41773，Critical）报正例；
+  Server: nginx/1.21.0（超出受影响区间且无框架指纹）不报反例。
+
+cases:
+  - id: apache_2_4_49_vulnerable
+    method: scan
+    expect: positive
+    target: http://127.0.0.1:8080
+    responses:
+      "/":
+        status: 200
+        headers:
+          Server: "Apache/2.4.49 (Unix)"
+          Content-Type: "text/html; charset=utf-8"
+        body: |
+          <html><body><h1>It works!</h1></body></html>
+    evidence_contains: "CVE-2021-41773"
+    reproduction: "fixture 复现（离线 mock）：响应头 Server: Apache/2.4.49 → 期望命中「后端组件漏洞：Apache 2.4.49」(Critical)"
+
+  - id: nginx_1_21_0_safe
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      "/":
+        status: 200
+        headers:
+          Server: "nginx/1.21.0"
+          Content-Type: "text/html; charset=utf-8"
+        body: |
+          <html><body><h1>Welcome</h1></body></html>
+    evidence_contains: ""
+    reproduction: "fixture 复现（离线 mock）：Server: nginx/1.21.0（超出受影响区间）→ 期望无任何 finding"

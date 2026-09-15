@@ -1,0 +1,35 @@
+# CORS fixture（正反例）。
+# 说明：mock（benchmark._make_fake_async_get）已支持 headers 字段，
+# CORSEngine.check 依据响应头 Access-Control-* 判定，正例靠 ACAO: * 表达。
+module: vulnclaw.engines.input_engines
+class: CORSEngine
+engine: cors
+
+cases:
+  - id: cors_positive_wildcard_acao
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/cors
+    param: url
+    parsed_query: ""
+    normal_resp: [200, "<html><body>ok</body></html>", {}]
+    responses:
+      /cors:
+        status: 200
+        body: "<html><body>ok</body></html>"
+        headers:
+          Access-Control-Allow-Origin: "*"
+    evidence_contains: "发现 CORS 端点: http://127.0.0.1:8080/cors"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/cors' --data-urlencode 'url=x' → 期望命中「CORS 端点发现」"
+
+  - id: cors_negative_no_acao
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/cors-safe
+    param: url
+    parsed_query: ""
+    normal_resp: [200, "<html><body>ok</body></html>", {}]
+    responses:
+      /cors-safe:
+        status: 200
+        body: "<html><body>ok</body></html>"

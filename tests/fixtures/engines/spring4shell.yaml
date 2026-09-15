@@ -1,0 +1,35 @@
+# G.1/组 D fixture：Spring4Shell（CVE-2022-22965，check 型）正反例。
+# 引擎判定：注入 class.module.* 命名参数后，响应出现参数绑定拒绝特征
+# （RequestRejectedException / invalid character / classloader）。
+module: vulnclaw.engines.framework_zero_day_engines
+class: Spring4ShellEngine
+engine: spring4shell
+
+cases:
+  - id: spring4shell_request_rejected
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/upload?file=x
+    param: file
+    parsed_query: "file=x"
+    normal_resp: [200, "upload ok", {}]
+    responses:
+      /upload:
+        status: 400
+        body: "RequestRejectedException: The request was rejected because the URL contained a potentially malicious String 'class.module.classLoader...'"
+    evidence_contains: "RequestRejectedException"
+    reproduction: "curl --get 'http://127.0.0.1:8080/upload' --data-urlencode 'file=class.module.classLoader.resources.context.parent.pipeline.first.pattern=vlc'"
+
+  - id: spring4shell_benign_upload
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/upload?file=x
+    param: file
+    parsed_query: "file=x"
+    normal_resp: [200, "upload ok", {}]
+    responses:
+      /upload:
+        status: 200
+        body: "upload ok"
+    evidence_contains: ""
+    reproduction: ""

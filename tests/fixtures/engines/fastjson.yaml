@@ -1,0 +1,93 @@
+# G.1 fixture：Fastjson 反序列化参数级 check 正例（P0 补齐，后端离线 mock）。
+# 正例：注入 autoType JSON 后响应回显 Fastjson 报错指纹（engine.FASTJSON_ERROR_PATTERNS），
+# 命中即 in-band 检出并提前返回，不会进入 OOB 分支，故全部离线可跑。
+# 注意：无带内指纹时会自动落到 __run_oob_scan（需外带/网络通道），故反例统一放在
+# tests/fixtures/engines/fastjson_deser_*.json（随 test_engine_fixtures 用 mock OOB 通道离线验证）。
+module: vulnclaw.engines.framework_zero_day_engines
+class: FastjsonDeserializationEngine
+engine: fastjson_deserialization
+
+cases:
+  - id: fastjson_syntax_error_marker
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/json
+    param: data
+    parsed_query: "data=x"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /json:
+        status: 500
+        body: "com.alibaba.fastjson.JSONException: syntax error, pos 2"
+    evidence_contains: "注入 JSON 后响应出现 Fastjson 错误特征 `fastjson`,基线无 —— autoType 解析在处理"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/json' --data-urlencode 'data=x' → 期望命中「Fastjson反序列化(autoType-Closeable)」"
+
+  - id: fastjson_autotype_marker
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/json
+    param: data
+    parsed_query: "data=x"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /json:
+        status: 500
+        body: "autoType is not support. com.sun.rowset.JdbcRowSetImpl"
+    evidence_contains: "注入 JSON 后响应出现 Fastjson 错误特征 `autotype`,基线无 —— autoType 解析在处理"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/json' --data-urlencode 'data=x' → 期望命中「Fastjson反序列化(autoType-Closeable)」"
+
+  - id: fastjson_type_exception_marker
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/json
+    param: data
+    parsed_query: "data=x"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /json:
+        status: 500
+        body: "TypeException: autoType open fail, safeMode deserialied"
+    evidence_contains: "注入 JSON 后响应出现 Fastjson 错误特征 `autotype`,基线无 —— autoType 解析在处理"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/json' --data-urlencode 'data=x' → 期望命中「Fastjson反序列化(autoType-Closeable)」"
+
+  - id: fastjson_parse_exception_marker
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/json
+    param: data
+    parsed_query: "data=x"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /json:
+        status: 400
+        body: "ParseException: unclosed string literal in JSON input"
+    evidence_contains: "注入 JSON 后响应出现 Fastjson 错误特征 `parseexception`,基线无 —— autoType"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/json' --data-urlencode 'data=x' → 期望命中「Fastjson反序列化(autoType-Closeable)」"
+
+  - id: fastjson_unexpected_token_marker
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/json
+    param: data
+    parsed_query: "data=x"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /json:
+        status: 400
+        body: "unexpected token, expected { or [ near \"{\"@type\""
+    evidence_contains: "unexpected token"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/json' --data-urlencode 'data=x' → 期望命中「Fastjson反序列化(autoType-Closeable)」"
+
+  - id: fastjson_jndi_chain_marker
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/json
+    param: data
+    parsed_query: "data=x"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /json:
+        status: 500
+        body: "java.lang.ClassCastException: org.apache.commons.collections.functors.InvokerTransformer"
+    evidence_contains: "org.apache.commons."
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/json' --data-urlencode 'data=x' → 期望命中「Fastjson反序列化(autoType-Closeable)」"

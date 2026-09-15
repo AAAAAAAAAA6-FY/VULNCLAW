@@ -1,0 +1,92 @@
+# G.1/组 D fixture：原型链污染（check 型）正反例。
+# 引擎判定：注入 __proto__/constructor.prototype 键后，唯一 marker(vlc_polluted_*)
+# 在攻击响应回显且带原型污染关键字（保守：需落地验证升级）。
+module: vulnclaw.engines.web_advanced_engines
+class: PrototypePollutionEngine
+engine: prototype_pollution
+
+cases:
+  - id: prototype_query_marker_echo
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/conf?config=x
+    param: config
+    parsed_query: "config=x"
+    normal_resp: [200, '{"ok":true}', {}]
+    responses:
+      /conf:
+        status: 200
+        body: '{"__proto__":{"polluted":"vlc_polluted_aa11bb22"},"ok":true}'
+    evidence_contains: "vlc_polluted"
+    reproduction: "curl -X POST 'http://127.0.0.1:8080/conf' -H 'Content-Type: application/json' --data '{\"__proto__\":{\"polluted\":\"vlcpp\"}}'"
+
+  - id: prototype_benign_conf
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/conf?config=x
+    param: config
+    parsed_query: "config=x"
+    normal_resp: [200, '{"ok":true}', {}]
+    responses:
+      /conf:
+        status: 200
+        body: '{"ok":true}'
+    evidence_contains: ""
+    reproduction: ""
+
+  - id: prototype_lodash_gadget_upgrade
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/conf?config=x
+    param: config
+    parsed_query: "config=x"
+    normal_resp: [200, '{"ok":true}', {}]
+    responses:
+      /conf:
+        status: 200
+        body: '{"__proto__":{"polluted":"vlc_polluted_c1d2e3f4"},"ok":true}'
+      /api:
+        status: 200
+        headers:
+          Server: "nginx"
+          X-Powered-By: "Lodash"
+        body: '{"ok":true,"leaked":{"polluted":"vlc_polluted_c1d2e3f4"}}'
+    evidence_contains: "gadget"
+    reproduction: "curl -X POST 'http://127.0.0.1:8080/conf' -H 'Content-Type: application/json' --data '{\"__proto__\":{\"polluted\":\"vlcpp\"}}'"
+
+  - id: prototype_json_body_marker
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/conf?config=x
+    param: config
+    parsed_query: "config=x"
+    normal_resp: [200, '{"ok":true}', {}]
+    responses:
+      /api:
+        status: 200
+        body: '{"ok":true,"leaked":{"polluted":"vlc_polluted_a5b6c7d8"}}'
+    evidence_contains: "原型链污染"
+    reproduction: "curl -X POST 'http://127.0.0.1:8080/conf' -H 'Content-Type: application/json' --data '{\"__proto__\":{\"polluted\":\"vlcpp\"}}'"
+
+  - id: prototype_gadget_not_upgraded
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/conf?config=x
+    param: config
+    parsed_query: "config=x"
+    normal_resp: [200, '{"ok":true}', {}]
+    responses:
+      /conf:
+        status: 200
+        body: '{"ok":true}'
+      /api:
+        status: 200
+        body: '{"ok":true}'
+      /api/user:
+        status: 200
+        body: '{"ok":true}'
+      /api/me:
+        status: 200
+        body: '{"ok":true}'
+    evidence_contains: ""
+    reproduction: ""

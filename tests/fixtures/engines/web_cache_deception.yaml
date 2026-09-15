@@ -1,0 +1,27 @@
+# G.1/组 D fixture：Web 缓存欺骗（scan 型）正反例。
+# 引擎判定：动态内容经 `<path>/<marker>.css` 伪装路径访问返回同内容(长度比<25%)，且响应
+# 带缓存命中证据(x-cache hit / cf-cache-status / age / cache-control public)。
+module: vulnclaw.engines.http_advanced_engines
+class: WebCacheDeceptionEngine
+engine: web_cache_deception
+
+cases:
+  - id: cache_deception_confusion_hit
+    expect: positive
+    target: http://127.0.0.1:8080/account/billing
+    responses:
+      /account/billing:
+        status: 200
+        body: "<html><body><h1>Monthly Billing</h1><p>invoice detail ...</p></body></html>"
+    evidence_contains: "缓存"
+    reproduction: "fixture 离线复现：/account/billing/vlcwcdabc.css 返回鉴权页同内容且带 x-cache/HIT"
+
+  - id: cache_deception_denied
+    expect: negative
+    target: http://127.0.0.1:8080/account/billing
+    responses:
+      /account/billing:
+        status: 404
+        body: "<html><body>not found</body></html>"
+    evidence_contains: ""
+    reproduction: ""

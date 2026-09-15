@@ -37,6 +37,8 @@ class _FakeRedis:
     def __init__(self):
         self.ping = AsyncMock(return_value=True)
         self.set = AsyncMock()
+        # P0-10：结果上报改为 SETNX 抢占（幂等），claim 成功 = True
+        self.setnx = AsyncMock(return_value=True)
         self.get = AsyncMock()
         self.hset = AsyncMock()
         self.setex = AsyncMock()
@@ -178,7 +180,7 @@ async def test_f_report_result_acks_and_queues(fake_redis):
 
     fake_redis.xack.assert_awaited_once_with(_STREAM_KEY, _GROUP_NAME, "msg-1")
     assert w._current_msg_id is None
-    fake_redis.set.assert_awaited_once_with(f"{_PREFIX}:result:t-005", json.dumps(result, default=str))
+    fake_redis.setnx.assert_awaited_once_with(f"{_PREFIX}:result:t-005", json.dumps(result, default=str))
     fake_redis.delete.assert_awaited_once_with(f"{_PREFIX}:assigned:{w._worker_id}:t-005")
     fake_redis.rpush.assert_awaited_once()
     queued = json.loads(fake_redis.rpush.await_args.args[1])

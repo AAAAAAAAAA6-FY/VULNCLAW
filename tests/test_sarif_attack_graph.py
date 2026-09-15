@@ -62,11 +62,19 @@ class TestSarifGraphs:
         s = json.dumps(sarif, ensure_ascii=False)
         assert json.loads(s)["version"] == "2.1.0"
 
-    def test_no_graph_when_missing(self):
+    def test_graph_built_when_missing(self):
+        """E1.5 非 AI 路径兜底：报告有漏洞但缺 attack_graph 时应自动补建（工作流9 接线门禁）。"""
         sarif = generate_sarif({"target": "http://t.example.com", "vulnerabilities": VULNS})
-        assert "graphs" not in sarif["runs"][0]
+        run0 = sarif["runs"][0]
+        assert "graphs" in run0 and run0["graphs"][0]["nodes"]
         # 主流程不破坏
-        assert sarif["runs"][0]["results"]
+        assert run0["results"]
+
+    def test_no_graph_when_empty(self):
+        """空报告（无漏洞/无资产/无子域）不得注入攻击图——与 ensure_attack_graph 守卫一致。"""
+        sarif = generate_sarif({"target": "http://t.example.com", "vulnerabilities": []})
+        assert "graphs" not in sarif["runs"][0]
+        assert sarif["runs"][0]["results"] == []
 
 
 # ============================================================

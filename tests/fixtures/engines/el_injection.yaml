@@ -1,0 +1,48 @@
+# G.1/组 D fixture：EL 表达式注入（check 型）正反例。
+# 引擎用算术回显（${7*7}->49）与 #{} 变体判定：攻击响应出现运算结果且基线无即命中。
+module: vulnclaw.engines.input_engines
+class: ELInjectionEngine
+engine: el_injection
+
+cases:
+  - id: el_math_echo_positive
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/el?expr=x
+    param: expr
+    parsed_query: "expr=x"
+    normal_resp: [200, "expression page ok", {}]
+    responses:
+      /el:
+        status: 200
+        body: "result=49"
+    evidence_contains: "49"
+    reproduction: "curl --get 'http://127.0.0.1:8080/el' --data-urlencode 'expr=${7*7}'"
+
+  - id: el_benign_page
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/el?expr=x
+    param: expr
+    parsed_query: "expr=x"
+    normal_resp: [200, "expression page ok", {}]
+    responses:
+      /el:
+        status: 200
+        body: "expression page ok"
+    evidence_contains: ""
+    reproduction: ""
+
+  - id: el_hash_math_echo
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/el?expr=x
+    param: expr
+    parsed_query: "expr=x"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /el:
+        status: 200
+        body: "computed=4928"
+    evidence_contains: "4928"
+    reproduction: "curl --get 'http://127.0.0.1:8080/el' --data-urlencode 'expr=#{7*7}7'"

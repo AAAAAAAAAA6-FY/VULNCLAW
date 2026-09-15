@@ -77,6 +77,24 @@ def test_finding_roundtrip_and_dedup(tmp_path):
     s.close()
 
 
+def test_add_findings_batch(tmp_path):
+    """P1-11：批量落盘与逐条落盘等价（幂等合并 + 单事务）。"""
+    s = _new_store(tmp_path)
+    f1 = {"url": "u", "parameter": "p", "type": "sqli", "method": "GET", "evidence": "e" * 100}
+    f2 = dict(f1)  # 同 fid → 批内去重
+    f3 = {"url": "u2", "parameter": "p", "type": "xss", "method": "GET", "evidence": "x"}
+    written = s.add_findings([f1, f2, f3])
+    assert written == 3  # 按行写入计数（合并发生在 DB 层 INSERT OR REPLACE）
+    loaded = s.load_findings()
+    assert len(loaded) == 2  # f1/f2 同 fid → 只留一条
+    assert {f["url"] for f in loaded} == {"u", "u2"}
+    # 空列表 / 全非字典 → 0 且无副作用
+    assert s.add_findings([]) == 0
+    assert s.add_findings(["not-a-dict"]) == 0
+    assert len(s.load_findings()) == 2
+    s.close()
+
+
 def test_agent_memory_roundtrip(tmp_path):
     s = _new_store(tmp_path)
     mem = {"experiences": [{"target": "t", "tool": "sqli", "success": True}]}

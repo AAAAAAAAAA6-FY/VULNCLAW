@@ -1,0 +1,38 @@
+# G.1 fixture：双会话差分水平越权 oracle（IDOR/BOLA 双会话）正反例。
+# check() 恒 fail-closed；差分判定走 diagnose()：需要 identity_a/identity_b 双身份矩阵
+# （IdentityMatrix）。正例：身份B（第二账号）可直接取走身份A 自属资源 -> horizontal_leak。
+# 反例：服务端已强制鉴权（B 请求 A 资源返回 403，无私有标记）-> oracle fail-closed。
+# 注：仅作数据集原料与审计口径；真实双会话链路由 scripts/idor_multirole_e2e.py 闭环验证。
+# evidence_contains / reproduction 为深度统计口径字段（组 E 统计脚本读取）。
+module: vulnclaw.engines.biz_oracle_engines
+class: DualSessionOracleEngine
+engine: idor_dual_session
+
+cases:
+  - id: cross_account_private_leak
+    expect: positive
+    # diagnose() 语义：身份B 对 own_value 自属资源请求命中身份A 私有标记 => 水平越权证实
+    url: http://127.0.0.1:8080/api/profile?id=1
+    param: id
+    parsed_query: "id=1"
+    normal_resp: [200, '{"id":1,"name":"alice","email":"alice@corp.local","private_token":"a1b2"}', {}]
+    responses:
+      /api/profile:
+        status: 200
+        body: '{"id":1,"name":"alice","email":"alice@corp.local","private_token":"a1b2"}'
+    evidence_contains: "双会话差分证实"
+    reproduction: "fixture 复现（离线 mock）：identity_a(id=1) 携身份A令牌、identity_b 携身份B令牌双会话请求 /api/profile?id=1 → 身份B 命中 private_token 私有标记，判 horizontal_leak"
+
+  - id: forced_authz_cross_account_deny
+    expect: negative
+    url: http://127.0.0.1:8080/api/profile?id=1
+    param: id
+    parsed_query: "id=1"
+    # 服务端已做属主断言：身份B 访问 A 资源返回 403，无私有标记 -> 引擎 fail-closed
+    normal_resp: [200, '{"id":1,"name":"alice"}', {}]
+    responses:
+      /api/profile:
+        status: 403
+        body: '{"error":"forbidden"}'
+    evidence_contains: ""
+    reproduction: ""

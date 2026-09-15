@@ -1,0 +1,49 @@
+# G.1/组 D fixture：Struts2 OGNL 注入（check 型）正反例。
+# 引擎判定：算数回显水印（%{123+456}->579）或被求值的运算结果在攻击响应出现且基线无；
+# 无回显时走 _run_oob_scan 外带（已由 oob_mock_struts2_* json 覆盖真实通道）。
+module: vulnclaw.engines.framework_zero_day_engines
+class: Struts2OGNLEngine
+engine: struts2_ognl
+
+cases:
+  - id: struts2_ognl_math_echo
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/action?method=x
+    param: method
+    parsed_query: "method=x"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /action:
+        status: 200
+        body: "value=579"
+    evidence_contains: "579"
+    reproduction: "curl --get 'http://127.0.0.1:8080/action' --data-urlencode 'method=%{123+456}'"
+
+  - id: struts2_benign_page
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/action?method=x
+    param: method
+    parsed_query: "method=x"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /action:
+        status: 200
+        body: "ok"
+    evidence_contains: ""
+    reproduction: ""
+
+  - id: struts2_ognl_error_sig
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/action?method=x
+    param: method
+    parsed_query: "method=x"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /action:
+        status: 500
+        body: "ognl.OgnlException: Source is null for getProperty(null, ...)\n at org.apache.struts2..."
+    evidence_contains: "org.apache.struts"
+    reproduction: "curl --get 'http://127.0.0.1:8080/action' --data-urlencode 'method=${123+456}'（服务端 OGNL 解析报错指纹）"

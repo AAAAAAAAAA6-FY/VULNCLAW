@@ -1,0 +1,189 @@
+module: vulnclaw.engines.web_engines
+class: LFIEngine
+engine: lfi
+
+target: http://127.0.0.1:8080/download?file=readme.txt
+
+cases:
+  - id: passwd_file_disclosure
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/download?file=readme.txt
+    param: file
+    parsed_query: "file=readme.txt"
+    normal_resp: [200, "readme", {}]
+    responses:
+      /download:
+        status: 200
+        body: "root:x:0:0:root:/root:/bin/bash"
+    evidence_contains: "root:x:0:0:root:/root:/bin/bash"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/download' --data-urlencode 'file=readme.txt' → 期望命中「文件包含-LFI(Windows win.ini)」"
+
+  - id: safe_download_response
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/download?file=readme.txt
+    param: file
+    parsed_query: "file=readme.txt"
+    normal_resp: [200, "readme", {}]
+    responses:
+      /download:
+        status: 200
+        body: "readme"
+
+  # ---------- 正例：敏感配置/源码/日志/目录列表 ----------
+  - id: env_secrets_disclosure
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/download?file=readme.txt
+    param: file
+    parsed_query: "file=readme.txt"
+    normal_resp: [200, "readme", {}]
+    responses:
+      /download:
+        status: 200
+        body: "DB_PASSWORD=sup3r3ncrypted\nSECRET_KEY=prod-key\nDATABASE_URL=mysql://app:pass@db"
+    evidence_contains: "DB_PASSWORD=sup3r3ncrypted"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/download' --data-urlencode 'file=readme.txt' → 期望命中「文件包含-LFI(Windows win.ini)」"
+
+  - id: winini_disclosure
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/download?file=readme.txt
+    param: file
+    parsed_query: "file=readme.txt"
+    normal_resp: [200, "readme", {}]
+    responses:
+      /download:
+        status: 200
+        body: "[boot loader]\ntimeout=30\ndefault=multi(0)disk(0)rdisk(0)partition(1)\\WINDOWS\n[operating systems]"
+    evidence_contains: "[boot loader]"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/download' --data-urlencode 'file=readme.txt' → 期望命中「文件包含-LFI(Windows win.ini)」"
+
+  - id: php_source_disclosure
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/download?file=readme.txt
+    param: file
+    parsed_query: "file=readme.txt"
+    normal_resp: [200, "readme", {}]
+    responses:
+      /download:
+        status: 200
+        body: "<?php\n$cmd = $_GET['cmd'];\necho system($cmd);\n?>"
+    evidence_contains: "<?php"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/download' --data-urlencode 'file=readme.txt' → 期望命中「文件包含-LFI(Windows win.ini)」"
+
+  - id: apache_access_log
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/download?file=readme.txt
+    param: file
+    parsed_query: "file=readme.txt"
+    normal_resp: [200, "readme", {}]
+    responses:
+      /download:
+        status: 200
+        body: "127.0.0.1 - - [12/May/2026:10:00:01 +0000] \"GET /poc.php HTTP/1.1\" 200"
+    evidence_contains: "12/May/2026:10:00:01"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/download' --data-urlencode 'file=readme.txt' → 期望命中「文件包含-LFI(Windows win.ini)」"
+
+  - id: dotenv_config
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/download?file=readme.txt
+    param: file
+    parsed_query: "file=readme.txt"
+    normal_resp: [200, "readme", {}]
+    responses:
+      /download:
+        status: 200
+        body: "APP_KEY=base64:abcdef==\nJWT_SECRET=tops3cr3t\nAPI_KEY=AKIAIOSFODNN7EXAMPLE"
+    evidence_contains: "APP_KEY=base64:abcdef=="
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/download' --data-urlencode 'file=readme.txt' → 期望命中「文件包含-LFI(Windows win.ini)」"
+
+  - id: directory_listing
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/download?file=readme.txt
+    param: file
+    parsed_query: "file=readme.txt"
+    normal_resp: [200, "readme", {}]
+    responses:
+      /download:
+        status: 200
+        body: "<html><head><title>Index of /download</title></head><body><pre><a href=\"readme.txt\">readme.txt</a>\t<a href=\"backup/\">backup/</a></pre></body></html>"
+
+  # ---------- 反例：空 / 5xx / WAF / 重定向 / 非文件参数 ----------
+    evidence_contains: "发现 2 个目录项: readme.txt, backup/"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/download' --data-urlencode 'file=readme.txt' → 期望命中「路径遍历-目录列表」"
+  - id: empty_response
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/download?file=readme.txt
+    param: file
+    parsed_query: "file=readme.txt"
+    normal_resp: [200, "readme", {}]
+    responses:
+      /download:
+        status: 200
+        body: ""
+
+  - id: server_error_5xx
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/download?file=readme.txt
+    param: file
+    parsed_query: "file=readme.txt"
+    normal_resp: [200, "readme", {}]
+    responses:
+      /download:
+        status: 502
+        body: "502 Bad Gateway"
+
+  - id: waf_block_403
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/download?file=readme.txt
+    param: file
+    parsed_query: "file=readme.txt"
+    normal_resp: [200, "readme", {}]
+    responses:
+      /download:
+        status: 403
+        body: "<html><body>403 Forbidden by WAF</body></html>"
+
+  - id: redirect_302
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/download?file=readme.txt
+    param: file
+    parsed_query: "file=readme.txt"
+    normal_resp: [200, "readme", {}]
+    responses:
+      /download:
+        status: 302
+        body: ""
+
+  - id: non_file_param_search
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/search?q=tools
+    param: q
+    parsed_query: "q=tools"
+    normal_resp: [200, '{"hits":[]}', {}]
+    responses: {}
+
+  - id: secure_download_octet
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/download?file=readme.txt
+    param: file
+    parsed_query: "file=readme.txt"
+    # normal_resp 与攻击响应一致（YAML 双引号会解析 \x00 为 NUL 控制字符，
+    # 此处以纯文本表达"非文件内容的响应"，无假 diff）
+    normal_resp: [200, "binary blob, not text", {}]
+    responses:
+      /download:
+        status: 200
+        body: "binary blob, not text"

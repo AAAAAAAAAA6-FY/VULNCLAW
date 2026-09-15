@@ -1,0 +1,35 @@
+# G.1/组 D fixture：容器/K8s 配置风险（check 型）正反例。
+# 引擎判定：响应内容命中风险特征（/var/run/docker.sock、securityContext.privileged true、
+# /etc/kubernetes、allowPrivilegeEscalation true 等）。
+module: vulnclaw.engines.container_engines
+class: ContainerSecurityEngine
+engine: container_security
+
+cases:
+  - id: docker_sock_mount_risk
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/pod
+    param: config
+    parsed_query: "config=x"
+    normal_resp: [200, "volumes:\n  - name: docker\n    hostPath:\n      path: /var/run/docker.sock\n      type: Socket", {}]
+    responses:
+      /pod:
+        status: 200
+        body: "volumes:\n  - name: docker\n    hostPath:\n      path: /var/run/docker.sock\n      type: Socket"
+    evidence_contains: "/var/run/docker.sock"
+    reproduction: "curl -s 'http://127.0.0.1:8080/pod'  # 返回含 Docker socket 挂载的 K8s 清单"
+
+  - id: clean_pod_manifest
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/pod
+    param: config
+    parsed_query: "config=x"
+    normal_resp: [200, "securityContext:\n  runAsNonRoot: true\n  readOnlyRootFilesystem: true", {}]
+    responses:
+      /pod:
+        status: 200
+        body: "securityContext:\n  runAsNonRoot: true\n  readOnlyRootFilesystem: true"
+    evidence_contains: ""
+    reproduction: ""

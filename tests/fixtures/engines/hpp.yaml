@@ -1,0 +1,34 @@
+# G.1/组 D fixture：HTTP 参数污染（HPP，check 型）正反例。
+# 引擎双值注入（&param=marker），marker 被回显或响应与基线差异明显即命中。
+module: vulnclaw.engines.input_engines
+class: HPPEngine
+engine: hpp
+
+cases:
+  - id: hpp_marker_reflected_last
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/search?q=orig
+    param: q
+    parsed_query: "q=orig"
+    normal_resp: [200, "results for orig", {}]
+    responses:
+      /search:
+        status: 200
+        body: "results for hppprobe marker（后值生效）"
+    evidence_contains: "hppprobe"
+    reproduction: "curl --get 'http://127.0.0.1:8080/search' --data-urlencode 'q=orig' --data-urlencode 'q=hppprobe0123ab'"
+
+  - id: hpp_normal_page
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/search?q=orig
+    param: q
+    parsed_query: "q=orig"
+    normal_resp: [200, "results for orig", {}]
+    responses:
+      /search:
+        status: 200
+        body: "results for orig"
+    evidence_contains: ""
+    reproduction: ""

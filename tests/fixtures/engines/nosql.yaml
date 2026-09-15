@@ -1,0 +1,127 @@
+# G.1 fixture：NoSQL 注入参数级 check 正反例。
+# 正例验证服务端返回 MongoDB 风格错误签名（unknown operator $ne）→ 注入可触发；
+# 负例为正常登录失败响应，注入 payload 与正常响应无差异，不误报。
+module: vulnclaw.engines.web_engines
+class: NoSQLEngine
+engine: nosql
+
+cases:
+  - id: mongodb_ne_error_reflected
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/api/login
+    param: user
+    parsed_query: "user=demo"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /api/login:
+        status: 200
+        body: '{"error":"MongoError: unknown operator $ne"}'
+    evidence_contains: "{\"error\":\"MongoError: unknown operator $ne\"}"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/api/login' --data-urlencode 'user=demo' → 期望命中「NoSQL注入(MongoDB $ne(不等于))」"
+
+  - id: safe_login_no_injection
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/api/login
+    param: user
+    parsed_query: "user=demo"
+    normal_resp: [200, '{"message":"invalid credentials"}', {}]
+    responses:
+      /api/login:
+        status: 200
+        body: '{"message":"invalid credentials"}'
+
+  # ---------- 正例：$where / $ne 等操作符报错签名 ----------
+  - id: mongodb_where_error
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/api/login
+    param: user
+    parsed_query: "user=demo"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /api/login:
+        status: 200
+        body: '{"error":"MongoError: unknown operator $where"}'
+    evidence_contains: "{\"error\":\"MongoError: unknown operator $where\"}"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/api/login' --data-urlencode 'user=demo' → 期望命中「NoSQL注入(MongoDB $ne(不等于))」"
+
+  - id: mongodb_regex_error
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/api/login
+    param: user
+    parsed_query: "user=demo"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /api/login:
+        status: 200
+        body: '{"error":"MongoError: invalid operator $regex"}'
+    evidence_contains: "{\"error\":\"MongoError: invalid operator $regex\"}"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/api/login' --data-urlencode 'user=demo' → 期望命中「NoSQL注入(MongoDB $ne(不等于))」"
+
+  - id: mongodb_gt_error
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/api/login
+    param: user
+    parsed_query: "user=demo"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /api/login:
+        status: 200
+        body: '{"errmsg":"MongoDB unknown operator: $gt","code":2}'
+
+  # ---------- 反例：正常登录失败 / 5xx / WAF / 空响应 ----------
+    evidence_contains: "{\"errmsg\":\"MongoDB unknown operator: $gt\",\"code\":2}"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/api/login' --data-urlencode 'user=demo' → 期望命中「NoSQL注入(MongoDB $ne(不等于))」"
+  - id: normal_auth_server_error
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/api/login
+    param: user
+    parsed_query: "user=demo"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /api/login:
+        status: 500
+        body: "Internal Server Error"
+
+  - id: waf_blocked_login
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/api/login
+    param: user
+    parsed_query: "user=demo"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /api/login:
+        status: 403
+        body: "<html><body>403 Forbidden</body></html>"
+
+  - id: empty_auth_response
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/api/login
+    param: user
+    parsed_query: "user=demo"
+    # normal_resp 与攻击响应一致：端点本就返回空，无假 diff
+    normal_resp: [200, "", {}]
+    responses:
+      /api/login:
+        status: 200
+        body: ""
+
+  - id: non_json_param
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/api/login
+    param: act
+    parsed_query: "act=login"
+    # 非 JSON 参数端点正常响应：mock 命中且与 normal 一致，注入无差异
+    normal_resp: [200, "ok", {}]
+    responses:
+      /api/login:
+        status: 200
+        body: "ok"

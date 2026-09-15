@@ -1,0 +1,105 @@
+engine: csrf
+module: vulnclaw.engines.http_advanced_engines
+class: CSRFEngine
+name: csrf 表单无 Token 防护缺失
+description: |
+  CSRF 引擎（scan 型）解析页面 HTML 表单：当表单为 POST 或 action 命中敏感操作
+  （login/logout/delete/upload…）且未发现 csrf/xsrf/nonce/token 类字段时，报 Medium 级
+  「CSRF防护缺失(表单无Token)」。本 fixture 验证「无保护表单报正例、有 Token 表单不报反例」。
+
+cases:
+  - id: form_without_token_post
+    method: scan
+    expect: positive
+    target: http://127.0.0.1:8080
+    responses:
+      "/":
+        status: 200
+        headers:
+          Content-Type: "text/html; charset=utf-8"
+        body: |
+          <html><body>
+          <form method="post" action="/login">
+            <input name="username">
+            <input name="password">
+            <button type="submit">登录</button>
+          </form>
+          </body></html>
+    evidence_contains: "CSRF Token"
+    reproduction: "fixture 复现（离线 mock）：GET http://127.0.0.1:8080/ → 期望命中「CSRF防护缺失(表单无Token)」"
+
+  - id: form_with_csrf_token
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      "/":
+        status: 200
+        headers:
+          Content-Type: "text/html; charset=utf-8"
+        body: |
+          <html><body>
+          <form method="post" action="/login">
+            <input name="username">
+            <input name="csrf_token">
+            <button type="submit">登录</button>
+          </form>
+          </body></html>
+    evidence_contains: ""
+    reproduction: "fixture 复现（离线 mock）：带 csrf_token 字段的表单 → 期望无任何 finding"
+
+  - id: form_without_token_get_state_change
+    method: scan
+    expect: positive
+    target: http://127.0.0.1:8080
+    responses:
+      "/":
+        status: 200
+        headers:
+          Content-Type: "text/html; charset=utf-8"
+        body: |
+          <html><body>
+          <form method="get" action="/admin/delete?id=1">
+            <input name="id" value="1">
+            <button type="submit">删除</button>
+          </form>
+          </body></html>
+    evidence_contains: "CSRF"
+    reproduction: "fixture 复现（离线 mock）：GET http://127.0.0.1:8080/ → 命中 GET 状态变更表单无 CSRF Token"
+
+  - id: form_with_hidden_anti_csrf
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      "/":
+        status: 200
+        headers:
+          Content-Type: "text/html; charset=utf-8"
+        body: |
+          <html><body>
+          <form method="post" action="/profile/update">
+            <input type="hidden" name="authenticity_token" value="abc123">
+            <input name="email">
+            <button type="submit">保存</button>
+          </form>
+          </body></html>
+    evidence_contains: ""
+    reproduction: ""
+
+  - id: page_no_forms
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      "/":
+        status: 200
+        headers:
+          Content-Type: "text/html; charset=utf-8"
+        body: |
+          <html><body>
+          <h1>欢迎</h1>
+          <p>这是一个纯静态页面，无任何表单。</p>
+          </body></html>
+    evidence_contains: ""
+    reproduction: ""

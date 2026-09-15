@@ -1,0 +1,27 @@
+# G.1/组 D fixture：API 版本差异检测（scan 型）正反例。
+# 引擎判定：目标含版本片段(/v1/)时探测对应新版(/v2/)，两版本均 2xx 存活即报多版本暴露，
+# 并对比新版本安全头降级。
+module: vulnclaw.engines.api_version
+class: APIVersionEngine
+engine: api_version
+
+cases:
+  - id: api_multiple_versions_alive
+    expect: positive
+    target: http://127.0.0.1:8080/api/v1/users
+    responses:
+      /api/v2/users:
+        status: 200
+        body: '[{"id":1}]'
+    evidence_contains: "多版本"
+    reproduction: "curl -s -o /dev/null -w '%{http_code}\\n' 'http://127.0.0.1:8080/api/v1/users' 'http://127.0.0.1:8080/api/v2/users'  # v1+v2 同时存活"
+
+  - id: api_single_version
+    expect: negative
+    target: http://127.0.0.1:8080/app
+    responses:
+      /app:
+        status: 200
+        body: "home"
+    evidence_contains: ""
+    reproduction: ""

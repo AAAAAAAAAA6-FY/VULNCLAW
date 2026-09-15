@@ -22,6 +22,7 @@ SRC_PKG = ROOT / "src" / "vulnclaw"
 ALLOWED_ROOT_ITEMS = {
     "src", "tests", "docs", "scripts", "assets", "thirdparty",
     "pyproject.toml", "README.md", "CHANGELOG.md", "CONTRIBUTING.md", "SECURITY.md",
+    "HANDOFF.md",  # 跨 Agent 交接文档（有意放根目录；此前漏登记导致 root_is_clean 误红）
     "LICENSE", ".gitignore", ".pre-commit-config.yaml",
     "_runtime_cache", "venv", ".vscode", ".idea", ".trae", ".codebuddy",
     # 薄壳入口与启动/环境文件
@@ -29,11 +30,17 @@ ALLOWED_ROOT_ITEMS = {
     "start_vulnclaw.sh", "start_vulnclaw.ps1",
     # Docker 部署文件（项目已有，2026-08-30 登记入白名单）
     "Dockerfile", "docker-compose.yaml",
+    # scripts/sbom.py 的默认输出产物（供应链 SBOM JSON，2026-09-13 登记入白名单）
+    "SBOM.json",
     ".git", ".github",
     # pytest-cov / coverage.py 的运行时产物（已在 .gitignore 中忽略；允许其出现在根，避免 --cov 跑完 layout 守卫变红）
     ".coverage", ".coverage.*",
     # coverage / pytest-reportlog 输出目录
     "htmlcov", ".pytest_cache",
+    # ruff 缓存目录（工具产物，与 .pytest_cache 同类）
+    ".ruff_cache",
+    # 部署清单目录（deploy/*.yaml、*.tpl：k8s/helm/裸机部署模板，项目自有）
+    "deploy",
 }
 
 # 旧顶层包：必须全部已迁入 src/vulnclaw/
@@ -107,17 +114,20 @@ def _purge_src_pycache_before_layout_checks():
         try:
             shutil.rmtree(pycache, ignore_errors=True)
             removed += 1
-        except Exception:
+        except (Exception, SystemExit):  # SystemExit：IDE safe-delete 钩子会抛，Exception 接不住
             pass
     for pyc in SRC_PKG.rglob("*.pyc"):
         try:
             pyc.unlink()
-        except Exception:
+        except (Exception, SystemExit):
             pass
     yield
     # 用例跑完后再清一次，避免下个会话继续被上一次的 pyc 污染。
     for pycache in SRC_PKG.rglob("__pycache__"):
-        shutil.rmtree(pycache, ignore_errors=True)
+        try:
+            shutil.rmtree(pycache, ignore_errors=True)
+        except (Exception, SystemExit):
+            pass
 
 
 def test_no_runtime_cache_or_pycache_in_src():

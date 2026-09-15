@@ -23,8 +23,12 @@
 import asyncio
 import base64
 import fnmatch
+import json
+import os
 import pickle
 from unittest.mock import AsyncMock, patch
+
+import pytest
 
 from vulnclaw.distributed.redis_backend import RedisContext
 
@@ -74,7 +78,24 @@ class _FakeRedis:
         return removed
 
     async def keys(self, pattern):
+        self.keys_calls = getattr(self, "keys_calls", 0) + 1
         return [k for k in self.store if fnmatch.fnmatchcase(k, pattern)]
+
+    async def scan(self, cursor=0, match=None, count=100):
+        """P1-12：SCAN 增量迭代（单次返回，游标回 0 结束）。"""
+        self.scan_calls = getattr(self, "scan_calls", 0) + 1
+        keys = [k for k in self.store if fnmatch.fnmatchcase(k, match or "*")]
+        return 0, keys[: int(count or 100)]
+
+    async def mget(self, keys):
+        self.mget_calls = getattr(self, "mget_calls", 0) + 1
+        return [self.store.get(k) for k in keys]
+
+    async def setnx(self, key, value):
+        if key in self.store:
+            return False
+        self.store[key] = value
+        return True
 
     async def exists(self, key):
         return 1 if key in self.store else 0
@@ -90,6 +111,80 @@ async def _run_fallback(scenario) -> RedisContext:
     with patch("redis.asyncio.from_url", side_effect=ConnectionError("no redis server")):
         await scenario(ctx)
     return ctx
+
+
+# ============================================================
+# P0-8 / P1-12：降级可观测 + fail-stop + SCAN/MGET 替代 KEYS
+# ============================================================
+class TestDegradedObservability:
+    def test_fallback_reports_degraded_state(self):
+        """P0-8：降级必须可观测（不许再静默当成功）。"""
+        async def scenario(ctx):
+            await ctx.set("k", 1)
+        ctx = asyncio.run(_run_fallback(scenario))
+        assert ctx.degraded() is True
+        info = ctx.degraded_info()
+        assert info["degraded"] is True
+        assert "connect" in (info["reason"] or ""), info
+
+    def test_fail_stop_raises_instead_of_silent_fallback(self):
+        """P0-8：fail-stop 开启 → 抛错，不用节点本地内存冒充分布式状态。"""
+        ctx = _make_ctx()
+        ctx._fail_stop = True
+        with patch("redis.asyncio.from_url", side_effect=ConnectionError("down")):
+            try:
+                asyncio.run(ctx.set("k", 1))
+            except RuntimeError as exc:
+                assert "fail-stop" in str(exc)
+            else:
+                raise AssertionError("fail-stop 开启时未抛错（仍会静默降级！）")
+
+    def test_default_is_not_fail_stop(self):
+        """默认关闭，保证无 Redis 单机场景可用性不回归。"""
+        ctx = _make_ctx()
+        assert ctx._fail_stop is False
+
+
+class TestScanInsteadOfKeys:
+    @staticmethod
+    def _ctx_with_fake(store=None):
+        fake = _FakeRedis(store or {})
+        ctx = _make_ctx()
+        ctx._redis = fake
+        return ctx, fake
+
+    def test_get_all_uses_scan_and_mget(self):
+        """P1-12：get_all 走 SCAN+MGET，不再 KEYS + 逐 key GET。"""
+        async def scenario():
+            ctx, fake = self._ctx_with_fake({
+                "vulnclaw:ctx:a": b"s:1", "vulnclaw:ctx:b": b"j:2"})
+            got = await ctx.get_all()
+            assert got == {"a": "1", "b": 2}
+            assert getattr(fake, "scan_calls", 0) >= 1
+            assert getattr(fake, "mget_calls", 0) >= 1
+            assert getattr(fake, "keys_calls", 0) == 0
+        asyncio.run(scenario())
+
+    def test_clear_uses_scan(self):
+        async def scenario():
+            ctx, fake = self._ctx_with_fake({
+                "vulnclaw:ctx:a": b"s:1", "vulnclaw:ctx:b": b"s:2"})
+            await ctx.clear()
+            assert fake.store == {}
+            assert getattr(fake, "scan_calls", 0) >= 1
+            assert getattr(fake, "keys_calls", 0) == 0
+        asyncio.run(scenario())
+
+    def test_falls_back_to_keys_when_scan_unavailable(self):
+        class _NoScan(_FakeRedis):
+            async def scan(self, *a, **k):
+                raise AttributeError("no scan")
+
+        async def scenario():
+            ctx = _make_ctx()
+            ctx._redis = _NoScan({"vulnclaw:ctx:z": b"s:9"})
+            assert await ctx.get_all() == {"z": "9"}
+        asyncio.run(scenario())
 
 
 # ============================================================
@@ -551,3 +646,153 @@ class TestSerializationRoundtrip:
                 assert await ctx.get("old") == {"a": 1}
 
         asyncio.run(scenario())
+
+
+@pytest.fixture(autouse=True)
+def _isolate_wal(tmp_path, monkeypatch):
+    """把 WAL 重定向到 tmp，避免测试之间通过 WAL 文件互相污染。
+
+    WAL 默认开启后会真实落盘。若不隔离，前一个"降级测试"写入的 WAL
+    会被后一个"Redis 路径测试"在首次连接时自动回放，把陈旧键值灌进
+    fake store —— test_get_all 这类全量断言会莫名失败（且极难定位）。
+    """
+    from vulnclaw.config.settings import settings
+    monkeypatch.setattr(settings, "redis_wal_path", str(tmp_path / "wal.jsonl"))
+    monkeypatch.setattr(settings, "redis_wal_enabled", True)
+
+
+# ============================================================
+# 7. P0-8 补：降级期 WAL（落盘 + 恢复后回放）
+# ============================================================
+class TestDegradedWAL:
+    """降级期写入此前只活在本进程内存：进程一退就丢，且从不回灌 Redis。
+
+    WAL 保证这些写入落盘，Redis 恢复（或进程重启）后按序回放。
+    """
+
+    @staticmethod
+    def _ctx_with_wal(tmp_path, name="wal.jsonl"):
+        """构造一个 WAL 指向 tmp_path 的 ctx（绕过 settings，路径可控）。"""
+        ctx = RedisContext(redis_url=REDIS_URL, prefix=PREFIX)
+        ctx._wal_path = str(tmp_path / name)
+        ctx._wal_enabled = True
+        return ctx
+
+    @staticmethod
+    def _read_wal(path):
+        with open(path, encoding="utf-8") as fh:
+            return [l for l in fh.read().splitlines() if l.strip()]
+
+    def test_degraded_writes_land_in_wal(self, tmp_path):
+        """降级期 set 必须落 WAL（否则恢复后无从回放）。"""
+        async def scenario(ctx):
+            await ctx.set("a", 1)
+            await ctx.set("b", {"x": "y"})
+
+        ctx = self._ctx_with_wal(tmp_path)
+        with patch("redis.asyncio.from_url", side_effect=ConnectionError("down")):
+            asyncio.run(scenario(ctx))
+
+        assert os.path.exists(ctx._wal_path), "降级写入未落 WAL"
+        lines = self._read_wal(ctx._wal_path)
+        assert len(lines) == 2
+        assert json.loads(lines[0])["key"] == "a"
+
+    def test_replay_refills_redis_after_recovery(self, tmp_path):
+        """Redis 恢复后首次连接自动回放：降级期写入真的进 Redis（不再永久丢失）。"""
+        async def scenario(ctx):
+            await ctx.set("a", 42)
+            await ctx.set("b", "hello")
+
+        ctx = self._ctx_with_wal(tmp_path)
+        with patch("redis.asyncio.from_url", side_effect=ConnectionError("down")):
+            asyncio.run(scenario(ctx))
+
+        # 新 ctx 复用同一 WAL（模拟进程重启后 Redis 已恢复）
+        ctx2 = self._ctx_with_wal(tmp_path)
+        fake = _FakeRedis()
+
+        async def recover():
+            with patch("redis.asyncio.from_url", return_value=fake):
+                await ctx2.set("c", "after")  # 首次连接即触发自动回放
+
+        asyncio.run(recover())
+
+        assert ctx2._deserialize(fake.store["vulnclaw:ctx:a"]) == 42
+        assert ctx2._deserialize(fake.store["vulnclaw:ctx:b"]) == "hello"
+        assert ctx2._deserialize(fake.store["vulnclaw:ctx:c"]) == "after"
+        # 回放成功后 WAL 必须清空（否则下次重复回灌）
+        assert self._read_wal(ctx2._wal_path) == []
+
+    def test_delete_and_merge_semantics_replayed(self, tmp_path):
+        """delete（get_and_clear）与 update 合并值都能被正确回放。"""
+        async def scenario(ctx):
+            await ctx.set("gone", "x")
+            await ctx.get_and_clear("gone")   # -> WAL delete
+            await ctx.set("lst", [1])
+            await ctx.update("lst", [2, 3])   # -> WAL 记合并后的 [1, 2, 3]
+
+        ctx = self._ctx_with_wal(tmp_path)
+        with patch("redis.asyncio.from_url", side_effect=ConnectionError("down")):
+            asyncio.run(scenario(ctx))
+
+        ctx2 = self._ctx_with_wal(tmp_path)
+        fake = _FakeRedis({"vulnclaw:ctx:gone": b"s:stale"})  # 回放前已存在的陈旧值
+
+        async def recover():
+            with patch("redis.asyncio.from_url", return_value=fake):
+                await ctx2.set("k", 0)
+
+        asyncio.run(recover())
+        assert "vulnclaw:ctx:gone" not in fake.store, "delete 未被回放"
+        assert ctx2._deserialize(fake.store["vulnclaw:ctx:lst"]) == [1, 2, 3]
+
+    def test_replay_is_idempotent(self, tmp_path):
+        """重复 replay 不报错且返回 0（WAL 已空），不会重复回灌。"""
+        async def scenario(ctx):
+            await ctx.set("a", 1)
+
+        ctx = self._ctx_with_wal(tmp_path)
+        with patch("redis.asyncio.from_url", side_effect=ConnectionError("down")):
+            asyncio.run(scenario(ctx))
+
+        ctx2 = self._ctx_with_wal(tmp_path)
+        fake = _FakeRedis()
+
+        async def recover():
+            with patch("redis.asyncio.from_url", return_value=fake):
+                await ctx2.set("z", 9)          # 触发自动回放（第 1 次）
+                return await ctx2.replay_wal()  # 第 2 次：应为 no-op
+
+        assert asyncio.run(recover()) == 0
+        assert ctx2._deserialize(fake.store["vulnclaw:ctx:a"]) == 1
+
+    def test_wal_disabled_writes_nothing(self, tmp_path):
+        """开关关闭时不产生任何 WAL 文件（保持旧行为）。"""
+        ctx = self._ctx_with_wal(tmp_path)
+        ctx._wal_enabled = False
+
+        async def scenario():
+            with patch("redis.asyncio.from_url", side_effect=ConnectionError("down")):
+                await ctx.set("a", 1)
+
+        asyncio.run(scenario())
+        assert not os.path.exists(ctx._wal_path)
+
+    def test_corrupt_wal_line_is_skipped(self, tmp_path):
+        """WAL 尾部半行（断电残留）不得让回放整体炸掉。"""
+        ctx = self._ctx_with_wal(tmp_path)
+        with open(ctx._wal_path, "w", encoding="utf-8") as fh:
+            fh.write('{"op":"set","key":"ok","value":')  # 被截断的半行
+            fh.write("\n")
+
+        fake = _FakeRedis()
+        ctx._redis = fake
+        # 坏行跳过 -> 不计入 applied；整体不抛异常
+        assert asyncio.run(ctx.replay_wal()) == 0
+
+    def test_replay_noop_when_wal_absent(self, tmp_path):
+        """无 WAL 文件时 replay 是安全的 no-op。"""
+        ctx = self._ctx_with_wal(tmp_path, "missing.jsonl")
+        ctx._redis = _FakeRedis()
+        assert asyncio.run(ctx.replay_wal()) == 0

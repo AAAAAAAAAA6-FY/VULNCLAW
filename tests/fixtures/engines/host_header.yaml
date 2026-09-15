@@ -1,0 +1,28 @@
+# Host 头注入 fixture（正反例）
+# 引擎 scan 注入 Host: evil.com 后检查响应体回显（_is_host_reflected）；
+# benchmark mock 忽略请求头、按 URL 子串返回固定 body → body 直接含 evil.com 即命中。
+# 注意：body 不得含 original_host（127.0.0.1）以免 _test_host_reflection 先行误判口径混淆。
+module: vulnclaw.engines.http_engines
+class: HostHeaderEngine
+engine: host_header
+
+cases:
+  - id: host_header_positive_reflection
+    method: scan
+    expect: positive
+    target: http://127.0.0.1:8080/host
+    responses:
+      /host:
+        status: 200
+        body: "<html><body>Requested host: evil.com</body></html>"
+    evidence_contains: "响应中包含注入的 Host 头值: evil.com"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/host' --data-urlencode '=x' → 期望命中「Host 头注入-反射」"
+
+  - id: host_header_negative
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080/host-safe
+    responses:
+      /host-safe:
+        status: 200
+        body: "<html><body>ok</body></html>"

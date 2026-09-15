@@ -1,0 +1,36 @@
+# G.1/组 D fixture：移动端 API 安全（scan 型）正反例。
+# 引擎判定：API 端点匿名可达返回 JSON 业务数据（弱认证）、http 明文传输。
+module: vulnclaw.engines.mobile_engines
+class: MobileAPIEngine
+engine: mobile_api
+
+cases:
+  - id: mobile_api_anon_json_access
+    expect: positive
+    target: http://127.0.0.1:8080/app
+    responses:
+      /api:
+        status: 200
+        body: '[{"user_id":1,"email":"alice@x.com"}]'
+    evidence_contains: "匿名可达"
+    reproduction: "curl -s 'http://127.0.0.1:8080/api'  # 匿名请求返回 JSON 业务数据"
+
+  - id: mobile_cleartext_http
+    expect: positive
+    target: http://127.0.0.1:8080/api/home
+    responses:
+      /api/home:
+        status: 200
+        body: "{}"
+    evidence_contains: "明文传输"
+    reproduction: "mobile app 走 http 明文 API：curl -s 'http://127.0.0.1:8080/api/home'"
+
+  - id: mobile_auth_required
+    expect: negative
+    target: https://127.0.0.1:8080/app
+    responses:
+      /api:
+        status: 401
+        body: '{"error":"unauthorized"}'
+    evidence_contains: ""
+    reproduction: ""

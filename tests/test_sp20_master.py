@@ -352,6 +352,44 @@ class TestHandleDeadWorker:
         assert asyncio.run(_go()) == 0
         fake.srem.assert_awaited_once()
 
+    def test_assigned_and_pending_same_task_requeued_once(self):
+        """P0-10：同一任务同时在 assigned 记录与 PEL 中 → 只重投递一次。"""
+        master, fake = _make_master()
+        assigned = {"task_id": "t-dup", "status": "running", "assigned_to": "w1"}
+        fake.keys.return_value = ["vulnclaw:assigned:w1:t-dup"]
+        fake.get.return_value = json.dumps(assigned)
+        # PEL 里是同一任务（worker 写了 assigned 但没来得及 XACK 就崩了）
+        fake.xpending_range.return_value = [{"message_id": "1-9", "consumer": "w1"}]
+        fake.xrange.side_effect = (
+            lambda stream, **kw: [("1-9", {"task": json.dumps(assigned)})]
+        )
+
+        async def _go():
+            return await master.handle_dead_worker("w1")
+
+        assert asyncio.run(_go()) == 1
+        # 分配记录路径投 1 次；PEL 路径只 ACK 不投递
+        assert fake.xadd.await_count == 1
+        assert fake.xack.await_count == 1
+
+    def test_duplicate_assigned_records_requeued_once(self):
+        """P0-10：同一 task_id 的多条分配记录 → 只重投递一次，多余记录清理。"""
+        master, fake = _make_master()
+        task = {"task_id": "t-dup2", "status": "running"}
+        fake.keys.return_value = [
+            "vulnclaw:assigned:w1:t-dup2",
+            "vulnclaw:assigned:w1:t-dup2#retry",
+        ]
+        fake.get.return_value = json.dumps(task)
+        fake.xpending_range.side_effect = Exception("no group")
+
+        async def _go():
+            return await master.handle_dead_worker("w1")
+
+        assert asyncio.run(_go()) == 1
+        assert fake.xadd.await_count == 1
+        assert fake.delete.await_count == 2
+
 
 class TestMonitorAndStatus:
     def test_start_monitor_detects_dead_worker_then_stop(self):
@@ -407,3 +445,81 @@ class TestMonitorAndStatus:
         status = asyncio.run(_go())
         assert status["workers"] == {"alive": 0, "dead": 0, "ids": []}
         assert status["tasks"]["pending"] == 0
+
+
+from vulnclaw.distributed import (  # noqa: E402
+    PROTOCOL_VERSION,
+    is_terminal,
+    validate_envelope,
+)
+
+
+# ============================================================
+# P2-19 编排端口协议：信封 schema 契约（Master/Worker 共享）
+# ============================================================
+class TestEnvelopeProtocol:
+    """此前 Master/Worker 之间只有隐式约定（字段散落在两侧实现里），
+    任一侧改字段都只能靠"跑一遍集群才发现问题"。协议把口头约定变成可断言的契约。
+    """
+
+    def test_valid_task_envelope(self):
+        ok, errs = validate_envelope("task", {"task_id": "t1", "type": "scan"})
+        assert ok is True and errs == []
+
+    def test_missing_required_field_is_error(self):
+        """缺必填 -> 判错（不许静默放行）。"""
+        ok, errs = validate_envelope("task", {"task_id": "t1"})
+        assert ok is False
+        assert "missing:type" in errs
+
+    def test_unknown_field_only_warns(self):
+        """未知字段 -> 只告警不判错（前向兼容：新版加字段，老节点不该炸）。"""
+        ok, errs = validate_envelope(
+            "task", {"task_id": "t1", "type": "scan", "future_field": 1})
+        assert ok is True
+        assert any(e.startswith("unknown:") for e in errs)
+
+    def test_version_mismatch_is_error(self):
+        ok, errs = validate_envelope(
+            "task", {"task_id": "t1", "type": "scan"}, version="0.9")
+        assert ok is False
+        assert "version_mismatch" in errs[0]
+
+    def test_heartbeat_and_result_envelopes(self):
+        assert validate_envelope("heartbeat", {"worker_id": "w1"})[0] is True
+        assert validate_envelope("heartbeat", {})[0] is False
+        assert validate_envelope(
+            "result", {"task_id": "t1", "status": "completed"})[0] is True
+        assert validate_envelope("result", {"task_id": "t1"})[0] is False
+
+    def test_unknown_kind_and_non_dict_rejected(self):
+        ok, errs = validate_envelope("bogus", {})
+        assert ok is False and "unknown_envelope_kind" in errs[0]
+        assert validate_envelope("task", ["not", "a", "dict"])[0] is False
+
+    def test_terminal_statuses(self):
+        """终态判定：故障转移时用于决定值不值得重投递。"""
+        assert is_terminal("completed") and is_terminal("failed")
+        assert not is_terminal("running") and not is_terminal("pending")
+
+    def test_submit_task_accepts_compliant_envelope(self):
+        """合规信封正常投递，不产生告警。"""
+        master, fake = _make_master()
+        with patch("vulnclaw.distributed.master.logger.warning") as warn:
+            tid = asyncio.run(master.submit_task({"type": "scan"}))  # task_id 由 master 补
+        assert tid
+        warn.assert_not_called()
+        fake.xadd.assert_awaited_once()
+
+    def test_submit_task_warns_but_still_delivers(self):
+        """不合规信封：只告警不阻断（老 Master 不得直接拒收新节点任务）。"""
+        master, fake = _make_master()
+        with patch("vulnclaw.distributed.master.logger.warning") as warn:
+            tid = asyncio.run(master.submit_task({"task_id": "t1"}))  # 缺 type
+        assert tid == "t1"
+        assert warn.call_count >= 1
+        assert "missing:type" in str(warn.call_args)
+        fake.xadd.assert_awaited_once()  # 仍然投递
+
+    def test_protocol_version_is_declared(self):
+        assert PROTOCOL_VERSION == "1.0"

@@ -1,0 +1,27 @@
+# G.1/组 D fixture：ViewState MAC 校验缺失（scan 型）正反例。
+# 引擎判定：目标含 __VIEWSTATE → 翻转 base64 字节后 POST，回显 MAC 校验失败签名
+# （view state mac validation failed / the state information is invalid 等）。
+module: vulnclaw.engines.framework_zero_day_engines
+class: ViewStateEngine
+engine: view_state
+
+cases:
+  - id: viewstate_no_mac_validation
+    expect: positive
+    target: http://127.0.0.1:8080/Login.aspx
+    responses:
+      /Login.aspx:
+        status: 200
+        body: '<input type="hidden" name="__VIEWSTATE" id="__VIEWSTATE" value="/wEPDwUKLTEw"/><input type="hidden" name="__VIEWSTATEGENERATOR" value="CA0B0334"/>'
+    evidence_contains: "view state mac validation failed"
+    reproduction: "fixture 离线复现：篡改 __VIEWSTATE(翻转中间字节) POST 后响应 'view state mac validation failed'"
+
+  - id: viewstate_normal_form
+    expect: negative
+    target: http://127.0.0.1:8080/Login.aspx
+    responses:
+      /Login.aspx:
+        status: 200
+        body: '<html><body><form><input name="username"></form>welcome</body></html>'
+    evidence_contains: ""
+    reproduction: ""

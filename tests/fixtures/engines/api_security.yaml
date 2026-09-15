@@ -1,0 +1,32 @@
+module: vulnclaw.engines.api_security_engines
+class: APISecurityEngine
+engine: api_security
+
+target: http://127.0.0.1:8080/graphql
+
+cases:
+  - id: graphql_endpoint_discovered
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/graphql
+    param: query
+    parsed_query: ""
+    normal_resp: [200, "", {}]
+    responses:
+      /graphql:
+        status: 200
+        body: '{"data":{"__typename":"Query"}}'
+    evidence_contains: "发现 GraphQL 端点: http://127.0.0.1:8080/graphql"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/graphql' --data-urlencode 'query=x' → 期望命中「GraphQL 端点发现」"
+
+  - id: ordinary_endpoint_not_graphql
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/profile
+    param: query
+    parsed_query: ""
+    normal_resp: [200, "", {}]
+    responses:
+      /profile:
+        status: 200
+        body: '{"user":"demo"}'

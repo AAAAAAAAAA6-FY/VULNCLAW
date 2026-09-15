@@ -75,3 +75,52 @@ class TestDefaultPathWiring:
         monkeypatch.setattr(core_utils.settings, "allowed_scope", "example.com")
         with pytest.raises(ScopeGuardError):
             asyncio.run(core_utils.async_get("https://evil.net/x"))
+
+
+class _RecordingCM:
+    """假 async context manager：只记录 kwargs，不发真请求。"""
+
+    async def __aenter__(self):
+        raise RuntimeError("stop: 只验证 kwargs")
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _RecordingSession:
+    def __init__(self):
+        self.calls = []
+
+    def request(self, method, url, **kwargs):
+        self.calls.append(kwargs)
+        return _RecordingCM()
+
+
+class TestProxySemantics:
+    """代理解析语义：**显式 proxy=None 必须真的直连**。
+
+    踩过的坑（2026-09-12）：旧写法 `kwargs.pop('proxy', None) or settings.proxy or 池`
+    会让 `async_get(url, proxy=None)` 依旧走配置代理——于是 phases_recon 里那句
+    "直连重试"实际还在用同一个坏代理重试（等于没兜底），真实目标上表现为**静默零结果**。
+    """
+
+    def _call(self, monkeypatch, url="http://example.com/", **kw):
+        monkeypatch.setattr(core_utils.settings, "allowed_scope", "")
+        monkeypatch.setattr(core_utils.settings, "proxy", "http://127.0.0.1:8080")
+        monkeypatch.setattr(core_utils, "_pool_active_proxy", lambda: None)
+        session = _RecordingSession()
+        asyncio.run(core_utils._http_request(
+            "GET", url, session=session, no_retry=True, **kw))
+        return session.calls[0]
+
+    def test_explicit_none_means_direct(self, monkeypatch):
+        assert "proxy" not in self._call(monkeypatch, proxy=None)
+
+    def test_explicit_empty_means_direct(self, monkeypatch):
+        assert "proxy" not in self._call(monkeypatch, proxy="")
+
+    def test_omitted_uses_configured_proxy(self, monkeypatch):
+        assert self._call(monkeypatch)["proxy"] == "http://127.0.0.1:8080"
+
+    def test_localhost_bypasses_proxy(self, monkeypatch):
+        assert "proxy" not in self._call(monkeypatch, url="http://localhost:9/")

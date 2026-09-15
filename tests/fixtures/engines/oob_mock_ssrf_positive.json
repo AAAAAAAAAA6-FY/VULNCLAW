@@ -1,0 +1,18 @@
+{
+  "engine": "framework_zero_day_engines._run_oob_scan",
+  "kwargs": {
+    "engine_name": "ssrf_engine",
+    "url": "https://target.example/proxy",
+    "param": "url",
+    "parsed_query": "url=https://target.example",
+    "payload_templates": [
+      "http://{OBS_HTTP}/",
+      "http://{OBS_HTTP}/ssrf-probe"
+    ],
+    "type_label": "SSRF-OOB盲打确认",
+    "evidence_note": "注入 http://<token>.oob 地址后由服务端发起请求并命中 OOB(服务端可出网)",
+    "recommendation": "对 SSRF 入口做 URL 白名单/IP 校验并禁用内网与元数据地址",
+    "oob_wait": 1
+  },
+  "expected": {"not_none": true, "type": "SSRF-OOB盲打确认(带外实锤)"}
+}

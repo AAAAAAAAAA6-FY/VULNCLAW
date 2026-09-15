@@ -97,6 +97,38 @@ class TestScopeGate:
         assert res.get("success") is True
 
 
+class TestScopeGateFailClosed:
+    """P0-4：白名单校验异常必须 fail-closed（旧实现 return True = 反向默认）。"""
+
+    def test_scope_check_exception_refuses(self, monkeypatch):
+        from vulnclaw.config.settings import settings as st
+        monkeypatch.setattr(st, "allowed_scope", "example.com")
+        import vulnclaw.core.sandbox_runner as s2
+
+        def _boom(_url):
+            raise RuntimeError("scope parser exploded")
+
+        monkeypatch.setattr("vulnclaw.core.http_client.url_in_scope", _boom)
+        assert s2._target_in_scope("https://anything.test/x") is False
+
+    def test_unset_scope_is_not_a_denial(self, monkeypatch):
+        from vulnclaw.config.settings import settings as st
+        monkeypatch.setattr(st, "allowed_scope", "")
+        import vulnclaw.core.sandbox_runner as s2
+        assert s2._target_in_scope("https://anything.test/x") is True
+
+    def test_docker_probe_failure_is_not_fatal(self, monkeypatch):
+        """P0-5：探测失败=不可用且不抛异常；缓存带 TTL 可恢复。"""
+        import vulnclaw.core.sandbox_runner as s2
+        s2._docker_cache.update({"checked": False, "ok": None, "ts": 0.0})
+        monkeypatch.setattr(s2.shutil, "which", lambda _n: "/nonexistent/docker")
+        assert s2.docker_available(timeout=1) is False
+        assert s2._docker_cache["checked"] is True
+        assert isinstance(s2._docker_cache["ts"], float)
+        s2._docker_cache["ts"] = 0.0  # TTL 过期 → 重新探测
+        assert s2.docker_available(timeout=1) is False
+
+
 class TestCommandVector:
     @pytest.mark.asyncio
     async def test_blocked_non_interpreter(self):

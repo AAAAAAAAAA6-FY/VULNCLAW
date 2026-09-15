@@ -1,0 +1,41 @@
+# G.1 fixture：TLS/SSL 传输层安全检测引擎正反例。
+# scan() 目标级：对 host:443 做真实握手，取版本/套件/证书；纯 HTTP 目标或握手失败静默跳过。
+# 正例：协商 TLSv1.1（legacy_protocol_enabled）+ RC4 弱套件（weak_cipher）+ 证书无效，
+#      一并产出 tls_legacy_protocol_enabled / tls_weak_cipher 两条 finding。
+# 反例：TLSv1.3 + AEAD 套件（TLS_AES_128_GCM_SHA256）+ 有效证书 -> 无 finding；纯 HTTP 目标也 skip。
+# evidence_contains / reproduction 为深度统计口径字段（组 E 统计脚本读取）。
+module: vulnclaw.engines.net_engines
+class: TlsSecurityEngine
+engine: tls_security
+
+cases:
+  - id: legacy_protocol_and_rc4
+    expect: positive
+    target: https://127.0.0.1:443/
+    responses:
+      /:
+        status: 200
+        body: "ok"
+    evidence_contains: "服务端仍可与以下已废弃协议完成握手"
+    reproduction: "fixture 复现（离线 mock）：对 127.0.0.1:443 完成 TLSv1.1 + RC4-SHA 握手 → 引擎产出 tls_legacy_protocol_enabled/tls_weak_cipher 候选"
+
+  - id: tlsv13_aead_valid_cert
+    expect: negative
+    target: https://127.0.0.1:443/
+    responses:
+      /:
+        status: 200
+        body: "ok"
+    evidence_contains: ""
+    reproduction: ""
+
+  - id: pure_http_no_tls_service
+    expect: negative
+    # 目标为纯 HTTP（443 无 TLS 服务、握手失败）-> 引擎静默跳过，不产生误报
+    target: http://127.0.0.1:8080/
+    responses:
+      /:
+        status: 200
+        body: "ok"
+    evidence_contains: ""
+    reproduction: ""

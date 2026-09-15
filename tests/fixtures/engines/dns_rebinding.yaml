@@ -1,0 +1,40 @@
+# G.4 fixture：DNS Rebinding 检测引擎（TOCTOU 竞争 / 多 A 记录混合网段）正反例。
+# scan() 目标级：对域名资产做两次 A 记录解析，比较 IP 集合与 TTL。参数级 check() 恒返回 None。
+# 正例：TOCTOU 两轮解析 IP 不一致（公网翻转为内网）+ 单查询返回公网/私网混合网段。
+# 反例：TTL=3600 单 IP 稳定（两次一致）-> 无 finding；值得注意：仅低 TTL 且两轮 IP 稳定
+#       按 fail-closed 铁律也不产出 finding（宁漏不误报）。
+# evidence_contains / reproduction 为深度统计口径字段（组 E 统计脚本读取）。
+module: vulnclaw.engines.net_engines
+class: DnsRebindingEngine
+engine: dns_rebinding
+
+cases:
+  - id: ttl_toctou_ip_flip
+    expect: positive
+    target: https://rebind.example.com/
+    responses: {}
+    evidence_contains: "DNS rebinding 风险"
+    reproduction: "fixture 复现（离线 mock）：rebind.example.com TTL=5s，两次解析 IP 不一致（1.2.3.4 → 127.0.0.1）→ 引擎产出 dns_rebinding candidate（High/TOCTOU）"
+
+  - id: mixed_network_a_records
+    expect: positive
+    target: https://mixed.example.com/
+    responses: {}
+    evidence_contains: "DNS rebinding 风险"
+    reproduction: "fixture 复现（离线 mock）：mixed.example.com 单查询返回公网+私网混合 IP（1.2.3.4, 192.168.1.10）→ 引擎产出 dns_rebinding candidate（Medium）"
+
+  - id: stable_single_public_ip_long_ttl
+    expect: negative
+    ## 正常配置：TTL=3600 单公网 IP，两轮解析一致 -> 引擎不判定为风险
+    target: https://stable.example.com/
+    responses: {}
+    evidence_contains: ""
+    reproduction: ""
+
+  - id: low_ttl_but_stable_ips
+    expect: negative
+    ## fail-closed：TTL 极低（<60）但两轮解析 IP 一致 -> 特征不足，不产出 finding（宁漏不误报）
+    target: https://edge.example.com/
+    responses: {}
+    evidence_contains: ""
+    reproduction: ""

@@ -1,0 +1,179 @@
+module: vulnclaw.engines.web_engines
+class: XSSEngine
+engine: xss
+
+target: http://127.0.0.1:8080/search?q=demo
+
+cases:
+  - id: reflected_script_payload
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/search?q=demo
+    param: q
+    parsed_query: "q=demo"
+    normal_resp: [200, "<html>results</html>", {}]
+    responses:
+      /search:
+        status: 200
+        body: "<html><body>"
+        reflect: true
+    evidence_contains: "[context=body]"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/search' --data-urlencode 'q=demo' → 期望命中「XSS-反射型(基础script标签(混淆))」"
+
+  - id: encoded_or_sanitized_response
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/search?q=demo
+    param: q
+    parsed_query: "q=demo"
+    normal_resp: [200, "<html>results</html>", {}]
+    responses:
+      /search:
+        status: 200
+        body: "<html><body>safe result</body></html>"
+
+  # ---------- 正例：事件/标签/SVG 载体回显 ----------
+  - id: reflected_img_onerror
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/search?q=demo
+    param: q
+    parsed_query: "q=demo"
+    normal_resp: [200, "<html>results</html>", {}]
+    responses:
+      /search:
+        status: 200
+        body: "<html><body>"
+        reflect: true
+    evidence_contains: "[context=body]"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/search' --data-urlencode 'q=demo' → 期望命中「XSS-反射型(基础script标签(混淆))」"
+
+  - id: reflected_svg_onload
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/search?q=demo
+    param: q
+    parsed_query: "q=demo"
+    normal_resp: [200, "<html>results</html>", {}]
+    responses:
+      /search:
+        status: 200
+        body: "<html><body>"
+        reflect: true
+    evidence_contains: "[context=body]"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/search' --data-urlencode 'q=demo' → 期望命中「XSS-反射型(基础script标签)」"
+
+  - id: reflected_js_uri
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/search?q=demo
+    param: q
+    parsed_query: "q=demo"
+    normal_resp: [200, "<html>results</html>", {}]
+    responses:
+      /search:
+        status: 200
+        body: "<html><body>"
+        reflect: true
+
+  # ---------- 反例：转义 / 5xx / WAF / 重定向 ----------
+    evidence_contains: "[context=body]"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/search' --data-urlencode 'q=demo' → 期望命中「XSS-反射型(基础script标签)」"
+  - id: escaped_entity_response
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/search?q=demo
+    param: q
+    parsed_query: "q=demo"
+    normal_resp: [200, "<html>results</html>", {}]
+    responses:
+      /search:
+        status: 200
+        body: "<html><body>&lt;script&gt;alert(1)&lt;/script&gt;</body></html>"
+
+  - id: server_error_5xx
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/search?q=demo
+    param: q
+    parsed_query: "q=demo"
+    normal_resp: [200, "<html>results</html>", {}]
+    responses:
+      /search:
+        status: 500
+        body: "500 Internal Server Error"
+
+  - id: waf_block_403
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/search?q=demo
+    param: q
+    parsed_query: "q=demo"
+    normal_resp: [200, "<html>results</html>", {}]
+    responses:
+      /search:
+        status: 403
+        body: "<html><body>403 WAF</body></html>"
+
+  - id: redirect_302
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/search?q=demo
+    param: q
+    parsed_query: "q=demo"
+    normal_resp: [200, "<html>results</html>", {}]
+    responses:
+      /search:
+        status: 302
+        body: ""
+
+  # ---------- 深度化：反射点上下文（attr / script / tag / comment）----------
+  # 机制：benchmark 的 reflect 把 query 值拼到 body 末尾；body 前缀决定反射点落入的
+  # HTML 上下文，供 XSSEngine._locate_reflection_context 归类（check 前置探针先定上下文）。
+  - id: reflected_attr_context
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/search?q=demo
+    param: q
+    parsed_query: "q=demo"
+    normal_resp: [200, "<html>results</html>", {}]
+    responses:
+      /search:
+        status: 200
+        body: '<input value="'
+        reflect: true
+    evidence_contains: "[context=attr]"
+    reproduction: "attribute 上下文反射（body='<input value=\"' + 反射 payload）→ 期望命中 [context=attr]"
+
+  - id: reflected_script_context
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/search?q=demo
+    param: q
+    parsed_query: "q=demo"
+    normal_resp: [200, "<html>results</html>", {}]
+    responses:
+      /search:
+        status: 200
+        body: '<script>var x="'
+        reflect: true
+    evidence_contains: "检测到JS执行特征"
+    reproduction: "JS/script 文本上下文反射（body='<script>var x=\"'）→ 期望命中 [context=script]"
+
+  - id: reflected_tag_context_svg
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/search?q=demo
+    param: q
+    parsed_query: "q=demo"
+    normal_resp: [200, "<html>results</html>", {}]
+    responses:
+      /search:
+        status: 200
+        body: '<svg'
+        reflect: true
+    evidence_contains: "[context=tag]"
+    reproduction: "标签名上下文反射（body='<svg'）→ 期望命中 [context=tag]（SVG 向量）"
+
+  # 注：comment 上下文不设 case——reflect 会把含 <script> 的 payload 反射进 body，
+  # 触发引擎的 JS 执行检测（属合法检出），无法构造「注释内不执行」的干净负例。

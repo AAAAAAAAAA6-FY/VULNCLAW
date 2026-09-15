@@ -1,0 +1,27 @@
+# G.1/组 D fixture：批量赋值/自动绑定（scan 型）正反例。
+# 引擎判定：对候选 API 端点 POST 特权字段（is_admin/role/balance 等），响应回显
+# 注入 marker(vulnclaw_ma_7f3c) 且基线无该字段即被绑定。
+module: vulnclaw.engines.api_security_engines
+class: MassAssignmentEngine
+engine: mass_assignment
+
+cases:
+  - id: mass_assignment_privilege_field
+    expect: positive
+    target: http://127.0.0.1:8080/api
+    responses:
+      /api/profile:
+        status: 200
+        body: '{"is_admin":"vulnclaw_ma_7f3c","email":"alice@x.com"}'
+    evidence_contains: "vulnclaw_ma_7f3c"
+    reproduction: "curl -s -X POST 'http://127.0.0.1:8080/api/profile' -H 'Content-Type: application/json' --data '{\"is_admin\":\"vulnclaw_ma_7f3c\"}'  # 特权字段被回显，说明被客户端写入"
+
+  - id: mass_assignment_no_reflect
+    expect: negative
+    target: http://127.0.0.1:8080/api
+    responses:
+      /api/profile:
+        status: 200
+        body: '{"email":"alice@x.com"}'
+    evidence_contains: ""
+    reproduction: ""

@@ -1,0 +1,117 @@
+# G.1 fixture：LDAP 注入参数级 check 正反例（组 D 深度补充）。
+# evidence_contains / reproduction 为深度统计口径字段（组 E 统计脚本读取）。
+module: vulnclaw.engines.input_engines
+class: LDAPEngine
+engine: ldap
+
+cases:
+  - id: ldap_filter_error_reflected
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/ldap?user=admin
+    param: user
+    parsed_query: "user=admin"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /ldap:
+        status: 200
+        body: "LDAPException: invalid search filter syntax"
+    evidence_contains: "invalid search filter"
+    reproduction: "curl --get 'http://127.0.0.1:8080/ldap' --data-urlencode 'user=*'"
+
+  - id: benign_login_page
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/ldap?user=admin
+    param: user
+    parsed_query: "user=admin"
+    normal_resp: [200, "welcome to portal", {}]
+    responses:
+      /ldap:
+        status: 200
+        body: "welcome to portal"
+    evidence_contains: ""
+    reproduction: ""
+
+  # ---------- 正例：LDAP 过滤器异常签名变体 ----------
+  - id: ldap_filter_syntax_error
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/ldap?user=admin
+    param: user
+    parsed_query: "user=admin"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /ldap:
+        status: 500
+        body: "javax.naming.directory.InvalidSearchFilterException: bad search filter"
+    evidence_contains: "bad search filter"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/ldap' --data-urlencode 'user=admin' → 期望命中「LDAP注入(通配符-全部匹配)」"
+
+  - id: ldap_malformed_filter
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/ldap?user=admin
+    param: user
+    parsed_query: "user=admin"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /ldap:
+        status: 500
+        body: "Uncategorized exception executing SQL/LDAP; nested exception is org.springframework.ldap.FilterSyntaxException"
+    evidence_contains: "FilterSyntaxException"
+    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/ldap' --data-urlencode 'user=admin' → 期望命中「LDAP注入(通配符-全部匹配)」"
+
+  # ---------- 反例：5xx 通用 / WAF / 空响应 / 非 LDAP 参数 ----------
+  - id: generic_server_error
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/ldap?user=admin
+    param: user
+    parsed_query: "user=admin"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /ldap:
+        status: 500
+        body: "Internal Server Error"
+    evidence_contains: ""
+    reproduction: ""
+
+  - id: waf_block
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/ldap?user=admin
+    param: user
+    parsed_query: "user=admin"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /ldap:
+        status: 403
+        body: "<html><body>403 Forbidden</body></html>"
+    evidence_contains: ""
+    reproduction: ""
+
+  - id: empty_ldap_response
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/ldap?user=admin
+    param: user
+    parsed_query: "user=admin"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /ldap:
+        status: 200
+        body: ""
+    evidence_contains: ""
+    reproduction: ""
+
+  - id: non_ldap_param
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/ldap?locale=en
+    param: locale
+    parsed_query: "locale=en"
+    normal_resp: [200, "ok", {}]
+    responses: {}
+    evidence_contains: ""
+    reproduction: ""

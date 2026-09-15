@@ -1,0 +1,27 @@
+# G.1/组 D fixture：云/容器暴露（kubelet/etcd/云元数据，scan 型）正反例。
+# 引擎判定：非本地目标上 kubelet /api/v1/... 返回含 kubelet/kubeVersion 特征即未授权
+# 可读；非本地 + 云元数据接口 200 有内容判暴露。
+module: vulnclaw.engines.framework_zero_day_engines_2
+class: CloudAndContainerExposureEngine
+engine: cloud_container_exposure
+
+cases:
+  - id: kubelet_pods_unauth
+    expect: positive
+    target: http://192.168.10.20:10250
+    responses:
+      /pods:
+        status: 200
+        body: '{"kubelet":{"kubeVersion":"v1.26.4"},"items":[{"metadata":{"name":"redis-0","namespace":"kube-system"}}]}'
+    evidence_contains: "kubelet"
+    reproduction: "curl -s 'http://192.168.10.20:10250/pods'   # 非本地目标 kubelet /pods 未授权可读"
+
+  - id: kubelet_denied
+    expect: negative
+    target: http://192.168.10.20:10250
+    responses:
+      /pods:
+        status: 401
+        body: "<html><body>Unauthorized</body></html>"
+    evidence_contains: ""
+    reproduction: ""

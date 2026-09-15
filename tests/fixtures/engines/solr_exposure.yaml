@@ -1,0 +1,43 @@
+# G.1/组 D fixture：Apache Solr Admin 未授权访问检测（scan 型）正反例。
+# 引擎判定：/solr/admin/cores?indexInfo=false&wt=json 命中 Solr 独有字节特征
+# （responseHeader/instanceDir/lucene）→ 报 High「Apache Solr Admin 未授权访问」；
+# 再探测版本接口 /solr/admin/info/system 泄露版本报 Medium。
+module: vulnclaw.engines.middleware_exposure_engines
+class: SolrExposureEngine
+engine: solr_exposure
+
+cases:
+  - id: solr_admin_unauth_cores
+    method: scan
+    expect: positive
+    target: http://127.0.0.1:8080
+    responses:
+      /solr/admin/cores?indexInfo=false&wt=json:
+        status: 200
+        headers:
+          Content-Type: "application/json"
+        body: '{"responseHeader":{"status":0},"status":{"core1":{"name":"core1","instanceDir":"/opt/solr/server/solr/core1","lucene":{"solr-spec-version":"8.11.2"}}}}'
+    evidence_contains: "产品 JSON 特征命中"
+    reproduction: "curl -s 'http://127.0.0.1:8080/solr/admin/cores?indexInfo=false&wt=json'  # 未授权读取核心状态/路径"
+
+  - id: solr_cores_not_found
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      /solr/admin/cores?indexInfo=false&wt=json:
+        status: 404
+        body: "Not Found"
+    evidence_contains: ""
+    reproduction: ""
+
+  - id: solr_not_product
+    method: scan
+    expect: negative
+    target: http://127.0.0.1:8080
+    responses:
+      /solr/admin/cores?indexInfo=false&wt=json:
+        status: 200
+        body: "<html><body>generic error page</body></html>"
+    evidence_contains: ""
+    reproduction: ""

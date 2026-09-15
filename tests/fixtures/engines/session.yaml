@@ -1,0 +1,37 @@
+# G.1/组 D fixture：会话安全（scan 型）正反例。
+# 引擎判定：Set-Cookie 缺少 Secure/HttpOnly/SameSite 等安全属性、Session ID 暴露在 URL、
+# 会话熵不足 / 注销不失效等（此处覆盖" Session ID 在 URL"与弱会话 Cookie）。
+module: vulnclaw.engines.auth_engines
+class: SessionEngine
+engine: session
+
+cases:
+  - id: session_id_in_url
+    expect: positive
+    target: http://127.0.0.1:8080/app?sid=abc123
+    responses:
+      /app:
+        status: 200
+        body: "welcome"
+    evidence_contains: "Session ID 在 URL 中"
+    reproduction: "curl -s 'http://127.0.0.1:8080/app?sid=abc123'  # JSESSIONID/sid 明文暴露于 URL"
+
+  - id: http_only_secure_cookie
+    expect: positive
+    target: http://127.0.0.1:8080/login
+    responses:
+      /login:
+        status: 200
+        body: "ok"
+    evidence_contains: "会话"
+    reproduction: "fixture 离线复现：Set-Cookie 缺少 Secure/HttpOnly/SameSite 的弱会话 Cookie"
+
+  - id: secured_session
+    expect: negative
+    target: http://127.0.0.1:8080/app
+    responses:
+      /app:
+        status: 200
+        body: "welcome"
+    evidence_contains: ""
+    reproduction: ""

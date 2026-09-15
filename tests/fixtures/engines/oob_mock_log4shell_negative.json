@@ -1,0 +1,15 @@
+{
+  "engine": "framework_zero_day_engines._run_oob_scan",
+  "kwargs": {
+    "engine_name": "log4shell",
+    "url": "https://target.example/a",
+    "param": "p",
+    "parsed_query": "p=x",
+    "payload_templates": [],
+    "type_label": "Log4j2 JNDI 注入",
+    "evidence_note": "注入 ${jndi:*}后未命中 OOB(修复版/无 JNDI 解析)",
+    "recommendation": "升级 Log4j2 至 2.17.1+，禁用 JNDI Lookup",
+    "oob_wait": 1
+  },
+  "expected": {"not_none": false}
+}
