@@ -23,6 +23,34 @@ cases:
     evidence_contains: "双会话差分证实"
     reproduction: "fixture 复现（离线 mock）：identity_a(id=1) 携身份A令牌、identity_b 携身份B令牌双会话请求 /api/profile?id=1 → 身份B 命中 private_token 私有标记，判 horizontal_leak"
 
+  - id: cross_account_write_to_owner
+    expect: positive
+    # 场景：A 写 B 资源（越权写）。差分语义同样是身份B 直接取走身份A 自属私有记录。
+    url: http://127.0.0.1:8080/api/records?id=2
+    param: id
+    parsed_query: "id=2"
+    normal_resp: [200, '{"id":2,"owner":"bob","private_session":"s3crEtKey"}', {}]
+    responses:
+      /api/records:
+        status: 200
+        body: '{"id":2,"owner":"bob","private_session":"s3crEtKey"}'
+    evidence_contains: "双会话差分证实"
+    reproduction: "fixture 复现（离线 mock）：写链端点 /api/records 作候选，identity_a(id=2) 携身份A令牌、identity_b 携身份B令牌双会话 GET 差分 → 身份B 命中 private_session 私有标记（B 未授权即可接触 A 自属写入的记录），判 horizontal_leak"
+
+  - id: cross_account_delete_doc
+    expect: positive
+    # 场景：A 删 B 资源（越权删）。差分语义仍是身份B 取走身份A 私有资源。
+    url: http://127.0.0.1:8080/api/doc?id=7
+    param: id
+    parsed_query: "id=7"
+    normal_resp: [200, '{"id":7,"title":"bob-cv","owner_account_id":7,"private_key":"9f2c1a"}', {}]
+    responses:
+      /api/doc:
+        status: 200
+        body: '{"id":7,"title":"bob-cv","owner_account_id":7,"private_key":"9f2c1a"}'
+    evidence_contains: "双会话差分证实"
+    reproduction: "fixture 复现（离线 mock）：删链端点 /api/doc 作候选，identity_a(id=7) 携身份A令牌、identity_b 携身份B令牌双会话 GET 差分 → 身份B 命中 private_key 私有标记（B 未授权即可接触 A 自属待删文档），判 horizontal_leak"
+
   - id: forced_authz_cross_account_deny
     expect: negative
     url: http://127.0.0.1:8080/api/profile?id=1

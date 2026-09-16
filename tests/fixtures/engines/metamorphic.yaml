@@ -20,6 +20,34 @@ cases:
     evidence_contains: "响应 HTTP "
     reproduction: "curl -sS -X POST 'http://127.0.0.1:8080/order' -d 'amount=0.01'  # 篡改金额 0.01 被服务端采信并回显"
 
+  - id: metamorphic_replay_dup_coupon
+    method: probe_replay_idempotency
+    expect: positive
+    url: http://127.0.0.1:8080/coupon/claim
+    param: coupon_id
+    parsed_query: "coupon_id=C1"
+    normal_resp: [200, '{"success":true,"coupon_code":"CP100001"}', {}]
+    responses:
+      /coupon/claim:
+        status: 200
+        body: '{"success":true,"coupon_code":"CP100002"}'
+    evidence_contains: "重放 2 次均成功"
+    reproduction: "curl -sS -X POST 'http://127.0.0.1:8080/coupon/claim' -d 'coupon_id=C1' 两次  # 相同请求重放两次均成功且资源码不同(CP100001->CP100002)，接口非幂等"
+
+  - id: metamorphic_idor_foreign_user_data
+    method: probe_idor_candidate
+    expect: positive
+    url: http://127.0.0.1:8080/profile
+    param: user_id
+    parsed_query: "user_id=1001"
+    normal_resp: [200, '{"success":true,"data":{"user":"alice","orders":[]}}', {}]
+    responses:
+      /profile:
+        status: 200
+        body: '{"success":true,"data":{"user":"bob","orders":[{"id":9001,"item":"laptop"}],"address":"Shanghai"}}'
+    evidence_contains: "未出现无权限提示"
+    reproduction: "curl -sS 'http://127.0.0.1:8080/profile?user_id=1002'  # 改 ID 仍返回他人业务数据且无鉴权提示 -> IDOR/BOLA 候选"
+
   - id: metamorphic_no_diff_no_issue
     method: check
     expect: negative

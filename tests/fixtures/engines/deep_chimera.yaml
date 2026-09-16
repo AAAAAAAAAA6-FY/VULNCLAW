@@ -1,24 +1,74 @@
 # G.1/组 D fixture：深藏复合漏洞（check 型）正反例。
 # 引擎判定：8 个载荷族注入"多层编码变体"后，强语义回显(marker)或剥壳后 A/B diff 弱信号
 # 聚合达阈值即命中（需 ≥1 强家庭或 ≥2 聚合弱家庭）。
+# 各正例的 responses.body 是"目标把多层编码载荷还原后的可执行形态"，其中包含的
+# MARKERS_BY_FAMILY 字面标记即引擎 _find_semantic_echo 命中点；evidence_contains 均取
+# 引擎 finding.evidence 中真实出现的强语义回显 marker 原文，保证统计口径与真实检出一致
+# （杜绝"统计自洽但真实检不出"）。响应既有信号时 normal_resp 不含同标记（负基线不泄漏）。
 module: vulnclaw.engines.deep_chimera
 class: DeepChimeraEngine
 engine: deep_chimera
 
 cases:
+  # --- 正例（攻击面多样化：不同编码族 / 剥壳还原形态） ---
+
   - id: deep_chimera_semantic_echo
     method: check
     expect: positive
     url: http://127.0.0.1:8080/echo?q=x
     param: q
     parsed_query: "q=x"
-    normal_resp: [200, "plain echo", {}]
+    normal_resp: [200, "plain plasma page", {}]
     responses:
       /echo:
         status: 200
-        body: "reflected=JL22%3AXXX[marker]computed" 
-    evidence_contains: "marker"
-    reproduction: "fixture 离线复现：注入多层编码变体后响应出现强语义回显重构标记(marker)"
+        body: "<h1>result</h1><img src=x onerror=alert(1)><svg/onload=alert(2)>"
+    evidence_contains: "<img"
+    reproduction: "fixture 离线复现：q 经 URL->HTML->JSON 逐层剥壳后原样落入未过滤 HTML 上下文，注入的 html_event(<img) 与 svg_onload(<svg) 两族强语义回显同现，引擎聚合为多族强回显"
+
+  - id: deep_chimera_script_break_chain
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/render?cb=x
+    param: cb
+    parsed_query: "cb=x"
+    normal_resp: [200, "static page skeleton", {}]
+    responses:
+      /render:
+        status: 200
+        body: "<div>frame</div></script><script>alert(1)</script><!--"
+    evidence_contains: "</script>"
+    reproduction: "fixture 离线复现：脚本上下文剥壳链还原出 </script><script> 逃逸原语，script_break 与 html_comment 两族强语义回显同现，证明可将载荷提升为可执行 JS"
+
+  - id: deep_chimera_json_sql_polyglot
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/search?s=x
+    param: s
+    parsed_query: "s=x"
+    normal_resp: [200, "{\"hits\":[]}", {}]
+    responses:
+      /search:
+        status: 200
+        body: "SELECT * WHERE name=' OR '1'='1"
+    evidence_contains: "' OR '1'='1"
+    reproduction: "fixture 离线复现：JSON->HTML->URL 剥壳后经由某适配层还原为 SQL 语义，json_sql_polyglot 族强语义回显 ' OR '1'='1 单族命中，判定为深藏注入点"
+
+  - id: deep_chimera_tag_polyglot
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/view?t=x
+    param: t
+    parsed_query: "t=x"
+    normal_resp: [200, "leaf template", {}]
+    responses:
+      /view:
+        status: 200
+        body: "{{tpl}}<!--&{x}</t>"
+    evidence_contains: "</t>"
+    reproduction: "fixture 离线复现：模板引擎上下文剥壳还原出 </t> 与 <!--&{x 原始语义，tag_break 与 tag_polyglot 两族强语义回显同现，判定为模板语义被破坏的深藏注入点"
+
+  # --- 反例（低误报铁律：不应检出） ---
 
   - id: deep_chimera_no_signal
     method: check
@@ -31,5 +81,19 @@ cases:
       /echo:
         status: 200
         body: "plain echo"
+    evidence_contains: ""
+    reproduction: ""
+
+  - id: deep_chimera_quoted_escape_reflection
+    method: check
+    expect: negative
+    url: http://127.0.0.1:8080/render?cb=x
+    param: cb
+    parsed_query: "cb=x"
+    normal_resp: [200, "static page skeleton", {}]
+    responses:
+      /render:
+        status: 200
+        body: "reflected=cb%27value inside double-quote attribute"
     evidence_contains: ""
     reproduction: ""

@@ -1,16 +1,18 @@
 # G.1 fixture：符号执行逻辑洞引擎（IR 驱动，dry-run 零网络）正反例。
 # scan() 以 recon_brief.business_ir（IR 业务模型）为输入，无 IR / 无带值域参数时 fail-closed。
-# 正例：转账端点 quantity 值域 [0,9] + 不变量 (余额 >= 0)：约束求解证明"金额篡改/数量越界"目标可满足。
-# 反例：无 IR 或 IR 无带值域参数 -> fail-closed 不产出（杜绝默认"无界即可满足"）。
-# evidence_contains / reproduction 为深度统计口径字段（组 E 统计脚本读取）。
+# 判定链：IR -> 目标谓词（objectives_for/evaluate）-> 约束求解证明"目标可满足" -> 产出 needs_verification 候选。
+# 正例一律要求"纯字典/字面匹配查不到、需要符号推演"：参数必须有带约束力值域，
+# 目标可行性由 solver 推导，且 evidence 恒以"约束求解证明目标可满足"开头（取引擎 evidence 前缀）。
+# 反例：无 IR / 无带值域参数 / 不变量锁定 -> fail-closed 不产出（杜绝默认"无界即可满足"）。
 module: vulnclaw.engines.symbolic_engine
 class: SymbolicLogicEngine
 engine: symbolic_logic
 
 cases:
+  # --- 正例（覆盖不同逻辑洞类：数量越界 / 越权 / 金额篡改 / 幂等-数量） ---
+
   - id: quantity_overflow_solvable
     expect: positive
-    # scan 入口：IR 携带 amount 参数（值域 0..9）与余额不变量，约束求解产出候选
     target: http://127.0.0.1:8080/order
     responses:
       /order:
@@ -18,6 +20,38 @@ cases:
         body: "ok"
     evidence_contains: "约束求解证明目标可满足"
     reproduction: "fixture 复现（离线 mock）：喂入 recon_brief.business_ir（quantity 值域[0,9] + 余额不变量）→ 约束求解证明数量越界目标可满足，产出 needs_verification 候选"
+
+  - id: authz_idor_escalation
+    expect: positive
+    target: http://127.0.0.1:8080/user/role
+    responses:
+      /user/role:
+        status: 200
+        body: "ok"
+    evidence_contains: "约束求解证明目标可满足"
+    reproduction: "fixture 复现（离线 mock）：IR 端点 /user/role 的 role 参数值域 enum{0,1}，符号推演证明高权限取值 role∈{1} 可达（水平/垂直越权 authz 目标），产出 needs_verification 候选"
+
+  - id: amount_tamper_total_solvable
+    expect: positive
+    target: http://127.0.0.1:8080/order/pay
+    responses:
+      /order/pay:
+        status: 200
+        body: "ok"
+    evidence_contains: "约束求解证明目标可满足"
+    reproduction: "fixture 复现（离线 mock）：IR unit_price=100 + 参数 qty 值域[-100,100]、total 值域[-100000,100000] → 符号推演证明 amount(total) 目标（qty>0 且 total<真实单价×qty）可满足，产出金额篡改候选"
+
+  - id: quantity_negative_solvable
+    expect: positive
+    target: http://127.0.0.1:8080/cart/update
+    responses:
+      /cart/update:
+        status: 200
+        body: "ok"
+    evidence_contains: "约束求解证明目标可满足"
+    reproduction: "fixture 复现（离线 mock）：IR 参数 qty 值域[-100,100]，符号推演证明数量越界目标（qty<1，见证 qty=-1）可满足，产出 needs_verification 候选"
+
+  # --- 反例（低误报铁律：fail-closed 不应产出） ---
 
   - id: no_ir_fail_closed
     expect: negative
@@ -38,3 +72,13 @@ cases:
         body: "ok"
     evidence_contains: ""
     reproduction: ""
+
+  - id: authz_blocked_by_invariant
+    expect: negative
+    target: http://127.0.0.1:8080/user/role
+    responses:
+      /user/role:
+        status: 200
+        body: "ok"
+    evidence_contains: ""
+    reproduction: "fixture 复现（离线 mock）：IR 声明 role==0 硬校验不变量（inv_role_locked）→ solvable 判死，提权目标不可满足 → 不产出（反例，低误报）"

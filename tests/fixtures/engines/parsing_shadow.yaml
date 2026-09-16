@@ -16,6 +16,26 @@ cases:
     evidence_contains: "路径归一化"
     reproduction: "fixture 离线复现：基线 /admin/panel 403，变体 /admin/panel/ 或 /admin/panel;shadow=1 返回 200 业务页"
 
+  - id: parsing_shadow_auth_flag_first_wins
+    expect: positive
+    target: http://127.0.0.1:8080/auth?admin=false
+    responses:
+      /auth:
+        status: 200
+        body: "<html><body><h1>Admin Panel - Authorized</h1><div>restricted dashboard</div><p>sensitive privileged user data record</p><table>config rows</table></body></html>"
+    evidence_contains: "解析语义分歧"
+    reproduction: "fixture 离线复现：admin=true 返 200 业务页、admin=false 返 403；变体 admin=true&admin=false（first 语义取 true）返 200 -> 鉴权参数语义分歧旁路"
+
+  - id: parsing_shadow_verified_zero_coerce
+    expect: positive
+    target: http://127.0.0.1:8080/portal?verified=false
+    responses:
+      /portal:
+        status: 200
+        body: "<html><body><h1>Premium Portal</h1><p>members-only premium content visible after verification bypass</p><table>account subscription details</table></body></html>"
+    evidence_contains: "解析语义分歧"
+    reproduction: "fixture 离线复现：verified=true 返 200 业务页、verified=false 返 403；变体 verified=0 被类型强转放行返 200 -> 鉴权参数语义分歧旁路"
+
   - id: parsing_shadow_no_bypass
     expect: negative
     target: http://127.0.0.1:8080/admin/panel
