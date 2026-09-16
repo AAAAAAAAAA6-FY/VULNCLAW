@@ -459,7 +459,7 @@ async def _generate_report(self) -> Dict:
         from vulnclaw.core_modules.alerting import alert_findings
 
         await alert_findings(self.findings, min_severity="high")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.debug(f"告警发送跳过: {e}")
     # E1.3: 攻击图 + TOP 攻击路径（构建失败不阻塞主报告，降级为跳过）
     try:
