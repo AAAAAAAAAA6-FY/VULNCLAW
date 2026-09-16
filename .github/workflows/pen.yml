@@ -58,7 +58,7 @@ jobs:
 
       - name: Upload verified artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: vulnclaw-verified
           path: |
@@ -87,7 +87,7 @@ jobs:
 
       - name: Upload report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: vulnclaw-report
           path: _runtime_cache/reports/
