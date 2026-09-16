@@ -247,6 +247,12 @@ class Settings(BaseSettings):
     react_dive_max_params: int = Field(3, alias="REACT_DIVE_MAX_PARAMS")  # 每轮最多深挖参数数
     react_dive_max_iterations: int = Field(5, alias="REACT_DIVE_MAX_ITERATIONS")  # 每参数 ReAct 轮数
     react_dive_budget: float = Field(150.0, alias="REACT_DIVE_BUDGET")  # 每参数总预算（秒）
+    # ========== T09: 通用 ReAct 工具循环 MVP（走 tool_registry 治理链路） ==========
+    # 与 enable_react_dive（扫描深挖 agent）不同：本开关控制通用 think→act→observe 循环，
+    # 工具经 CLITool→tool_registry.run_tool 治理执行。默认关闭 = 零行为变更。
+    react_tool_loop: bool = Field(False, alias="REACT_TOOL_LOOP")
+    react_tool_loop_max_steps: int = Field(6, alias="REACT_TOOL_LOOP_MAX_STEPS")  # 每轮循环硬上限（防 runaway）
+    react_tool_loop_max_context_chars: int = Field(4000, alias="REACT_TOOL_LOOP_MAX_CONTEXT_CHARS")  # 上下文长度保护（防爆 token）
     # ========== P2: AgentCoordinator 多智能体协调器（strix 式 agent 树，Tier-1 确定性引擎） ==========
     agent_coordinator_enabled: bool = Field(True, alias="AGENT_COORDINATOR_ENABLED")  # 默认开：与 enable_agent_roles 协同深挖（预算软截止保护）
     # ========== DualAgent 双智能体并行（广度=主链路 scan 与 深度=AgentCoordinator 同时执行） ==========

@@ -13,6 +13,7 @@ AI 工具注册表 - 动态注册所有引擎
 修复：从合并文件导入所有引擎
 """
 
+import json
 import re
 import shlex
 
@@ -623,4 +624,156 @@ async def execute_tool(name: str, **kwargs) -> Dict:
         return {"error": str(e)}
 
 
-__all__ = ['TOOL_REGISTRY', 'execute_tool']
+class ReactToolLoop:
+    """T09: 通用 ReAct 工具循环 MVP（think→act→observe→repeat）。
+
+    与 dispatcher.ReActAgent 的分工：ReActAgent 是「扫描深挖 agent」（Plan-and-Execute，
+    直接驱动 AI 引擎工具）；本类是通用的*最小工具循环* —— LLM/本地启发式决定调用哪个
+    已注册 CLI 工具，工具经 execute_tool → CLITool.execute → tool_registry.run_tool
+    治理链路执行（pre/post_run 治理钩子），绝不绕过治理直接执行。
+
+    - max_steps 硬上限：防 runaway（达到即优雅终止）。
+    - 上下文长度保护：每条 observation 若超长被裁剪，总上下文超限丢弃最旧步骤，防爆 token。
+    - 显式开关 settings.react_tool_loop（默认 False）：关闭时 run() 原样返回，零行为变更。
+    """
+
+    def __init__(self, llm=None, max_steps: int = None, max_context_chars: int = None):
+        self.llm = llm
+        self.max_steps = int(max_steps or getattr(settings, "react_tool_loop_max_steps", 6) or 6)
+        self.max_context_chars = int(
+            max_context_chars or getattr(settings, "react_tool_loop_max_context_chars", 4000) or 4000
+        )
+        self._local_idx = 0
+
+    # ---------------- 工具/开关 ----------------
+    @staticmethod
+    def _clip(text: object, limit: int) -> str:
+        text = str(text or "")
+        if len(text) <= limit:
+            return text
+        return text[:limit] + "...[truncated]"
+
+    def enabled(self) -> bool:
+        """循环是否开启（默认关）。"""
+        return bool(getattr(settings, "react_tool_loop", False))
+
+    def _get_llm(self):
+        if self.llm is not None:
+            return self.llm
+        from vulnclaw.ai.core import get_llm_client  # 局部导入避免模块循环
+
+        return get_llm_client()
+
+    @staticmethod
+    def _parse_action(text: object) -> Dict:
+        """把 LLM/启发式输出解析为动作字典。兼容 JSON 字符串与已解析 dict。"""
+        if isinstance(text, dict):
+            raw = text
+        else:
+            try:
+                raw = json.loads(str(text))
+            except (ValueError, TypeError):
+                return {"action": "finish", "conclusion": str(text)[:500]}
+        if not isinstance(raw, dict):
+            return {"action": "finish", "conclusion": str(raw)[:500]}
+        return raw
+
+    # ---------------- 核心步骤 ----------------
+    async def think(self, llm, tools: List[str], target: Optional[str],
+                    context: List[Dict]) -> Dict:
+        """决策下一步：取值 tools 清单里尚未耗尽策略的可调用工具（本地启发式），
+        或让 LLM 采纳以下两类动作：
+          {"action":"call","tool":"<name>","extra_args":"<可选>"}
+          {"action":"finish","conclusion":"<结论>"}
+        返回统一动作 dict。
+        """
+        if llm is None:
+            return self._local_think(tools, context)
+        tool_list = ", ".join(tools) or "(无可用工具)"
+        history = "\n".join(
+            f"- 调用 {s.get('tool', '?')}: {ReactToolLoop._clip(s.get('observation'), 500)}"
+            for s in context[-6:]
+        ) or "(尚无观察)"
+        prompt = (
+            "你是通用工具编排 Agent。目标/目标主机：%(target)s\n"
+            "以下为已执行步骤的观察（最新在末尾）：\n%(history)s\n\n"
+            "可用工具清单(经治理注册)：[%(tool_list)s]\n"
+            "每次只输出一个 JSON 动作，无其他文字：\n"
+            "  - 若信息已足够得出确定结论，输出 "
+            '{"action":"finish","conclusion":"<你的结论>"}\n'
+            '  - 否则输出 {"action":"call","tool":"<清单内工具名>","extra_args":"<可选参数字符串>"}'
+        ) % {"target": target or "未知", "history": history, "tool_list": tool_list}
+        out = await llm.ask(prompt, force_json=True, task_type="react")
+        return self._parse_action(out)
+
+    def _local_think(self, tools: List[str], context: List[Dict]) -> Dict:
+        """无 LLM 时的确定性启发式：按序调用工具；某工具已观察过失败/成功则推进；
+        耗尽工具清单或已收敛到足够信息即 finish（防 runaway 由 max_steps 兜底）。"""
+        while self._local_idx < len(tools):
+            tool = tools[self._local_idx]
+            self._local_idx += 1
+            return {"action": "call", "tool": tool, "extra_args": ""}
+        return {"action": "finish", "conclusion": "已完成工具清单遍历，未确认可验证结论"}
+
+    async def act(self, tool: str, target: Optional[str], extra_args: str = "",
+                  **exec_kwargs) -> Dict:
+        """执行工具调用 —— 默认走 execute_tool → CLITool → tool_registry.run_tool
+        治理链路（绝不绕过治理）。exec_kwargs 供测试注入/微调。"""
+        if tool not in TOOL_REGISTRY:
+            return {"success": False, "error": f"未知工具: {tool}（未注册/未过治理）"}
+        try:
+            result = await execute_tool(
+                tool, url=target or "", extra_args=extra_args or "", **exec_kwargs
+            )
+            return result
+        except Exception as e:  # noqa: BLE001 - 工具异常作为可观察失败注入上下文
+            return {"success": False, "error": str(e)}
+
+    def observe(self, context: List[Dict], thought: str, tool: str, result: Dict) -> None:
+        """把工具结果注入上下文，并做上下文长度保护（裁剪 + 丢弃最旧超限步骤）。"""
+        ok = bool(result and (result.get("success") or result.get("ok")))
+        summary = str(result.get("summary") or result.get("output") or result.get("stdout")
+                      or result.get("error") or "") if result else "无结果"
+        observation = self._clip(summary, self.max_context_chars // max(1, self.max_steps))
+        context.append({
+            "thought": self._clip(thought, 500),
+            "tool": tool,
+            "success": ok,
+            "error": self._clip(result.get("error") if result else "", 300) if not ok else None,
+            "observation": observation,
+        })
+        total = sum(len(str(s.get("observation", ""))) for s in context)
+        while context and total > self.max_context_chars:
+            dropped = context.pop(0)
+            total -= len(str(dropped.get("observation", "")))
+
+    # ---------------- 主循环 ----------------
+    async def run(self, tools: List[str], target: Optional[str] = None,
+                  **exec_kwargs) -> Dict:
+        """ReAct 主循环。开关关闭时原样返回（enabled=False，零行为变更）。"""
+        if not self.enabled():
+            return {"enabled": False, "conclusion": "", "steps": [], "tool_calls": 0}
+        llm = self._get_llm()
+        context: List[Dict] = []
+        confirmed: Optional[str] = None
+        for step in range(self.max_steps):
+            thought = await self.think(llm, tools, target, context)
+            action = self._parse_action(thought)
+            if action.get("action") == "finish":
+                confirmed = action.get("conclusion")
+                return {
+                    "enabled": True, "conclusion": confirmed, "steps": context,
+                    "tool_calls": step, "stopped_reason": "concluded",
+                }
+            tool = str(action.get("tool") or "")
+            if not tool:
+                continue  # 空动作：不烧步数语义下直接推进（仍受 max_steps 兜底）
+            result = await self.act(tool, target, action.get("extra_args") or "", **exec_kwargs)
+            self.observe(context, str(thought), tool, result)
+        return {
+            "enabled": True, "conclusion": confirmed, "steps": context,
+            "tool_calls": self.max_steps, "stopped_reason": "max_steps",
+        }
+
+
+__all__ = ['TOOL_REGISTRY', 'execute_tool', 'ReactToolLoop']
