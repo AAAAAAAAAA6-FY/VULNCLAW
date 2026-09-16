@@ -95,7 +95,7 @@ jobs:
 
       - name: 上传报告/归档产物（扫描失败也上传，便于事后排查）
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: vulnclaw-scan-artifacts
           path: |
