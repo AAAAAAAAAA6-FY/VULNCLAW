@@ -26,7 +26,7 @@ dependencies = [
     "aiofiles",
     "beautifulsoup4",
     "dnspython",
-    "redis>=5.0",
+    "redis>=8.1.0",
     "tqdm",
     # 0.9.6 修复 TLD 解析边界情况；对应 Dependabot PR #5
     "python-whois>=0.9.6",
