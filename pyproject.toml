@@ -12,7 +12,7 @@ authors = [{name = "VULNCLAW Contributors"}]
 requires-python = ">=3.11"
 dependencies = [
     "aiohttp>=3.9.0",
-    "pydantic>=2.0.0",
+    "pydantic>=2.13.5",
     # 2.15+ 保证 Field alias / env alias 行为稳定；对应 Dependabot PR #7
     "pydantic-settings>=2.15.0",
     "python-dotenv>=1.0.0",
