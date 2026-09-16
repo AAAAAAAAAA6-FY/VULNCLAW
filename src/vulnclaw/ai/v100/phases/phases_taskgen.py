@@ -7,6 +7,7 @@
 import os
 import re
 import time
+from typing import Optional
 
 from vulnclaw.ai.v100.batch_processor import BatchProcessor
 from vulnclaw.core.logger import logger
