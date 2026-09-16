@@ -136,6 +136,60 @@ class FeedbackLedger:
             n += 1
         return n
 
+    def absorb_verify(
+        self,
+        finding: Dict[str, Any],
+        verdict: str,
+        reason: str = "",
+        payload: str = "",
+        payload_reproduced: bool = False,
+        target: str = "",
+        tech_stack: Optional[List[str]] = None,
+    ) -> bool:
+        """回流单条 AI 验证裁决（T11 写端）。
+
+        把 verify 阶段对某 finding 的裁决结论结构化落盘（结论/理由/payload/
+        证据摘要/是否复现成功）。指纹口径与 absorb_finding 完全一致
+        (vuln_type, param, payload, target_host)，并叠加 verdict 去重：
+        同指纹同裁决已回流过（source=verify 行）则跳过，返回 False（幂等）。
+
+        verdict: confirm（确认/复现成功） / rejected（未确认）等，归一到底层口径。
+        """
+        f = dict(finding or {})
+        v = str(verdict).strip().lower() or "rejected"
+        vt = str(f.get("type") or f.get("vuln_type") or "")
+        pm = str(f.get("parameter") or f.get("param") or "")
+        pl = str(payload or f.get("payload") or "")
+        th = _host_of(str(target or f.get("target") or ""))
+        fp = (vt, pm, pl, th, v)
+        for row in self.rows():
+            if str(row.get("source")) != "verify":
+                continue
+            if (str(row.get("vuln_type") or ""),
+                    str(row.get("param") or ""),
+                    str(row.get("payload") or ""),
+                    str(row.get("target_host") or ""),
+                    str(row.get("verdict") or "")) == fp:
+                return False
+        fact = {
+            "kind": "finding",
+            "source": "verify",
+            "vuln_type": vt,
+            "engine": str(f.get("engine") or ""),
+            "param": pm,
+            "payload": pl,
+            "severity": str(f.get("severity") or ""),
+            "evidence": str(f.get("evidence") or "")[:300],
+            "verdict": v,
+            "tech_stack": [str(t) for t in (tech_stack or [])][:8],
+            "target_host": th,
+            "confidence": f.get("confidence"),
+            "verify_reason": str(reason or "")[:300],
+            "payload_reproduced": bool(payload_reproduced),
+        }
+        self.record(fact)
+        return True
+
     # ---------------- 读取 ----------------
     def rows(self) -> List[Dict[str, Any]]:
         """读全量事实（追加式账本，MVP 量级线性扫描安全）。"""

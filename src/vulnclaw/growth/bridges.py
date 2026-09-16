@@ -57,6 +57,36 @@ def maybe_absorb_scan(report: Dict[str, Any]) -> bool:
         return False
 
 
+def maybe_absorb_verify(
+    finding: Dict[str, Any],
+    verdict: str,
+    reason: str = "",
+    payload: str = "",
+    payload_reproduced: bool = False,
+    target: str = "",
+    tech_stack: Optional[List[str]] = None,
+) -> bool:
+    """方向2 回流写端（单条 AI 验证裁决）。
+
+    把 verify 阶段对某 finding 的裁决结论写回经验账本
+    （结论/理由/payload/证据摘要/是否复现成功）。默认关
+    （enable_growth_feedback=False 不落任何数据）；失败静默不影响验证主流程。
+    返回是否实际写入了该条经验。
+    """
+    if not _flag(GROWTH_FEEDBACK_KEY):
+        return False
+    try:
+        from vulnclaw.growth.feedback_ledger import get_feedback_ledger
+        return get_feedback_ledger().absorb_verify(
+            finding, verdict=verdict, reason=reason, payload=payload,
+            payload_reproduced=payload_reproduced, target=target,
+            tech_stack=tech_stack,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"growth: verify 回流失败（忽略，不影响主流程）: {exc}")
+        return False
+
+
 def maybe_ingest_cves(limit: int = 50) -> Dict[str, Any]:
     """方向1：扫描开始前增量摄入 CVE -> 草稿（确定性骨架，LLM 增强按开关）。
 

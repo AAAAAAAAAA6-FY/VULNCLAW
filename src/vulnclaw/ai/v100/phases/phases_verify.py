@@ -568,6 +568,27 @@ async def _verify_all_findings(self):
             if self.burp_available and severity in ("Critical", "High"):
                 burp_result = await self._verify_with_burp_repeater(vuln)
                 burp_verified = burp_result.get("confirmed", False)
+            # T11 回流写端（2026-09-16）：把单条 AI 验证裁决结构化落回经验账本。
+            # 默认关（enable_growth_feedback=False）零影响；失败静默。
+            # 覆盖"单条裁决 + 批量复用（preset_ai_result）"两条路径——二者都会在此收敛。
+            try:
+                from vulnclaw.growth.bridges import maybe_absorb_verify
+                _tver = ai_result.get("technical_verification") or {}
+                maybe_absorb_verify(
+                    vuln,
+                    verdict=("confirm" if (ai_result.get("confirmed") or burp_verified)
+                             else "rejected"),
+                    reason=str(ai_result.get("reason")
+                               or ai_result.get("verification_method") or ""),
+                    payload=str(vuln.get("payload") or ""),
+                    payload_reproduced=bool(
+                        _tver.get("exploitable") or _tver.get("oob_confirmed")
+                        or burp_verified),
+                    target=str(vuln.get("url") or vuln.get("target") or ""),
+                    tech_stack=vuln.get("tech_stack"),
+                )
+            except Exception:  # noqa: BLE001 - 回流失败绝不影响验证主流程
+                pass
             return ai_result, burp_verified
     # A 方案步骤2/3: 断言前置——组装证据包、并发 probe，客观信号落回 finding。
     # 必须在 batch 分组（下方 _verify_cross_batch 调用）之前执行，否则 batch prompt 吃不到。

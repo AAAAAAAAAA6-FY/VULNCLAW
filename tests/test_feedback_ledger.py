@@ -224,3 +224,62 @@ class TestShadowMode:
         assert rep["shadow_enabled"] is True
         assert rep["recommend_calls"] == 1
         assert os.path.exists(out), "报表必须落盘"
+
+
+# ============================================================
+# T11 回流写端：验证结果回流账本（absorb_verify / maybe_absorb_verify）
+# ============================================================
+class TestVerifyFeedback:
+    """AI 验证阶段把单条裁决结构话写回账本：正常回流 / 幂等 / 开关关闭零行为。"""
+
+    @staticmethod
+    def _switch(monkeypatch, live=True):
+        from vulnclaw.config.settings import settings
+        monkeypatch.setattr(settings, "enable_growth_feedback", live)
+
+    def _verify_rows(self, ledger):
+        return [r for r in ledger.rows() if r.get("source") == "verify"]
+
+    def test_normal_absorb_verify(self, ledger):
+        ok = ledger.absorb_verify(
+            _f(vuln_type="xss", param="q", payload="<script>"), verdict="confirm",
+            reason="echo 复现", payload_reproduced=True,
+            target="https://b.example.com/x?q=1",
+        )
+        assert ok is True
+        rows = self._verify_rows(ledger)
+        assert len(rows) == 1
+        r = rows[0]
+        assert r["kind"] == "finding"
+        assert r["source"] == "verify"
+        assert r["vuln_type"] == "xss"
+        assert r["verdict"] == "confirm"
+        assert r["target_host"] == "b.example.com"
+        assert r["payload_reproduced"] is True
+        assert r["verify_reason"] == "echo 复现"
+
+    def test_idempotent_same_verdict_skipped(self, ledger):
+        assert ledger.absorb_verify(_f(payload="/etc/passwd"), verdict="confirm") is True
+        assert ledger.absorb_verify(_f(payload="/etc/passwd"), verdict="confirm") is False
+        assert len(self._verify_rows(ledger)) == 1
+
+    def test_duplicate_different_verdict_still_recorded(self, ledger):
+        ledger.absorb_verify(_f(payload="/etc/passwd"), verdict="confirm")
+        ledger.absorb_verify(_f(payload="/etc/passwd"), verdict="rejected")
+        rows = self._verify_rows(ledger)
+        assert len(rows) == 2, "同指纹不同裁决应各自保留（口径含 verdict）"
+
+    def test_maybe_absorb_verify_off_is_zero_behavior(self, ledger, monkeypatch):
+        self._switch(monkeypatch, live=False)
+        assert bridges.maybe_absorb_verify(
+            _f(payload="/etc/passwd"), verdict="confirm") is False
+        assert len(ledger.rows()) == 0, "开关关闭必须零落盘"
+
+    def test_maybe_absorb_verify_on_writes(self, ledger, monkeypatch):
+        self._switch(monkeypatch, live=True)
+        assert bridges.maybe_absorb_verify(
+            _f(payload="/etc/passwd"), verdict="confirm",
+            reason="复现成功", target="https://c.example.com/",
+        ) is True
+        assert len(ledger.rows()) == 1
+        assert ledger.rows()[0]["target_host"] == "c.example.com"
