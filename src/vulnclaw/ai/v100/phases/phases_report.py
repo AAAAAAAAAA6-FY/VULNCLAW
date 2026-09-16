@@ -362,6 +362,13 @@ async def _generate_report(self) -> Dict:
     balancer_stats = self.balancer.get_stats()
     model_stats = await self.get_model_stats_cached()
     engine_inventory = get_engine_inventory()
+    # T12：本次扫描实际用到的 prompt 版本（key+version），落报告顶部元数据，
+    # 失败静默降级为空列表，绝不让审计字段缺失打断报告生成。
+    try:
+        from vulnclaw.ai.prompt_registry import used_versions as _pv
+        prompt_versions = _pv()
+    except Exception:  # noqa: BLE001 - 审计字段降级
+        prompt_versions = []
     report = {
         "target": self.target,
         "scan_time": __import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -381,6 +388,7 @@ async def _generate_report(self) -> Dict:
         "cache_poison_findings": self._cache_poison_findings,
         "verified_findings": len(self.findings),
         "engine_inventory": engine_inventory,
+        "prompt_versions": prompt_versions,
         "vulnerabilities": findings_ordered,
         "severity_stats": severity_count,
         "pending_review": list(getattr(self, "_pending_review", []) or []),

@@ -27,7 +27,7 @@ from typing import Any, Dict, List
 # prompt id -> spec
 _PROMPTS: Dict[str, Dict[str, Any]] = {
     "verify.cross_batch": {
-        "version": 1,
+        "version": "1.0",
         "description": "同 URL+参数下多引擎候选的批量证据型裁决"
                        "（phases_verify._verify_cross_batch）",
         "system": "只输出 JSON 数组，不要 Markdown 代码块。",
@@ -69,7 +69,7 @@ _PROMPTS: Dict[str, Dict[str, Any]] = {
         ],
     },
     "verify.single_evidence": {
-        "version": 1,
+        "version": "1.0",
         "description": "单条候选的证据型裁决（phases_verify：证据包 + probe 观测）",
         "system": "",
         "params": {},
@@ -106,7 +106,7 @@ _PROMPTS: Dict[str, Dict[str, Any]] = {
         ],
     },
     "verify.dedupe": {
-        "version": 1,
+        "version": "1.0",
         "description": "同类型+同 URL、仅参数不同的重复报告判定（phases_verify 去重）",
         "system": "",
         "params": {},
@@ -128,7 +128,7 @@ _PROMPTS: Dict[str, Dict[str, Any]] = {
         ],
     },
     "strategic.plan_llm": {
-        "version": 1,
+        "version": "1.0",
         "description": "战略层 LLM 增强：按侦察情报产出高价值路径 Top-N"
                        "（decision_layers.strategic_plan_llm）",
         "system": "只输出 JSON。",
@@ -156,9 +156,37 @@ _PROMPTS: Dict[str, Dict[str, Any]] = {
 }
 
 
+# 审计：本次进程内实际渲染过的 prompt (key -> version)。注册表保持纯函数，
+# 仅此处维护"哪些版本被用过"的可追溯记录，供扫描报告挂载 prompt_versions。
+_USED: Dict[str, str] = {}
+
+
 def get_prompt(pid: str) -> Dict[str, Any]:
     """取 prompt spec（不存在返回空 dict —— 调用方据此回退，不抛异常）。"""
     return _PROMPTS.get(pid) or {}
+
+
+def get_version(pid: str) -> str:
+    """取 prompt 注册的语义化版本（major.minor）。未注册返回 ""（fail-open）。"""
+    spec = _PROMPTS.get(pid)
+    return str(spec.get("version") or "") if spec else ""
+
+
+def used_versions() -> List[Dict[str, str]]:
+    """本次进程内实际渲染过的 prompt 清单 ``[{key, version}, ...]``，供审计/报告。
+
+    读取失败一律返回空列表（写/读失败静默降级，绝不打断报告链路）。
+    """
+    try:
+        return [{"key": pid, "version": ver}
+                for pid, ver in _USED.items() if pid]
+    except Exception:  # noqa: BLE001 - 审计字段降级
+        return []
+
+
+def reset_used() -> None:
+    """清空已用记录（测试隔离；生产单进程单扫描天然自洽）。"""
+    _USED.clear()
 
 
 def list_prompts() -> List[Dict[str, Any]]:
@@ -181,6 +209,10 @@ def render(pid: str, **kwargs: Any) -> str:
     spec = _PROMPTS.get(pid)
     if not spec:
         return ""
+    try:
+        _USED[pid] = str(spec.get("version") or "")
+    except Exception:  # noqa: BLE001 - 审计记录失败静默降级，不影响渲染
+        pass
     text = str(spec.get("template") or "")
     for key, val in kwargs.items():
         text = text.replace("{" + str(key) + "}", str(val))

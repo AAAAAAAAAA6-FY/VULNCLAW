@@ -311,7 +311,7 @@ class TestPromptRegistry:
     def test_list_prompts_exposes_version(self):
         from vulnclaw.ai.prompt_registry import list_prompts
         rows = list_prompts()
-        assert any(r["id"] == self.PID and r["version"] >= 1 for r in rows)
+        assert any(r["id"] == self.PID and r["version"] == "1.0" for r in rows)
 
     def test_all_registered_prompts_pass_own_regression(self):
         """每个已注册 prompt 都必须通过自己的样例回归（防新增 prompt 忘记配样例）。"""
@@ -342,6 +342,61 @@ class TestPromptRegistry:
         assert "S" in d and "重复报告" in d
         s = render("strategic.plan_llm", tech="T", ports="P", vulns="V")
         assert "技术栈: T" in s and "端口: P" in s and "已发现漏洞: V" in s
+
+    # ---- T12 prompt 版本管理：语义化版本 + render 兼容 + 审计接线 ----
+
+    def test_all_versions_are_semver(self):
+        """version 字段必须是 major.minor 语义化版本，便于 diff/回滚/灰度。"""
+        from vulnclaw.ai.prompt_registry import list_prompts
+        import re
+        rows = list_prompts()
+        assert rows
+        for r in rows:
+            assert re.fullmatch(r"\d+\.\d+", str(r["version"])), r
+
+    def test_get_version_known_and_unknown(self):
+        """get_version(key) 给出语义化版本；未知 key fail-open 返回空串。"""
+        from vulnclaw.ai.prompt_registry import get_version
+        assert get_version(self.PID) == "1.0"
+        assert get_version("does.not.exist") == ""
+
+    def test_render_still_returns_str_for_legacy_callers(self):
+        """render() 保持返回 str，既有调用方（phases_* / decision_layers）零改动。"""
+        from vulnclaw.ai.prompt_registry import render
+        out = render(self.PID, items="X")
+        assert isinstance(out, str)
+        assert out
+
+    def test_used_versions_recorded_on_render(self):
+        """静态（T12）审计：render 过的 prompt 会被记入 used_versions()。
+        （调用方仍可逐条迁移到动态审计通道；此处是静态契约。）
+        """
+        from vulnclaw.ai.prompt_registry import render, used_versions, reset_used
+        reset_used()
+        render("verify.cross_batch", items="x")
+        render("strategic.plan_llm", tech="t", ports="80", vulns="v")
+        pv = used_versions()
+        keys = {p["key"] for p in pv}
+        assert "verify.cross_batch" in keys
+        assert "strategic.plan_llm" in keys
+        assert all(p["version"] for p in pv)
+
+    def test_unknown_render_not_recorded(self):
+        from vulnclaw.ai.prompt_registry import render, used_versions, reset_used
+        reset_used()
+        render("does.not.exist", items="x")  # fail-open：返回空串且不记录
+        assert used_versions() == []
+
+    def test_prompt_versions_in_report_metadata(self):
+        """报告顶层元数据带 prompt_versions（key+version），json 序列化不丢失。"""
+        from vulnclaw.ai.prompt_registry import used_versions, reset_used, render
+        import json as _json
+        reset_used()
+        render("verify.single_evidence", evidence_pack="EP", probe_summary="PS")
+        report = {"target": "http://t.example.com", "prompt_versions": used_versions()}
+        roundtrip = _json.loads(_json.dumps(report, ensure_ascii=False))
+        assert roundtrip["prompt_versions"] == [
+            {"key": "verify.single_evidence", "version": "1.0"}]
 
 
 # ============================================================
