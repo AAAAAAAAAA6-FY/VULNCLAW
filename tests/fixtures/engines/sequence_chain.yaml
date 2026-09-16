@@ -19,7 +19,7 @@ cases:
         status: 200
         body: '{"ok":true,"order_id":"ORD20260915001"}'
     evidence_contains: "业务成功信号"
-    reproduction: "curl -sS 'http://127.0.0.1:8080/payflow/complete?step=pay'  # 跳过敏捷步骤直接访问末步被业务接受"
+    reproduction: "curl -sS -m 8 'http://127.0.0.1:8080/payflow/complete?step=pay'  # 跳过前置支付步骤直达末步，被业务 oracle 接受(缺跨步骤状态校验)"
 
   # 多步序列——"取 token 后改密"业务链（run_sequence 提取变量注入后续步骤，末步 oracle 判定成功）
   - id: sequence_chain_token_pwd_reset
@@ -34,7 +34,7 @@ cases:
         status: 200
         body: '{"ok":true,"message":"密码已更新","session":"RS-88213"}'
     evidence_contains: "业务成功信号"
-    reproduction: "按序 GET /reset/request 提取 token -> POST /reset/confirm 改密成功，末步命中业务成功信号（缺跨步骤一次性令牌校验）"
+    reproduction: "curl -sS -m 8 'http://127.0.0.1:8080/reset/request'  # 第一步取一次性 token(置状态)\ncurl -sS -m 8 'http://127.0.0.1:8080/reset/confirm?step=finalize'  # 第二步未校验 token 直达改密成功(缺跨步骤一次性令牌校验)"
 
   # 多步序列——"加购后结算下单"业务链，末步返回业务资源标识 order_id 判成功
   - id: sequence_chain_cart_checkout
@@ -49,7 +49,7 @@ cases:
         status: 200
         body: '{"ok":true,"order_id":"ORD20260917003","amount":199}'
     evidence_contains: "业务成功信号"
-    reproduction: "按序 加购 -> 结算 -> 支付下单成功，末步返回 order_id（缺跨步骤状态/金额重校验）"
+    reproduction: "curl -sS -m 8 'http://127.0.0.1:8080/cart/add?item=SKU001' && curl -sS -m 8 'http://127.0.0.1:8080/cart/checkout?step=pay'  # 加购->结算->支付下单成功返回 order_id(缺跨步骤状态/金额重校验)"
 
   - id: sequence_chain_order_enforced
     method: check

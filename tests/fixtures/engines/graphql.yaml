@@ -15,7 +15,7 @@ cases:
         status: 200
         body: '{"data":{"__schema":{"queryType":{"name":"Query"},"types":[{"name":"Query","kind":"OBJECT","fields":[{"name":"status","type":{"name":"String","kind":"SCALAR"}}]},{"name":"String","kind":"SCALAR"}]}}}'
     evidence_contains: "内省查询返回"
-    reproduction: "curl -X POST 'http://127.0.0.1:8080/graphql' -H 'Content-Type: application/json' --data '{\"query\":\"query { __schema { types { name } } }\"}'"
+    reproduction: "curl -sS -m 8 -X POST 'http://127.0.0.1:8080/graphql' -H 'Content-Type: application/json' --data '{\"query\":\"{__schema{queryType{name}}}\"}'  # 内省开启探测：__schema 返回 queryType=Query"
 
   - id: no_graphql_endpoint
     expect: negative
@@ -47,7 +47,7 @@ cases:
         status: 200
         body: '[{"data":{"__typename":"Query"}},{"data":{"__typename":"Query"}}]'
     evidence_contains: "GraphQL 请求级批量"
-    reproduction: "fixture 复现（离线 mock）：POST http://127.0.0.1:8080/graphql 传 JSON 数组 [{q},{q}] → 服务端接受并返回多元素 data → 期望命中「GraphQL 请求级批量(限流绕过面)」"
+    reproduction: "curl -sS -m 8 -X POST 'http://127.0.0.1:8080/graphql' -H 'Content-Type: application/json' --data '[{\"query\":\"{__typename}\"},{\"query\":\"{__typename}\"}]'  # 请求级批量(限流绕过面)：JSON 数组被接受并返回多元素 data"
 
   - id: graphql_no_http_batch
     expect: negative
@@ -91,7 +91,7 @@ cases:
         status: 200
         body: '{"data":{"a0":{"__typename":"Query"},"a1":{"__typename":"Query"},"a2":{"__typename":"Query"},"a3":{"__typename":"Query"},"a4":{"__typename":"Query"},"a5":{"__typename":"Query"},"a6":{"__typename":"Query"},"a7":{"__typename":"Query"},"a8":{"__typename":"Query"},"a9":{"__typename":"Query"}}}'
     evidence_contains: "GraphQL alias 批量"
-    reproduction: "fixture 复现（离线 mock）：单请求 query 内 10 个别名（a0..a9）均被执行并返回 → 期望命中「GraphQL alias 批量(限流绕过面)」"
+    reproduction: "curl -sS -m 8 -X POST 'http://127.0.0.1:8080/graphql' -H 'Content-Type: application/json' --data '{\"query\":\"{a0:__typename a1:__typename a2:__typename a3:__typename a4:__typename a5:__typename a6:__typename a7:__typename a8:__typename a9:__typename}\"}'  # GraphQL alias 批量(限流绕过面)：单请求内 10 个别名均被执行返回"
 
   - id: graphql_no_alias_batching
     expect: negative

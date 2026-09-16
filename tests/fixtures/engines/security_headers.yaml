@@ -19,7 +19,7 @@ cases:
           Content-Type: text/html
         body: "<html><body>hello</body></html>"
     evidence_contains: "Strict-Transport-Security"
-    reproduction: "fixture 复现（离线 mock）：对目标 GET，观察是否缺失 HSTS/CSP/X-Frame-Options 等 → 期望命中「安全头缺失」"
+    reproduction: "curl -sS -m 8 -D - http://127.0.0.1:8080/ -o /dev/null  # 回显响应头，缺失 HSTS/CSP/X-Frame-Options/X-Content-Type-Options/Referrer-Policy 等 → 命中「安全头缺失」"
 
   - id: all_required_headers_present
     method: scan
@@ -57,4 +57,4 @@ cases:
           Referrer-Policy: "same-origin"
         body: "<html><body>hello</body></html>"
     evidence_contains: "Strict-Transport-Security"
-    reproduction: "fixture 复现（离线 mock）：缺失 HSTS 与 CSP → 期望命中两个 High 级安全头缺失"
+    reproduction: "curl -sS -m 8 -D - http://127.0.0.1:8080/ -o /dev/null  # 响应头仅含 X-Frame-Options/X-Content-Type-Options/Referrer-Policy，缺失 HSTS 与 CSP → 命中两个 High 级安全头缺失"

@@ -10,6 +10,20 @@ description: |
   Server: nginx/1.21.0（超出受影响区间且无框架指纹）不报反例。
 
 cases:
+  - id: apache_2_4_50_vulnerable
+    method: scan
+    expect: positive
+    target: http://127.0.0.1:8080
+    responses:
+      "/":
+        status: 200
+        headers:
+          Server: "Apache/2.4.50 (Unix)"
+          Content-Type: "text/html"
+        body: "<html><body>site</body></html>"
+    evidence_contains: "Apache"
+    reproduction: "curl -s -I 'http://127.0.0.1:8080/' | grep -i '^Server'  # Apache 2.4.50 落在高危版本区间（CVE-2021-42013）"
+
   - id: apache_2_4_49_vulnerable
     method: scan
     expect: positive
@@ -23,7 +37,7 @@ cases:
         body: |
           <html><body><h1>It works!</h1></body></html>
     evidence_contains: "CVE-2021-41773"
-    reproduction: "fixture 复现（离线 mock）：响应头 Server: Apache/2.4.49 → 期望命中「后端组件漏洞：Apache 2.4.49」(Critical)"
+    reproduction: "curl -sS -m 8 -D - -o /dev/null http://127.0.0.1:8080/ | grep -i '^Server:'  # Server: Apache/2.4.49 → 命中 CVE-2021-41773(Critical) → 后端组件漏洞命中"
 
   - id: nginx_1_21_0_safe
     method: scan

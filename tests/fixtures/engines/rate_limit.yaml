@@ -9,6 +9,17 @@ class: RateLimitEngine
 engine: rate_limit
 
 cases:
+  - id: login_405_without_rate_limit
+    method: scan
+    expect: positive
+    target: http://127.0.0.1:8080
+    responses:
+      /login:
+        status: 405
+        body: "<html><body><form method=post action=/login><input name=user><input type=password name=pass><button>Login</button></form></body></html>"
+    evidence_contains: "限流"
+    reproduction: "cmd /c \"for /L %i in (1,1,10) do curl -sS -m 3 -o NUL -X POST -d 'user=admin&pass=wrong' http://127.0.0.1:8080/login\"  # 连续 10 次错误口令均无 429/锁定(均 200/405)，反驳存在限流"
+
   - id: login_without_rate_limit
     method: scan
     expect: positive
@@ -18,7 +29,7 @@ cases:
         status: 200
         body: "<html><body><form method=post action=/login><input name=username><input type=password name=password><button>Sign in</button></form></body></html>"
     evidence_contains: "限流"
-    reproduction: "fixture 复现（离线 mock）：对 'http://127.0.0.1:8080/login' 连续 5 次错误口令 POST，观察是否出现 429/锁定提示 → 期望命中「登录接口缺少限流」"
+    reproduction: "cmd /c \"for /L %i in (1,1,10) do curl -sS -m 3 -o NUL -X POST -d 'username=admin&password=wrong' http://127.0.0.1:8080/login\"  # 连续 10 次错误口令均返回 200(无 429/锁定)，反驳存在限流"
 
   # ---------- 反例 ----------
   - id: no_login_endpoint

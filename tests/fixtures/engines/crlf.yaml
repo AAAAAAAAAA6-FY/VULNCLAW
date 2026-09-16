@@ -10,6 +10,22 @@ description: |
   本 fixture 验证：响应体含注入特征串 → 正例；响应与基线零差异且无任何特征 → 反例（低误报铁律）。
 
 cases:
+  - id: crlf_response_split_cookie
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/page?url=ORIG
+    param: url
+    normal_resp: [200, "<html>normal</html>", {}]
+    responses:
+      "127.0.0.1:8080/page":
+        status: 200
+        headers:
+          Content-Type: "text/html"
+        body: |
+          <html><body>Set-Cookie: session=evil</body></html>
+    evidence_contains: "Set-Cookie: session=evil"
+    reproduction: "curl -sS --get 'http://127.0.0.1:8080/page' --data-urlencode 'url=%0d%0aSet-Cookie: session=evil'  # 响应拆分注入 Cookie"
+
   - id: crlf_body_injection_feature
     method: check
     expect: positive
@@ -24,7 +40,7 @@ cases:
         body: |
           <html><body>X-Test: injected</body></html>
     evidence_contains: "X-Test: injected"
-    reproduction: "fixture 复现（离线 mock）：对 ?url= 注入 CRLF 后响应体出现 X-Test: injected → 期望命中「CRLF注入」"
+    reproduction: "curl -sS -m 8 --get 'http://127.0.0.1:8080/page' --data-urlencode 'url=x%0d%0aX-Test:%20injected%0d%0aHost:%20evil'  # CRLF 注入改响应体，命中「CRLF注入」"
 
   - id: crlf_clean_no_injection
     method: check

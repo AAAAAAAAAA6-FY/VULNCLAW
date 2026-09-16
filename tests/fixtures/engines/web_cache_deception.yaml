@@ -6,15 +6,25 @@ class: WebCacheDeceptionEngine
 engine: web_cache_deception
 
 cases:
+  - id: cache_deception_profile_hit
+    expect: positive
+    target: http://127.0.0.1:8080/user/profile
+    responses:
+      /user/profile:
+        status: 200
+        body: "<html><body><h1>User Profile</h1><p>email: alice@example.com, plan: pro, session: active, billing: enabled</p></body></html>"
+    evidence_contains: "缓存"
+    reproduction: "curl -sS -m 8 'http://127.0.0.1:8080/user/profile' && curl -sS -m 8 -D - -o /dev/null 'http://127.0.0.1:8080/user/profile/vlcwcdABC.css'  # .css 伪装路径返回鉴权页同内容 → 命中「Web缓存欺骗」"
+
   - id: cache_deception_confusion_hit
     expect: positive
     target: http://127.0.0.1:8080/account/billing
     responses:
       /account/billing:
         status: 200
-        body: "<html><body><h1>Monthly Billing</h1><p>invoice detail ...</p></body></html>"
+        body: "<html><body><h1>Monthly Billing</h1><p>invoice detail: account 12345, plan pro, amount 99.00 USD, due 2026-10-01</p></body></html>"
     evidence_contains: "缓存"
-    reproduction: "fixture 离线复现：/account/billing/vlcwcdabc.css 返回鉴权页同内容且带 x-cache/HIT"
+    reproduction: "curl -sS -m 8 'http://127.0.0.1:8080/account/billing' && curl -sS -m 8 -H 'X-Forwarded-Proto: https' -D - -o /dev/null 'http://127.0.0.1:8080/account/billing/vlcwcdABC.css'  # 步骤2取 .css 伪装路径，若返回鉴权页同内容(长度比<25%)且带 Cache-Control/x-cache HIT → 命中「Web缓存欺骗」"
 
   - id: cache_deception_denied
     expect: negative

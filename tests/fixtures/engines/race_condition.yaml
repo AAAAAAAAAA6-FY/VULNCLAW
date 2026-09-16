@@ -17,7 +17,35 @@ cases:
         status: 200
         body: '{"ok":true}'
     evidence_contains: "竞争条件候选端点"
-    reproduction: "并发请求 'http://127.0.0.1:8080/api/checkout'（折扣/库存/余额类端点）检测竞态"
+    reproduction: "curl -sS -m 5 -X POST -d 'order=100' 'http://127.0.0.1:8080/api/checkout' & curl -sS -m 5 -X POST -d 'order=100' 'http://127.0.0.1:8080/api/checkout' & wait  # 并发下单探测竞态;需服务端无锁(库存/余额未原子扣减)前提"
+
+  - id: withdraw_balance_candidate
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/api/withdraw
+    param: amount
+    parsed_query: "amount=100"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /api/withdraw:
+        status: 200
+        body: '{"ok":true}'
+    evidence_contains: "竞争条件候选端点"
+    reproduction: "curl -sS -m 5 -X POST -d 'amount=100' 'http://127.0.0.1:8080/api/withdraw' & curl -sS -m 5 -X POST -d 'amount=100' 'http://127.0.0.1:8080/api/withdraw' & wait  # 并发提现探测余额扣减竞态;需服务端无锁前提"
+
+  - id: coupon_redeem_candidate
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/api/coupon/redeem
+    param: code
+    parsed_query: "code=SAVE10"
+    normal_resp: [200, "ok", {}]
+    responses:
+      /api/coupon/redeem:
+        status: 200
+        body: '{"redeemed":true}'
+    evidence_contains: "竞争条件候选端点"
+    reproduction: "curl -sS -m 5 -X POST -d 'code=SAVE10' 'http://127.0.0.1:8080/api/coupon/redeem' & curl -sS -m 5 -X POST -d 'code=SAVE10' 'http://127.0.0.1:8080/api/coupon/redeem' & wait  # 并发兑换同一一次性优惠券探测超兑;需服务端无锁前提"
 
   - id: static_search_page
     method: check

@@ -9,6 +9,21 @@ description: |
   本 fixture 验证：Location: http://evil.com → 正例；始终 200 无 Location → 反例（低误报铁律）。
 
 cases:
+  - id: open_redirect_https_path_prefix
+    method: check
+    expect: positive
+    url: http://127.0.0.1:8080/redirect?redirect=ORIG
+    param: redirect
+    normal_resp: [200, "<html>ok</html>", {}]
+    responses:
+      "127.0.0.1:8080/redirect":
+        status: 302
+        headers:
+          Location: "https://evil.com/phish"
+        body: ""
+    evidence_contains: "evil.com"
+    reproduction: "curl -sS -m 8 --get 'http://127.0.0.1:8080/redirect' --data-urlencode 'redirect=https://evil.com/phish' -D -  # 302 Location 指向外部恶意域 evil.com → 命中「开放重定向」"
+
   - id: open_redirect_location_evil
     method: check
     expect: positive
@@ -22,7 +37,7 @@ cases:
           Location: "http://evil.com"
         body: ""
     evidence_contains: "evil.com"
-    reproduction: "fixture 复现（离线 mock）：?redirect=//evil.com → 响应 302 Location: http://evil.com → 期望命中「开放重定向」"
+    reproduction: "curl -sS -m 8 --get 'http://127.0.0.1:8080/redirect' --data-urlencode 'redirect=//evil.com' -D -  # //evil.com 协议相对跳转 → 302 Location: http://evil.com → 命中「开放重定向」"
 
   - id: open_redirect_clean_no_redirect
     method: check

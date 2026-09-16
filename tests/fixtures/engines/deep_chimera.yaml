@@ -24,7 +24,7 @@ cases:
         status: 200
         body: "<h1>result</h1><img src=x onerror=alert(1)><svg/onload=alert(2)>"
     evidence_contains: "<img"
-    reproduction: "fixture 离线复现：q 经 URL->HTML->JSON 逐层剥壳后原样落入未过滤 HTML 上下文，注入的 html_event(<img) 与 svg_onload(<svg) 两族强语义回显同现，引擎聚合为多族强回显"
+    reproduction: "curl -sS -m 8 'http://127.0.0.1:8080/echo' --data-urlencode \"q=%253Cimg%2520src%253Dx%2520onerror%253Dalert(1)%253E\"  # 双层编码(URL->HTML)剥壳后落回未过滤 HTML 上下文，html_event(<img) 族强回显"
 
   - id: deep_chimera_script_break_chain
     method: check
@@ -38,7 +38,7 @@ cases:
         status: 200
         body: "<div>frame</div></script><script>alert(1)</script><!--"
     evidence_contains: "</script>"
-    reproduction: "fixture 离线复现：脚本上下文剥壳链还原出 </script><script> 逃逸原语，script_break 与 html_comment 两族强语义回显同现，证明可将载荷提升为可执行 JS"
+    reproduction: "curl -sS -m 8 'http://127.0.0.1:8080/render' --data-urlencode \"cb=%253C%252Fscript%253E%253Cscript%253Ealert(1)%253C%252Fscript%253E\"  # 双层编码剥壳还原出 </script><script> 逃逸原语，script_break/html_comment 族强回显"
 
   - id: deep_chimera_json_sql_polyglot
     method: check
@@ -52,7 +52,7 @@ cases:
         status: 200
         body: "SELECT * WHERE name=' OR '1'='1"
     evidence_contains: "' OR '1'='1"
-    reproduction: "fixture 离线复现：JSON->HTML->URL 剥壳后经由某适配层还原为 SQL 语义，json_sql_polyglot 族强语义回显 ' OR '1'='1 单族命中，判定为深藏注入点"
+    reproduction: "curl -sS -m 8 'http://127.0.0.1:8080/search' --data-urlencode \"s=%2527%2520OR%2520%25271%2527%253D%25271\"  # JSON->HTML->URL 剥壳后还原为 SQL 语义 ' OR '1'='1，json_sql_polyglot 族强回显"
 
   - id: deep_chimera_tag_polyglot
     method: check
@@ -66,7 +66,7 @@ cases:
         status: 200
         body: "{{tpl}}<!--&{x}</t>"
     evidence_contains: "</t>"
-    reproduction: "fixture 离线复现：模板引擎上下文剥壳还原出 </t> 与 <!--&{x 原始语义，tag_break 与 tag_polyglot 两族强语义回显同现，判定为模板语义被破坏的深藏注入点"
+    reproduction: "curl -sS -m 8 'http://127.0.0.1:8080/view' --data-urlencode \"t=%257B%257Btpl%257D%257D%253C%2521--%2526%257Bx%253C%252Ft%253E\"  # 双层编码剥壳还原出 '{{tpl}}' '<!--&{x</t>' 模板语义破坏，tag_break/tag_polyglot 族强回显"
 
   # --- 反例（低误报铁律：不应检出） ---
 

@@ -21,7 +21,7 @@ cases:
           Cache-Control: "public, max-age=3600"
         body: "<html><body>static page</body></html>"
     evidence_contains: "Cache-Control"
-    reproduction: "fixture 复现（离线 mock）：对目标 GET，响应 Cache-Control 含 public → 期望命中「可缓存响应 Cache-Control: public」"
+    reproduction: "curl -sS -m 8 -D - -o /dev/null 'http://127.0.0.1:8080/'  # 响应含 Cache-Control: public, max-age=3600 → 命中「缓存投毒风险-Cache-Control: public」"
 
   - id: cache_control_no_store
     method: scan
@@ -48,4 +48,4 @@ cases:
           Content-Type: text/html
         body: "<html><body>static page</body></html>"
     evidence_contains: "Cache-Control"
-    reproduction: "fixture 复现（离线 mock）：响应缺失 Cache-Control/Pragma → 期望命中 LOW「缺失缓存头」"
+    reproduction: "curl -sS -m 8 -D - -o /dev/null 'http://127.0.0.1:8080/'  # 响应缺 Cache-Control/Pragma → 命中「缓存策略未配置-Low」"

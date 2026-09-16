@@ -21,7 +21,7 @@ cases:
         status: 200
         body: "<html><body><h1>Sign in</h1><label>请登录后继续</label></body></html>"
     evidence_contains: "越序直达"
-    reproduction: "curl -s 'http://127.0.0.1:8080/checkout/confirm'  # 无前置状态直达关键阶段页（对照 /login 差异显著）"
+    reproduction: "curl -sS -m 8 'http://127.0.0.1:8080/checkout/confirm'  # 无前置状态直达关键阶段页(对照 /login 差异显著) 越序直达"
 
   # 越序直达——管理类阶段端点（/admin/ 命中阶段关键字），无登录态直达业务仪表盘
   - id: state_admin_direct_access
@@ -39,7 +39,7 @@ cases:
         status: 200
         body: "<html><body><h1>Sign in</h1><label>请登录后继续</label></body></html>"
     evidence_contains: "越序直达"
-    reproduction: "curl -s 'http://127.0.0.1:8080/admin/dashboard'  # 无登录态直达管理仪表盘，对照 /login 差异显著"
+    reproduction: "curl -sS -m 8 'http://127.0.0.1:8080/admin/dashboard'  # 无登录态直达管理仪表盘(对照 /login 差异显著) 越序直达"
 
   # 二次/存储型触发：注入随机 stchain_ 标记至 /profile/update?nick=，消费端点 /messages 回显该标记
   #   （对应 _detect_second_order：marker：stchain_ + 8 位 hex，消费端点 2xx 且命中 _MARKER_RE 才报）
@@ -58,7 +58,7 @@ cases:
         status: 200
         body: "<html><body><ul class=feed><li>guest echo: stchain_active 可见</li></ul></body></html>"
     evidence_contains: "存储型二次触发"
-    reproduction: "注入随机标记 stchain_<hex8> 至 /profile/update?nick=<payload>，再 GET /messages 消费端点，响应回显该标记（HTTP 200），证明输入被持久化并在其他上下文二次触发"
+    reproduction: "curl -sS -m 8 'http://127.0.0.1:8080/profile/update' --data-urlencode 'nick=stchain_a1b2c3d4'  # 第一步注入存储型标记 stchain_<hex8>\ncurl -sS -m 8 'http://127.0.0.1:8080/messages'  # 第二步消费端点回显该标记(HTTP 200) 存储型二次触发"
 
   - id: state_protected_flow
     method: check

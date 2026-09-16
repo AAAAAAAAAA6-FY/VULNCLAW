@@ -24,7 +24,7 @@ cases:
         status: 200
         body: "ok"
     evidence_contains: "会话"
-    reproduction: "fixture 离线复现：Set-Cookie 缺少 Secure/HttpOnly/SameSite 的弱会话 Cookie"
+    reproduction: "curl -sS -m 8 -D - -o /dev/null -X POST -d 'username=admin&password=admin' http://127.0.0.1:8080/login  # 观察 Set-Cookie，缺 Secure/HttpOnly/SameSite 等安全属性 → 弱会话 Cookie 命中"
 
   - id: secured_session
     expect: negative

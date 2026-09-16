@@ -14,7 +14,7 @@ cases:
         status: 200
         body: '<input type="hidden" name="__VIEWSTATE" id="__VIEWSTATE" value="/wEPDwUKLTEw"/><input type="hidden" name="__VIEWSTATEGENERATOR" value="CA0B0334"/>'
     evidence_contains: "view state mac validation failed"
-    reproduction: "fixture 离线复现：篡改 __VIEWSTATE(翻转中间字节) POST 后响应 'view state mac validation failed'"
+    reproduction: "curl -sS -m 8 -c cj.txt 'http://127.0.0.1:8080/Login.aspx' >/dev/null && curl -sS -m 8 -b cj.txt -d '__VIEWSTATE=/wEPDwUKLTEx' -d '__VIEWSTATEGENERATOR=CA0B0334' 'http://127.0.0.1:8080/Login.aspx'  # 篡改 __VIEWSTATE 基础字节翻转变体 POST → 回显 MAC 校验失败 → 命中「ViewState未启用MAC校验」"
 
   - id: viewstate_normal_form
     expect: negative

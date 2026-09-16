@@ -16,7 +16,7 @@ cases:
         status: 200
         body: "internal_secret=lab-only"
     evidence_contains: "internal_secret=lab-only"
-    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/fetch' --data-urlencode 'url=https%3A%2F%2Fexample.com' → 期望命中「SSRF(localhost)」"
+    reproduction: "curl -sS -m 8 --get 'http://127.0.0.1:8080/fetch' --data-urlencode 'url=http://127.0.0.1/'  # 攻击 url 指向回环 127.0.0.1 → 命中「SSRF(localhost)」"
 
   - id: ordinary_fetch_response
     method: check
@@ -40,7 +40,7 @@ cases:
         status: 200
         body: "internal_secret=lab-only"
     evidence_contains: "internal_secret=lab-only"
-    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/import' --data-urlencode 'source=https%3A%2F%2Fcdn.example' → 期望命中「SSRF(localhost)」"
+    reproduction: "curl -sS -m 8 --get 'http://127.0.0.1:8080/import' --data-urlencode 'source=http://127.0.0.1/'  # 攻击 source 指向回环 → 命中「SSRF(localhost)」"
 
   - id: cloud_metadata_ami_reflected
     method: check
@@ -54,7 +54,7 @@ cases:
         status: 200
         body: "ami-id: ami-0abcdef1234567890&security-credentials"
     evidence_contains: "ami-id: ami-0abcdef1234567890&security-credentials"
-    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/fetch' --data-urlencode 'url=https%3A%2F%2Fexample.com' → 期望命中「SSRF(localhost)」"
+    reproduction: "curl -sS -m 8 --get 'http://127.0.0.1:8080/fetch' --data-urlencode 'url=http://169.254.169.254/latest/meta-data/ami-id'  # 攻击 url 指向云元数据 169.254.169.254 → 命中「SSRF」"
 
   - id: file_protocol_passwd
     method: check
@@ -68,7 +68,7 @@ cases:
         status: 200
         body: "root:x:0:0:root:/root:/bin/bash"
     evidence_contains: "root:x:0:0:root:/root:/bin/bash"
-    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/read' --data-urlencode 'file=readme.txt' → 期望命中「SSRF(file协议-passwd)」"
+    reproduction: "curl -sS -m 8 --get 'http://127.0.0.1:8080/read' --data-urlencode 'file=file:///etc/passwd' --data-urlencode 'file=readme.txt'  # 攻击 file 用 file:// 协议读 /etc/passwd → 命中「SSRF(file协议-passwd)」"
 
   - id: file_protocol_winini_registry
     method: check
@@ -82,7 +82,7 @@ cases:
         status: 200
         body: "[fonts] HKEY_LOCAL_MACHINE\\SOFTWARE\\Windows"
     evidence_contains: "[fonts] HKEY_LOCAL_MACHINE\\SOFTWARE\\Windows"
-    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/read' --data-urlencode 'file=readme.txt' → 期望命中「SSRF(file协议-win.ini)」"
+    reproduction: "curl -sS -m 8 --get 'http://127.0.0.1:8080/read' --data-urlencode 'file=file:///C:/Windows/win.ini' --data-urlencode 'file=readme.txt'  # 攻击 file 读 win.ini → 命中「SSRF(file协议-win.ini)」"
 
   - id: redis_banner_reflected
     method: check
@@ -99,7 +99,7 @@ cases:
         status: 200
         body: "redis_version:6.2.6"
     evidence_contains: "redis_version:6.2.6"
-    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/proxy' --data-urlencode 'url=https%3A%2F%2Fexample.com' → 期望命中「SSRF(dict协议-Redis)」"
+    reproduction: "curl -sS -m 8 --get 'http://127.0.0.1:8080/proxy' --data-urlencode 'url=dict://127.0.0.1:3306/' --data-urlencode 'url=https://example.com'  # 攻击 url 送 dict://127.0.0.1:3306 → 命中「SSRF(MySQL/Redis端口)」"
 
   - id: dict_protocol_redis
     method: check
@@ -113,7 +113,7 @@ cases:
         status: 200
         body: "$1\r\nredis_version\r\n"
     evidence_contains: "redis_version"
-    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/proxy' --data-urlencode 'url=x' → 期望命中「SSRF(dict协议-Redis)」"
+    reproduction: "curl -sS -m 8 --get 'http://127.0.0.1:8080/proxy' --data-urlencode 'url=dict://127.0.0.1:6379/info'  # dict:// 指向回环 Redis → 命中「SSRF(dict协议-Redis)」"
 
   - id: gopher_protocol_redis
     method: check
@@ -127,7 +127,7 @@ cases:
         status: 200
         body: "+OK\r\nredis_version:7.0.0"
     evidence_contains: "redis_version:7.0.0"
-    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/proxy' --data-urlencode 'url=x' → 期望命中「SSRF(gopher协议-Redis)」"
+    reproduction: "curl -sS -m 8 --get 'http://127.0.0.1:8080/proxy' --data-urlencode 'url=gopher://127.0.0.1:6379/_INFO%0d%0a'  # gopher:// 指向回环 Redis → 命中「SSRF(gopher协议-Redis)」"
 
   - id: integer_ip_bypass_reflected
     method: check
@@ -141,7 +141,7 @@ cases:
         status: 200
         body: "internal_secret=lab-only"
     evidence_contains: "internal_secret=lab-only"
-    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/fetch' --data-urlencode 'url=https%3A%2F%2Fexample.com' → 期望命中「SSRF(整数IP-127.0.0.1)」"
+    reproduction: "curl -sS -m 8 --get 'http://127.0.0.1:8080/fetch' --data-urlencode 'url=http://2130706433/'  # 整数 IP 2130706433=127.0.0.1 绕过过滤 → 命中「SSRF(整数IP-127.0.0.1)」"
 
   - id: ssh_banner_reflected
     method: check
@@ -157,7 +157,7 @@ cases:
 
   # ---------- 反例：空响应 / 5xx / WAF / 重定向 / 非 SSRF 参数 ----------
     evidence_contains: "SSH-2.0-OpenSSH_7.4"
-    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/fetch' --data-urlencode 'url=https%3A%2F%2Fexample.com' → 期望命中「SSRF(SSH端口)」"
+    reproduction: "curl -sS -m 8 --get 'http://127.0.0.1:8080/fetch' --data-urlencode 'url=http://127.0.0.1:22/'  # 探测本机 SSH 端口 22 → 命中「SSRF(SSH端口)」"
   - id: empty_response_200_fetch
     method: check
     expect: negative
@@ -241,7 +241,7 @@ cases:
         status: 302
         body: "internal_secret=lab-only"
     evidence_contains: "internal_secret=lab-only"
-    reproduction: "SSRF 经 302 跳转后返回内网内容（响应含 internal_secret）→ 期望命中「SSRF(localhost)」"
+    reproduction: "curl -sS -m 8 -L --get 'http://127.0.0.1:8080/fetch' --data-urlencode 'url=https://example.com'  # 跟随 302 跳转后 URL 落到内网并回显 internal_secret → 命中「SSRF(localhost)」"
 
   - id: dns_rebind_nip_io
     method: check
@@ -255,7 +255,7 @@ cases:
         status: 200
         body: "internal_secret=lab-only"
     evidence_contains: "internal_secret=lab-only"
-    reproduction: "DNS rebind（127.0.0.1.nip.io 通配解析到内网）→ 期望命中「SSRF(localhost)」"
+    reproduction: "curl -sS -m 8 --get 'http://127.0.0.1:8080/fetch' --data-urlencode 'url=http://127.0.0.1.nip.io/'  # 127.0.0.1.nip.io 通配解析到内网回环 → 命中「SSRF(localhost)」"
 
   - id: dns_rebind_localtest_me
     method: check
@@ -269,4 +269,4 @@ cases:
         status: 200
         body: "redis_version:6.2.6"
     evidence_contains: "redis_version:6.2.6"
-    reproduction: "DNS rebind（localtest.me 解析到 127.0.0.1）→ 期望命中「SSRF(内网端口)」"
+    reproduction: "curl -sS -m 8 --get 'http://127.0.0.1:8080/fetch' --data-urlencode 'url=http://localtest.me:6379/'  # localtest.me 解析到 127.0.0.1 → 命中「SSRF(内网端口)」"

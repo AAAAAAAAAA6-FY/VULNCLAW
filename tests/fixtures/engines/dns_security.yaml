@@ -16,7 +16,7 @@ cases:
         status: 200
         body: "no v=spf1 record"
     evidence_contains: "的 TXT 记录中未找到 v=spf1 记录"
-    reproduction: "fixture 复现（离线 mock）：域名 TXT 无 SPF + _dmarc 为 p=none → 引擎产出 email_spf_missing/email_dmarc_none 候选"
+    reproduction: "nslookup -type=TXT example.com   # TXT 无 v=spf1 记录 → email_spf_missing；nslookup -type=TXT _dmarc.example.com → p=none → email_dmarc_none"
 
   - id: dnssec_disabled
     expect: positive
@@ -26,7 +26,7 @@ cases:
         status: 200
         body: "no DS record"
     evidence_contains: "无 DS 记录（DNSSEC 未启用）"
-    reproduction: "fixture 复现（离线 mock）：域名 DS 查询 NoAnswer → 引擎产出 dns_dnssec_missing 候选"
+    reproduction: "nslookup -type=DS example.com   # DS 查询 NoAnswer（无 DS 记录）→ DNSSEC 未启用 → dns_dnssec_missing"
 
   - id: fully_hardened_email_security
     expect: negative

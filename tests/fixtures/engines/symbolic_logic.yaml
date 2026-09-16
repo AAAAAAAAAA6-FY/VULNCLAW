@@ -19,7 +19,7 @@ cases:
         status: 200
         body: "ok"
     evidence_contains: "约束求解证明目标可满足"
-    reproduction: "fixture 复现（离线 mock）：喂入 recon_brief.business_ir（quantity 值域[0,9] + 余额不变量）→ 约束求解证明数量越界目标可满足，产出 needs_verification 候选"
+    reproduction: "curl -sS -m 8 --get 'http://127.0.0.1:8080/order' --data-urlencode 'quantity=10'  # 符号推演：quantity 值域[0,9] 越界目标可满足，产出 needs_verification"
 
   - id: authz_idor_escalation
     expect: positive
@@ -29,7 +29,7 @@ cases:
         status: 200
         body: "ok"
     evidence_contains: "约束求解证明目标可满足"
-    reproduction: "fixture 复现（离线 mock）：IR 端点 /user/role 的 role 参数值域 enum{0,1}，符号推演证明高权限取值 role∈{1} 可达（水平/垂直越权 authz 目标），产出 needs_verification 候选"
+    reproduction: "curl -sS -m 8 --get 'http://127.0.0.1:8080/user/role' --data-urlencode 'role=1'  # 符号推演：role 值域 enum{0,1} 高权限取值 role=1 可达(越权 authz 目标)"
 
   - id: amount_tamper_total_solvable
     expect: positive
@@ -39,7 +39,7 @@ cases:
         status: 200
         body: "ok"
     evidence_contains: "约束求解证明目标可满足"
-    reproduction: "fixture 复现（离线 mock）：IR unit_price=100 + 参数 qty 值域[-100,100]、total 值域[-100000,100000] → 符号推演证明 amount(total) 目标（qty>0 且 total<真实单价×qty）可满足，产出金额篡改候选"
+    reproduction: "curl -sS -m 8 --get 'http://127.0.0.1:8080/order/pay' --data-urlencode 'total=-1'  # 符号推演：total 值域[-100000,100000] 证明 qty>0 且 total<单价×qty 的金额篡改目标可满足"
 
   - id: quantity_negative_solvable
     expect: positive
@@ -49,7 +49,7 @@ cases:
         status: 200
         body: "ok"
     evidence_contains: "约束求解证明目标可满足"
-    reproduction: "fixture 复现（离线 mock）：IR 参数 qty 值域[-100,100]，符号推演证明数量越界目标（qty<1，见证 qty=-1）可满足，产出 needs_verification 候选"
+    reproduction: "curl -sS -m 8 --get 'http://127.0.0.1:8080/cart/update' --data-urlencode 'qty=-1'  # 符号推演：qty 值域[-100,100] 证明 qty<1 见证 qty=-1 的数量越界目标可满足"
 
   # --- 反例（低误报铁律：fail-closed 不应产出） ---
 

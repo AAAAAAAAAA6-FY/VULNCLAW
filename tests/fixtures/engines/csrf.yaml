@@ -26,7 +26,7 @@ cases:
           </form>
           </body></html>
     evidence_contains: "CSRF Token"
-    reproduction: "fixture 复现（离线 mock）：GET http://127.0.0.1:8080/ → 期望命中「CSRF防护缺失(表单无Token)」"
+    reproduction: "curl -sS -m 8 -c c.txt -b c.txt -X POST -d 'username=admin&password=wrong' 'http://127.0.0.1:8080/login'  # 表单无 CSRF Token，跨站伪造同型提交即可被接受"
 
   - id: form_with_csrf_token
     method: scan
@@ -65,7 +65,7 @@ cases:
           </form>
           </body></html>
     evidence_contains: "CSRF"
-    reproduction: "fixture 复现（离线 mock）：GET http://127.0.0.1:8080/ → 命中 GET 状态变更表单无 CSRF Token"
+    reproduction: "curl -sS -m 8 -c c.txt -b c.txt --get 'http://127.0.0.1:8080/admin/delete' --data-urlencode 'id=1'  # GET 状态变更表单无 CSRF Token，跨站 <img> 即可触发删除"
 
   - id: form_with_hidden_anti_csrf
     method: scan

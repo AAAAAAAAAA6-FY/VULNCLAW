@@ -23,7 +23,7 @@ cases:
           <a id="location" href="/foo">link</a>
           </body></html>
     evidence_contains: "DOM Clobbering"
-    reproduction: "fixture 复现（离线 mock）：页面含 form id=top / img name=self / a id=location → 期望命中「DOM Clobbering(危险名覆盖)」"
+    reproduction: "curl -sS -m 8 'http://127.0.0.1:8080/'  # 探测注入点 echo 页，确认 id/name 覆盖 window/document 全局属性；完整触发需浏览器解析后 DOM 覆盖"
 
   - id: dom_clobbering_js_url
     expect: positive
@@ -37,7 +37,7 @@ cases:
           <form action="javascript:void(0)"><input name="x"></form>
           </body></html>
     evidence_contains: "javascript:"
-    reproduction: "fixture 复现（离线 mock）：页面含 <a href=javascript:...> 与 <form action=javascript:...> → 期望命中「DOM Clobbering(javascript: URL 注入)」"
+    reproduction: "curl -sS -m 8 'http://127.0.0.1:8080/'  # 探测注入点 echo 页，确认 href/action 含 javascript: URL；完整触发需浏览器解析并执行注入脚本"
 
   - id: dom_clobbering_clean
     expect: negative

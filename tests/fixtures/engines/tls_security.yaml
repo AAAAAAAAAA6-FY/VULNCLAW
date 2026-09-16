@@ -17,7 +17,7 @@ cases:
         status: 200
         body: "ok"
     evidence_contains: "服务端仍可与以下已废弃协议完成握手"
-    reproduction: "fixture 复现（离线 mock）：对 127.0.0.1:443 完成 TLSv1.1 + RC4-SHA 握手 → 引擎产出 tls_legacy_protocol_enabled/tls_weak_cipher 候选"
+    reproduction: "openssl s_client -connect 127.0.0.1:443 -tls1_1 2>&1 </dev/null | head -8  # 服务端接受 TLSv1.1 握手 → tls_legacy_protocol_enabled；openssl s_client -connect 127.0.0.1:443 -cipher RC4-SHA 2>&1 </dev/null | head -8  # RC4 套件可达 → tls_weak_cipher"
 
   - id: tlsv13_aead_valid_cert
     expect: negative

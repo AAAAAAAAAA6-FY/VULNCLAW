@@ -18,7 +18,7 @@ cases:
         body: "<html><body>"
         reflect: true
     evidence_contains: "[context=body]"
-    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/search' --data-urlencode 'q=demo' → 期望命中「XSS-反射型(基础script标签(混淆))」"
+    reproduction: "curl -sS -m 8 --get 'http://127.0.0.1:8080/search' --data-urlencode 'q=<script>alert(1)</script>'  # 反射 script 负载 → 命中「XSS-反射型(基础script)」"
 
   - id: encoded_or_sanitized_response
     method: check
@@ -46,7 +46,7 @@ cases:
         body: "<html><body>"
         reflect: true
     evidence_contains: "[context=body]"
-    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/search' --data-urlencode 'q=demo' → 期望命中「XSS-反射型(基础script标签(混淆))」"
+    reproduction: "curl -sS -m 8 --get 'http://127.0.0.1:8080/search' --data-urlencode 'q=<img src=x onerror=alert(1)>'  # 反射 img onerror 负载 → 命中「XSS-反射型(img标签)」"
 
   - id: reflected_svg_onload
     method: check
@@ -61,7 +61,7 @@ cases:
         body: "<html><body>"
         reflect: true
     evidence_contains: "[context=body]"
-    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/search' --data-urlencode 'q=demo' → 期望命中「XSS-反射型(基础script标签)」"
+    reproduction: "curl -sS -m 8 --get 'http://127.0.0.1:8080/search' --data-urlencode 'q=<svg onload=alert(1)>'  # 反射 SVG onload 负载 → 命中「XSS-反射型(svg)」"
 
   - id: reflected_js_uri
     method: check
@@ -78,7 +78,7 @@ cases:
 
   # ---------- 反例：转义 / 5xx / WAF / 重定向 ----------
     evidence_contains: "[context=body]"
-    reproduction: "fixture 复现（离线 mock）：curl -sS --get 'http://127.0.0.1:8080/search' --data-urlencode 'q=demo' → 期望命中「XSS-反射型(基础script标签)」"
+    reproduction: "curl -sS -m 8 --get 'http://127.0.0.1:8080/search' --data-urlencode 'q=javascript:alert(1)'  # JS URI 上下文反射 → 命中「XSS-反射型(js-uri)」"
   - id: escaped_entity_response
     method: check
     expect: negative
@@ -143,7 +143,7 @@ cases:
         body: '<input value="'
         reflect: true
     evidence_contains: "[context=attr]"
-    reproduction: "attribute 上下文反射（body='<input value=\"' + 反射 payload）→ 期望命中 [context=attr]"
+    reproduction: "curl -sS -m 8 --get 'http://127.0.0.1:8080/search' --data-urlencode 'q=\"><script>alert(1)</script>'  # payload 落入 <input value=\" 属性上下文 → 命中 [context=attr]"
 
   - id: reflected_script_context
     method: check
@@ -158,7 +158,7 @@ cases:
         body: '<script>var x="'
         reflect: true
     evidence_contains: "检测到JS执行特征"
-    reproduction: "JS/script 文本上下文反射（body='<script>var x=\"'）→ 期望命中 [context=script]"
+    reproduction: "curl -sS -m 8 --get 'http://127.0.0.1:8080/search' --data-urlencode 'q=\"x\";alert(1);//'  # payload 落入 <script> 文本上下文 → 命中 [context=script]"
 
   - id: reflected_tag_context_svg
     method: check
@@ -173,7 +173,7 @@ cases:
         body: '<svg'
         reflect: true
     evidence_contains: "[context=tag]"
-    reproduction: "标签名上下文反射（body='<svg'）→ 期望命中 [context=tag]（SVG 向量）"
+    reproduction: "curl -sS -m 8 --get 'http://127.0.0.1:8080/search' --data-urlencode 'q=/onload=alert(1)>'  # payload 落入 <svg 标签名上下文 → 命中 [context=tag]"
 
   # 注：comment 上下文不设 case——reflect 会把含 <script> 的 payload 反射进 body，
   # 触发引擎的 JS 执行检测（属合法检出），无法构造「注释内不执行」的干净负例。

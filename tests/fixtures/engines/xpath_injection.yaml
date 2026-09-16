@@ -18,7 +18,7 @@ cases:
         status: 500
         body: "System.Xml.XPath.XPathException: Expression must evaluate to a node-set"
     evidence_contains: "System.Xml.XPath"
-    reproduction: "curl --get 'http://127.0.0.1:8080/find' --data-urlencode \"q=' or '1'='1\""
+    reproduction: "curl -sS -m 8 --get 'http://127.0.0.1:8080/find' --data-urlencode \"q=' or '1'='1\"  # 注入布尔恒真破坏 XPath 表达式，服务端回显 XPathException"
 
   - id: xpath_benign_json
     method: check
@@ -46,4 +46,4 @@ cases:
         status: 200
         body: '{"count":null,"users":[{"name":"alice"}]}'
     evidence_contains: "count"
-    reproduction: "fixture 离线复现：双引号恒真 ' or '1'='1 改变节点集数量，响应结构显著变化"
+    reproduction: "curl -sS -m 8 --get 'http://127.0.0.1:8080/find' --data-urlencode \"q=' or '1'='1\"  # 布尔盲注恒真改变节点集数量，响应结构显著变化(count 变化)"
