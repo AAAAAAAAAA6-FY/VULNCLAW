@@ -19,6 +19,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          # T02 门禁用 "HEAD~1"...HEAD 三-dot diff；checkout@v7 默认 fetch-depth:1
+          # 缺历史对象，git diff 报 fatal exit 128 会让 step 直接挂掉（根因，非 BLE001 命中）
+          fetch-depth: 0
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v7
@@ -43,8 +47,8 @@ jobs:
         run: |
           BASE="${GITHUB_BASE_REF:+origin/$GITHUB_BASE_REF}"
           if [ -z "$BASE" ]; then BASE="HEAD~1"; fi
-          git fetch origin --quiet || true
-          CHANGED=$(git diff --name-only "$BASE"...HEAD -- '*.py' 2>/dev/null || git diff --name-only HEAD~1 -- '*.py' 2>/dev/null)
+          # fetch-depth:0 保证 HEAD~1 存在；diff 再失败也不让 step 以 git 128 挂掉
+          CHANGED=$(git diff --name-only "$BASE"...HEAD -- '*.py' || true)
           if [ -z "$CHANGED" ]; then
             echo "no changed python files"
           else
